@@ -3,7 +3,10 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || {
+    printf '%s\n' 'SKIP: ROS2 Python environment is unavailable'
+    exit 77
+}
 
 run_dir=$(mktemp -d "$root_dir/output.dm-mc02-ros2.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
@@ -25,10 +28,14 @@ server.bind(path)
 server.listen(1)
 try:
     import rclpy  # noqa: F401
+    from rclpy.node import Node  # noqa: F401
+    from sensor_msgs.msg import Imu  # noqa: F401
+    from sensor_msgs.msg import JointState  # noqa: F401
+    from std_msgs.msg import Float64MultiArray  # noqa: F401
 except ImportError:
     print("SKIP: ROS2 Python environment is unavailable")
     server.close()
-    sys.exit(0)
+    sys.exit(77)
 process = subprocess.Popen([
     worker_launcher, "--cosim", path, "--engine", "ros2",
     "--rate", "1000", "--frames", "5"

@@ -80,5 +80,5 @@ if ((needs_reconfigure)); then
         -Dbuildtype="$build_type" -Dqom_cast_debug="$qom_cast_debug" \
         -Dplugins="$plugins" -Dwerror=false >/dev/null
 fi
-"$root_dir/.venv/bin/ninja" -C "$build_dir" qemu-system-arm
+"$root_dir/tools/meson" compile -C "$build_dir" qemu-system-arm
 printf 'QEMU build ready: %s (buildtype=%s)\n' "$build_dir/qemu-system-arm" "$build_type"

@@ -515,6 +515,26 @@ Every support claim requires all of the following evidence:
 4. Registration in the authoritative test runner; an unregistered script is
    not a regression gate.
 
+`tools/dm_mc02_test_gate.py` owns the authoritative project gate. It builds
+before taking binary identities, then runs four disjoint inventories: selected
+DM Meson unit/qtests, native Host CTest entries selected with
+`-LE gate-external`, the complete pytest inventory with host plugin autoload
+disabled, and the stable shell-smoke inventory. A test belongs to exactly one
+inventory. The historical CTest Python and shell delegators remain available
+for direct use but carry the `gate-external` label and are not counted by the
+authoritative Host collection. Smoke scripts consume prebuilt production QEMU
+and Host binaries; they may still build an individual guest fixture.
+
+The gate records each dynamic inventory, command, result, raw exit status and
+QEMU/Host SHA-256 identity in
+`build/test-results/qemu-gate/<run>/summary.json`. PASS, FAIL and command-line
+errors return 0, 1 and 2. Exit 77 means SKIP only for the explicitly optional
+ROS2 and MuJoCo backends; a required dependency or result that is absent is
+BLOCKED. A run containing only BLOCKED failures returns 78, while FAIL takes
+precedence over BLOCKED. Binary identity drift during testing is a failure.
+This gate covers the project inventories, not all upstream QEMU tests or a
+real external plant performance profile.
+
 Public user interfaces are versioned wire protocols, documented launch
 profiles, and read-only QMP diagnostics. External backends must use those
 interfaces and cannot depend on QOM paths, board-private structs, or a CAN/USB

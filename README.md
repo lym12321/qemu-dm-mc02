@@ -104,74 +104,22 @@
 
 ## 快速检查
 
+正式项目门禁统一使用：
+
 ```bash
-bash tools/check-qemu.sh --report-only
-cmake -S . -B build/host
-cmake --build build/host
-build/host/dm_mc02_probe || test $? -eq 2
-bash tools/build-smoke.sh
-bash tools/build-qemu.sh
-bash tools/run-mc02-smoke.sh
-bash tools/run-cold-reset-smoke.sh
-bash tools/run-iwdg-smoke.sh
-bash tools/run-bmi088-smoke.sh
-bash tools/run-bmi088-fifo-smoke.sh
-build/host/dm_mc02_bmi088_chip_smoke
-bash tools/run-cosim-smoke.sh
-bash tools/run-uart-smoke.sh
-bash tools/run-uart-dma-smoke.sh
-bash tools/run-uart2-dma-smoke.sh
-bash tools/run-uart-idle-smoke.sh
-bash tools/run-uart-rx-timing-smoke.sh
-bash tools/run-fdcan-smoke.sh
-bash tools/run-fdcan-clock-smoke.sh
-bash tools/run-fdcan-ext-smoke.sh
-bash tools/run-fdcan-rx-buffer-smoke.sh
-bash tools/run-fdcan-busoff-smoke.sh
-bash tools/run-can-medium-smoke.sh
-bash tools/run-dm-motor-smoke.sh
-bash tools/run-sim-worker-smoke.sh
-bash tools/run-mujoco-worker-smoke.sh
-bash tools/run-ros2-worker-smoke.sh
-bash tools/run-qemu-worker-smoke.sh
-bash tools/run-backend-plugin-smoke.sh
-bash tools/run-qemu-v2-step-done-smoke.sh
-bash tools/run-dma-smoke.sh
-bash tools/run-dma-ht-smoke.sh
-bash tools/run-ws2812-smoke.sh
-bash tools/run-spi2-dma-smoke.sh
-bash tools/run-spi2-dma-smoke.sh off
-bash tools/run-spi2-dma-legacy-smoke.sh
-bash tools/run-dma-irq-smoke.sh
-bash tools/run-adc-dma-smoke.sh
-bash tools/run-adc-jauto-dma-smoke.sh
-bash tools/run-adc-input-smoke.sh
-bash tools/run-adc-analog-smoke.sh
-bash tools/run-adc-power-smoke.sh
-bash tools/run-power-boundary-smoke.sh
-bash tools/run-tim8-dma-smoke.sh
-bash tools/run-tim8-dbm-smoke.sh
-bash tools/run-tim8-approx-dma-smoke.sh
-bash tools/run-tim2-clock-smoke.sh
-bash tools/run-clock-zero-smoke.sh
-bash tools/run-tim3-irq-smoke.sh
-bash tools/run-ospi-smoke.sh
-bash tools/run-cordic-smoke.sh
-bash tools/run-crc-smoke.sh
-bash tools/run-usb-smoke.sh
-bash tools/run-usb-pipe-smoke.sh
-bash tools/run-stm32h723-usb-host-smoke.sh
-bash tools/run-stm32h723-usb-host-bulk-smoke.sh
-bash tools/run-peripheral-reset-smoke.sh
-bash tools/run-flash-smoke.sh
-bash tools/run-rs485-smoke.sh
-build/host/dm_mc02_transport_smoke
-bash tools/run-cosim-link-readback-smoke.sh
-bash tools/run-cosim-link-timing-smoke.sh
-bash tools/run-socketcan-smoke.sh
+python3 tools/dm_mc02_test_gate.py
+python3 tools/dm_mc02_test_gate.py --no-build
+python3 tools/dm_mc02_test_gate.py --smoke-only
+python3 tools/dm_mc02_test_gate.py --jobs 4 --report-dir /tmp/dm-mc02-gate
 ```
 
-真实固件性能基线（只读使用 `trobot/build/Release/trobot.elf`，不会修改固件）：
+默认入口先构建，再运行不重复的 Meson、原生 Host CTest、完整 pytest 和 shell smoke
+集合。`--no-build` 只消费已有产物；每次运行在报告目录中保存 `summary.json` 和各
+runner 日志。退出码 0/1/2/78 分别表示 PASS、FAIL、命令行错误和仅有 BLOCKED；
+ROS2/MuJoCo 缺 backend 会明确记录 SKIP。单个 `tools/run-*-smoke.sh` 可用于定向
+诊断，但不替代正式聚合结果。
+
+真实固件性能基线（只读使用固件 ELF，不会修改固件）：
 
 ```bash
 bash tools/collect-firmware-rtf.sh --warmup 0.25 --duration 1.0

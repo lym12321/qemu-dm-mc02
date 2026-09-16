@@ -1,6 +1,6 @@
 # QEMU 工程基线：活动任务与长时交接
 
-更新时间：2026-09-10。当前目标是 QEMU STM32H723 / DM-MC02 工程基线；
+更新时间：2026-09-16。当前目标是 QEMU STM32H723 / DM-MC02 工程基线；
 里程碑总览见 [工作区 PLAN](../PLAN.md)，审查快照见
 [PROGRESS_REPORT](../PROGRESS_REPORT.md)，R-01～R-06 指该次审查的局部编号。
 本节取代旧活动 backlog 的优先级；下方保留历史记录。
@@ -24,14 +24,15 @@
 - 初始证据（2026-09-10）：Meson 65 目标中 runtime-sync 链接失败，其余 64 通过；
   Host CTest 54/54（内含 smoke 92/92），pytest 256 通过。原始日志见
   [review logs](reports/2026-09-10-review/)。Release 三轮结果仍是历史证据。
-- 最近完成：**QEMU-01**；仅修改 unit Meson source set 和计划/交付记录。
-- 当前结果：ADC runtime-sync 3/3、直接 ADC qtest 75/75、完整 Meson 65/65
-  （54 unit、11 qtest）、Host CTest 54/54（67.97 s，含 smoke 92/92）、pytest 256 通过。
-  没有排除测试；本轮未执行 Renode 或新的三轮性能门。
-- 命令、日志和输入 hash 见 [QEMU-01 交付证据](reports/2026-09-10-qemu-01/README.md)。
-- 唯一下一步：**QEMU-02（待开始）**，核对现有 runner 清单与 smoke 的退出码/跳过
-  路径，再在工具层实现薄聚合入口。当前没有进行中任务；R-02～R-05 和 R-06 的
-  QEMU 部分仍未关闭。
+- 最近完成：**QEMU-02**；统一构建/测试 owner、结果语义和二进制身份检查，R-04 已关闭。
+- 当前统一门（2026-09-16）：Meson 65/65、原生 Host CTest 51/51、完整 pytest
+  265/265、shell smoke 92/92，四个集合分别记录分母，不跨集合求和。ROS2/MuJoCo
+  本轮实际 PASS；QEMU 与 51 个 Host 可执行文件的测试前后 SHA-256 均未改变。
+- 命令、身份和结果见 [QEMU-02 交付证据](reports/2026-09-16-qemu-02/README.md)；
+  QEMU-01 历史证据仍见 [原交付记录](reports/2026-09-10-qemu-01/README.md)。
+- 唯一下一步：**QEMU-03（待开始）**，在性能采样工具层统一 reset epoch 和合法
+  32-bit tick wrap 判定。当前没有进行中任务；R-02、R-03、R-05 和 R-06 的 QEMU
+  部分仍未关闭。
 
 ## QEMU-01：恢复 ADC 隔离测试
 
@@ -50,7 +51,7 @@
 
 ## QEMU-02：统一现有测试门禁
 
-- 状态：待开始；依赖：QEMU-01；关联 R-04；所属层：验证工具。
+- 状态：完成（2026-09-16）；依赖：QEMU-01；关联 R-04 已关闭；所属层：验证工具。
 - Producer：现有 CTest/pytest/Meson 与 smoke 结果；boundary：薄聚合入口；
   consumer：终端报告与持续验收，不自建测试框架。
 - 聚合完整集合，记录 runner 身份、分母、PASS/FAIL/SKIP/BLOCKED 和退出码；
@@ -64,6 +65,17 @@
 - 验收还须确认测试阶段无隐式重建，报告绑定实际被测二进制身份；身份漂移不得
   静默算作同一构建的通过证据。
 - 限制：该门不包含真实 plant 性能或完整上游 QEMU 测试集。
+- 实现：`tools/dm_mc02_test_gate.py` 是唯一正式入口；Meson、原生 Host CTest、完整
+  pytest 和稳定排序 smoke 是四个不重复集合。CTest 的 Python/shell 委托项使用
+  `gate-external` 标签，正式 Host 集合以 `-LE gate-external` 排除；旧 shell suite
+  只是 `--smoke-only` 兼容包装。
+- 状态语义：PASS=0、FAIL=1、CLI=2；只有 ROS2/MuJoCo 缺 backend 且返回 77 时记
+  SKIP，必需项 77/78 或缺产物记 BLOCKED，只有 BLOCKED 时总入口返回 78，FAIL
+  优先。每次报告写入 `build/test-results/qemu-gate/.../summary.json`。
+- 验证：受控 runner/身份隔离测试 9/9；正式默认入口退出 0，Meson 65/65、Host
+  51/51、pytest 265/265、smoke 92/92。QEMU SHA-256 前后均为
+  `29175e5f691cd73864f88b1765f7e1859281af4db32c95952e28d1f1d60dc248`，
+  51 个 Host 身份前后相同；测试阶段未调用生产构建入口，也未调用 Renode。
 
 ## QEMU-03：性能采样的复位与回绕判定
 

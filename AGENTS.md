@@ -291,6 +291,24 @@ fallback; otherwise the error will propagate into every dependent layer.
   approximation boundaries visible, especially for incomplete H723, USB,
   timing, FIFO, and physical-layer models.
 
+## Canonical Test Gate
+
+- `tools/dm_mc02_test_gate.py` is the authoritative aggregate entry. New tests
+  must belong to exactly one of its Meson, native Host CTest, complete pytest,
+  or shell-smoke inventories.
+- CTest entries that delegate to pytest or the shell suite must carry the
+  `gate-external` label. The authoritative Host collection uses
+  `-LE gate-external`; `run-qemu-smoke-suite.sh` remains a compatibility wrapper
+  around `--no-build --smoke-only`.
+- Build all production QEMU and Host binaries before testing. Smoke scripts
+  consume those binaries and must not configure or rebuild them. Guest ELF
+  fixture compilation remains local to the smoke that owns the fixture.
+- Reports must preserve runner paths/versions, commands, dynamic denominators,
+  PASS/FAIL/SKIP/BLOCKED, raw exits and QEMU/Host SHA-256 before and after the
+  test phase. Identity drift fails the gate.
+- Exit 77 is an optional SKIP only for the named ROS2 and MuJoCo smoke scripts.
+  Missing required inputs are BLOCKED; FAIL takes precedence over BLOCKED.
+
 ## Error Handling and Performance
 
 - Handle realistic runtime failures at public boundaries: malformed input,

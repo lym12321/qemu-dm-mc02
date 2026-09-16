@@ -1,3 +1,26 @@
+# 2026-09-16 QEMU-02 统一测试门禁交付
+
+- **R-04 已关闭。** 所属层是验证工具；producer 是 Meson、原生 Host CTest、完整
+  pytest 和 shell smoke，boundary 是 `tools/dm_mc02_test_gate.py` 的清单、状态与
+  身份聚合，consumer 是终端退出码和结构化 `summary.json`。
+- 正式入口先构建并冻结身份，再运行四个不重复集合。历史 CTest Python/shell
+  委托项标为 `gate-external`；两个 co-sim smoke 只消费预构建 production binary；
+  旧 shell suite 已收敛为同一入口的兼容包装。ROS2/MuJoCo 缺依赖统一返回 77，
+  只有这两个显式可选项可成为 SKIP。
+- 隔离测试覆盖 PASS、FAIL、可选 77、必需 77、FAIL/BLOCKED 优先级、稳定发现、
+  CLI 错误、pytest 插件隔离和受控 SHA 漂移，共 9/9 通过。实际默认门退出 0：
+  Meson 65/65、Host 51/51、pytest 265/265、smoke 92/92；ROS2/MuJoCo 实际 PASS。
+- QEMU 测试前后 SHA-256 均为
+  `29175e5f691cd73864f88b1765f7e1859281af4db32c95952e28d1f1d60dc248`；
+  51 个 Host 测试可执行文件的身份映射前后相同。测试阶段没有 production rebuild，
+  未调用 Renode，也未修改 `trobot/`。
+- 变更文件：统一入口及测试、CMake 标签、构建/兼容 runner、ROS2/MuJoCo 跳过语义、
+  AGENTS/ARCHITECTURE/PLAN/README/REVIEW 和交付记录。设备、板级、固件与 wire API
+  未变，`INTERFACES.md` 无需更新。
+- 证据见 [QEMU-02 交付记录](reports/2026-09-16-qemu-02/README.md)。该门不覆盖完整
+  上游 QEMU、真实 plant 性能或硅级时序；唯一下一步是 QEMU-03 的 reset/wrap
+  采样边界。
+
 # 2026-09-10 QEMU-01 交付与审查状态
 
 - 当前推进范围仅 QEMU；Renode 专属审计项为范围外，不要求修复、构建或验证。
@@ -47,7 +70,7 @@
    同脚本 `190–196` 在 QMP 存活但 tick 低于 ready 阈值时可无限等待。受控时钟
    超过 100 s 仍循环，由诊断 fixture 主动中止。socket/单命令 timeout 不能约束
    整个启动阶段；需独立 deadline、停滞诊断和有界清理，并校验 NaN/Inf 参数。
-4. **R-04 / P2：测试聚合遗漏，skip 可记为 pass。**
+4. **R-04 / P2：测试聚合遗漏，skip 可记为 pass（后续已由 QEMU-02 关闭）。**
    `CMakeLists.txt:715–723,778–782` 未聚合完整 pytest/Meson；unittest discovery
    漏掉函数式和参数化测试。`run-ros2-worker-smoke.sh:26–31` 缺依赖时 exit 0，
    `run-qemu-smoke-suite.sh:35` 按退出码计 pass。本轮 ROS2 实际 PASS，问题是

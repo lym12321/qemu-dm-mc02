@@ -18,10 +18,9 @@ command -v timeout >/dev/null 2>&1 || {
     printf '%s\n' 'blocked: timeout is required' >&2
     exit 1
 }
-"$script_dir/build-qemu.sh" >/dev/null
 [[ -x "$qemu_bin" ]] || {
     printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2
-    exit 1
+    exit 77
 }
 [[ -x "$elf" ]] || "$script_dir/build-bmi088-smoke.sh" >/dev/null
 

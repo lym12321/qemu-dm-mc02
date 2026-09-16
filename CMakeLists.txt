@@ -716,11 +716,13 @@ if(BUILD_TESTING)
     add_test(NAME dm_mc02_worker_transport
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_worker_transport.py")
-    set_tests_properties(dm_mc02_worker_transport PROPERTIES TIMEOUT 5)
+    set_tests_properties(dm_mc02_worker_transport
+                         PROPERTIES TIMEOUT 5 LABELS gate-external)
     add_test(NAME dm_mc02_motor_protocol
              COMMAND "${Python3_EXECUTABLE}"
                      "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_motor_protocol.py")
-    set_tests_properties(dm_mc02_motor_protocol PROPERTIES TIMEOUT 5)
+    set_tests_properties(dm_mc02_motor_protocol
+                         PROPERTIES TIMEOUT 5 LABELS gate-external)
     add_test(NAME dm_mc02_bmi088_timing_smoke
              COMMAND dm_mc02_bmi088_timing_smoke)
     set_tests_properties(dm_mc02_bmi088_timing_smoke PROPERTIES TIMEOUT 5)
@@ -779,5 +781,5 @@ if(BUILD_TESTING)
              COMMAND bash
                      "${CMAKE_CURRENT_SOURCE_DIR}/tools/run-qemu-smoke-suite.sh")
     set_tests_properties(dm_mc02_qemu_smoke_suite
-                         PROPERTIES TIMEOUT 900 SKIP_RETURN_CODE 77)
+                         PROPERTIES TIMEOUT 900 LABELS gate-external)
 endif()

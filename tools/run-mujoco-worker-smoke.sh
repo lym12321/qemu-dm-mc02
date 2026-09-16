@@ -3,15 +3,24 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 1; }
-command -v uv >/dev/null 2>&1 || { printf '%s\n' 'blocked: uv is required' >&2; exit 1; }
+command -v uv >/dev/null 2>&1 || {
+    printf '%s\n' 'SKIP: uv is required for the MuJoCo backend'
+    exit 77
+}
+mujoco_python="$root_dir/.venv/bin/python"
+if [[ ! -x "$mujoco_python" ]] ||
+   ! "$mujoco_python" -c 'import mujoco' >/dev/null 2>&1; then
+    printf '%s\n' 'SKIP: MuJoCo Python environment is unavailable'
+    exit 77
+fi
 
 run_dir=$(mktemp -d "$root_dir/output.dm-mc02-mujoco.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 cleanup() { rm -rf -- "$run_dir"; }
 trap cleanup EXIT
 
-uv run --project "$root_dir" --extra mujoco python - "$cosim_socket" \
+UV_NO_SYNC=1 uv run --project "$root_dir" --extra mujoco --frozen --no-sync \
+    python - "$cosim_socket" \
     "$root_dir/tools/run-worker.sh" \
     "$root_dir/smoke/dm_mc02_mujoco_smoke.xml" <<'PY'
 import json
