@@ -24,14 +24,15 @@
 - 初始证据（2026-09-10）：Meson 65 目标中 runtime-sync 链接失败，其余 64 通过；
   Host CTest 54/54（内含 smoke 92/92），pytest 256 通过。原始日志见
   [review logs](reports/2026-09-10-review/)。Release 三轮结果仍是历史证据。
-- 最近完成：**QEMU-02**；统一构建/测试 owner、结果语义和二进制身份检查，R-04 已关闭。
+- 最近完成：**QEMU-03**；统一性能采样 reset epoch 与合法 uint32 tick wrap 判定，
+  R-02 已关闭。
 - 当前统一门（2026-09-16）：Meson 65/65、原生 Host CTest 51/51、完整 pytest
-  265/265、shell smoke 92/92，四个集合分别记录分母，不跨集合求和。ROS2/MuJoCo
+  281/281、shell smoke 93/93，四个集合分别记录分母，不跨集合求和。ROS2/MuJoCo
   本轮实际 PASS；QEMU 与 51 个 Host 可执行文件的测试前后 SHA-256 均未改变。
-- 命令、身份和结果见 [QEMU-02 交付证据](reports/2026-09-16-qemu-02/README.md)；
-  QEMU-01 历史证据仍见 [原交付记录](reports/2026-09-10-qemu-01/README.md)。
-- 唯一下一步：**QEMU-03（待开始）**，在性能采样工具层统一 reset epoch 和合法
-  32-bit tick wrap 判定。当前没有进行中任务；R-02、R-03、R-05 和 R-06 的 QEMU
+- 命令、身份和结果见 [QEMU-03 交付证据](reports/2026-09-16-qemu-03/README.md)；
+  QEMU-02 历史证据见 [QEMU-02 交付记录](reports/2026-09-16-qemu-02/README.md)。
+- 唯一下一步：**QEMU-04（待开始）**，补齐 startup-ready 总期限、有限数值校验和
+  有界进程清理。当前没有进行中任务；R-03、R-05 和 R-06 的 QEMU
   部分仍未关闭。
 
 ## QEMU-01：恢复 ADC 隔离测试
@@ -79,13 +80,22 @@
 
 ## QEMU-03：性能采样的复位与回绕判定
 
-- 状态：待开始；依赖：QEMU-02；关联 R-02；所属层：工具采样边界。
+- 状态：完成（2026-09-16）；依赖：QEMU-02；关联 R-02 已关闭；所属层：工具采样边界。
 - Producer：QMP tick/reset/watchdog 观测；boundary：采样有效性；consumer：RTF 结果。
 - baseline/virtual 共用 reset 与合法 wrap 判定，复用现有 QMP 客户端/事件能力；
   不允许非 IWDG reset 形成巨大无符号正增量后通过。
 - 隔离：非 IWDG reset、合法 32-bit wrap、watchdog 变化、正常递增；直接门：
   实际 QEMU 控制的 reset 和正常采样；随后工具回归和 QEMU-02 门禁。
 - 限制：guest tick 只是当前测量 profile 的时间代理，不推导其它固件或 plant 时序。
+- 实现：collector 从 shell heredoc 抽为 `tools/dm_mc02_firmware_rtf.py`，复用 pinned
+  `QmpSession`；`-S` 启动后须确认 `prelaunch/running=false`，在 stopped 边界读取
+  tick/watchdog、清旧事件再 `cont`。baseline/startup-ready/virtual 共用
+  `TickEpochTracker`，整批扫描 `RESET`、拒绝 watchdog 变化，并以半空间规则接受合法
+  uint32 wrap、拒绝反向/歧义增量。结束先 `stop` 并确认 `paused`，再接受最终观测。
+- 验证：隔离与 gate 测试 25/25；真实 QMP `system_reset` 产生
+  `RESUME,RESET(reason=host-qmp-system-reset)` 并在 tracker 前进前被拒绝；真实 Release
+  baseline/virtual 短样本均通过且 IWDG timeout=0。统一门 Meson 65/65、Host 51/51、
+  pytest 281/281、smoke 93/93，所有被测二进制身份前后一致。
 
 ## QEMU-04：采样启动期限与清理
 

@@ -126,7 +126,10 @@ bash tools/collect-firmware-rtf.sh --warmup 0.25 --duration 1.0
 ```
 
 RTF 定义为固件虚拟时间（FreeRTOS tick，1 tick = 1 ms）除以宿主墙钟时间；该指标与
-NullEngine 的协议吞吐不可直接比较。
+NullEngine 的协议吞吐不可直接比较。采样器以 `-S` 建立单一 QMP epoch，开始前确认
+`prelaunch` 并清除旧事件；baseline 和 virtual 模式都会拒绝任意 `RESET`、IWDG timeout
+变化以及不合法的 32-bit tick 反向/歧义跳变，同时允许自然回绕。样本末尾先暂停 QEMU
+再读取最终状态，避免把复位误算成巨大正向 tick 增量。
 
 标准 Release gate（从 reset 开始，60 秒虚拟时间，3 次，默认 `0.999x` 测量容差）：
 

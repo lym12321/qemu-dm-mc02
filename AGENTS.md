@@ -59,6 +59,16 @@
   as a documented QMP/wall-clock sampling tolerance and must still print the
   exact measured RTF for all three runs. A different firmware, external plant,
   trace mode, or debugger is a different performance profile.
+- The firmware RTF collector starts QEMU with `-S`, requires the initial
+  `prelaunch` non-running state, captures tick/watchdog state, and clears old
+  QMP events before `cont`. A sample belongs to one epoch only: every event
+  batch is scanned for `RESET`, the IWDG timeout count must remain unchanged,
+  and each uint32 tick delta must be below the half range. Natural wrap is
+  allowed; backward or ambiguous progress rejects the sample.
+- A firmware RTF sample ends by stopping QEMU and proving `paused` before the
+  final tick/watchdog observation. Reset rejection is a tooling validity rule,
+  not evidence for another firmware, external plant, or complete reset-domain
+  behavior.
 - A feature is supported only after its isolated lower-layer test, direct
   consumer boundary test, and relevant firmware integration test pass. Snapshot
   or migration support additionally requires complete VMState coverage. Never

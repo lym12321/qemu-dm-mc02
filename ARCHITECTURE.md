@@ -411,6 +411,18 @@ It measures a continuous 60 virtual-second sample after `xTickCount >= 250`:
   debugger, trace, non-default firmware, Gazebo or MuJoCo is measured and
   reported separately.
 
+The collector launches with `-S` and admits an epoch only after QMP reports
+`prelaunch` with `running=false`. While stopped it records the initial uint32
+FreeRTOS tick and IWDG timeout count, drains startup events, then issues
+`cont`. Baseline, startup-ready and virtual-window observations use the same
+`TickEpochTracker`: any QMP `RESET` in the complete event batch, any IWDG
+timeout-count change, or any tick delta at least `0x80000000` invalidates the
+sample before progress is committed. The modulo delta admits a real
+`0xffffffff -> 0` wrap. At the end, QMP `stop` must produce the `paused`
+runstate before the final tick/watchdog snapshot; a second status/event barrier
+closes the last reset race. This is measurement validity for the named
+firmware profile, not a new guest timebase or reset-domain support claim.
+
 `tools/run-release-rtf-gate.sh` enforces this profile, the 60 *virtual*-second
 target, the `0.999x` measurement threshold and the three-run report. The hot path
 may not allocate, write files, poll external

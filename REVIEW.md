@@ -1,3 +1,30 @@
+# 2026-09-16 QEMU-03 性能采样 epoch 交付
+
+- **R-02 已关闭。** 所属层是工具采样边界；producer 是 QMP event、FreeRTOS uint32
+  tick 与 IWDG diagnostics，boundary 是 `TickEpochTracker` 的单 epoch admission，
+  consumer 是 baseline/virtual RTF 结果。
+- 采样器现在以 `-S` 启动，只接受 `prelaunch/running=false` 的初始状态；在 stopped
+  边界读取 tick/watchdog 并清除旧事件后才 `cont`。所有运行阶段扫描完整 QMP event
+  batch；任意 `RESET` 或 IWDG timeout 变化先使样本失效，不推进 tracker。
+- tick delta 使用 `(current - previous) & 0xffffffff`，仅 `<0x80000000` 合法；因此
+  `0xfffffff0 -> 0x10` 是 32-tick 自然 wrap，而 `10000 -> 100` 和恰好半空间跳变
+  被拒绝。样本结束执行 `stop`，确认 `paused` 后读取最终状态，并用第二个 status/event
+  barrier 封闭末端 reset 竞态。
+- 隔离测试覆盖正常递增、wrap、倒退/歧义、RESET、watchdog、两种运行模式和 stop
+  顺序。真实 WFI fixture 的无 reset 批次 `RESUME,STOP` 被接受；随后 QMP
+  `system_reset` 的 `RESUME,RESET(reason=host-qmp-system-reset)` 批次被拒绝，tracker
+  保持未推进。相关 pytest 25/25 通过。
+- 真实 Release-current 固件的 0.1 virtual-second 短样本为 104 tick / 0.104380 s、
+  RTF `0.996358x`；0.25 s warmup 后的 0.1 s baseline 为 102 tick / 0.102846 s、
+  RTF `0.991770x`；两者 IWDG timeout 均为 0。这些短样本只验证正常 consumer，
+  不是正式 Release 性能结论。
+- 权威 `--no-build` 门退出 0：Meson 65/65、Host 51/51、pytest 281/281、smoke
+  93/93；QEMU 与 51 个 Host 可执行文件身份前后一致，未调用 Renode，未修改
+  `trobot/`。证据见 [QEMU-03 交付记录](reports/2026-09-16-qemu-03/README.md)。
+- 残余风险转入 QEMU-04：NaN/Inf、startup-ready 总期限、QMP connect deadline、
+  stderr pipe 与 cleanup exception 仍需独立修复。本切片不声明其它固件/plant 时序、
+  完整 reset-domain、silicon timing 或 machine migration。
+
 # 2026-09-16 QEMU-02 统一测试门禁交付
 
 - **R-04 已关闭。** 所属层是验证工具；producer 是 Meson、原生 Host CTest、完整

@@ -1,3 +1,33 @@
+# 0.52 Firmware RTF sampling epoch boundary
+
+`tools/dm_mc02_firmware_rtf.py` owns the performance collector's domain
+checks, while `tools/dm_mc02_qmp.py` and pinned QEMU continue to own QMP
+negotiation, framing, request IDs and event routing. The reusable tooling
+boundary is:
+
+```python
+forward_tick_delta(previous: int, current: int) -> int
+TickEpochTracker(initial_tick, initial_watchdog_timeouts).observe(
+    tick, events=(), watchdog_timeouts=None, phase="sample"
+) -> int
+```
+
+Tick values are uint32. The delta is `(current - previous) & 0xffffffff` and is
+accepted only below `0x80000000`, which admits natural wrap and rejects
+backward or ambiguous movement. `observe()` scans the complete QMP event batch
+for `RESET` and compares the IWDG timeout count before mutating tracker
+progress. Baseline, startup-ready and virtual-window consumers share this
+admission rule.
+
+QEMU starts with `-S`; the collector requires `prelaunch/running=false`, reads
+the initial producer state and drains older events before `cont`. It closes the
+epoch with `stop`, requires `paused`, and only then accepts the final snapshot.
+The isolated gate is `tests/test_firmware_rtf.py`; the direct QMP event gate is
+`tools/run-firmware-rtf-reset-smoke.sh`. The latter uses a test-only WFI image
+and does not replace the real Release firmware performance profile. This
+interface does not define another firmware's tick rate, external-plant pacing,
+silicon timing, or machine migration.
+
 # 0.51 STM32H723 SoC RAM ownership and migration boundary
 
 `DmMc02SocMemory` owns the backing `MemoryRegion` objects for the H723 internal
