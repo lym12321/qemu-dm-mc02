@@ -1,0 +1,26 @@
+# Local environments and build products
+/.venv/
+/build/
+/.pytest_cache/
+/.mypy_cache/
+/.coverage
+**/__pycache__/
+*.py[cod]
+
+# The QEMU fork is a separate Git repository pinned by qemu.lock.
+/qemu/upstream/
+
+# Runtime and probe artifacts
+/config-temp/
+/config.log
+/output.*
+/perf-runs.txt
+/tb.err
+*.sock
+*.elf
+*.o
+
+# Reports keep their reviewed README; raw logs and generated identity dumps do
+# not belong to the source baseline.
+/reports/**/*.log
+/reports/**/inputs*.txt

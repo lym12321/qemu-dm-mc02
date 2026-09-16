@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+meson_python=${DM_MC02_MESON_PYTHON:-"$root_dir/.venv/bin/python"}
+if [[ ! -x "$meson_python" ]]; then
+    printf '%s\n' 'blocked: uv environment is missing; run uv sync --group dev' >&2
+    exit 1
+fi
+exec "$meson_python" -m mesonbuild.mesonmain "$@"
