@@ -24,15 +24,15 @@
 - 初始证据（2026-09-10）：Meson 65 目标中 runtime-sync 链接失败，其余 64 通过；
   Host CTest 54/54（内含 smoke 92/92），pytest 256 通过。原始日志见
   [review logs](reports/2026-09-10-review/)。Release 三轮结果仍是历史证据。
-- 最近完成：**QEMU-03**；统一性能采样 reset epoch 与合法 uint32 tick wrap 判定，
-  R-02 已关闭。
+- 最近完成：**QEMU-04**；统一 startup-ready 总期限、QMP connect/disconnect 与进程
+  清理边界，R-03 已关闭。
 - 当前统一门（2026-09-16）：Meson 65/65、原生 Host CTest 51/51、完整 pytest
-  281/281、shell smoke 93/93，四个集合分别记录分母，不跨集合求和。ROS2/MuJoCo
+  296/296、shell smoke 94/94，四个集合分别记录分母，不跨集合求和。ROS2/MuJoCo
   本轮实际 PASS；QEMU 与 51 个 Host 可执行文件的测试前后 SHA-256 均未改变。
-- 命令、身份和结果见 [QEMU-03 交付证据](reports/2026-09-16-qemu-03/README.md)；
-  QEMU-02 历史证据见 [QEMU-02 交付记录](reports/2026-09-16-qemu-02/README.md)。
-- 唯一下一步：**QEMU-04（待开始）**，补齐 startup-ready 总期限、有限数值校验和
-  有界进程清理。当前没有进行中任务；R-03、R-05 和 R-06 的 QEMU
+- 命令、身份和结果见 [QEMU-04 交付证据](reports/2026-09-16-qemu-04/README.md)；
+  QEMU-03 历史证据见 [QEMU-03 交付记录](reports/2026-09-16-qemu-03/README.md)。
+- 唯一下一步：**QEMU-05（待开始）**，建立当前能力与证据矩阵并纠正文档陈述。
+  当前没有进行中任务；R-05 和 R-06 的 QEMU
   部分仍未关闭。
 
 ## QEMU-01：恢复 ADC 隔离测试
@@ -99,7 +99,7 @@
 
 ## QEMU-04：采样启动期限与清理
 
-- 状态：待开始；依赖：QEMU-03；关联 R-03；所属层：工具进程/采样生命周期。
+- 状态：完成（2026-09-16）；依赖：QEMU-03；关联 R-03 已关闭；所属层：工具进程/采样生命周期。
 - Producer：进程状态、QMP 响应与 host deadline；boundary：startup-ready admission；
   consumer：采样开始或有界失败退出。
 - 独立 startup-ready 总期限，校验 NaN/Inf 和无效参数，处理停滞/断连/提前退出；
@@ -107,6 +107,16 @@
 - 隔离：QMP 存活但 tick 冻结、异常参数、超时与退出；直接门：正常 QEMU 启动、
   停滞/终止后的退出及清理；随后工具回归和统一门禁。
 - 限制：host deadline 只约束工具，不改变 guest virtual-time 语义。
+- 实现：新增默认 10 秒的 `--startup-timeout`，从 launch 覆盖 socket、完整 upstream
+  QMP connect/greeting/capabilities、status/watchdog/tick、`cont` 和 virtual ready tick；
+  每个命令最多 2 秒且返回后再次检查总期限。NaN/Inf、越界 ready tick、零 tick
+  virtual window 和非有限派生 timeout 均拒绝。
+- 生命周期：stderr 改为每轮临时文件；所有路径按 TERM 2 s、KILL/reap 2 s、QMP
+  disconnect 2 s、file、directory 顺序清理。`QmpSession` 只为 upstream connect/
+  disconnect coroutine 提供期限，不复制协议实现。真实 lifecycle smoke 以 PID+
+  `/proc` starttime 识别进程，覆盖正常 WFI、冻结 ready tick 和 exit 17。
+- 验证：相关 pytest 41/41、lifecycle smoke、真实 Release baseline/virtual 短样本通过；
+  统一门 Meson 65/65、Host 51/51、pytest 296/296、smoke 94/94，身份前后一致。
 
 ## QEMU-05：当前能力与证据矩阵
 

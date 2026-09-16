@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import importlib.util
 import io
+import math
 from pathlib import Path
+import subprocess
 import sys
 from typing import Any
 
@@ -107,6 +109,10 @@ class _FakeQmp:
         self.commands: list[str] = []
         self.closed = False
         self.status = "prelaunch"
+        self.timeout: float | None = None
+
+    def settimeout(self, timeout: float | None) -> None:
+        self.timeout = timeout
 
     def command(self, name: str, arguments: dict[str, Any] | None = None) -> Any:
         del arguments
@@ -253,6 +259,7 @@ def test_baseline_and_virtual_run_paths_share_observe_runtime_tracker(
         tracker: collector.TickEpochTracker,
         tick_address: str,
         phase: str,
+        **_kwargs: Any,
     ) -> tuple[int, str]:
         assert observed_qmp is qmp
         assert observed_process is process
@@ -293,4 +300,238 @@ def test_baseline_and_virtual_run_paths_share_observe_runtime_tracker(
         "human-monitor-command",
         "clear-events",
         "cont",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("warmup", math.nan, "warmup must be finite"),
+        ("duration", math.inf, "duration must be finite"),
+        ("virtual_seconds", math.nan, "virtual seconds must be finite"),
+        ("virtual_seconds", math.inf, "virtual seconds must be finite"),
+        ("min_rtf", math.nan, "minimum RTF must be finite"),
+        ("poll_interval", math.inf, "poll interval must be finite"),
+        ("startup_timeout", math.nan, "startup timeout must be finite"),
+    ],
+)
+def test_config_rejects_non_finite_numeric_values(
+    field: str, value: float, message: str
+) -> None:
+    values: dict[str, Any] = {
+        "qemu": "qemu-system-arm",
+        "elf": "firmware.elf",
+        "tick_address": "0x20000000",
+    }
+    values[field] = value
+
+    with pytest.raises(ValueError, match=message):
+        collector.validate_config(collector.RunConfig(**values))
+
+
+def test_config_rejects_virtual_window_that_rounds_to_zero_ticks() -> None:
+    config = collector.RunConfig(
+        qemu="qemu-system-arm",
+        elf="firmware.elf",
+        tick_address="0x20000000",
+        virtual_seconds=0.0004,
+    )
+
+    with pytest.raises(ValueError, match="at least one tick"):
+        collector.validate_config(config)
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 100.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def monotonic_ns(self) -> int:
+        return int(self.now * 1_000_000_000)
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_startup_ready_deadline_cleans_up_a_live_frozen_guest(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "qmp.sock").touch()
+    process = _FakeProcess()
+    qmp = _FakeQmp(tick=0, timeouts=0, events=[])
+    clock = _FakeClock()
+
+    monkeypatch.setattr(collector.tempfile, "mkdtemp", lambda **_kwargs: str(run_dir))
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(collector, "QmpSession", lambda *_args, **_kwargs: qmp)
+    monkeypatch.setattr(collector.time, "monotonic", clock.monotonic)
+    monkeypatch.setattr(collector.time, "monotonic_ns", clock.monotonic_ns)
+    monkeypatch.setattr(collector.time, "sleep", clock.sleep)
+
+    config = collector.RunConfig(
+        qemu="qemu-system-arm",
+        elf="firmware.elf",
+        tick_address="0x20000000",
+        virtual_seconds=0.001,
+        ready_tick=1,
+        poll_interval=0.010,
+        startup_timeout=0.025,
+    )
+
+    with pytest.raises(collector.StartupTimeoutError, match="startup-ready"):
+        collector.run_one(config, 1)
+
+    assert process.terminated is True
+    assert qmp.closed is True
+    assert not run_dir.exists()
+
+
+def test_early_process_exit_reports_tempfile_stderr_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    process = _FakeProcess()
+    process.terminated = True
+
+    def start_process(*_args: Any, **kwargs: Any) -> _FakeProcess:
+        kwargs["stderr"].write("controlled QEMU startup failure\n")
+        kwargs["stderr"].flush()
+        assert kwargs["stderr"] is not subprocess.PIPE
+        return process
+
+    monkeypatch.setattr(collector.tempfile, "mkdtemp", lambda **_kwargs: str(run_dir))
+    monkeypatch.setattr(collector.subprocess, "Popen", start_process)
+
+    config = collector.RunConfig(
+        qemu="qemu-system-arm",
+        elf="firmware.elf",
+        tick_address="0x20000000",
+    )
+
+    with pytest.raises(RuntimeError, match="controlled QEMU startup failure"):
+        collector.run_one(config, 1)
+
+    assert not run_dir.exists()
+
+
+def test_qmp_disconnect_during_setup_still_cleans_up_process_and_directory(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "qmp.sock").touch()
+    process = _FakeProcess()
+
+    class DisconnectedQmp(_FakeQmp):
+        def command(
+            self, name: str, arguments: dict[str, Any] | None = None
+        ) -> Any:
+            del name, arguments
+            raise EOFError("controlled QMP disconnect")
+
+    qmp = DisconnectedQmp(tick=0, timeouts=0, events=[])
+    monkeypatch.setattr(collector.tempfile, "mkdtemp", lambda **_kwargs: str(run_dir))
+    monkeypatch.setattr(collector.subprocess, "Popen", lambda *_args, **_kwargs: process)
+    monkeypatch.setattr(collector, "QmpSession", lambda *_args, **_kwargs: qmp)
+
+    config = collector.RunConfig(
+        qemu="qemu-system-arm",
+        elf="firmware.elf",
+        tick_address="0x20000000",
+    )
+
+    with pytest.raises(EOFError, match="controlled QMP disconnect"):
+        collector.run_one(config, 1)
+
+    assert process.terminated is True
+    assert qmp.closed is True
+    assert not run_dir.exists()
+
+
+def test_cli_reports_qmp_disconnect_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def disconnect(_config: collector.RunConfig) -> list[dict[str, Any]]:
+        raise EOFError("controlled QMP disconnect")
+
+    monkeypatch.setattr(collector, "run", disconnect)
+
+    status = collector.main(
+        [
+            "--qemu",
+            "qemu-system-arm",
+            "--elf",
+            "firmware.elf",
+            "--tick-address",
+            "0x20000000",
+        ]
+    )
+
+    assert status == 1
+    assert capsys.readouterr().err == "error: controlled QMP disconnect\n"
+
+
+def test_cleanup_uses_bounded_term_kill_and_releases_remaining_resources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    events: list[str] = []
+
+    class StubbornProcess:
+        stderr = None
+
+        def __init__(self) -> None:
+            self.dead = False
+            self.killed = False
+
+        def poll(self) -> int | None:
+            return 0 if self.dead else None
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout: float) -> int:
+            events.append(f"wait:{timeout}")
+            if not self.killed:
+                raise subprocess.TimeoutExpired("qemu", timeout)
+            self.dead = True
+            return 0
+
+        def kill(self) -> None:
+            events.append("kill")
+            self.killed = True
+
+    class BrokenQmp:
+        def close(self) -> None:
+            events.append("qmp-close")
+            raise TimeoutError("controlled close timeout")
+
+    class StderrFile(io.StringIO):
+        def close(self) -> None:
+            events.append("stderr-close")
+            super().close()
+
+    monkeypatch.setattr(
+        collector.shutil,
+        "rmtree",
+        lambda *_args, **_kwargs: events.append("rmtree"),
+    )
+
+    error = collector.cleanup_run_resources(
+        StubbornProcess(), BrokenQmp(), StderrFile(), str(tmp_path / "run")
+    )
+
+    assert error is None
+    assert events == [
+        "terminate",
+        "wait:2.0",
+        "kill",
+        "wait:2.0",
+        "qmp-close",
+        "stderr-close",
+        "rmtree",
     ]

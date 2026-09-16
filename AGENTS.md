@@ -69,6 +69,14 @@
   final tick/watchdog observation. Reset rejection is a tooling validity rule,
   not evidence for another firmware, external plant, or complete reset-domain
   behavior.
+- Firmware RTF startup has one finite host-monotonic deadline, defaulting to
+  10 seconds, covering QMP socket creation, connect/greeting/capabilities,
+  stopped-state queries, `cont` and the virtual-mode ready tick. QMP commands
+  and disconnect also retain bounded per-operation timeouts.
+- Collector numeric wall-clock inputs must be finite and a virtual window must
+  select at least one FreeRTOS tick. QEMU stderr uses a temporary file. Cleanup
+  is bounded TERM, KILL/reap, QMP disconnect, file close and directory removal;
+  lifecycle tests identify a process with both PID and Linux start time.
 - A feature is supported only after its isolated lower-layer test, direct
   consumer boundary test, and relevant firmware integration test pass. Snapshot
   or migration support additionally requires complete VMState coverage. Never

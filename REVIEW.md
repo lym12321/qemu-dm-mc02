@@ -1,3 +1,29 @@
+# 2026-09-16 QEMU-04 采样启动期限与清理交付
+
+- **R-03 已关闭。** 所属层是工具进程/采样生命周期；producer 是 process/QMP 状态
+  与 host monotonic clock，boundary 是单一 startup-ready deadline 和有界 cleanup，
+  consumer 是采样开始或明确非零失败。
+- `--startup-timeout` 默认 10 秒，从 launch 覆盖 socket、upstream QMP connect/
+  greeting/capabilities、初始命令、`cont` 与 virtual ready tick。每个 startup QMP
+  command 最多 2 秒，成功返回后再次检查总期限。QMP adapter 同样以 2 秒约束
+  upstream disconnect，不复制 negotiation/framing/event routing。
+- 所有 wall-clock 浮点输入拒绝 NaN/Inf；virtual window 必须至少对应一个 1 ms tick，
+  ready tick 限定为 uint32。QEMU stderr 使用临时文件，避免 PIPE 填满阻塞 guest。
+- cleanup 固定为 TERM/wait 2 秒、必要时 KILL/wait 2 秒、QMP close 2 秒、stderr close、
+  删除目录。真实 lifecycle smoke 用 PID+Linux starttime 防止 PID reuse，覆盖正常 WFI
+  sample、活着但 tick 冻结的 startup timeout、受控 exit 17 和 stderr 诊断；三条路径
+  都确认本轮进程已消失。
+- 独立审查发现并关闭两个问题：最初 QMP close 无期限，最初 smoke 仅凭 PID 可能误杀
+  复用进程。stalled disconnect coroutine 测试和 PID/starttime 核对已成为回归门。
+- 相关 pytest 41/41 通过；真实 Release-current virtual 短样本为 103 tick /
+  0.103930 s、RTF `0.991049x`，baseline 为 102 tick / 0.102643 s、RTF
+  `0.993738x`，均无 IWDG timeout。短样本只验证 consumer，不是正式 Release gate。
+- 权威 `--no-build` 门退出 0：Meson 65/65、Host 51/51、pytest 296/296、smoke
+  94/94；QEMU 与 51 个 Host executable identity 前后一致。未调用 Renode，未修改
+  `trobot/`。证据见 [QEMU-04 交付记录](reports/2026-09-16-qemu-04/README.md)。
+- host timeout 只约束工具，不改变 virtual time 或固件。其它 firmware/plant startup、
+  无节流容量、worker pacing、silicon timing 和 machine migration 均未据此声明支持。
+
 # 2026-09-16 QEMU-03 性能采样 epoch 交付
 
 - **R-02 已关闭。** 所属层是工具采样边界；producer 是 QMP event、FreeRTOS uint32

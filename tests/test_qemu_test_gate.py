@@ -190,7 +190,7 @@ def test_repository_smoke_inventory_has_one_stable_non_wrapper_set() -> None:
         path.name for path in gate.discover_smoke_scripts(PROJECT_ROOT / "tools")
     ]
 
-    assert len(smoke_scripts) == 93
+    assert len(smoke_scripts) == 94
     assert smoke_scripts == sorted(set(smoke_scripts))
     assert all("renode" not in name.lower() for name in smoke_scripts)
 

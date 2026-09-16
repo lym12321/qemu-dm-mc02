@@ -1,3 +1,37 @@
+# 0.53 Firmware RTF startup and cleanup boundary
+
+The canonical QMP adapter extends the pinned upstream legacy client only with
+host-side bounds:
+
+```python
+QmpSession(
+    address,
+    timeout=2.0,
+    connect_timeout=None,
+    close_timeout=2.0,
+)
+```
+
+`timeout` remains the upstream command timeout. `connect_timeout` wraps the
+existing upstream socket/greeting/capabilities coroutine; `close_timeout`
+wraps its disconnect coroutine. The adapter does not parse JSON, assign IDs or
+route events.
+
+`RunConfig.startup_timeout` defaults to 10 seconds and owns one monotonic
+deadline from QEMU launch through socket creation, QMP setup, `cont` and the
+virtual-mode ready tick. Every startup command receives at most the remaining
+deadline and is checked again after return. Numeric wall-clock inputs must be
+finite, and `virtual_seconds` must round to at least one 1 ms firmware tick.
+
+Each run writes QEMU stderr to a temporary file and releases resources in the
+fixed order TERM/wait, KILL/wait if required, bounded QMP close, stderr close,
+temporary-directory removal. The isolated gates are
+`tests/test_firmware_rtf.py` and `tests/test_qmp_client.py`; the direct gate is
+`tools/run-firmware-rtf-lifecycle-smoke.sh`, which covers a normal QEMU sample,
+a live frozen ready tick and an early process exit. PID plus Linux process
+start time identifies the spawned process. This host lifecycle contract does
+not change guest virtual time or establish another firmware's startup limit.
+
 # 0.52 Firmware RTF sampling epoch boundary
 
 `tools/dm_mc02_firmware_rtf.py` owns the performance collector's domain

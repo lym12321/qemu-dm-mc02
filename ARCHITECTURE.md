@@ -423,6 +423,23 @@ runstate before the final tick/watchdog snapshot; a second status/event barrier
 closes the last reset race. This is measurement validity for the named
 firmware profile, not a new guest timebase or reset-domain support claim.
 
+The startup lifecycle uses one host-monotonic deadline from immediately before
+QEMU launch through socket creation, the complete upstream QMP
+connect/greeting/capabilities coroutine, initial status/watchdog/tick commands,
+`cont`, and the virtual-mode ready tick. The default is 10 seconds; each QMP
+command is additionally bounded to at most 2 seconds. All wall-clock numeric
+inputs must be finite, and a virtual window that rounds below one FreeRTOS tick
+is invalid rather than an empty passing sample.
+
+QEMU stderr is written to a per-run temporary file so a full pipe cannot stop
+guest progress. Every success or failure path performs bounded cleanup in this
+order: TERM and a 2-second wait, KILL and a 2-second wait when required, QMP
+disconnect with a 2-second adapter timeout, stderr close, then temporary-tree
+removal. The adapter applies connect/disconnect deadlines around the pinned
+upstream coroutines; it does not duplicate QMP framing or negotiation. These
+host deadlines constrain the measurement tool only and do not alter virtual
+time or guest behavior.
+
 `tools/run-release-rtf-gate.sh` enforces this profile, the 60 *virtual*-second
 target, the `0.999x` measurement threshold and the three-run report. The hot path
 may not allocate, write files, poll external

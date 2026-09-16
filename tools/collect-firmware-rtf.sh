@@ -17,13 +17,14 @@ runs=1
 min_rtf=''
 ready_tick=1
 poll_interval=0.250
+startup_timeout=10
 iwdg_boot_grace_ms=''
 adc_accurate_timing=0
 tcg_tb_size=''
 tcg_thread=''
 
 usage() {
-    printf 'usage: %s [--elf path] [--warmup seconds] [--duration seconds] [--virtual-seconds seconds] [--runs count] [--min-rtf factor] [--ready-tick ticks] [--poll-interval seconds] [--iwdg-boot-grace-ms ms] [--adc-accurate-timing] [--tcg-tb-size bytes] [--tcg-thread single|multi]\n' "$0"
+    printf 'usage: %s [--elf path] [--warmup seconds] [--duration seconds] [--virtual-seconds seconds] [--runs count] [--min-rtf factor] [--ready-tick ticks] [--poll-interval seconds] [--startup-timeout seconds] [--iwdg-boot-grace-ms ms] [--adc-accurate-timing] [--tcg-tb-size bytes] [--tcg-thread single|multi]\n' "$0"
 }
 
 while (($#)); do
@@ -36,6 +37,7 @@ while (($#)); do
         --min-rtf) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; min_rtf=$2; shift 2 ;;
         --ready-tick) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; ready_tick=$2; shift 2 ;;
         --poll-interval) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; poll_interval=$2; shift 2 ;;
+        --startup-timeout) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; startup_timeout=$2; shift 2 ;;
         --iwdg-boot-grace-ms) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; iwdg_boot_grace_ms=$2; shift 2 ;;
         --adc-accurate-timing) adc_accurate_timing=1; shift ;;
         --tcg-tb-size) [[ $# -ge 2 ]] || { usage >&2; exit 2; }; tcg_tb_size=$2; shift 2 ;;
@@ -71,6 +73,7 @@ python_args=(
     --runs "$runs"
     --ready-tick "$ready_tick"
     --poll-interval "$poll_interval"
+    --startup-timeout "$startup_timeout"
 )
 [[ -n "$virtual_seconds" ]] && python_args+=(--virtual-seconds "$virtual_seconds")
 [[ -n "$min_rtf" ]] && python_args+=(--min-rtf "$min_rtf")

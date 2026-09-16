@@ -20,11 +20,37 @@ if not Path(_legacy.__file__).resolve().is_relative_to(_qemu_python):
 class QmpSession(QEMUMonitorProtocol):
     """Connect and negotiate once; retain the scripts' two result conventions."""
 
-    def __init__(self, address, timeout=2.0):
+    def __init__(
+        self,
+        address,
+        timeout=2.0,
+        connect_timeout=None,
+        close_timeout=2.0,
+    ):
+        self._initial_connect_timeout = None
+        self._disconnect_timeout = None
+        self._close_timeout = close_timeout
+        self._atexit_registered = False
         super().__init__(address)
         self.settimeout(timeout)
-        self.connect()
+        self._initial_connect_timeout = (
+            timeout if connect_timeout is None else connect_timeout
+        )
+        try:
+            self.connect()
+        finally:
+            self._initial_connect_timeout = None
         atexit.register(self.close)
+        self._atexit_registered = True
+
+    def _sync(self, future, timeout=None):
+        # legacy.connect() has no timeout argument. Apply one to its existing
+        # upstream coroutine without taking ownership of QMP negotiation.
+        if timeout is None and self._initial_connect_timeout is not None:
+            timeout = self._initial_connect_timeout
+        if timeout is None and self._disconnect_timeout is not None:
+            timeout = self._disconnect_timeout
+        return super()._sync(future, timeout)
 
     def command(self, name, arguments=None):
         """Return the command value; QEMU raises on a QMP error response."""
@@ -37,9 +63,13 @@ class QmpSession(QEMUMonitorProtocol):
     def close(self):
         # QEMU normally closes the peer after replying to quit. Command
         # errors still propagate; EOF while releasing the transport is normal.
+        self._disconnect_timeout = self._close_timeout
         try:
             super().close()
         except EOFError:
             pass
         finally:
-            atexit.unregister(self.close)
+            self._disconnect_timeout = None
+            if self._atexit_registered:
+                atexit.unregister(self.close)
+                self._atexit_registered = False
