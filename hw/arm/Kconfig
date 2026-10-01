@@ -374,6 +374,22 @@ config ARM_V7M
     depends on TCG && ARM
     select PTIMER
 
+config STM32H723
+    bool
+    depends on TCG && ARM
+    select ARM_V7M
+
+config STM32H723_USB_HOST
+    bool
+    depends on STM32H723
+    select USB
+
+config DM_MC02
+    bool
+    depends on TCG && ARM
+    select STM32H723
+    select DM_W25Q64
+
 config ALLWINNER_A10
     bool
     select AHCI

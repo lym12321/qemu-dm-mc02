@@ -13,6 +13,10 @@ config FDC_SYSBUS
 config SSI_M25P80
     bool
 
+config DM_W25Q64
+    bool
+    select SSI
+
 config NAND
     bool
 

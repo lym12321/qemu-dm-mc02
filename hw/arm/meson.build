@@ -1,5 +1,16 @@
 arm_ss = ss.source_set()
 arm_ss.add(files('boot.c'), fdt)
+arm_ss.add(when: 'CONFIG_STM32H723', if_true: [
+  files('dm_mc02_soc.c', 'dm_mc02_gpio.c', 'dm_mc02_gpio_vmstate.c', 'dm_mc02_gpio_exti_vmstate.c', 'dm_mc02_pwr_rcc.c', 'dm_mc02_pwr_rcc_vmstate.c', 'dm_stm32h7_clock_tree.c', 'dm_mc02_flash.c', 'dm_mc02_flash_vmstate.c', 'dm_mc02_fmc.c', 'dm_mc02_fmc_vmstate.c', 'dm_mc02_tim2.c', 'dm_mc02_tim2_vmstate.c', 'dm_mc02_syscfg.c', 'dm_mc02_syscfg_vmstate.c', 'dm_mc02_exti.c', 'dm_mc02_exti_vmstate.c', 'dm_mc02_dma.c', 'dm_mc02_dma_endpoint.c', 'dm_mc02_dma_vmstate.c', 'dm_mc02_dma_subsystem_vmstate.c', 'dm_mc02_dmamux_vmstate.c', 'dm_mc02_uart.c', 'dm_mc02_uart_vmstate.c', 'dm_mc02_adc.c', 'dm_mc02_adc_vmstate.c', 'dm_mc02_adc_common.c', 'dm_mc02_adc_common_vmstate.c', 'dm_mc02_adc_pair_vmstate.c', 'dm_mc02_trigger.c', 'dm_mc02_dbgmcu.c', 'dm_mc02_dbgmcu_vmstate.c', 'dm_mc02_rng.c', 'dm_mc02_rng_vmstate.c', 'dm_mc02_crc.c', 'dm_mc02_crc_vmstate.c', 'dm_mc02_ospi.c', 'dm_mc02_ospi_state.c', 'dm_mc02_ospi_vmstate.c', 'dm_mc02_ssi_nor.c', 'dm_mc02_iwdg.c', 'dm_mc02_iwdg_timing.c', 'dm_mc02_iwdg_vmstate.c', 'dm_mc02_wwdg.c', 'dm_mc02_wwdg_timing.c', 'dm_mc02_wwdg_vmstate.c', 'dm_mc02_cordic.c', 'dm_mc02_cordic_vmstate.c', 'dm_mc02_spi.c', 'dm_mc02_spi_vmstate.c'),
+  meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_nor_flash_persistence.c',
+])
+arm_ss.add(when: 'CONFIG_DM_MC02', if_true: [
+  files('dm_mc02.c', 'dm_mc02_board.c', 'dm_mc02_board_reset.c', 'dm_mc02_cosim_link.c', 'dm_mc02_power.c', 'dm_mc02_power_vmstate.c', 'dm_mc02_fdcan.c', 'dm_mc02_fdcan_vmstate.c', 'dm_mc02_fdcan_msg_ram_link_vmstate.c', 'dm_mc02_usb.c', 'dm_mc02_bmi088_signal.c', 'dm_mc02_bmi088.c', 'dm_mc02_bmi088_vmstate.c', 'dm_mc02_bmi088_spi.c', 'dm_mc02_bmi088_spi_vmstate.c', 'dm_mc02_bmi088_spi_link.c', 'dm_mc02_bmi088_spi_link_vmstate.c', 'dm_mc02_reset_input.c'),
+  meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_wire.c',
+  meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_wire.c',
+  meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_payload.c',
+])
+arm_ss.add(when: 'CONFIG_STM32H723_USB_HOST', if_true: files('stm32h723_usb_host.c'))
 arm_ss.add(when: 'CONFIG_ARM_VIRT', if_true: files('virt.c'))
 arm_ss.add(when: 'CONFIG_ACPI', if_true: files('virt-acpi-build.c'))
 arm_ss.add(when: 'CONFIG_DIGIC', if_true: files('digic_boards.c'))

@@ -1,5 +1,34 @@
 hw_usb_modules = {}
 
+# The local USB code is scoped to the H723 models.  Host composition is
+# further scoped to the standalone H723 host-role reference machine; unit
+# tests still compile the board-independent fixture sources directly.
+system_ss.add(when: 'CONFIG_STM32H723', if_true: files(
+  'dm_usb_endpoint_queue.c',
+  'dm_usb_control.c',
+  'dm_usb_vmstate.c',
+  'dm_usb_control_vmstate.c',
+  'dm_usb_transaction.c',
+  'dm_usb_dwc2_device.c',
+  'dm_usb_dwc2_device_vmstate.c',
+  'dm_usb_dwc2_control_vmstate.c',
+  'dm_stm32h7_otg_host.c',
+))
+system_ss.add(when: 'CONFIG_STM32H723_USB_HOST', if_true: files(
+  'dm_usb_host.c',
+  'dm_usb_host_port.c',
+  'dm_usb_host_pio_fifo.c',
+  'dm_stm32h7_otg_host_qemu.c',
+  'dm_usb_host_channel_control.c',
+  'dm_usb_host_channel_data_path.c',
+  'dm_usb_host_channel_transport.c',
+  'dm_usb_host_qemu_completion_scheduler.c',
+  'dm_usb_host_qemu_memory.c',
+  'dm_usb_host_qemu_transport.c',
+  'dm_usb_host_qemu_port.c',
+  'dm_usb_qemu_adapter.c',
+))
+
 # usb subsystem core
 system_ss.add(when: 'CONFIG_USB', if_true: files(
   'bus.c',

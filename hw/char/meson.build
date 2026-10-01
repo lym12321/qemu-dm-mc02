@@ -1,3 +1,5 @@
+system_ss.add(when: 'CONFIG_STM32H723', if_true: files('dm_uart_timing.c'))
+
 system_ss.add(when: 'CONFIG_CADENCE', if_true: files('cadence_uart.c'))
 system_ss.add(when: 'CONFIG_CMSDK_APB_UART', if_true: files('cmsdk-apb-uart.c'))
 system_ss.add(when: 'CONFIG_ESCC', if_true: files('escc.c'))

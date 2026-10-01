@@ -208,6 +208,19 @@ qtests_arm = \
   (config_all_devices.has_key('CONFIG_TPM_TIS_I2C') ? ['tpm-tis-i2c-test'] : []) + \
   (config_all_devices.has_key('CONFIG_VEXPRESS') ? ['test-arm-mptimer'] : []) + \
   (config_all_devices.has_key('CONFIG_MICROBIT') ? ['microbit-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_DM_MC02') ? [
+   'dm-mc02-adc-test',
+   'dm-mc02-fmc-test',
+   'dm-mc02-memory-test',
+   'dm-mc02-cpu-test',
+   'dm-mc02-tim2-test',
+   'dm-mc02-reset-test',
+   'dm-mc02-uart-test',
+   'dm-mc02-usb-test',
+   'dm-mc02-iwdg-test',
+   'dm-mc02-wwdg-test'] : []) + \
+  (config_all_devices.has_key('CONFIG_STM32H723_USB_HOST') ?
+   ['stm32h723-usb-host-test'] : []) + \
   ['arm-cpu-features',
    'boot-serial-test']
 
