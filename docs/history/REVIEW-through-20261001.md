@@ -171,7 +171,7 @@ APP-01、物理 QE/保护/Flash 延迟、闭环 plant、整机 migration；ADC 1
 # 2026-09-26 QEMU-05 当前能力审计（已验收）
 
 - 所属层：工程文档；producer 是当前源码、注册测试和最新 canonical gate；boundary
-  是 [CAPABILITIES.md](CAPABILITIES.md) 的五态矩阵；consumer 是 README、项目计划
+  是 [CAPABILITIES.md](../../CAPABILITIES.md) 的五态矩阵；consumer 是 README、项目计划
   和用户可引用的能力声明。README 中 ADC regular `SQR1` 1--4 ranks 的旧结论已由
   `dm_mc02_adc.c` 的 `SQR1..SQR4` 解码和 ADC qtest 1--16 ranks 用例纠正。
 - 明确区分：DM-MC02 USB Device 子集与独立 USB Host fixture；ROS2 topic adapter 与
@@ -1701,7 +1701,7 @@ smoke 均通过。host smoke 中 QEMU 内部头文件仍会产生既有 GNU exte
 `ACC_PWR_CONF/ACC_PWR_CTRL/GYRO_LPM1`，断电或 suspend 状态仍可能产生 raw/FIFO
 数据。这是芯片层的功能缺陷，不应由 DM-MC02 machine 或 host worker 绕过修补。
 
-现已在 [`dm_mc02_bmi088.c`](qemu/upstream/hw/arm/dm_mc02_bmi088.c:92) 集中判断
+现已在 [`dm_mc02_bmi088.c`](../../qemu/upstream/hw/arm/dm_mc02_bmi088.c#L92) 集中判断
 die 电源状态，新增 `dm_mc02_bmi088_is_powered()`，断电时拒绝新样本并清除 DRDY；
 判断逻辑仍独立于板级 pin、电源 policy 和 co-sim。FIFO smoke 先验证断电注入不会
 产生 data frame，再执行真实上电寄存器序列并复用原有 FIFO/sensor-time 断言。
@@ -2126,7 +2126,7 @@ ID 路径，之后全量 51/51 smoke 回归通过。
 最新构建和全量回归已确认通过：QEMU smoke `51/51`、host CTest `4/4`、Python
 `16 passed`。
 
-日期：2026-08-29  
+日期：2026-08-29
 范围：`dm-mc02-qemu/` 项目代码、QEMU 8.2.2 本地 machine patch、host codec/transport、Python worker、构建脚本和 smoke 测试。只读检查了 `trobot/` 的 linker、`.ioc` 和时钟初始化，用于核对板级契约；没有修改 `trobot/`。
 
 本轮补齐了 FDCAN 扩展 ID 过滤器和 FIFO1：支持扩展 range/dual/mask、EFEC 路由、全局
@@ -2262,11 +2262,11 @@ guest/device 状态机，不能据此宣称真实 USB 枚举、PHY 或宿主机 
 
 ### P1 — QMP/system reset 不会复位自定义 machine 状态（已修复）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02.c`](qemu/upstream/hw/arm/dm_mc02.c:452-500)、[`qemu/upstream/hw/arm/dm_mc02.c`](qemu/upstream/hw/arm/dm_mc02.c:1252-1272)
+位置：[`qemu/upstream/hw/arm/dm_mc02.c`](../../qemu/upstream/hw/arm/dm_mc02.c#L452)、[`qemu/upstream/hw/arm/dm_mc02.c`](../../qemu/upstream/hw/arm/dm_mc02.c#L1252)
 
 此前 machine 只定义了 `instance_finalize`，没有统一 reset callback。现已增加统一 handler，并为关键普通 C 结构、byte array、FIFO、Flash 控制器和 `QEMUTimer` 增加 reset 路径；未覆盖的完整芯片寄存器语义仍不在范围内。另提供 `cold-reset=on` 清空片上 SRAM。
 
-影响（修复前）：重复测试、失败后重试、仿真“从头开始”都可能继承上一轮状态。  
+影响（修复前）：重复测试、失败后重试、仿真“从头开始”都可能继承上一轮状态。
 已修复：machine 注册统一 reset handler；关键外设、FIFO、CAN medium、DMA、BMI088、timer、power 和 co-sim parser 均清理，QMP smoke 已覆盖片选恢复。
 
 本轮又补齐了此前遗漏的已建模状态：CORDIC 结果/参数、USB 控制寄存器、EXTI、SYSCFG、
@@ -2276,21 +2276,21 @@ DBGMCU 和 FMC 现在在 warm reset 后恢复复位值；跨复位 smoke 已验�
 
 ### P2 — co-sim 接收丢字节计数曾误计正常帧（已修复）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_cosim_link.c`](qemu/upstream/hw/arm/dm_mc02_cosim_link.c:125)
+位置：[`qemu/upstream/hw/arm/dm_mc02_cosim_link.c`](../../qemu/upstream/hw/arm/dm_mc02_cosim_link.c#L125)
 
 帧解析成功后会消费接收缓冲区，但该消费不应计入 `rx_dropped_bytes`。旧实现把所有已消费
 字节都累计为丢弃字节，导致后续诊断不可信；现在只有坏帧前缀、坏帧和缓冲溢出才增加该计数。
 
 ### P2 — DM 多电机控制/反馈 ID 冲突（已修复）
 
-位置：[`tools/dm_mc02_sim_worker.py`](tools/dm_mc02_sim_worker.py:768)
+位置：[`tools/dm_mc02_sim_worker.py`](../../tools/dm_mc02_sim_worker.py#L768)
 
 参数解析现在检查显式映射与未显式映射的连续默认 ID，并拒绝控制 ID、反馈 ID 之间的任意
 冲突，避免反馈帧被当作另一个电机的控制命令或导致电机不可达。
 
 ### P2 — ROS2 JointState 缺失字段沿用旧值（已修复）
 
-位置：[`tools/dm_mc02_sim_worker.py`](tools/dm_mc02_sim_worker.py:641)
+位置：[`tools/dm_mc02_sim_worker.py`](../../tools/dm_mc02_sim_worker.py#L641)
 
 `sensor_msgs/JointState` 允许 position、velocity、effort 数组长度不同。worker 现在每条
 消息先清除上一条状态，再按索引填充当前消息提供的字段；未提供的字段为零，effort validity
@@ -2298,7 +2298,7 @@ DBGMCU 和 FMC 现在在 warm reset 后恢复复位值；跨复位 smoke 已验�
 
 ### P1 — 外设 timer 时钟与动态 CPU/RCC 时钟脱节（已修复当前配置）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](qemu/upstream/hw/arm/dm_mc02_tim2.c:25-85)
+位置：[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](../../qemu/upstream/hw/arm/dm_mc02_tim2.c#L25)
 
 旧实现将 `TIM2_CLOCK_HZ` 固定为 24 MHz。当前实现由共享 `TIMERCLK` 驱动这些 timer，并在 RCC 切换时保持 CNT 连续；ADC kernel clock 和完整 APB 分频树仍未覆盖。
 
@@ -2308,7 +2308,7 @@ DBGMCU 和 FMC 现在在 warm reset 后恢复复位值；跨复位 smoke 已验�
 
 ### P1 — PLL 时钟树只覆盖当前配置，通用 RCC 语义不正确（已修复）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_pwr_rcc.c`](qemu/upstream/hw/arm/dm_mc02_pwr_rcc.c:139-214)
+位置：[`qemu/upstream/hw/arm/dm_mc02_pwr_rcc.c`](../../qemu/upstream/hw/arm/dm_mc02_pwr_rcc.c#L139)
 
 当前模型对当前 HSE/M=2/N=40/P=1、FRACN=0 配置能得到 480 MHz，但存在三个边界：
 
@@ -2318,7 +2318,7 @@ DBGMCU 和 FMC 现在在 warm reset 后恢复复位值；跨复位 smoke 已验�
 
 ### P1 — 电源状态没有成为运行时供电边界（已修复为可选策略）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_power.c`](qemu/upstream/hw/arm/dm_mc02_power.c:37-62)、[`qemu/upstream/hw/arm/dm_mc02_power.c`](qemu/upstream/hw/arm/dm_mc02_power.c:64-84)、[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](qemu/upstream/hw/arm/dm_mc02_fdcan.c:344-352)
+位置：[`qemu/upstream/hw/arm/dm_mc02_power.c`](../../qemu/upstream/hw/arm/dm_mc02_power.c#L37)、[`qemu/upstream/hw/arm/dm_mc02_power.c`](../../qemu/upstream/hw/arm/dm_mc02_power.c#L64)、[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](../../qemu/upstream/hw/arm/dm_mc02_fdcan.c#L344)
 
 `dm_mc02_power_update()` 计算了 `system_5v_good`/`system_3v3_good`，但 FDCAN medium 的 enabled 条件只是 RX FIFO 已配置；FDCAN、UART、SPI 等路径没有检查 rail。`system_5v_good` 也只依赖 VIN 正常，不依赖 PC15 的 switched-5V enable。`switched_5v_enabled` 目前是记录值。
 
@@ -2328,7 +2328,7 @@ DBGMCU 和 FMC 现在在 warm reset 后恢复复位值；跨复位 smoke 已验�
 
 ### P1 — chardev TX 丢帧且没有可恢复的可靠性契约（co-sim telemetry 重试已修复）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_cosim_link.c`](qemu/upstream/hw/arm/dm_mc02_cosim_link.c:307-353)、[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](qemu/upstream/hw/arm/dm_mc02_fdcan.c:209-225)、[`qemu/upstream/hw/arm/dm_mc02_uart.c`](qemu/upstream/hw/arm/dm_mc02_uart.c:326-336)
+位置：[`qemu/upstream/hw/arm/dm_mc02_cosim_link.c`](../../qemu/upstream/hw/arm/dm_mc02_cosim_link.c#L307)、[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](../../qemu/upstream/hw/arm/dm_mc02_fdcan.c#L209)、[`qemu/upstream/hw/arm/dm_mc02_uart.c`](../../qemu/upstream/hw/arm/dm_mc02_uart.c#L326)
 
 co-sim telemetry、FDCAN 和 UART TX 已改用有界队列及 partial-write 续传；UART 队列满时按 drop-newest。co-sim telemetry 在控制帧占满队列时会延迟重试最新状态。协议虽然有 sequence，但没有 ACK、重传、丢失区间或 host 查询诊断的接口。
 
@@ -2340,7 +2340,7 @@ FDCAN host TX 在 backend 尚未打开时现在会先进入 QEMU 有界队列，
 
 ### P1 — 外部电机 engine 语义曾不一致（Null/MuJoCo/ROS2 基础链路已修复）
 
-位置：[`tools/dm_mc02_sim_worker.py`](tools/dm_mc02_sim_worker.py:410-630)
+位置：[`tools/dm_mc02_sim_worker.py`](../../tools/dm_mc02_sim_worker.py#L410)
 
 DM-MIT 的 QEMU/worker 闭环现在覆盖 reset、enable、位置/速度/Kp/Kd/前馈力矩和反馈编码；NullEngine、MuJoCo 与 ROS2 均遵守 enable gate 和配置扭矩上限。ROS2 通过可配置的 `sensor_msgs/JointState` 按索引接收每个电机的 position/velocity/effort；没有状态消息时退化为零状态，因此具体 Gazebo 模型仍需提供该话题才能完成有效闭环。
 
@@ -2348,7 +2348,7 @@ DM-MIT 的 QEMU/worker 闭环现在覆盖 reset、enable、位置/速度/Kp/Kd/�
 
 ### P1 — FDCAN 接收过滤器曾被忽略（已修复当前板级路径）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](qemu/upstream/hw/arm/dm_mc02_fdcan.c:250-350)
+位置：[`qemu/upstream/hw/arm/dm_mc02_fdcan.c`](../../qemu/upstream/hw/arm/dm_mc02_fdcan.c#L250)
 
 旧模型把收到的帧直接写入 Rx FIFO，未读取 `GFC/SIDFC` 和标准过滤器 message-RAM 元素。
 现在支持标准/扩展 range、dual-ID、mask 过滤，匹配 FIFO0/FIFO1/拒绝路由、全局非匹配策略、
@@ -2360,7 +2360,7 @@ DM-MIT 的 QEMU/worker 闭环现在覆盖 reset、enable、位置/速度/Kp/Kd/�
 
 ### P2 — BMI088 仍是简化传感器模型
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_bmi088.h`](qemu/upstream/hw/arm/dm_mc02_bmi088.h:1)、[`qemu/upstream/hw/arm/dm_mc02_bmi088.c`](qemu/upstream/hw/arm/dm_mc02_bmi088.c:1)、[`qemu/upstream/hw/arm/dm_mc02_bmi088_signal.h`](qemu/upstream/hw/arm/dm_mc02_bmi088_signal.h:1)、[`qemu/upstream/hw/arm/dm_mc02.c`](qemu/upstream/hw/arm/dm_mc02.c:180)
+位置：[`qemu/upstream/hw/arm/dm_mc02_bmi088.h`](../../qemu/upstream/hw/arm/dm_mc02_bmi088.h#L1)、[`qemu/upstream/hw/arm/dm_mc02_bmi088.c`](../../qemu/upstream/hw/arm/dm_mc02_bmi088.c#L1)、[`qemu/upstream/hw/arm/dm_mc02_bmi088_signal.h`](../../qemu/upstream/hw/arm/dm_mc02_bmi088_signal.h#L1)、[`qemu/upstream/hw/arm/dm_mc02.c`](../../qemu/upstream/hw/arm/dm_mc02.c#L180)
 
 现已支持量程/灵敏度寄存器联动、由 accel `ACC_CONF` 与 gyro `BANDWIDTH` 配置的 ODR 节流、数据手册带宽档位对应的虚拟时间一阶低通、DRDY 状态和 accel 25.6 kHz sensor-time；RESET 把 host time 映射到 QEMU virtual time，未来样本在对应虚拟时刻进入 BMI088。首个滤波样本直接初始化，零噪声时默认数据路径仍保持确定性。host 的 dps/g 输入仍不是一个完整的连续传感器模拟：模型不回放中间遗漏帧，且当前噪声仍是可配置的独立采样。
 
@@ -2370,7 +2370,7 @@ DM-MIT 的 QEMU/worker 闭环现在覆盖 reset、enable、位置/速度/Kp/Kd/�
 
 ### P1 — IWDG 超时复位（已修复最小语义）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_iwdg.c`](qemu/upstream/hw/arm/dm_mc02_iwdg.c:1)
+位置：[`qemu/upstream/hw/arm/dm_mc02_iwdg.c`](../../qemu/upstream/hw/arm/dm_mc02_iwdg.c#L1)
 
 此前 IWDG 只是安全寄存器窗口，固件不刷新时不会复位。当前已支持 `KR` 解锁/reload/start、`PR` `/4..../256`、12-bit `RLR`、默认 32 kHz LSI 和 QEMU virtual timer；超时请求 `SHUTDOWN_CAUSE_GUEST_RESET`，并注册 reset 清理内部状态。`run-iwdg-smoke.sh` 已验证锁定配置、启动、超时和第二次 Reset_Handler 执行。
 
@@ -2378,13 +2378,13 @@ DM-MIT 的 QEMU/worker 闭环现在覆盖 reset、enable、位置/速度/Kp/Kd/�
 
 ### P2 — TIM update deadline 漂移（已修复当前抽象模型）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](qemu/upstream/hw/arm/dm_mc02_tim2.c:80)
+位置：[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](../../qemu/upstream/hw/arm/dm_mc02_tim2.c#L80)
 
 更新事件现在保存绝对 virtual-time deadline；回调延迟时按周期推进 deadline，并跳过已经错过的抽象事件，避免 callback 延迟改变长期频率或形成追赶风暴。该策略仍是当前 TIM update/DMA 抽象的 pacing policy，不等同于逐个 compare-match 波形。
 
 ### P2 — ADC、DMA 和定时器输出仍是窄切片，不能代表真实吞吐/波形
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_adc.c`](qemu/upstream/hw/arm/dm_mc02_adc.c:57-63)、[`qemu/upstream/hw/arm/dm_mc02_adc.c`](qemu/upstream/hw/arm/dm_mc02_adc.c:302-315)、[`qemu/upstream/hw/arm/dm_mc02_dma.c`](qemu/upstream/hw/arm/dm_mc02_dma.c:1-13)、[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](qemu/upstream/hw/arm/dm_mc02_tim2.c:136-204)
+位置：[`qemu/upstream/hw/arm/dm_mc02_adc.c`](../../qemu/upstream/hw/arm/dm_mc02_adc.c#L57)、[`qemu/upstream/hw/arm/dm_mc02_adc.c`](../../qemu/upstream/hw/arm/dm_mc02_adc.c#L302)、[`qemu/upstream/hw/arm/dm_mc02_dma.c`](../../qemu/upstream/hw/arm/dm_mc02_dma.c#L1)、[`qemu/upstream/hw/arm/dm_mc02_tim2.c`](../../qemu/upstream/hw/arm/dm_mc02_tim2.c#L136)
 
 ADC kernel source/APB 分频仍未完整建模；当前板级的 PLL2P 与 ADC common `CCR.CKMODE/PRESC` 已参与有效 ADC 时钟计算，默认连续序列保留 1 ms 最小间隔以限制 QEMU 事件量，`accurate-timing=on` 才按转换周期运行。DMA 已支持基础 peripheral-request DBM/M1AR/CT 交替，但没有 FIFO、FE/DME 和完整错误/仲裁语义。TIM8 当前是 update event 近似，不是 compare/PWM 波形。
 
@@ -2392,7 +2392,7 @@ ADC kernel source/APB 分频仍未完整建模；当前板级的 PLL2P 与 ADC c
 
 ### P1 — DMAMUX duplicate request 可能漏服务（已修复）
 
-位置：[`qemu/upstream/hw/arm/dm_mc02_dma.c`](qemu/upstream/hw/arm/dm_mc02_dma.c:359)
+位置：[`qemu/upstream/hw/arm/dm_mc02_dma.c`](../../qemu/upstream/hw/arm/dm_mc02_dma.c#L359)
 
 旧缓存只记录一个 `request_id -> stream`，当多个 DMAMUX channel 同时选择同一 request 时，后续 stream 不会收到该 peripheral event。当前缓存改为 8-bit stream mask：常见单 stream 仍使用快速路径，共享 request 时服务全部匹配 stream；DMA stream 的 CR/PAR 改写会使缓存失效，避免 endpoint/enable 状态陈旧。
 
@@ -2400,7 +2400,7 @@ ADC kernel source/APB 分频仍未完整建模；当前板级的 PLL2P 与 ADC c
 
 ### P2 — Python 工具没有统一通过 uv 入口运行（已修复）
 
-位置：[`tools/run-worker.sh`](tools/run-worker.sh:1-29)、三个 worker smoke。
+位置：[`tools/run-worker.sh`](../../tools/run-worker.sh#L1)、三个 worker smoke。
 
 `run-worker.sh` 已按 engine 统一选择 uv 或 ROS2 system Python，三个 worker smoke 和
 性能基线使用项目环境；MuJoCo extra 的依赖由入口自动声明。ROS2 仍要求调用者先 source
@@ -2411,7 +2411,7 @@ worker realtime 的初始虚拟时间偏移已修复，并由
 
 ### P2 — register model 的 sub-word 访问语义不一致
 
-位置示例：[`qemu/upstream/hw/arm/dm_mc02_gpio.c`](qemu/upstream/hw/arm/dm_mc02_gpio.c:32-70)、[`qemu/upstream/hw/arm/dm_mc02_gpio.c`](qemu/upstream/hw/arm/dm_mc02_gpio.c:80-126)
+位置示例：[`qemu/upstream/hw/arm/dm_mc02_gpio.c`](../../qemu/upstream/hw/arm/dm_mc02_gpio.c#L32)、[`qemu/upstream/hw/arm/dm_mc02_gpio.c`](../../qemu/upstream/hw/arm/dm_mc02_gpio.c#L80)
 
 GPIO 已实现 8/16/32-bit lane merge 并有 smoke 覆盖；其它仍允许子字节访问的外设（例如部分 SPI/UART/timer 窗口）仍可能存在寄存器中间字节语义不统一。
 
@@ -2419,7 +2419,7 @@ GPIO 已实现 8/16/32-bit lane merge 并有 smoke 覆盖；其它仍允许子�
 
 ### P3 — 维护入口有一个容易误导的历史 machine skeleton
 
-位置：[`src/qemu/dm_mc02_machine.c`](src/qemu/dm_mc02_machine.c:1-35)、[`CMakeLists.txt`](CMakeLists.txt:14-19)
+位置：``src/qemu/dm_mc02_machine.c``（历史路径）、[`CMakeLists.txt`](../../CMakeLists.txt#L14)
 
 真正实现位于 `qemu/upstream/hw/arm/dm_mc02.c`，`src/qemu/dm_mc02_machine.c` 只是不会被编译的历史 marker，却包含同名 machine skeleton。新开发者可能误改或误测它。
 
@@ -2520,7 +2520,7 @@ co-sim `step_id` 或板级 SPI 细节下沉到芯片层。
 
 ## 2026-08-30 BMI088 芯片对象边界 smoke 复核
 
-新增 [`tests/bmi088_chip_smoke.c`](tests/bmi088_chip_smoke.c)，直接测试可复用的
+新增 [`tests/bmi088_chip_smoke.c`](../../tests/bmi088_chip_smoke.c)，直接测试可复用的
 `DmMc02Bmi088` 接口：两个 die 的电源状态、断电样本拒绝、温度编码边界、越界寄存器
 访问、FIFO partial read，以及 accel config frame 不误报 data-frame completion。该测试
 使用始终生效的 `CHECK`，避免 Release `NDEBUG` 使回归断言失效。
@@ -2537,8 +2537,8 @@ build、CTest `9/9`、QEMU smoke `64/64` 和 QEMU build 均通过。QEMU 内部 
 IRQ 输出门控，标志仍可轮询并通过 LIFCR/HIFCR W1C 清除。FIFO mode 复用了当前
 逐 request 的低字节保留宽度转换，保证 UART TDR 的 MMIO side effect 仍真实发生。
 
-新增 [`smoke/dm_mc02_dma_fcr_smoke.c`](smoke/dm_mc02_dma_fcr_smoke.c) 及
-[`tools/run-dma-fcr-smoke.sh`](tools/run-dma-fcr-smoke.sh)，测试 FCR 保留位、
+新增 [`smoke/dm_mc02_dma_fcr_smoke.c`](../../smoke/dm_mc02_dma_fcr_smoke.c) 及
+[`tools/run-dma-fcr-smoke.sh`](../../tools/run-dma-fcr-smoke.sh)，测试 FCR 保留位、
 DMEIF/IRQ/W1C、FIFO 16-bit 到 8-bit 转换和 HTIF/TCIF。定向 smoke 和全量
 QEMU smoke `67/67` 通过；原有 DMA、UART DMA、SPI2 DMA 和 TIM8 DBM smoke
 保持通过。
@@ -2554,8 +2554,8 @@ QEMU smoke `67/67` 通过；原有 DMA、UART DMA、SPI2 DMA 和 TIM8 DBM smoke
 随机游走计算。BMI088 chip object 只转发参数，machine 层以四个三轴 QOM 字符串
 属性提供配置；板级 `imu-temperature-c` 同步更新 accel/gyro 两个 die。
 
-新增 [`tests/bmi088_drift_smoke.c`](tests/bmi088_drift_smoke.c) 和
-[`tools/run-bmi088-drift-smoke.sh`](tools/run-bmi088-drift-smoke.sh)。host smoke
+新增 [`tests/bmi088_drift_smoke.c`](../../tests/bmi088_drift_smoke.c) 和
+[`tools/run-bmi088-drift-smoke.sh`](../../tools/run-bmi088-drift-smoke.sh)。host smoke
 验证温漂轴向映射、seed 确定性、ODR 拒绝不推进漂移以及 reset 保留配置/清除动态
 bias；QMP smoke 验证启动和运行时属性。drift smoke、QEMU build、CTest `11/11`
 （含 QEMU smoke `68/68`）和 Python `243 passed` 均通过；Release 固件 RTF
@@ -4284,7 +4284,7 @@ QEMU 通用 ARM 机器，未把它误报为 DM-MC02 支持。
 QEMU 上游 `vhost-shadow-virtqueue.c` 的既有 `r may be used uninitialized` warning 仍在，
 不属于本轮修改。下一道迁移门仍是 W25Q64 die 接入 QEMU `m25p80`，必须先完成独立
 adapter/differential gate 再接 board profile。
- 
+
 # 2026-09-01 STM32H723 timer VMState review
 
 本轮组件级审查发现两个可在当前边界闭合的问题：序列化 scheduler 曾接受早于 phase
