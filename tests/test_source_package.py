@@ -84,6 +84,30 @@ def test_project_inventory_excludes_gitlink_not_source(monkeypatch, tmp_path: Pa
     assert source_package.project_paths() == ["README.md", "new-tool.py"]
 
 
+def test_fork_base_snapshot_matches_pinned_upstream_tree(tmp_path: Path) -> None:
+    def git(*args: str) -> str:
+        return subprocess.check_output(["git", "-C", str(tmp_path), *args], text=True).strip()
+
+    git("init")
+    git("config", "user.name", "Test")
+    git("config", "user.email", "test@example.invalid")
+    (tmp_path / "qemu.c").write_text("official source")
+    git("add", "qemu.c")
+    git("commit", "-m", "upstream")
+    upstream = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    base = git("commit-tree", tree, "-m", "source snapshot")
+    fork = git("commit-tree", tree, "-p", base, "-m", "project changes")
+    lock = {"upstream_commit": upstream, "upstream_tree": tree,
+            "fork_base_commit": base}
+
+    assert source_package.validate_qemu_fork(tmp_path, lock, fork) == (base, tree)
+    with pytest.raises(ValueError, match="upstream_tree"):
+        source_package.validate_qemu_fork(tmp_path, {**lock, "upstream_tree": "0" * 40}, fork)
+    with pytest.raises(ValueError, match="pinned base commit"):
+        source_package.validate_qemu_fork(tmp_path, {**lock, "fork_base_commit": upstream}, fork)
+
+
 def test_worktree_snapshot_preserves_edits_additions_and_deletions(tmp_path: Path) -> None:
     def git(*args: str) -> None:
         subprocess.run(["git", "-C", str(tmp_path), *args], check=True,

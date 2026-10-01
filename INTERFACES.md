@@ -8,6 +8,12 @@ does not contain the fork bytes. The source packager excludes the outer
 gitlink and enumerates the canonical inner repository separately. Set
 `DM_MC02_ELF` to identify an external firmware file; it is hashed, not bundled.
 The legacy sibling Release-current path is only the default when unset.
+For the compact published fork, `qemu.lock` retains the official v8.2.2 commit
+and tree hash, plus a repository-local baseline commit with the same tree and a
+fork commit on top. The source packager checks both the baseline ancestry and
+tree identity; the source snapshot therefore needs only that baseline and the
+project diff, not older upstream history. `create --allow-worktree` remains an
+explicit mode for an uncommitted development snapshot.
 
 ## 0.53 Firmware RTF startup and cleanup boundary
 

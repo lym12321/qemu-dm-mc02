@@ -89,6 +89,35 @@ def qemu_snapshot(directory: Path, allow_worktree: bool) -> tuple[list[str], dic
     }
 
 
+def validate_qemu_fork(directory: Path, lock: dict, qemu_head: str) -> tuple[str, str]:
+    upstream_commit = lock["upstream_commit"]
+    fork_base = lock.get("fork_base_commit", upstream_commit)
+    try:
+        merge_base = git(directory, "merge-base", qemu_head, fork_base).decode().strip()
+    except subprocess.CalledProcessError as exc:
+        raise ValueError("QEMU fork is missing its pinned base commit") from exc
+    if merge_base != fork_base:
+        raise ValueError("QEMU fork does not descend from qemu.lock fork_base_commit")
+
+    base_tree = git(directory, "rev-parse", f"{fork_base}^{{tree}}").decode().strip()
+    expected_tree = lock.get("upstream_tree")
+    if expected_tree:
+        if base_tree != expected_tree:
+            raise ValueError("QEMU fork base tree does not match qemu.lock upstream_tree")
+        try:
+            source_tree = git(directory, "rev-parse", f"{upstream_commit}^{{tree}}").decode().strip()
+        except subprocess.CalledProcessError:
+            source_tree = None
+        if source_tree and source_tree != expected_tree:
+            raise ValueError("qemu.lock upstream_commit does not match upstream_tree")
+    else:
+        try:
+            base_tree = git(directory, "rev-parse", f"{upstream_commit}^{{tree}}").decode().strip()
+        except subprocess.CalledProcessError as exc:
+            raise ValueError("qemu.lock lacks upstream_tree for a snapshot base") from exc
+    return fork_base, base_tree
+
+
 def wrap_revision(name: str) -> str:
     parser = configparser.ConfigParser()
     parser.read(QEMU / "subprojects" / f"{name}.wrap")
@@ -128,9 +157,8 @@ def sources(allow_worktree: bool = False) -> tuple[list[tuple[str, Path]], dict]
                 if line and not line.startswith("#") and "=" in line)
     if lock.get("fork_commit") != qemu_head:
         raise ValueError("qemu.lock fork_commit does not match nested QEMU HEAD")
-    upstream_base = lock["upstream_commit"]
-    if git(QEMU, "merge-base", qemu_head, upstream_base).decode().strip() != upstream_base:
-        raise ValueError("QEMU fork does not descend from qemu.lock upstream_commit")
+    upstream_base, base_tree = validate_qemu_fork(QEMU, lock, qemu_head)
+    expected_tree = lock.get("upstream_tree", base_tree)
 
     paths = [(f"project/{path}", ROOT / path) for path in project_paths()
              if (ROOT / path).exists() or (ROOT / path).is_symlink()]
@@ -174,6 +202,8 @@ def sources(allow_worktree: bool = False) -> tuple[list[tuple[str, Path]], dict]
         "qemu_worktree": qemu_worktree,
         "upstream_base": upstream_base,
         "upstream_url": lock["upstream_url"],
+        "upstream_source_commit": lock["upstream_commit"],
+        "upstream_source_tree": expected_tree or base_tree,
         "qemu_local_delta": {"source": "upstream_base..tracked_worktree (excluding submodules)",
                              "sha256_binary_diff": sha256(qemu_delta),
                              "changed_paths": len(git(QEMU, "diff", "--name-only",

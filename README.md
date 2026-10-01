@@ -49,7 +49,10 @@ git submodule update --init --depth 1 qemu/upstream
 SSH 用户可将 clone URL 替换为 `git@github.com:lym12321/qemu-dm-mc02.git`。
 子模块使用相对 URL，沿用父仓库的 HTTPS/SSH 访问方式；私有仓库需先配置对应凭据。
 `main` 保存共享模型、工具和文档；同仓库的 `dm-mc02/v8.2.2` 分支保存 QEMU fork，
-通过子模块固定到确切提交。`qemu.lock` 记录官方基线与 fork 身份。
+通过子模块固定到确切提交。为控制首次发布的历史体积，fork 保留官方 v8.2.2 的
+完整源文件树作为本地基线快照，并在其上单独提交项目改动；不包含 v8.2.2 之前的
+QEMU 历史。`qemu.lock` 同时记录官方提交/树哈希、本地基线和 fork 提交，打包器检查
+基线树身份及 fork 差异。
 **main ZIP 不含子模块源码，不能直接构建。** 无需递归下载全部 ROM 子模块；当前
 ARM profile 所需 Meson wraps 由构建脚本获取。
 
@@ -253,7 +256,7 @@ python3 tools/dm_mc02_source_package.py restore \
 包不含 `.git`、ROM 工作树、二进制或固件，ELF 只记录哈希。应先完成首次构建获取 wraps。
 如果按快速开始使用了浅子模块，打包前还需执行
 `git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2`，
-使 packager 能核验官方基线 ancestry；普通构建和运行不需要完整历史。
+使 packager 能检查项目提交相对 v8.2.2 基线的差异；普通构建和运行不需要完整历史。
 默认拒绝未提交 QEMU 修改；开发快照可显式 `create --allow-worktree`，manifest 保存
 真实差异和逐文件哈希。verify 证明内容完整，不代替独立构建与运行测试。
 

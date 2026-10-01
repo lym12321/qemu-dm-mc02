@@ -3,8 +3,14 @@
 ## Source publication
 
 The GitHub repository `lym12321/qemu-dm-mc02` owns both `main` (project tools,
-shared cores and documentation) and `dm-mc02/v8.2.2` (QEMU fork, retaining
-official upstream ancestry). `qemu/upstream` is a Git submodule pinned to the
+shared cores and documentation) and `dm-mc02/v8.2.2` (QEMU fork). To keep the
+initial publication bounded, the fork starts with a root baseline snapshot
+whose source tree hash equals the official v8.2.2 commit, followed by a commit
+with the DM-MC02 changes. Earlier upstream history is omitted. `qemu.lock`
+records the official commit and tree, local baseline commit, and fork commit;
+the source packager verifies tree identity and the fork diff against that
+baseline. This preserves a direct upgrade/review point without uploading the
+entire older QEMU history. `qemu/upstream` is a Git submodule pinned to the
 same fork commit recorded by `qemu.lock`. Standard Git submodule initialization
 is the only acquisition path; no official-tag bootstrap or second patch tree.
 Builds consume this path even in source archives without Git metadata.
