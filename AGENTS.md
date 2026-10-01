@@ -81,6 +81,8 @@
   `fixture`, `unsupported`, or `unverified`), its public boundary,
   implementation, current evidence, limits, and next gate. `README.md` may
   summarize and link to it but must not maintain a second rolling feature list.
+  The README is the project entry point; `docs/USER_AND_DEVELOPMENT_GUIDE.md`
+  owns the detailed usage and development procedures.
 - A historical checklist, old test count, component VMState result, short smoke,
   or adapter-compatible external API must not silently promote a matrix status.
   Update the matrix in the same change whenever production behavior, evidence,

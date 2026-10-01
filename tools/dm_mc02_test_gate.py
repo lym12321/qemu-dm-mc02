@@ -709,6 +709,10 @@ def _runner_versions(root: Path, smoke_only: bool) -> dict[str, Any]:
                         [str(root / "tools" / "meson"), "--version"], root
                     ),
                 },
+                "ninja": {
+                    "path": shutil.which("ninja"),
+                    "version": _command_version(["ninja", "--version"], root),
+                },
                 "cmake": {
                     "path": shutil.which("cmake"),
                     "version": _command_version(["cmake", "--version"], root),
@@ -811,10 +815,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             ]
         )
     if not args.no_build and not args.smoke_only:
-        required_commands.extend(["cc", "rg"])
+        required_commands.extend(["cc", "ninja", "rg"])
         required_paths.extend(
             [
-                root / ".venv" / "bin" / "ninja",
                 root / "qemu" / "upstream" / "configure",
                 root / "tools" / "build-qemu.sh",
             ]

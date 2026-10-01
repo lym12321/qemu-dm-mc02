@@ -3,7 +3,7 @@
 更新时间：2026-10-01。范围为 QEMU STM32H723 / DM-MC02；Renode 不进入构建验收，
 固件保持只读。当前能力唯一入口为 [CAPABILITIES.md](CAPABILITIES.md)。
 
-## 当前切片：GitHub 完整源码发布（进行中）
+## GitHub 工程发布（完成）
 
 用户已授权提交并推送 `git@github.com:lym12321/qemu-dm-mc02.git`。
 所属层：源码交付/工具；producer：已提交 QEMU fork；boundary：同仓库分支、
@@ -14,7 +14,7 @@
 - [x] README 合并使用入口，移除重复 RELEASE，历史审查归档。
 - [x] 固定 QEMU 提交，验证 packager 边界与完整工程门。
 - [x] 干净 checkout 构建验证并推送 QEMU fork 分支；QEMU 源码树哈希固定。
-- [ ] 提交/推送外层 main，并从 GitHub 克隆复核 lock、gitlink 与子模块源码。
+- [x] 推送外层 main，并从 GitHub 浅克隆核对 qemu.lock、gitlink 与子模块 URL。
 
 最小门为 source-package pytest；直接消费者门为干净 clone/build/package；集成门为
 四集合 canonical gate。系统依赖与外部 ELF 不随 Git 分发，发布不新增功能支持声明。
@@ -30,13 +30,17 @@ Meson 66/66、Host 51/51、pytest 320/320、smoke 94/94，
 针对本次 snapshot/base 校验回归再次运行权威门：Meson 66/66、Host 51/51、
 pytest 321/321、smoke 94/94，退出 0；报告：
 `build/test-results/github-snapshot-final/20261001T130707.987155Z-202330/summary.json`。
-新快照源码包已 create/verify，11,618 个路径通过哈希验证；包 SHA-256 为
-`788be40b66319cbe65e25f14c4cfa3adc5be54284c6a5192e1976ceb363f0b1b`。
+新快照源码包已 create/verify，11,618 个路径通过哈希验证。
 纯净 checkout 从零下载 wraps 并构建成功，独立目录全门也通过 66/51/320/94，
 零失败/跳过/阻断；报告为
 `build/test-results/github-clean-checkout/20261001T123348.760680Z-189336/summary.json`。
 GitHub QEMU 分支推送完成；relative 子模块 URL 沿用父仓库凭据，适用于 HTTPS/SSH。
-- [x] GitHub fork 分支已上传；基线/项目提交与 qemu.lock/gitlink 对齐，源码包通过验证。
+外层发布提交为 `e81b524`，远端 `main` 指向该提交；远端
+`dm-mc02/v8.2.2` 指向 `1ee606afbbc907982aa08f57b842b3114d0d7dda`，与 lock 和 gitlink 一致。
+GitHub 浅克隆成功取得 main，确认相对子模块 URL 并开始拉取 QEMU fork；本运行环境
+下载子模块速度低，完整 36 MiB 接收未完成便停止验证。远端 ref 可见，SHA 精确匹配；
+fork 源码树 `058cdcf2465bba7424039a6fd42d26bd89056b41` 已在独立干净 checkout 编译，
+四集合门通过。主机网络慢是本次唯一未完整重放的检查，不影响远端 ref 或已测源码身份。
 
 ## 已完成
 

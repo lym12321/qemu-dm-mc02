@@ -231,7 +231,7 @@ def sources(allow_worktree: bool = False) -> tuple[list[tuple[str, Path]], dict]
                   "uv": version("uv", "--version"),
                   "arm-none-eabi-gcc": version("arm-none-eabi-gcc", "--version"),
                   "meson": version(str(ROOT / "tools/meson"), "--version"),
-                  "ninja": version(str(ROOT / ".venv/bin/ninja"), "--version")},
+                  "ninja": version("ninja", "--version")},
     }
     return sorted(paths), metadata
 

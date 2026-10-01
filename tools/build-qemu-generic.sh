@@ -10,15 +10,13 @@ build_dir="$root_dir/build/qemu-generic"
     printf '%s\n' 'blocked: run git submodule update --init qemu/upstream first' >&2
     exit 1
 }
-[[ -x "$root_dir/.venv/bin/ninja" ]] || {
-    printf '%s\n' 'blocked: uv environment is missing; run uv sync --group dev' >&2
+command -v ninja >/dev/null 2>&1 || {
+    printf '%s\n' 'blocked: ninja is required (apt: ninja-build)' >&2
     exit 1
 }
 
-# QEMU's configure creates a per-build pyvenv for Meson and requires a Python
-# installation with ensurepip.  The project uv environment is used for the
-# build command below; keep configure's bootstrap lookup on the system Python
-# because this workspace's uv environment intentionally has no ensurepip.
+# QEMU's configure creates a per-build pyvenv for its pinned Meson.  Keep
+# configure's bootstrap lookup on the system Python.
 configure_path=/usr/bin:/bin:/usr/local/bin
 configure_args=(
     --target-list=arm-softmmu
@@ -40,6 +38,5 @@ if [[ ! -f "$build_dir/build.ninja" ]]; then
     )
 fi
 
-export PATH="$root_dir/.venv/bin:$PATH"
-"$root_dir/.venv/bin/ninja" -C "$build_dir" qemu-system-arm
+ninja -C "$build_dir" qemu-system-arm
 printf 'Generic ARM QEMU build ready: %s\n' "$build_dir/qemu-system-arm"

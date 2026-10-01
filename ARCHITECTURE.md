@@ -14,8 +14,9 @@ entire older QEMU history. `qemu/upstream` is a Git submodule pinned to the
 same fork commit recorded by `qemu.lock`. Standard Git submodule initialization
 is the only acquisition path; no official-tag bootstrap or second patch tree.
 Builds consume this path even in source archives without Git metadata.
-README is the single user guide; PLAN/REVIEW contain current state, and dated
-reports/history are evidence, not a second capability matrix.
+README is the project entry point; `docs/USER_AND_DEVELOPMENT_GUIDE.md` owns
+detailed usage and development procedures. PLAN/REVIEW contain current state,
+and dated reports/history are evidence, not a second capability matrix.
 
 ## 0.51 STM32H723 SoC RAM ownership and migration registration
 
@@ -444,6 +445,17 @@ in QEMU source metadata; this ARM build does not require those ROM submodules.
 The package manifest hashes every included path, and restore verifies the
 materialized tree. This source gate does not establish a clean build; QEMU-07
 must configure, build and run the canonical gate from an isolated restore.
+
+QEMU's configure owns the build-tree Meson environment: it creates
+`build/qemu/pyvenv` and installs the pinned Meson wheel from the QEMU source.
+`tools/meson` uses that executable for build and test operations; do not install
+a second Meson in the project Python environment. The system `ninja-build`
+package supplies Ninja. `python3-venv` supports QEMU's configure-time venv;
+`uv` manages only project Python tests and optional worker dependencies, so it
+is not required for a QEMU-only build. The full gate additionally requires
+CMake/CTest, ripgrep, and the ARM guest compiler/binutils. A Meson version
+change must trigger QEMU configure again so the build metadata is regenerated
+with the source-pinned version.
 
 For the explicitly requested pending-commit release, `create --allow-worktree`
 includes QEMU tracked edits, additions and deletions. Manifest schema 2 records
