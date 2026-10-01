@@ -12,12 +12,23 @@
 - [x] 核对空远端，补全官方 ancestry，保留 ROM 工作树。
 - [x] 标准子模块取代官方 bootstrap、伪 patch 和系统 QEMU 探测脚本。
 - [x] README 合并使用入口，移除重复 RELEASE，历史审查归档。
-- [ ] 固定 QEMU 提交，验证 packager 边界与完整工程门。
+- [x] 固定 QEMU 提交，验证 packager 边界与完整工程门。
 - [ ] 干净 checkout 构建验证，推送两个分支。
 - [ ] GitHub 克隆复核 lock/gitlink/源码与运行入口，记录结果。
 
 最小门为 source-package pytest；直接消费者门为干净 clone/build/package；集成门为
 四集合 canonical gate。系统依赖与外部 ELF 不随 Git 分发，发布不新增功能支持声明。
+
+已验证：QEMU 提交 `b54f49e4be05c4114d667bf5de11f17f63ea59db`；packager 隔离
+pytest 6/6；工程门 Meson 66/66、Host 51/51、pytest 320/320、smoke 94/94，
+无失败/跳过/阻断。本地报告：
+`build/test-results/github-publication/20261001T123034.807679Z-167341/summary.json`。
+基于外层 `71b80ef` 的源码包已 create/verify/restore，11,618 个路径通过哈希验证；
+包 SHA-256 为 `193226b463bcd72c23af5fcd12bf8b2efa32c6cf68b8e39eebb4311a18f46ebb`。
+纯净 checkout 从零下载 wraps 并构建成功，独立目录全门也通过 66/51/320/94，
+零失败/跳过/阻断；报告为
+`build/test-results/github-clean-checkout/20261001T123348.760680Z-189336/summary.json`。
+远端子模块复核继续进行；relative URL 沿用父仓库凭据，适用于 HTTPS/SSH。
 
 ## 已完成
 

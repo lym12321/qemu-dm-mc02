@@ -47,6 +47,7 @@ git submodule update --init --depth 1 qemu/upstream
 ```
 
 SSH 用户可将 clone URL 替换为 `git@github.com:lym12321/qemu-dm-mc02.git`。
+子模块使用相对 URL，沿用父仓库的 HTTPS/SSH 访问方式；私有仓库需先配置对应凭据。
 `main` 保存共享模型、工具和文档；同仓库的 `dm-mc02/v8.2.2` 分支保存 QEMU fork，
 通过子模块固定到确切提交。`qemu.lock` 记录官方基线与 fork 身份。
 **main ZIP 不含子模块源码，不能直接构建。** 无需递归下载全部 ROM 子模块；当前
@@ -202,7 +203,6 @@ python3 tools/dm_mc02_test_gate.py --no-build
 及测试前后二进制 SHA-256；可用 `--report-dir /absolute/path` 修改目录。
 退出码 0/1/2/78 分别为 PASS/FAIL/参数错误/仅 BLOCKED。
 只有命名的 ROS2、MuJoCo 可选后端允许 SKIP，跳过不代表验收通过。
-固件生命周期测试需要外部 ELF 时，应显式设置 `DM_MC02_ELF`。
 
 2026-10-01 NOR 收敛后的结果为 Meson 66/66、Host 51/51、pytest 319/319、smoke 94/94。
 发布工具后续回归见 [PLAN.md](PLAN.md)；计数不是覆盖率或项目完成率。
@@ -251,6 +251,9 @@ python3 tools/dm_mc02_source_package.py restore \
 
 恢复目录必须不存在，源码在其 `project/` 下；按本文重新安装依赖、构建与测试。
 包不含 `.git`、ROM 工作树、二进制或固件，ELF 只记录哈希。应先完成首次构建获取 wraps。
+如果按快速开始使用了浅子模块，打包前还需执行
+`git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2`，
+使 packager 能核验官方基线 ancestry；普通构建和运行不需要完整历史。
 默认拒绝未提交 QEMU 修改；开发快照可显式 `create --allow-worktree`，manifest 保存
 真实差异和逐文件哈希。verify 证明内容完整，不代替独立构建与运行测试。
 
@@ -288,5 +291,5 @@ python3 tools/dm_mc02_source_package.py restore \
 
 依赖方向为 `STM32H723 → DM-MC02 → 器件/driver → external plant → tooling`。
 每次只推进一个边界，先隔离测试，再直接消费者测试，最后工程门。
-QEMU 许可证见 [`qemu/upstream/COPYING`](qemu/upstream/COPYING) 与源码文件声明；
+QEMU 许可证见 [fork 的 COPYING](https://github.com/lym12321/qemu-dm-mc02/blob/dm-mc02/v8.2.2/COPYING) 与源码文件声明；
 第三方代码保留各自版权和许可证，本仓库不重新许可这些依赖，也不包含固件授权。
