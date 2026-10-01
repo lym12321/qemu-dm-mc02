@@ -1,277 +1,292 @@
-# DM-MC02 QEMU backend (M0-M3)
+# DM-MC02：基于 QEMU 的 STM32H723 仿真工程
 
-代码 review 结论见 [`REVIEW.md`](REVIEW.md)，长期分层、真实性、复用和性能门见
-[`ARCHITECTURE.md`](ARCHITECTURE.md)，当前 v1 与最小 v2 的 QEMU/co-sim/plant 接口见
-[`INTERFACES.md`](INTERFACES.md)。
+在 Linux 上运行面向 DM-MC02 的 Cortex-M7 固件，调试已建模的 STM32H723 外设，
+通过确定性虚拟时间接口连接电机、IMU 和外部仿真后端。项目不依赖 Renode；
+固件是只读外部输入，不随仓库分发。
 
-这是一个独立的 QEMU 后端实验项目。它不会修改现有的 `simulation/`、`trobot/` 或其他目录。
+这是可构建、运行和回归验证的工程版本，**不是完整芯片数字孪生**。
+支持范围与证据统一见 [CAPABILITIES.md](CAPABILITIES.md)。完整业务 ready、真实机构
+闭环、整机 snapshot/live migration 尚未验证或支持。
 
-当前版本已实现 M0/M1 的可运行基础路径、M2 的 SPI2/BMI088 最小链路，以及 M3 的二进制 co-sim codec/transport：
+## 导航
 
-- 检查 `qemu-system-arm`、QEMU 版本和 ARM system target；
-- 预留固定版本的 QEMU 源码目录；
-- 提供编译进独立 QEMU 的 `dm-mc02` machine；
-- 提供 Cortex-M7、H723 Flash/ITCM/DTCM/AXI SRAM/D2/D3 SRAM 地址映射；
-- 提供 SoC 工厂 UID/校准数据只读窗口（`0x1FF1E000`），支持已知 UID、ADC 校准值读取并拒绝 guest 写入；
-- 提供从 Flash 向量表加载 MSP/Reset_Handler 的真实 guest 启动 smoke；
-- 提供 GPIOC 片选、SPI2 寄存器窗口和两个 BMI088 die 的芯片 ID/静止 raw 读取 smoke；
-- 提供 PA15 active-low 用户键输入和 EXTI0--15 常用 pending/IRQ/W1C 路径，可通过 `user-key`
-  machine/QMP 属性交互；
-- 提供 `gpio-input=PORTPIN=0|1` 通用外部输入注入，输入经 GPIO IDR、SYSCFG EXTICR 和 EXTI
-  进入 NVIC；
-- 提供 PWR/RCC 最小寄存器模型，支持电压 ready、HSI/PLL 状态和时钟使能寄存器路径，并通过 bare-metal smoke；
-- 启动阶段显式记录 H723 `RCC_RSR.PORRSTF` 上电原因；普通 `system_reset` 保留已建模原因，`RMVF` 可清除；
-- 提供可复用的 H723 D1 时钟树派生：`D1CPRE` 独立影响 CPU，`HPRE` 支持 `/1`、`/2`、`/4`、`/8`、`/16`、`/64`、`/128`、`/256`、`/512` 并影响 HCLK；ADC synchronous `CKMODE=01/10/11` 使用 `HCLK/{1,2,4}`，覆盖 helper 与 ADC 边界测试；完整 APB/D2/D3 分频和 kernel source matrix 仍未实现；
-- 提供虚拟时间对齐的 little-endian IMU/telemetry/ADC frame codec，带坏帧、NaN、整数电压边界、序号和时间单调性拒绝；
-- v1 frame 的 header/body 编解码和 typed payload 校验由 `cosim/dm_mc02_wire.[ch]` 在 host 与 QEMU link 间共享；transport/chardev 仍独立管理队列、时钟和回调；
-- v2 frame 的 36-byte header、section 结构和 compact IMU 判别由 `cosim/dm_mc02_v2_wire.[ch]` 共享；C/Python 使用同一组完整 golden vectors 做字节级 parity，typed payload/session 状态仍由各自 consumer 校验；
-- v2 固定响应、板级遥测和 ADC 输入 section 的长度、little-endian 字段、保留位、flags 及消费 mask 由 `cosim/dm_mc02_v2_payload.[ch]` 共享；QEMU link 不再维护这些 payload 的私有字节偏移，IMU/MotorCommand/MotorState 变长 sections 仍由消费者校验；
-- 提供 Unix-domain/TCP stream adapter，支持 4-byte little-endian 长度前缀、partial I/O 和阻塞/非阻塞模式；
-- 提供 QEMU-native chardev 双向 link：host IMU frame 可经 BMI088 raw register 由 guest 原有 SPI2 路径读回，ADC_INPUT frame 可按 channel 注入 ADC1 raw 值，ADC_VOLTAGE type 6 可按 ADC pin 电压注入，并在连接建立及板级输出变化时发送 telemetry；
-- 提供可选 v2 step 控制面：`--protocol v2` 可通过同一 chardev 执行 `RESET/RESET_ACK` 和带 `ImuSampleV2`/ADC sections 的 `STEP/STEP_ACK`，需要 guest 消费栅栏时可加 `--wait-step-done` 等待 BMI088 raw burst/FIFO 读取完成，并提供基础 diagnostics；v1 仍为默认。v2 还定义了可插拔的 `MotorCommand -> MOTOR_STATE` endpoint，但默认 `dm-mc02` machine 不绑定具体 plant，默认电机闭环仍走 FDCAN；
-- 提供默认关闭的 `cosim-motor-loopback=on` 确定性 v2 endpoint fixture，用于验证 MotorCommand/MotorState、重复 STEP 和非法 payload 拒绝；它不模拟真实电机动力学，也不改变默认 FDCAN 路径；
-- 提供只读 QMP `cosim-diagnostics`，查询 co-sim 收发、短写、丢帧和有界队列占用；该诊断面不改变 v1 wire；v1 不提供 ACK/重传，v2 STEP 由 worker 提供有限 ACK 重发；
-- QEMU machine reset 时会在已打开的 co-sim chardev 上发送出站 RESET 和新 telemetry session，避免出站 sequence 回退；序号/时间单调性不因此放宽。
-- 提供可选 UART1/2/3、UART5、UART7、USART10 chardev 字节通道，含 polling TX/RX、RX FIFO、RXNE/RDR，以及按 STM32H723 request ID 接线的最小 UART DMA TX/RX；UART1/USART2 默认使用可复用 DMA endpoint，`uart-dma-endpoint=off` 保留旧 MMIO 路径；
-- TIM12_CH2/PB15 的 PWM 输出按虚拟时间惰性观察，并通过 `/machine` QOM 只读属性提供使能、电平、频率和占空比；不为 PWM 边沿创建 host 定时器；
-- 提供可复用 timer 的 `CR2.MMS/MMS2` 主触发选择：`EGR.UG` reset、`CEN` enable、update 和 CC1 compare pulse 事件按虚拟时间输出；芯片层同时支持 CC1..CC4 compare flag、IRQ 和 W0C，H723 TIM1/TIM8 profile 显式打开 `MMS2`，并支持 `OC1REF..OC4REF` 的 master event；支持 edge-aligned、up-counting 的 PWM1/PWM2 以及 forced active/inactive，`PSC/ARR/CCR1..4` 的 active/shadow 更新语义已接入；组合模式仍未实现；
-- 将 timer 的 `TRGO`/`TRGO2` source ID 收敛到可复用的 board route，并接入 TIM2/TIM3/TIM8/TIM1 的 ADC 触发映射：TIM2 regular/injected 使用 `EXTSEL=11`/`JEXTSEL=2`，TIM3 `TRGO` 使用 `4/12`，TIM3 `OC4REF` 使用 `EXTSEL=15`/`JEXTSEL=4`，TIM8 使用 `7/9`、`8/10`，TIM1 使用 `9/0`、`10/8`；正、负路径已通过 ADC qtest 和 trigger smoke；其它 timer source matrix、组合模式仍未实现；
-- UART host TX 使用有界 4096-byte 队列，支持 chardev 短写后的虚拟时间重试；队列满时丢弃最新字节并保留内部计数；USART kernel clock 已按 H723 `D2CCIP2R` 的 USART16/USART234578 两组 source mux 动态派生；当 `BRR/PRESC/OVER8` 配置有效时，TX 按默认 8N1 帧长度使用 QEMU 虚拟时间逐字节发送，`TC` 在最后一帧完成后置位；
-- 提供可选 FDCAN1/2/3 chardev：真实 M_CAN message RAM TX/RX FIFO、64 个 dedicated Rx Buffer、扩展/标准过滤器、CAN/CAN-FD DLC、虚拟时间戳和 `ILS/ILE` 双中断线；
-- FDCAN 生产收发接入 QEMU 标准 `CanBusState`：支持 `-object can-bus,id=canbus -machine dm-mc02,canbus=canbus`，未指定时自动创建板内 bus；标准 bus 即时广播、发送者不回环，并以可接收 peer 作为 ACK 结果。旧固定 84-byte chardev 仍是显式 host wire；它保留外部时间戳但不提供标准 bus 的 CAN ID 仲裁、物理位时序、物理 ACK、error frame 或完整 bus-off recovery；旧 virtual-time medium 仅保留为 test-only fixture，不进入生产 ARM target；
-- 提供 SPI2 DMA1 Stream4/3 的最小 DMAMUX request TX/RX 链路，可将 BMI088 返回字节直接写回 guest buffer；默认使用可复用 DMA endpoint，也可用 `spi-dma-endpoint=off` 保留旧 MMIO 路径；
-- 提供 DMA1/2 Stream 的 TC/TE level-sensitive IRQ 接线到 Cortex-M NVIC，并支持 LIFCR/HIFCR 清除；
-- 提供基础 peripheral-request DMA 双缓冲：支持 `M1AR`、`DBM`、`CT`、M0/M1 交替、每 buffer `NDTR` 重装和 TC/HT 状态；DMA FCR/DME 支持 direct-mode 宽度错误、4-word FIFO 的 packing/unpacking、`FTH` 阈值和动态 `FS`，同一 request 的竞争 stream 已按 `SxCR.PL` 仲裁，完整 FIFO 错误触发条件和总线时序仍未实现；
-- DMA 还提供兼容的 `dm_mc02_dma_request_batch()`：保留每个 item 的地址空间读写和外设 MMIO 副作用，同时将匹配查找与 level-sensitive IRQ fan-out 聚合到批次边界，并对每个 item 独立仲裁；UART TX 已使用该路径，需要逐事件中断边界时仍使用单 item API；
-- DMA stream 在达到半传输边界时始终锁存 HTIF，HTIE 仅控制 IRQ；DMA memory/request、循环和 IRQ smoke 均覆盖 HT/TC；
-- 提供 ADC1 request 9 的最小连续 half-word 数据面：支持从 `SQR1` 读取 1--4 个
-  regular rank、按 channel 提供 raw/ADC-pin-voltage 输入，按 `SMPR1/SMPR2`
-  逐 rank 推进，并支持软件启动、TIM2/TIM3/TIM8/TIM1 更新及 TIM3 `OC4REF` 外部触发、ADC IRQ18 的 EOC/EOS/OVR
-  状态与 W1C/DR 清除、`CFGR.OVRMOD` 保留/覆盖模式，以及 DMA circular NDTR/地址
-  回绕；默认模式为实时友好的
-  1 ms 连续序列限流，`accurate-timing=on` 按板级有效 ADC 时钟调度转换；ADC common
-  `CCR.CKMODE/PRESC` 及 PLL2P/PLL3R/CLKP 的当前选择路径参与时钟计算；
-  ADC 校准数据路径按 `DIFSEL` 选择单端/差分 `CALFACT` offset，并将
-  `ADC_CALFACT2` word 1 作为 signed Q0.30 线性增益近似应用于 regular/injected
-  16-bit 结果，同时保留六个 `LINCALRDYW` 窗口；TIM2/TIM3/TIM8/TIM1 update 及 TIM3
-  `OC4REF` 外部触发已按 regular `EXTSEL` 与 injected `JEXTSEL` 的真实 mux 编码分别映射
-  （包括 TIM3 `TRGO` 的 `EXTSEL=4`/`JEXTSEL=12` 和 `OC4REF` 的 `15/4`）；真实 H723 SAR
-  电容级线性补偿仍未建模。
-- `CFGR.JAUTO` regular-to-injected 自动序列和 `JQM=1` context 清空已通过
-  `tools/run-adc-jauto-dma-smoke.sh` 与 regular circular DMA 的 guest/QEMU 边界回归；
-  当前覆盖 regular/injected 各两个 rank 的成功路径，不代表完整 injected queue、discontinuous 组合或
-  injected trigger matrix。
-- ADC 芯片层可通过 `adc-power-model=on` 复现 H723 `DEEPPWD`/`ADVREGEN` 的复位、
-  10 us 内部稳压启动和 `ADEN` ready gate；默认 `off` 仅保留旧直接启动 fixture 的
-  兼容行为，严格 guest/板级验证应显式开启。
-- 提供板级离散电源模型：默认 VIN=24 V，ADC channel 4 按 VIN/11 分压，channel 19
-  以 LCD 按键 NONE 为默认值，并根据 GPIOC PC13/PC14/PC15 派生输出使能和电源状态；
-  VIN=0 会在两种供电策略下复位并暂停 Cortex-M7，恢复有效 VIN 后从复位入口启动；
-  `/machine` QOM 只读属性 `mcu-power-good` 可用于工具侧确认 MCU 电源状态；
-- 提供 TIM8 `CC1DE`/request 47 到 DMA2 Stream6 的最小 compare request 路径，可将 D2 SRAM PWM 序列通过真实 DMA 外设写入 `TIM8_CCR1`；默认近似模式合并固定端点的批量写入并保留 DMA 状态，`accurate-timing=on` 仍保留逐 item 外设副作用；
-- 提供 OCTOSPI2 的 W25Q64 数据路径：生产 QEMU 通过板卡无关 SSI 适配器使用标准 `w25q64/m25p80`，支持 JEDEC/status/WREN、普通/fast/quad read、page program、4K/32K/64K/chip erase、memory-mapped read、DMA endpoint 和 raw-image persistence；旧 `DmNorFlash` 仅用于显式 host test fixture，真实 OSPI DMA request/line timing/DTR 仍未完整建模；
-- 提供 CORDIC Q1.31 sine/cosine 功能子集，支持配对结果和不支持配置的明确诊断；BMI088 信号层支持静态 bias、噪声、ODR、带宽、温漂系数和可复现 bias random walk；
-- 提供 CRC 常用计算子集：32/16/8/7-bit polynomial、INIT/RESET、字节/半字/字输入及输入/输出 bit-reversal；
-- 提供 USB OTG HS/DWC2 controller-ready 寄存器路径和复位完成状态；可选 serial slot 10 提供 FIFO0 虚拟 CDC 字节管道；另有板卡无关的 endpoint packet queue、EP0 control-transfer core、request-level QEMU USB adapter、transaction dispatcher、synthetic upstream host 和最小 DWC2 device-mode core，内部 harness 覆盖 descriptor、CDC line coding、EP1..EP5、DWC2 EP1 FIFO/计数/IRQ、公共 FIFO count 查询、上电 TX FIFO 寄存器、64-byte 分包、PID toggle、NAK、STALL、控制传输阶段和 bulk packetization；control unit `7/7`、transaction unit `5/5`、host unit `4/4`、DWC2 unit `7/7`、USB qtest `10/10`；DWC2 已接入 DM-MC02 USB MMIO 窗口和 IRQ 77/NVIC，仍未实现真实 USB bus attachment、DMA/FIFO 时序、PHY、SOF 和宿主机枚举；
-- 新增可复用 `DmUsbDwc2ControlLink`，以 `control -> DWC2 raw` 顺序联合保存控制传输中间态和 DWC2 endpoint/FIFO 状态；`test-dm-usb-dwc2-control-link-vmstate` `7/7` 验证 DATA_IN 续传、SET_ADDRESS pending、request-level consumer、错误 child 顺序和失败前无 runtime sync；该组件尚未注册为整机 migration；
-- 提供独立 `stm32h723-usb-host` reference profile：将可复用 H723 host controller、QEMU USB root port 和 IRQ 77 组合为单-root-port fixture；同时提供不依赖 QEMU API 或 DM-MC02 board wiring 的 Cortex-M7 EP0 polling client、configuration descriptor parser、endpoint pipe/data-toggle state、completion-driven channel operation、controller-independent async completion/cancel record、single-packet PIO client 和 bulk packet adapter。以直接绑定 root port 的 `usb-kbd,bus=usb-bus.0,port=1` 完成 `GET_DESCRIPTOR -> SET_ADDRESS(5) -> GET_STATUS -> GET_CONFIGURATION(header/full) -> HID endpoint pipe/state -> SET_CONFIGURATION(1) -> interrupt-IN NAK` bare-metal smoke；另以 `usb-serial` 的 64-byte bulk endpoint 完成 130-byte OUT 和 12-byte IN（2-byte FTDI 状态头加 10-byte chardev 输入）的 H723 PIO/QEMU transfer smoke，并校验最终 `HCCHAR/HCTSIZ`、PID、lease 释放和 chardev payload。该 profile 不改变 `dm-mc02` 的 USB Device-mode 角色，也不表示 DM-MC02 支持 USB Host；
-- 提供可写的 1 MiB 内部 Flash backing，支持固件直接编程和 FLASH_R 解锁/sector erase 快速路径；擦除时序、ECC、option bytes 语义仍未实现；
-- `stm32h723-usb-host` reference profile 默认启用 QEMU virtual-clock deferred completion；
-  通用 `dm-stm32h7-otg-host-qemu` 可通过 `completion-scheduler=false|true` 选择同步或
-  scheduler 路径，并可在设备初始化前用 `completion-delay-ns=<ns>` 设置确定性虚拟延迟。
-  零延迟仍是 virtual-timer 事件，system reset 会取消尚未投递的 completion。
-- 可通过 `flash-file` 选择性启用内部 Flash 文件持久化，默认不产生磁盘 I/O；
-- BMI088 输入支持可复现的 gyro/accel 噪声、三轴零偏、随机种子、量程灵敏度联动与可配置温度；固件配置 ODR 后，host 输入按其 frame 时间戳采样，并更新 DRDY 与加速度计 25.6 kHz sensor-time；`ACC_PWR_CONF/ACC_PWR_CTRL/GYRO_LPM1` 会门控断电或 suspend 状态下的新样本；加速度计 1024-byte FIFO 与陀螺仪 100-frame/8-byte FIFO 可经真实 SPI FIFO 寄存器读取；默认仍为零噪声/零偏、25°C；
-- 提供 `tools/dm_mc02_sim_worker.py` 外部仿真桥：NullEngine 和 MuJoCo 可进行 DM-MIT 电机控制/反馈联调，MuJoCo 通过 uv optional extra 接入，ROS2 engine 通过标准 IMU/力矩话题连接 Gazebo，支持固定步长和 `--realtime` 时间对齐；
-- 提供独立 host-side `DmMotorBusAdapter`：将 DM-MIT/legacy float CAN wire 映射为协议中立的电机命令和状态，worker、NullEngine、MuJoCo、ROS2 共享同一映射策略；默认仍保持 guest FDCAN wire-faithful 闭环；
-- 提供协议中立的 backend registry：内建 Null/MuJoCo/ROS2 使用统一 factory，用户可通过 `--backend MODULE:FACTORY` 直接加载 backend，或通过 `--backend-registry MODULE:INITIALIZER --engine NAME` 注册并选择自定义 backend，不需修改 worker 核心文件；
-- 提供 `tools/collect-performance-baseline.sh`，以固定 10000 帧采集 NullEngine 吞吐、worker 启动延迟和 DM-MC02 启动 smoke 时间；
-- 提供 `tools/collect-firmware-rtf.sh`，直接启动 Release 固件并读取 ELF 中的 `xTickCount`，报告真实固件 RTF、有效 tick/s、QEMU CPU 利用率和 RSS；
-- 提供可独立编译的 host-side machine capability probe；
-- 提供不依赖 guest 固件的 `-machine none` smoke 检查（在本机安装 QEMU 后可执行）。
-- 提供初始化前可选、初始化后锁定的 `board-profile` machine 属性；timer/UART/FDCAN
-  route 的地址与 IRQ 绑定由 profile 内聚管理，便于复用同 SoC 芯片模型。
-- 板级连接描述集中在 QEMU 内部的 `dm_mc02_board` profile：UART/FDCAN/TIM/ADC
-  地址、serial slot、DMAMUX request、DMA 控制器、IRQ vector 和 RS485 DE 引脚由
-  静态 wiring 数据提供；DMA、ADC、UART、FDCAN 等芯片模型不依赖 DM-MC02 板级文件。
-  更换板卡时可复用芯片模型和 machine 组装流程，只替换 profile。
-- 已注册的备用 profile `STM32H723-EVAL` 可通过
-  `-machine dm-mc02,board-profile=STM32H723-EVAL` 选择。它是用于复用验收的虚拟
-  评估板配置，不声称对应某一块真实商业板卡；当前提供 2 个 UART、1 个 FDCAN 和
-  独立的 GPIO/DMA wiring。
+- [安装与构建](#安装与构建)
+- [首次验证](#首次验证)
+- [运行固件](#运行固件)
+- [Flash 持久化](#flash-持久化)
+- [串口与外部仿真](#串口与外部仿真)
+- [测试与性能](#测试与性能)
+- [更新与源码包](#更新与源码包)
+- [常见问题](#常见问题)
+- [目录与文档](#目录与文档)
 
-这不是完整 STM32H723 模型。ARMv7-M 的 CPU/NVIC/SysTick 基础由 QEMU 提供；当前 H723 外设已加入 GPIO、SPI2/BMI088、PWR/RCC、DMA/DMAMUX、定时器窗口、UART/FDCAN/ADC、OCTOSPI2、CORDIC、USB FIFO0 虚拟管道及若干启动兼容窗口，但其中许多仍是寄存器安全模型。QEMU chardev link 已接入 IMU 注入和板级输出 telemetry：PA7 活动投影为白色 LED，TIM8 DMA2 Stream6 的真实 firmware buffer 可解码为 WS2812 RGB，TIM12_CH2/PB15 投影为蜂鸣器，PC13/PC15 投影为 24 V/5 V 标志；BMI088 已支持量程、ODR 下采样、轻量带宽滤波、DRDY、accel sensor-time、参数化温漂/random walk 及 accel/gyro FIFO SPI 数据面（含 accel config/skip/sensortime 基础帧），但不包含 INT tag、sample-drop frame、FIFO 中断引脚、完整器件级滤波校准或动态温度物理源；UART/FDCAN 已有可选主机通道，UART TX 支持有界缓存和短写重试，FDCAN1/2/3 通过 QEMU standard CAN bus 连接，固定 84-byte chardev 仍是独立 host wire，USART2/USART3 支持 GPIO/AF 两种 RS485 DE 方向模式。外部 worker 已支持 Null/MuJoCo，并提供 ROS2 话题桥接 Gazebo，同时可选地通过 SocketCAN host bridge 接入 Linux CAN/CAN-FD；`tools/run-worker.sh` 会为 Null/MuJoCo 选择 uv 环境，为 ROS2 选择已 source 的系统 ROS Python。`system_reset` 默认是 warm reset，也可用 `cold-reset=on` 清空片上 SRAM；其它 DMA 外设 request/定时器波形、未接出 timer 的 TRGO/TRGO2 source、timer 组合触发、完整 USB 枚举/端点/总线、Flash ECC/option bytes、SocketCAN 原生 QEMU 后端仍 pending。Release 固件已能持续运行并驱动 FreeRTOS tick，但尚不能声称完整业务启动。未实现功能会继续报告为 pending。
+## 安装与构建
 
-## 快速检查
+### 1. 宿主依赖
 
-正式项目门禁统一使用：
+已验证宿主为 **Ubuntu 24.04 x86_64**，需要 Python ≥ 3.11。Windows/macOS 原生
+构建不在当前验收范围。Ubuntu 安装命令：
 
 ```bash
-python3 tools/dm_mc02_test_gate.py
+sudo apt-get update
+sudo apt-get install -y build-essential pkg-config python3 python3-venv \
+  libglib2.0-dev zlib1g-dev cmake git ripgrep \
+  gcc-arm-none-eabi binutils-arm-none-eabi
+```
+
+另外按 [uv 官方说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 uv，
+确认 `uv --version` 可用。Meson、Ninja、pytest 由 `uv.lock` 固定；ARM 工具链用于
+编译仓库自带的测试 guest。首次安装 Python 依赖及 QEMU wraps 需要网络，`/tmp` 必须可写。
+
+### 2. 获取完整源码
+
+```bash
+git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+cd qemu-dm-mc02
+git submodule update --init --depth 1 qemu/upstream
+```
+
+SSH 用户可将 clone URL 替换为 `git@github.com:lym12321/qemu-dm-mc02.git`。
+`main` 保存共享模型、工具和文档；同仓库的 `dm-mc02/v8.2.2` 分支保存 QEMU fork，
+通过子模块固定到确切提交。`qemu.lock` 记录官方基线与 fork 身份。
+**main ZIP 不含子模块源码，不能直接构建。** 无需递归下载全部 ROM 子模块；当前
+ARM profile 所需 Meson wraps 由构建脚本获取。
+
+### 3. 构建
+
+后续命令均从项目根目录执行：
+
+```bash
+uv sync --locked --group dev
+PYTHON=/usr/bin/python3 bash tools/build-qemu.sh
+cmake -S . -B build/host -DCMAKE_BUILD_TYPE=Release
+cmake --build build/host --parallel 4
+```
+
+主程序为 `build/qemu/qemu-system-arm`，Host 测试/桥接程序在 `build/host/`。
+默认 Release、`arm-softmmu`、项目设备 profile；发行版自带的 QEMU 没有本项目
+`dm-mc02` machine。`.venv/` 和 `build/` 都不入库。
+
+调试构建可用 `QEMU_BUILD_TYPE=debugoptimized bash tools/build-qemu.sh`；性能测试前
+切回 Release。`tools/build-qemu-generic.sh` 只检查通用 ARM 复用边界，不是本板运行入口。
+
+## 首次验证
+
+不需要外部业务固件：
+
+```bash
+build/qemu/qemu-system-arm -machine help | rg 'dm-mc02'
+bash tools/run-mc02-smoke.sh
+bash tools/run-ospi-smoke.sh
+bash tools/run-flash-smoke.sh
+```
+
+脚本编译仓库内最小 guest，消费已经构建的 QEMU；模型修改后应先重新构建。
+`tools/run-qemu.sh --smoke` 只是通用空 machine 探测，不是固件启动器。
+
+## 运行固件
+
+提供适用于 DM-MC02 地址空间的 ARM ELF；其他 MCU/板卡的固件不会自动适配。
+本项目验证使用外部 `trobot` Release ELF，不修改或分发它。
+
+```bash
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
+sha256sum "$DM_MC02_ELF"
+build/qemu/qemu-system-arm -machine dm-mc02 \
+  -kernel "$DM_MC02_ELF" -nodefaults -display none \
+  -serial none -monitor stdio
+```
+
+终端进入 QEMU monitor：`info status` 查看状态，`stop`/`cont` 暂停/继续，
+`system_reset` 请求普通系统复位，`quit` 正常退出。没有 UART 后端时不会自动显示
+串口文字。`-serial none` 保留二进制 co-sim 槽位，避免协议数据污染终端。
+
+查看可配置属性：`build/qemu/qemu-system-arm -machine dm-mc02,help`。
+GDB 调试可加 `-S -gdb tcp:127.0.0.1:1234`，使用 ARM GDB 加载同一个 ELF，执行
+`target remote localhost:1234`。调试暂停与 trace 不属于默认性能场景。
+
+自动化控制可加 `-qmp unix:/tmp/dm-mc02-qmp.sock,server=on,wait=off`；每个进程使用
+独立短路径。项目 Python 工具经 `tools/dm_mc02_qmp.py` 复用固定 QEMU Python client。
+
+## Flash 持久化
+
+把启动命令的 machine 参数替换为：
+
+```text
+-machine dm-mc02,flash-file=/absolute/internal.raw,ospi2-flash-file=/absolute/external.raw
+```
+
+| 属性 | raw 大小 | 尺寸/I/O 错误 |
+|---|---:|---|
+| `flash-file` | 1 MiB（1048576 字节） | 拒绝启动 |
+| `ospi2-flash-file` | 8 MiB（8388608 字节） | warning，保留擦除态 |
+
+空路径禁用磁盘 I/O；缺失文件保留 `0xff` 擦除态。路径初始化后不可修改。
+只有正常 shutdown 才保存完整镜像，崩溃/`kill -9` 不保证保存，没有掉电原子性。
+内部镜像加载后，`-kernel` 仍会加载 ELF 段，因此程序区可能被覆盖；持久参数应避开
+ELF 段。不要用零填充文件冒充擦除态。
+
+外部 NOR 为独立 `dm-w25q64`，复用 QEMU QOM/SSI 和项目存储核心；官方
+`m25p80.c`、`flash.h` 保持 v8.2.2 内容。命令为功能级同步模型，quad 用字节 token
+近似；QE/保护/SFDP、真实忙时序和器件迁移未实现，详见能力矩阵。
+
+## 串口与外部仿真
+
+### UART 与 FDCAN
+
+`-serial` 参数顺序决定连接位置：
+
+| 槽位（从 0 开始） | 用途 |
+|---:|---|
+| 0 | 二进制 co-sim |
+| 1–6 | USART1、USART2、USART3、UART5、UART7、USART10 |
+| 7–9 | FDCAN1、FDCAN2、FDCAN3 |
+
+例如 USART1 输出到文件，monitor 留在终端：
+
+```bash
+mkdir -p build/runtime
+build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
+  -nodefaults -display none -monitor stdio \
+  -serial none -serial file:build/runtime/usart1.log
+```
+
+FDCAN 是固定 84 字节帧，不是文本串口或直接的 SocketCAN socket。
+wire 布局、时间 owner、背压和复位规则见 [INTERFACES.md](INTERFACES.md)。
+
+### Worker
+
+先验证仓库自带连接 fixture：
+
+```bash
+bash tools/run-qemu-worker-smoke.sh
+bash tools/run-qemu-v2-motor-smoke.sh
+bash tools/run-worker.sh --help
+```
+
+手工连接时，把 QEMU 的第一个 `-serial none` 替换成
+`-chardev socket,id=cosim,path=/tmp/dm-mc02-cosim.sock,server=on,wait=off -serial chardev:cosim`，
+然后另一个终端运行：
+
+```bash
+bash tools/run-worker.sh --cosim /tmp/dm-mc02-cosim.sock
+```
+
+此命令只接 co-sim 控制/采样通道；电机总线还需 FDCAN socket 与 `--fdcan`。
+完整 wiring 可参照 `tools/run-qemu-worker-smoke.sh`，仅控制通道连通不代表机构闭环。
+
+- MuJoCo：`uv sync --locked --group dev --extra mujoco`，再执行
+  `bash tools/run-mujoco-worker-smoke.sh`；实际模型、初始条件仍需按接口准备。
+- ROS 2：安装并 source 系统环境（验收宿主为 Jazzy），运行
+  `bash tools/run-ros2-worker-smoke.sh`。`--engine ros2` 使用系统 ROS Python。
+  默认 topics 是 `/dm_mc02/imu`、`/dm_mc02/joint_states`、`/dm_mc02/motor_cmd`。
+  adapter smoke 不等于 Gazebo world/model 联调，后者尚未验证。
+- SocketCAN：worker 的 `--socketcan can0` 配合 `--fdcan` 连接已有 Linux CAN 接口，
+  不模拟电气位时序、真实 ACK 或物理错误。
+- 自定义 plant：`--backend package:create_backend` 或
+  `--backend-registry package:register --engine name`。factory 的方法与拒绝契约见
+  接口文档；plant 不应重复实现 wire 解析与 DM-MIT 映射。
+
+## 测试与性能
+
+### 权威工程门
+
+```bash
+PYTHON=/usr/bin/python3 python3 tools/dm_mc02_test_gate.py --jobs 4
+# 仅在源码与构建产物已同步时：
 python3 tools/dm_mc02_test_gate.py --no-build
-python3 tools/dm_mc02_test_gate.py --smoke-only
-python3 tools/dm_mc02_test_gate.py --jobs 4 --report-dir /tmp/dm-mc02-gate
 ```
 
-默认入口先构建，再运行不重复的 Meson、原生 Host CTest、完整 pytest 和 shell smoke
-集合。`--no-build` 只消费已有产物；每次运行在报告目录中保存 `summary.json` 和各
-runner 日志。退出码 0/1/2/78 分别表示 PASS、FAIL、命令行错误和仅有 BLOCKED；
-ROS2/MuJoCo 缺 backend 会明确记录 SKIP。单个 `tools/run-*-smoke.sh` 可用于定向
-诊断，但不替代正式聚合结果。
+按 Meson、原生 Host CTest、完整 pytest、shell smoke 四个集合验证。
+报告保存到 `build/test-results/qemu-gate/<run>/summary.json`，含动态分母、日志、退出码
+及测试前后二进制 SHA-256；可用 `--report-dir /absolute/path` 修改目录。
+退出码 0/1/2/78 分别为 PASS/FAIL/参数错误/仅 BLOCKED。
+只有命名的 ROS2、MuJoCo 可选后端允许 SKIP，跳过不代表验收通过。
+固件生命周期测试需要外部 ELF 时，应显式设置 `DM_MC02_ELF`。
 
-真实固件性能基线（只读使用固件 ELF，不会修改固件）：
+2026-10-01 NOR 收敛后的结果为 Meson 66/66、Host 51/51、pytest 319/319、smoke 94/94。
+发布工具后续回归见 [PLAN.md](PLAN.md)；计数不是覆盖率或项目完成率。
+
+### 固件调度和实时性能
 
 ```bash
-bash tools/collect-firmware-rtf.sh --warmup 0.25 --duration 1.0
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
+bash tools/collect-firmware-rtf.sh --warmup 0 --virtual-seconds 2 --ready-tick 250
+bash tools/run-release-rtf-gate.sh
 ```
 
-RTF 定义为固件虚拟时间（FreeRTOS tick，1 tick = 1 ms）除以宿主墙钟时间；该指标与
-NullEngine 的协议吞吐不可直接比较。采样器以 `-S` 建立单一 QMP epoch，开始前确认
-`prelaunch` 并清除旧事件；baseline 和 virtual 模式都会拒绝任意 `RESET`、IWDG timeout
-变化以及不合法的 32-bit tick 反向/歧义跳变，同时允许自然回绕。样本末尾先暂停 QEMU
-再读取最终状态，避免把复位误算成巨大正向 tick 增量。`--startup-timeout` 默认 10 秒，
-统一约束 QEMU/QMP 启动和 virtual 模式的 ready tick；输入必须是有限数，清理采用有界
-TERM/KILL/QMP disconnect，QEMU stderr 使用每轮临时文件。
+采样针对已记录的 `trobot` FreeRTOS tick/watchdog 观测接口，不是任意 ELF 的业务
+健康检查。两秒命令用于诊断；正式门从 reset 启动，执行三次各 60 虚拟秒采样。
+目标 `1.0x`，允许已记录的 `0.999x` QMP/墙钟抖动容差，打印精确 RTF、启动延迟、
+CPU、RSS 和 watchdog。默认 startup 总期限 10 秒，超时/复位/断连必须失败退出。
 
-标准 Release gate（从 reset 开始，60 秒虚拟时间，3 次，默认 `0.999x` 测量容差）：
+2026-09-29 独立重建版本三轮 RTF 为 `0.999993x / 0.999961x / 0.999999x`，见
+[冻结交付记录](reports/2026-09-29-engineering-release/README.md)。该证据限定默认板卡、
+指定 ELF、无外部 worker，不代表新宿主、其它固件、无节流吞吐或 plant pacing。
+tick 推进不等于完整业务 ready。
+
+## 更新与源码包
+
+日常更新：
 
 ```bash
-DM_MC02_ELF=/home/lab/sim/trobot/build/Release-current/trobot.elf \
-  bash tools/run-release-rtf-gate.sh
+git pull --ff-only
+git submodule update --init --depth 1 qemu/upstream
 ```
 
-probe 返回 `2` 表示发现了尚未实现的外设能力；M1 的 CPU、内存映射和 ARMv7-M 基础路径会报告为 ready。
+子模块通常是 detached HEAD；修改前在其中创建工作分支。先提交 QEMU 模型/测试，
+再同步外层 gitlink 与 `qemu.lock` 的 `fork_commit`。不要用 `update --remote` 替代固定
+版本，也不要把官方 tag 当成本项目 fork。上游基线为 QEMU v8.2.2；升级需审查差异，
+通过下层、消费者和完整工程门。
 
-若安装了 QEMU，可运行：
+需要包含已下载 wraps 的可校验源码包时：
 
 ```bash
-bash tools/check-qemu.sh
-bash tools/run-qemu.sh --smoke
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
+python3 tools/dm_mc02_source_package.py create build/source-packages/source.tar.gz
+python3 tools/dm_mc02_source_package.py verify build/source-packages/source.tar.gz
+python3 tools/dm_mc02_source_package.py restore \
+  build/source-packages/source.tar.gz /absolute/path/to/new-restore
 ```
 
-源码构建的 QEMU 位于 `build/qemu/qemu-system-arm`，也可以显式指定：
+恢复目录必须不存在，源码在其 `project/` 下；按本文重新安装依赖、构建与测试。
+包不含 `.git`、ROM 工作树、二进制或固件，ELF 只记录哈希。应先完成首次构建获取 wraps。
+默认拒绝未提交 QEMU 修改；开发快照可显式 `create --allow-worktree`，manifest 保存
+真实差异和逐文件哈希。verify 证明内容完整，不代替独立构建与运行测试。
 
-```bash
-QEMU_SYSTEM_ARM="$PWD/build/qemu/qemu-system-arm" bash tools/run-mc02-smoke.sh
-```
+## 常见问题
 
-## 准备 QEMU 源码
+| 现象 | 处理 |
+|---|---|
+| `unsupported machine type dm-mc02` | 使用 `build/qemu/qemu-system-arm`，不是系统 QEMU |
+| 缺少 `qemu/upstream/configure` | 初始化固定子模块；main ZIP 不含其源码 |
+| Meson/Ninja/venv 缺失 | 从根目录执行 `uv sync --locked --group dev` |
+| guest 编译失败 | 检查 `arm-none-eabi-gcc` 和 `arm-none-eabi-objcopy` |
+| 无串口文字 | 槽位 0 是 co-sim；核对 UART 顺序和固件配置 |
+| socket 连接失败 | 检查服务端、短路径、路径冲突和 `/tmp` 权限 |
+| RTF 失败 | 核对 ELF 哈希、RESET/watchdog、startup deadline、Release 配置及宿主负载 |
+| ROS2/MuJoCo SKIP | 安装对应依赖；ROS2 还需 source 系统环境 |
+| Flash 未保存 | monitor `quit` 正常退出；检查尺寸、路径与 stderr |
 
-默认脚本只做探测，不联网。明确需要下载时才使用：
+可加 `-d unimp,guest_errors -D build/runtime/qemu.log` 诊断未知寄存器/命令，先创建目录。
+先定位第一处错误状态，不用固件特判或上层脚本掩盖尚未理解的下层缺陷。
 
-```bash
-bash tools/bootstrap-qemu.sh --download --ref <固定tag或commit>
-bash tools/build-qemu.sh
-# 可选：构建不含 DM-MC02/H723/协同仿真的通用 ARM QEMU
-bash tools/build-qemu-generic.sh
-```
+## 目录与文档
 
-源码、构建目录和锁定信息都限制在本目录下。`qemu.lock` 会记录版本、探测结果和 M2 smoke 状态。Python 工具环境由本目录的 `pyproject.toml` 和 `uv` 管理；QEMU 8.2.2 的 Meson/Ninja 构建依赖也只在本目录的环境中使用。DM-MC02 构建位于 `build/qemu`，通用 ARM 构建位于独立的 `build/qemu-generic`，后者不包含项目专用 feature symbol 或源对象。
+| 路径 | 内容 |
+|---|---|
+| `qemu/upstream/` | QEMU fork、H723 外设、DM-MC02 machine、NOR、qtest/unit |
+| `cosim/` | 板卡无关 C 模型、协议与 adapter |
+| `tools/` | 构建、worker、QMP、性能采样、源码包与统一门禁 |
+| `tests/` | Host C、Python 和 smoke guest fixtures |
+| `reports/`、`docs/history/` | 冻结验收与历史审查；旧结果不代表当前版本 |
+| [CAPABILITIES.md](CAPABILITIES.md) | 唯一当前能力矩阵 |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | 分层、复用与真实性裁决 |
+| [INTERFACES.md](INTERFACES.md) | 公共接口、时间与错误语义 |
+| [PLAN.md](PLAN.md)、[REVIEW.md](REVIEW.md) | 当前进度、下一步与残余风险 |
+| [AGENTS.md](AGENTS.md) | 逐层修改和验收约束 |
 
-```bash
-uv sync --group dev
-# 可选 MuJoCo 引擎：uv sync --group dev --extra mujoco
-```
-
-## 当前阻塞项
-
-在没有 `qemu-system-arm` 或 QEMU 源码的机器上，不能声称 M-profile/M7 smoke 已通过。请查看：
-
-```bash
-bash tools/check-qemu.sh --report-only
-```
-
-M1 已完成内存/复位/向量表路径和 PWR/RCC 最小模型，M2 已完成 polled SPI2/BMI088 子集、SPI2 byte DMA TX/RX request、UART DMA 基础路径、ADC1 channel/rank raw input、ADC pin voltage input、SMPR1/SMPR2 rank-level 采样时间、软件启动、TIM8 更新外部触发、ADCAL 虚拟完成、EOC/EOS/OVR IRQ18 中断、默认 24 V/VIN 分压与 LCD NONE 源和 circular DMA、最小 USART IDLE IRQ、DMA TC/TE IRQ、UART、FDCAN chardev 通道、QEMU standard CAN bus、DMA memory-to-memory 搬运、WS2812 buffer observer、OCTOSPI2/W25Q64 最小路径、OCTOSPI2 板卡无关 DMA endpoint 与 synthetic DMA 边界测试、CORDIC Q1.31 sine/cosine 子集和 USART2/USART3 RS485 DE，M3 host transport、QEMU chardev IMU/ADC link、输出 telemetry、SocketCAN host bridge 和外部仿真 worker 已完成最小垂直切片。Release 固件已能持续运行；下一步是 Gazebo/MuJoCo 具体模型联调、时间戳对齐和完整电机映射，再补齐其它 DMA 外设 request、完整 HAL ReceiveToIdle event-size 语义、完整 SPI/DMA 状态机、ADC 完整外部触发选择矩阵和定时器波形。
-
-UART chardev 按 QEMU serial 后端顺序映射：`serial_hd(0)` 保留给二进制 co-sim，
-`serial_hd(1)` 至 `serial_hd(6)` 依次对应 USART1、USART2、USART3、UART5、UART7、
-USART10。因此命令行应先放一个 `-serial none`，再放 UART 的 `-serial chardev:<id>`；
-不提供这些后端时，UART 仍可用于固件初始化和轮询寄存器测试；UART DMA request
-映射仍在板内生效。当前 IDLE IRQ 已支持最小标志/清除路径，但尚未实现完整
-`ReceiveToIdle_DMA` event-size 回调语义。
-
-FDCAN chardev 沿用同一 serial 后端序列：`serial_hd(7)` 至 `serial_hd(9)` 依次对应
-FDCAN1、FDCAN2、FDCAN3。每帧固定 84 字节，布局为
-`can_id:u32 flags:u32 dlc:u8 reserved[3] virtual_time_ns:u64 data[64]`。
-
-可选 SocketCAN bridge 运行在 host worker 侧，不改变 QEMU 的固定 84 字节接口：
-`python tools/dm_mc02_sim_worker.py --cosim <socket> --fdcan <socket> --socketcan can0`。
-QEMU 发出的 FDCAN 帧会转发到 Linux `CAN_RAW` socket，来自 SocketCAN 的 classic
-CAN/CAN-FD 帧会带 worker 当前虚拟时间转回 QEMU。需要 Linux `AF_CAN` 和相应接口
-（例如预先创建的 `vcan0`）；未指定 `--socketcan` 时行为不变。该桥接不模拟 CAN
-物理层、位时序、真实 ACK 或总线错误恢复。
-
-Gazebo/ROS2 模式使用 `--engine ros2`：默认订阅 `/dm_mc02/imu`
-（`sensor_msgs/Imu`）和 `/dm_mc02/joint_states`（`sensor_msgs/JointState`），并发布
-`/dm_mc02/motor_cmd`（`std_msgs/Float64MultiArray`）。JointState 按数组索引提供电机的
-position/velocity/effort，worker 据此执行 DM-MIT 控制项并返回反馈；没有状态消息时会
-退化为零状态，仍保持 enable 门控。具体 Gazebo 模型需提供这两个传感器话题；可用
-`--ros-joint-state-topic` 改名。
-
-自定义 backend 使用同一个 worker 控制面。factory 接收完整的
-`argparse.Namespace`，返回实现 `step(dt)`、`set_motor()`、`reset_motor()`、
-`set_motor_enabled()`、`set_motor_dm()` 和 `motor_feedback()` 的对象；对象可选提供
-`reset()`、`close()`，以及 `imu_timestamp_ns` 以启用外部时间戳映射。直接加载示例：
-
-```bash
-PYTHONPATH="$PWD/plugins" bash tools/run-worker.sh \
-  --cosim /tmp/dm-mc02.sock --backend my_backend:create_backend
-```
-
-注册表 initializer 的形式如下，`--engine` 选择 initializer 注册的名称：
-
-```bash
-PYTHONPATH="$PWD/plugins" bash tools/run-worker.sh \
-  --cosim /tmp/dm-mc02.sock \
-  --backend-registry my_backends:register --engine my_plant
-```
-
-自定义 backend 默认使用项目的 uv Python；依赖 ROS2 的自定义 backend 可额外传
-`--engine ros2` 让 `run-worker.sh` 使用已 source 的系统 ROS Python，同时仍由
-`--backend` 加载指定 factory。backend registry 只负责构造对象，不改变 v1/v2 wire
-协议、时间 owner 或 FDCAN adapter 语义。
-
-## 2026-09-01 OSPI2 raw-image persistence
-
-DM-MC02 machine 支持可选属性 `ospi2-flash-file`。属性必须在 machine 初始化前配置；
-启动创建 OSPI2 后从该文件加载，正常退出时保存完整的 W25Q64 raw image。默认空路径
-不做磁盘 I/O。文件是精确几何的原始镜像，当前 DM-MC02 OSPI2 镜像大小为 8 MiB，
-不包含 header；文件尺寸不匹配不会加载，并继续使用擦除态镜像。缺失文件也保持擦除态，
-其它加载/保存 I/O 错误以 warning 报告。
-
-该功能由板卡无关的 `cosim/dm_nor_flash_persistence.[ch]` 提供，并由
-`DmMc02Ospi` 以薄封装接入 OSPI backing storage。它只覆盖正常退出保存，不模拟真实
-Flash latency、ECC、异常退出或掉电原子性。
-
-验证：`dm_nor_flash_persistence_smoke`、OSPI 直接边界测试和
-`bash tools/run-ospi-smoke.sh` 通过；后者验证 8 MiB 镜像的启动加载、guest 读回、
-正常 `quit` 后保存及最终尺寸。
-
-## 2026-09-01 H723 APB/timer clock model
-
-QEMU 当前已按 H723 D2 clock tree 派生 APB1/APB2 和 timer kernel clock。`D2CFGR`
-的 APB1/APB2 prescaler 与 `CFGR.TIMPRE` 会在 guest 改写后实时传播到对应定时器；
-TIM2/3/12/24 使用 APB1，TIM1/8 使用 APB2。复位时 D2 APB prescaler 为 `/1`，
-所以 H723 复位 HCLK/TIM clock 为 64 MHz；DM-MC02 固件配置
-`HPRE=/2,D2PPRE1=/2,D2PPRE2=/2` 后，480 MHz SYSCLK 下得到 HCLK=240 MHz、
-APB=120 MHz、timer=240 MHz。
-
-验证：`dm_stm32h7_clock_tree_smoke`、定时器 qtest `22/22`、
-`bash tools/run-tim2-clock-smoke.sh`、`bash tools/run-pwm-smoke.sh` 和 host CTest
-`53/53` 通过。FDCAN 和 USART kernel-clock source 已分别接入独立边界；SPI、
-其它 kernel-clock source 仍未扩展，也未模拟
-oscillator/PLL settle、CSS、低功耗或完整 APB3/APB4/D3 clock semantics。
-
-## 2026-09-01 H723 USART kernel-clock model
-
-USART1/6/10 使用 `D2CCIP2R` 的 USART16 source mux，USART2/3/UART4/5/7/8
-使用 USART234578 mux；APB source 分别来自 APB2 和 APB1，PLL2Q、PLL3Q、HSI/HSIDIV、
-CSI、LSE 和 reserved source 的结果由 RCC readiness 规则派生。QEMU machine 为每个
-group 和每个 routed UART 建立独立 `Clock` 对象，并通过只读 QOM 属性
-`usart16-kernel-clock-hz`、`usart234578-kernel-clock-hz` 提供诊断值。该功能提供
-kernel-clock 边界；可复用 UART consumer 现在会在有效 `BRR/PRESC/OVER8` 配置下按默认
-8N1 帧长度使用虚拟时间逐字节发送，尚未覆盖 RX 位级采样。
-
-验证：`bash tools/run-uart-clock-smoke.sh` 覆盖 9 个 source/APB divider case，完整
-QEMU smoke `86/86` 和 host CTest `53/53` 通过。由于当前 QEMU HMP 没有可用的 `mw`
-命令，source case 通过独立 guest 启动验证，运行中 RCC 改写仍是后续切片。
+依赖方向为 `STM32H723 → DM-MC02 → 器件/driver → external plant → tooling`。
+每次只推进一个边界，先隔离测试，再直接消费者测试，最后工程门。
+QEMU 许可证见 [`qemu/upstream/COPYING`](qemu/upstream/COPYING) 与源码文件声明；
+第三方代码保留各自版权和许可证，本仓库不重新许可这些依赖，也不包含固件授权。

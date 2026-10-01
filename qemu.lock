@@ -4,4 +4,4 @@ upstream_url=https://gitlab.com/qemu-project/qemu.git
 upstream_ref=v8.2.2
 upstream_commit=11aa0b1ff115b86160c4d37e7c37e6a6b13b77ea
 fork_branch=dm-mc02/v8.2.2
-fork_commit=73ac4b85cfcd16a31211e2158fcd9788b7d8c429
+fork_commit=b54f49e4be05c4114d667bf5de11f17f63ea59db

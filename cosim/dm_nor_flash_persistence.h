@@ -1,4 +1,4 @@
-/* Host-side persistence for a caller-owned NOR Flash image. */
+/* Host-side persistence for caller-owned Flash bytes. */
 #ifndef DM_NOR_FLASH_PERSISTENCE_H
 #define DM_NOR_FLASH_PERSISTENCE_H
 

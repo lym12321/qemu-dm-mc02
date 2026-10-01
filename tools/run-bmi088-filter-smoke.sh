@@ -26,7 +26,7 @@ if [[ ! -x "$elf" ||
         -o "$elf" "$root_dir/smoke/dm_mc02_bmi088_filter_smoke.c"
 fi
 
-run_dir=$(mktemp -d "$root_dir/output.bmi088-filter-smoke.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.bmi088-filter-smoke.XXXXXX")
 chardev_socket="$run_dir/cosim.sock"
 qmp_socket="$run_dir/qmp.sock"
 qemu_pid=''

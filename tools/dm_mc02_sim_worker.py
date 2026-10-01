@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-import heapq
 import importlib.util
 import math
 import select
@@ -60,7 +59,10 @@ except ModuleNotFoundError as exc:
     step_protocol_spec.loader.exec_module(step_protocol)
 
 try:
-    from dm_mc02_motor_adapter import DmMotorBusAdapter
+    from dm_mc02_motor_adapter import (
+        DM_DEFAULT_FEEDBACK_ID, DM_DEFAULT_P_MAX, DM_DEFAULT_SLAVE_ID,
+        DM_DEFAULT_T_MAX, DM_DEFAULT_V_MAX, DmMotorBusAdapter,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "dm_mc02_motor_adapter":
         raise
@@ -72,7 +74,10 @@ except ModuleNotFoundError as exc:
     motor_adapter_module = importlib.util.module_from_spec(motor_adapter_spec)
     sys.modules[motor_adapter_spec.name] = motor_adapter_module
     motor_adapter_spec.loader.exec_module(motor_adapter_module)
-    from dm_mc02_motor_adapter import DmMotorBusAdapter
+    from dm_mc02_motor_adapter import (
+        DM_DEFAULT_FEEDBACK_ID, DM_DEFAULT_P_MAX, DM_DEFAULT_SLAVE_ID,
+        DM_DEFAULT_T_MAX, DM_DEFAULT_V_MAX, DmMotorBusAdapter,
+    )
 
 try:
     from dm_mc02_step_coordinator import StepCoordinator
@@ -121,8 +126,6 @@ ADC_VOLTAGE = 6
 ADC_VOLTAGE_MAX_UV = 3_300_000
 ADC_VOLTAGE_FLAGS_MASK = 1
 CAN_WIRE_SIZE = 84
-CAN_FLAG_RTR = 1 << 1
-CAN_FLAG_FD = 1 << 2
 MAX_PENDING_FRAMES = 256
 V2_BODY_FIXED_SIZE = 4 + step_protocol.STEP_HEADER_SIZE
 ROS_RESET_TIMEOUT_SEC = 2.0
@@ -130,19 +133,12 @@ V2_STEP_RESPONSE_TIMEOUT_SEC = 2.0
 V2_STEP_ACK_TIMEOUT_SEC = 0.25
 V2_STEP_MAX_RETRIES = 3
 V2_STEP_DONE_MAX_RETRIES = 3
-
-# The DM motor used by the board firmware speaks the common MIT 8-byte CAN
-# protocol.  Keep the generic float command path below for small plant smoke
-# tests, but do not silently interpret a real MIT packet as a float.
-DM_RESET_COMMAND = b"\xff\xff\xff\xff\xff\xff\xff\xfb"
-DM_ENABLE_COMMAND = b"\xff\xff\xff\xff\xff\xff\xff\xfc"
-DM_DISABLE_COMMAND = b"\xff\xff\xff\xff\xff\xff\xff\xfd"
-DM_DEFAULT_SLAVE_ID = 1
-DM_DEFAULT_FEEDBACK_ID = 0x11
-DM_DEFAULT_P_MAX = 12.5
-DM_DEFAULT_V_MAX = 30.0
-DM_DEFAULT_T_MAX = 10.0
-
+BACKEND_REQUIRED_METHODS = (
+    "step", "set_motor", "reset_motor", "set_motor_enabled",
+    "set_motor_dm", "motor_feedback",
+)
+BACKEND_OPTIONAL_METHODS = ("reset", "close")
+_MISSING_BACKEND_MEMBER = object()
 
 def realtime_target_ns(wall_origin_ns: int, virtual_time_ns: int,
                        clock_base_ns: int) -> int:
@@ -689,75 +685,6 @@ class MotorState:
         self.dm_command = [None] * count
 
 
-def _decode_linear(raw: int, bits: int, minimum: float,
-                   maximum: float) -> float:
-    return raw * (maximum - minimum) / ((1 << bits) - 1) + minimum
-
-
-def decode_dm_mit(data: bytes, p_max: float = DM_DEFAULT_P_MAX,
-                  v_max: float = DM_DEFAULT_V_MAX,
-                  t_max: float = DM_DEFAULT_T_MAX) -> dict | None:
-    """Decode one DM MIT control packet into physical units."""
-    if len(data) != 8:
-        return None
-    p_raw = (data[0] << 8) | data[1]
-    v_raw = (data[2] << 4) | (data[3] >> 4)
-    kp_raw = ((data[3] & 0x0f) << 8) | data[4]
-    kd_raw = (data[5] << 4) | (data[6] >> 4)
-    t_raw = ((data[6] & 0x0f) << 8) | data[7]
-    return {
-        "position": _decode_linear(p_raw, 16, -p_max, p_max),
-        "speed": _decode_linear(v_raw, 12, -v_max, v_max),
-        "kp": _decode_linear(kp_raw, 12, 0.0, 500.0),
-        "kd": _decode_linear(kd_raw, 12, 0.0, 5.0),
-        "torque": _decode_linear(t_raw, 12, -t_max, t_max),
-    }
-
-
-def dm_motor_ids(args: argparse.Namespace, index: int) -> tuple[int, int]:
-    """Return the control/slave and feedback IDs for one logical motor."""
-    mapping = getattr(args, "dm_motor_map", {})
-    if index in mapping:
-        return mapping[index]
-    return (args.dm_slave_id + index, args.dm_feedback_id + index)
-
-
-def dm_motor_index(args: argparse.Namespace, can_id: int) -> int | None:
-    """Resolve a control ID, preferring explicit per-motor mappings."""
-    mapping = getattr(args, "dm_motor_map", {})
-    for index, (slave_id, _) in mapping.items():
-        if can_id == slave_id:
-            return index
-    index = can_id - args.dm_slave_id
-    return index if 0 <= index < args.motor_count else None
-
-
-def _encode_linear(value: float, bits: int, minimum: float,
-                   maximum: float) -> int:
-    value = min(max(value, minimum), maximum)
-    return int(round((value - minimum) * ((1 << bits) - 1) /
-                     (maximum - minimum)))
-
-
-def encode_dm_feedback(position: float, velocity: float, torque: float,
-                       motor_id: int = DM_DEFAULT_SLAVE_ID,
-                       p_max: float = DM_DEFAULT_P_MAX,
-                       v_max: float = DM_DEFAULT_V_MAX,
-                       t_max: float = DM_DEFAULT_T_MAX) -> bytes:
-    """Encode a DM MIT status packet matching motor::dm::decoder."""
-    p_raw = _encode_linear(position, 16, -p_max, p_max)
-    v_raw = _encode_linear(velocity, 12, -v_max, v_max)
-    t_raw = _encode_linear(torque, 12, -t_max, t_max)
-    return bytes((
-        (motor_id & 0x0f),
-        p_raw >> 8, p_raw & 0xff,
-        v_raw >> 4,
-        ((v_raw & 0x0f) << 4) | (t_raw >> 8),
-        t_raw & 0xff,
-        25, 25,
-    ))
-
-
 def dm_mit_effort(command: dict, position: float, velocity: float,
                   torque_limit: float) -> float:
     """Evaluate the common MIT command law and apply the plant torque limit."""
@@ -1158,6 +1085,13 @@ class Ros2Engine:
             self.rclpy.shutdown()
 
 
+def _validate_worker_timing(args: argparse.Namespace) -> None:
+    if not math.isfinite(args.rate) or args.rate <= 0:
+        raise ValueError("rate must be finite and positive")
+    if not math.isfinite(args.connect_timeout) or args.connect_timeout <= 0:
+        raise ValueError("connect-timeout must be finite and positive")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--cosim", required=True,
@@ -1219,8 +1153,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--connect-timeout", type=float, default=10.0)
     parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
-    if args.rate <= 0 or args.motor_count < 0:
-        parser.error("rate must be positive and motor-count non-negative")
+    try:
+        _validate_worker_timing(args)
+    except ValueError as exc:
+        parser.error(str(exc))
+    if args.motor_count < 0:
+        parser.error("motor-count must be non-negative")
     if args.socketcan and not args.fdcan:
         parser.error("--socketcan requires --fdcan")
     if args.backend and args.backend_registry:
@@ -1252,8 +1190,9 @@ def parse_args() -> argparse.Namespace:
     # colliding with another control ID is unsafe because feedback could be
     # interpreted as a new command by this worker.
     seen_ids = {}
+    motor_adapter = DmMotorBusAdapter.from_namespace(args)
     for index in range(args.motor_count):
-        slave_id, feedback_id = dm_motor_ids(args, index)
+        slave_id, feedback_id = motor_adapter.motor_ids(index)
         for role, can_id in (("slave", slave_id), ("feedback", feedback_id)):
             if not 0 <= can_id <= 0x7ff:
                 parser.error(
@@ -1302,62 +1241,12 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def decode_motor_command(can_id: int, flags: int, data: bytes,
-                         args: argparse.Namespace) -> tuple | None:
-    """Return ``(kind, index, value)`` for a supported motor CAN packet."""
-    if flags & (CAN_FLAG_RTR | CAN_FLAG_FD):
-        return None
-
-    if args.motor_protocol in ("auto", "dm-mit"):
-        index = dm_motor_index(args, can_id)
-        if index is not None and len(data) == 8:
-            if data == DM_RESET_COMMAND:
-                return ("dm-reset", index, None)
-            if data == DM_ENABLE_COMMAND:
-                return ("dm-enable", index, None)
-            if data == DM_DISABLE_COMMAND:
-                return ("dm-disable", index, None)
-            command = decode_dm_mit(data, args.dm_p_max, args.dm_v_max,
-                                    args.dm_t_max)
-            if command is not None:
-                return ("dm-control", index, command)
-
-    if args.motor_protocol in ("auto", "float"):
-        index = can_id - args.motor_can_base
-        if 0 <= index < args.motor_count and len(data) >= 4:
-            value = struct.unpack("<f", data[:4])[0]
-            if math.isfinite(value):
-                return ("float", index, value)
-    return None
-
-
-def apply_motor_command(engine, command: tuple) -> None:
-    kind, index, value = command
-    if kind == "float":
-        engine.set_motor(index, value)
-    elif kind == "dm-reset":
-        engine.reset_motor(index)
-    elif kind == "dm-enable":
-        engine.set_motor_enabled(index, True)
-    elif kind == "dm-disable":
-        engine.set_motor_enabled(index, False)
-    elif kind == "dm-control":
-        engine.set_motor_dm(index, value)
-
-
 def send_dm_feedback(can: CanStream, engine, indices: Iterable[int],
-                     args: argparse.Namespace, timestamp_ns: int,
-                     adapter: DmMotorBusAdapter | None = None) -> None:
+                     timestamp_ns: int,
+                     adapter: DmMotorBusAdapter) -> None:
     for index in indices:
-        if adapter is not None:
-            state = adapter.state(engine, index, timestamp_ns)
-            feedback_id, payload = adapter.encode_feedback(state)
-        else:
-            position, velocity, torque = engine.motor_feedback(index)
-            slave_id, feedback_id = dm_motor_ids(args, index)
-            payload = encode_dm_feedback(position, velocity, torque,
-                                         slave_id, args.dm_p_max,
-                                         args.dm_v_max, args.dm_t_max)
+        state = adapter.state(engine, index, timestamp_ns)
+        feedback_id, payload = adapter.encode_feedback(state)
         can.send(feedback_id, 0, 8, timestamp_ns,
                  payload)
 
@@ -1384,11 +1273,40 @@ def create_backend_registry() -> BackendRegistry:
 def create_engine(args: argparse.Namespace):
     """Construct a backend from a direct factory or an isolated registry."""
     if args.backend:
-        return load_factory(args.backend)(args)
-    registry = create_backend_registry()
-    if args.backend_registry:
-        load_registry(registry, args.backend_registry)
-    return registry.create(args.engine, args)
+        engine = load_factory(args.backend)(args)
+    else:
+        registry = create_backend_registry()
+        if args.backend_registry:
+            load_registry(registry, args.backend_registry)
+        engine = registry.create(args.engine, args)
+
+    invalid_required = [
+        name for name in BACKEND_REQUIRED_METHODS
+        if not callable(getattr(engine, name, None))
+    ]
+    invalid_optional = []
+    for name in BACKEND_OPTIONAL_METHODS:
+        member = getattr(engine, name, _MISSING_BACKEND_MEMBER)
+        if (member is not _MISSING_BACKEND_MEMBER and
+                not callable(member)):
+            invalid_optional.append(name)
+    if invalid_required or invalid_optional:
+        problems = []
+        if invalid_required:
+            problems.append(
+                "missing callable methods: " + ", ".join(invalid_required))
+        if invalid_optional:
+            problems.append(
+                "optional methods must be callable when present: " +
+                ", ".join(invalid_optional))
+        close = getattr(engine, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as exc:
+                problems.append(f"backend close() failed: {exc}")
+        raise TypeError("invalid backend instance: " + "; ".join(problems))
+    return engine
 
 
 def engine_uses_external_time(engine) -> bool:
@@ -1397,16 +1315,38 @@ def engine_uses_external_time(engine) -> bool:
 
 
 def run(args: argparse.Namespace) -> int:
+    _validate_worker_timing(args)
     cosim_sock = connect_unix(args.cosim, args.connect_timeout)
-    cosim = (StepFramedSocket(cosim_sock) if args.protocol == "v2"
-             else FramedSocket(cosim_sock))
-    can_sock = connect_unix(args.fdcan, args.connect_timeout) if args.fdcan else None
-    can = CanStream(can_sock) if can_sock else None
-    socketcan_sock = open_socketcan(args.socketcan) if args.socketcan else None
-    socketcan_tx = DatagramQueue(socketcan_sock) if socketcan_sock else None
-    engine = create_engine(args)
-    motor_adapter = DmMotorBusAdapter.from_namespace(args)
-    coordinator = StepCoordinator(engine, motor_adapter)
+    can_sock = None
+    socketcan_sock = None
+    engine = None
+    try:
+        cosim = (StepFramedSocket(cosim_sock) if args.protocol == "v2"
+                 else FramedSocket(cosim_sock))
+        can_sock = (connect_unix(args.fdcan, args.connect_timeout)
+                    if args.fdcan else None)
+        can = CanStream(can_sock) if can_sock else None
+        socketcan_sock = open_socketcan(args.socketcan) if args.socketcan else None
+        socketcan_tx = DatagramQueue(socketcan_sock) if socketcan_sock else None
+        engine = create_engine(args)
+        motor_adapter = DmMotorBusAdapter.from_namespace(args)
+        coordinator = StepCoordinator(engine, motor_adapter)
+    except Exception:
+        # Preserve the admission failure while attempting every cleanup.
+        if engine is not None:
+            close = getattr(engine, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+        for resource in (socketcan_sock, can_sock, cosim_sock):
+            if resource is not None:
+                try:
+                    resource.close()
+                except OSError:
+                    pass
+        raise
 
     cosim_sock.setblocking(False)
     # The initial telemetry timestamp is the best available common clock
@@ -1691,8 +1631,9 @@ def run(args: argparse.Namespace) -> int:
                     if done_response is False:
                         continue
             if can and coordinator.active_indices:
-                send_dm_feedback(can, engine, sorted(coordinator.active_indices), args,
-                                  virtual_time_ns, motor_adapter)
+                send_dm_feedback(can, engine,
+                                 sorted(coordinator.active_indices),
+                                 virtual_time_ns, motor_adapter)
             imu_frames += 1
             if args.realtime:
                 # wall_origin corresponds to clock_base_ns, not virtual time
@@ -1710,8 +1651,9 @@ def run(args: argparse.Namespace) -> int:
         if socketcan_tx:
             socketcan_tx.drain()
     finally:
-        if hasattr(engine, "close"):
-            engine.close()
+        close = getattr(engine, "close", None)
+        if callable(close):
+            close()
         cosim_sock.close()
         if can_sock:
             can_sock.close()
@@ -1723,7 +1665,7 @@ def run(args: argparse.Namespace) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(run(parse_args()))
-    except (BufferError, ConnectionError, OSError, TimeoutError, ValueError, RuntimeError,
-            SocketCANError) as exc:
+    except (BufferError, ConnectionError, OSError, TimeoutError, TypeError,
+            ValueError, RuntimeError, SocketCANError) as exc:
         print(f"dm_mc02_sim_worker: {exc}", file=sys.stderr)
         raise SystemExit(1)

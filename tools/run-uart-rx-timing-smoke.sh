@@ -14,7 +14,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-uart-rx-timing.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-uart-rx-timing.XXXXXX")
 qtest_socket="$run_dir/qtest.sock"
 uart_socket="$run_dir/uart1.sock"
 qemu_pid=''

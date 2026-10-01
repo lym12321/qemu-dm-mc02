@@ -27,7 +27,7 @@ arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -Wl,-T,"$root_dir/smoke/dm_mc02_power_runtime_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_power_runtime_smoke.c"
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-power-runtime.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-power-runtime.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 qemu_pid=''
 cleanup() {

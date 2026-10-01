@@ -10,7 +10,7 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-v2-motor.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-motor.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 qemu_pid=''
 cleanup() {

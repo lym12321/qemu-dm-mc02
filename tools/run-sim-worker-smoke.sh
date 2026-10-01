@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 command -v uv >/dev/null 2>&1 || { printf '%s\n' 'blocked: uv is required' >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-worker.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-worker.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 worker_pid=''
 cleanup() {

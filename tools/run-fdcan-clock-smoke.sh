@@ -19,7 +19,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-fdcan-clock.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-fdcan-clock.XXXXXX")
 qemu_pid=''
 cleanup() {
     if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then

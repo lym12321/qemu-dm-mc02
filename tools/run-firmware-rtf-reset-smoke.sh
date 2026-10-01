@@ -15,7 +15,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-firmware-rtf-reset.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-firmware-rtf-reset.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_bin="$run_dir/idle.bin"
 qemu_pid=''

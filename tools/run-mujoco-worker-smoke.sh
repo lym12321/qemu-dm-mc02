@@ -14,7 +14,7 @@ if [[ ! -x "$mujoco_python" ]] ||
     exit 77
 fi
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-mujoco.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-mujoco.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 cleanup() { rm -rf -- "$run_dir"; }
 trap cleanup EXIT

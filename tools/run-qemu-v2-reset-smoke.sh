@@ -15,7 +15,7 @@ command -v arm-none-eabi-gcc >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-v2-reset.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-reset.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/reset.elf"

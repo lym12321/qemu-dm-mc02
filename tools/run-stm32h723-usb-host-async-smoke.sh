@@ -19,7 +19,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.stm32h723-usb-host-async.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.stm32h723-usb-host-async.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/usb-host-async.elf"
 qemu_pid=''

@@ -19,7 +19,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.stm32h723-usb-host-bulk.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.stm32h723-usb-host-bulk.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/usb-host-bulk.elf"
 serial_socket="$run_dir/usb-serial.sock"

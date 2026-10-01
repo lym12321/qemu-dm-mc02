@@ -8,7 +8,7 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 command -v arm-none-eabi-gcc >/dev/null
 command -v python3 >/dev/null
 [[ -x "$qemu_bin" ]]
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-fdcan-ext.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-fdcan-ext.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"; can_socket="$run_dir/can.sock"; guest_elf="$run_dir/ext.elf"
 qemu_pid=''
 cleanup() { [[ -n "$qemu_pid" ]] && kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; rm -rf -- "$run_dir"; }

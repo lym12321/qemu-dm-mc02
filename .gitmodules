@@ -1,0 +1,4 @@
+[submodule "qemu/upstream"]
+	path = qemu/upstream
+	url = https://github.com/lym12321/qemu-dm-mc02.git
+	branch = dm-mc02/v8.2.2

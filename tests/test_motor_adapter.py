@@ -37,6 +37,32 @@ def test_dm_and_float_frames_decode_to_protocol_neutral_commands():
                 "float", 0, 1.5, 456)
 
 
+def test_dm_decode_rejects_unsupported_frames_and_ids():
+    adapter = adapter_module.DmMotorBusAdapter(1)
+    mit_zero = bytes((0x80, 0, 0x80, 0, 0, 0, 8, 0))
+
+    assert adapter.decode(1, adapter_module.CAN_FLAG_RTR, mit_zero) is None
+    assert adapter.decode(1, adapter_module.CAN_FLAG_FD, mit_zero) is None
+    assert adapter.decode(1, 0, mit_zero[:-1]) is None
+    assert adapter.decode(2, 0, mit_zero) is None
+
+    float_adapter = adapter_module.DmMotorBusAdapter(1, motor_protocol="float")
+    assert float_adapter.decode(0x200, 0, struct.pack("<f", float("nan"))) is None
+
+
+def test_motor_ids_use_explicit_mapping_and_contiguous_defaults():
+    adapter = adapter_module.DmMotorBusAdapter(
+        2, dm_motor_map={1: (0x31, 0x41)})
+    mit_zero = bytes((0x80, 0, 0x80, 0, 0, 0, 8, 0))
+
+    assert adapter.motor_ids(0) == (1, 0x11)
+    assert adapter.motor_ids(1) == (0x31, 0x41)
+    command = adapter.decode(0x31, 0, mit_zero)
+    assert command is not None
+    assert command.index == 1
+    assert adapter.decode(0x41, 0, mit_zero) is None
+
+
 def test_control_words_and_backend_application_are_explicit():
     adapter = adapter_module.DmMotorBusAdapter(1)
     events = []
@@ -79,5 +105,5 @@ def test_feedback_uses_configured_ids_and_wire_limits():
     feedback_id, payload = adapter.encode_feedback(state)
 
     assert feedback_id == 0x41
-    assert len(payload) == 8
-    assert payload[0] == (0x31 & 0x0f)
+    assert payload == bytes((0x01, 0xff, 0xff, 0x00,
+                             0x0f, 0xff, 25, 25))

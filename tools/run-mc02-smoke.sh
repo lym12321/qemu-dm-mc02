@@ -23,7 +23,7 @@ fi
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required for QMP smoke' >&2; exit 1; }
 command -v timeout >/dev/null 2>&1 || { printf '%s\n' 'blocked: timeout is required for bounded smoke' >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-smoke.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-smoke.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 qemu_pid=''
 cleanup() {

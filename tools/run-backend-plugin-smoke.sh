@@ -8,7 +8,7 @@ command -v uv >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-backend.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-backend.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 cleanup() { rm -rf -- "$run_dir"; }
 trap cleanup EXIT

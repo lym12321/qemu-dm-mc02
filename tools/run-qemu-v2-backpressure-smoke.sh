@@ -16,7 +16,7 @@ command -v uv >/dev/null 2>&1 || {
 }
 [[ -x "$guest_elf" ]] || "$script_dir/build-bmi088-smoke.sh" >/dev/null
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-v2-backpressure.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-backpressure.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 qemu_pid=''
 cleanup() {

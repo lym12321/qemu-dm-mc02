@@ -14,7 +14,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-bmi088-drift.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-bmi088-drift.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 qemu_pid=''
 cleanup() {

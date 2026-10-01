@@ -1,4 +1,4 @@
-/* Host-side persistence for a caller-owned NOR Flash image. */
+/* Host-side persistence for caller-owned Flash bytes. */
 #include "dm_nor_flash_persistence.h"
 
 #include <errno.h>

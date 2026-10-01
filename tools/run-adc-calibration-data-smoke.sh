@@ -9,7 +9,7 @@ command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'RESULT: blocked
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'RESULT: blocked (python3 is required)' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'RESULT: blocked (QEMU not found: %s)\n' "$qemu_bin" >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-adc-calibration-data.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-adc-calibration-data.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 cosim_socket="$run_dir/cosim.sock"
 guest_elf="$run_dir/adc-calibration-data.elf"

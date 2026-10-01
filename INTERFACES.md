@@ -1,4 +1,29 @@
-# 0.53 Firmware RTF startup and cleanup boundary
+# DM-MC02 Public Interfaces
+
+## Git source delivery
+
+`qemu/upstream` is a submodule of the same GitHub repository, pinned by its
+gitlink and `qemu.lock` fork_commit. Initialize with standard Git; `main` alone
+does not contain the fork bytes. The source packager excludes the outer
+gitlink and enumerates the canonical inner repository separately. Set
+`DM_MC02_ELF` to identify an external firmware file; it is hashed, not bundled.
+The legacy sibling Release-current path is only the default when unset.
+
+## 0.53 Firmware RTF startup and cleanup boundary
+
+## Pending-commit source delivery (2026-09-29)
+
+Linux smoke runtime files/sockets live in private `mktemp -d` directories
+under `/tmp/dm-qemu.*`, independent of source-root length. Existing per-script
+traps own cleanup; `/tmp` must be writable. No socket protocol changes.
+
+`dm_mc02_source_package.py create --allow-worktree PACKAGE` explicitly bundles
+tracked edits, untracked source and deletions in nested QEMU. Schema 2 records
+HEAD/base, tracked diff hash, new/deleted paths and actual per-path bytes/modes.
+Default `create` still rejects dirty QEMU. ROM worktrees/build outputs are
+excluded; configured wrap source cleanliness and pins remain mandatory.
+Verification and restore check exact content. Source changes during creation
+reject the archive. HEAD and qemu.lock are never fabricated for a snapshot.
 
 The canonical QMP adapter extends the pinned upstream legacy client only with
 host-side bounds:
@@ -129,9 +154,9 @@ truncated streams before runtime projection.
 
 `MemoryRegion`, DMA endpoint callbacks, QEMU SSI bus/device, Flash storage,
 geometry and JEDEC configuration are destination-owned wiring or static profile
-configuration. The standard `w25q64/m25p80` child remains the sole owner of NOR
-command/storage state and its own QEMU VMState; this controller description does
-not duplicate it. Normal post-load derives the memory-mapped gate from
+configuration. The independent `dm-w25q64` child remains the sole owner of NOR
+command/storage state and explicitly blocks migration; this controller
+description does not serialize it. Normal post-load derives the memory-mapped gate from
 `CR.FMODE` and re-selects SSI CS only for an interrupted page-program command.
 The raw description validates the same fields without projecting memory or CS,
 for use by a future parent composite.
@@ -1868,9 +1893,16 @@ DM-MC02 machine 可配置以下低频模型参数（默认值不改变既有行�
 ```
 
 噪声使用六个均匀分布、方差归一化的确定性 LCG 近似标准正态分布；单位分别为 dps 和 g。reset
-会恢复随机序列起点，便于回归测试。`accurate-timing` 关闭 WS2812 高频批处理，并关闭 ADC
-连续序列的 1 ms 事件限流，使 ADC 按当前 DM-MC02 PLL2P/PLL3R/CLKP 选择与 common
-`CCR.CKMODE/PRESC` 计算出的有效转换时钟运行，
+会恢复随机序列起点，便于回归测试。`accurate-timing` 只控制 WS2812 高频批处理，不控制 ADC。
+ADC 使用独立的 `adc-accurate-timing` 属性；DM-MC02 默认开启，按当前 PLL2P/PLL3R/CLKP
+选择与 common `CCR.CKMODE/PRESC` 计算出的有效 ADC 时钟安排转换。显式设置
+`adc-accurate-timing=off` 时，连续 regular sequence 使用至少 1 ms 的兼容 cadence。
+ADC1/2 每个 regular/injected rank 的数字转换 deadline 由该 channel 的 SMPR 采样周期
+加 `CFGR.RES` 处理周期构成；`RES=00/01/10/11` 对应 16/14/12/10-bit 和
+16.5/14.5/12.5/10.5 个 ADC 时钟。两组共用整数半周期换算，虚拟 ns 向上取整。
+`EOC/JEOC` 与随后的 DMA 请求在 rank deadline 前均不得出现。Release 当前 16-bit、
+32.5-cycle sampling、1.5 MHz 配置的每 rank deadline 为 32,667 ns；这个契约不覆盖
+模拟采样孔径、SAR 物理过程或 DMA 总线时钟级仲裁。
 `dma-batch-limit` 仅限制 SPI2 DMA 每次虚拟 timer callback 的最大搬运数。
 `adc-power-model=on` 启用 ADC 芯片层的 H723 低功耗序列：复位时 `DEEPPWD=1`、
 `ADVREGEN=0`；guest 清除 `DEEPPWD` 并置位 `ADVREGEN` 后，regulator 在 10 us
@@ -1878,10 +1910,12 @@ DM-MC02 machine 可配置以下低频模型参数（默认值不改变既有行�
 不消耗 host wall-clock。默认值为 `off`，仅作为旧 fixture 的显式兼容路径；严格的
 板级/固件回归应开启它。该切片不模拟模拟电源纹波、欠压曲线或 ADC enable 的模拟
 起振细节。
-`flash-file` 非空时在启动时加载最多 1 MiB，并在 QEMU 正常退出时写回整个 backing；
-默认为空，因此默认运行完全以内存为后端。该文件只保存片上 Flash，不保存 SRAM 或外设
-状态。默认 `system_reset` 是 warm reset，会保留 SRAM/Flash；`cold-reset=on` 会在每次
-reset 时清空 ITCM、DTCM、AXI SRAM、D2/D3 SRAM，但仍保留片上和外部 Flash。
+`flash-file` 非空时通过共享 raw-image adapter 读写精确 1 MiB 的片上 Flash backing；
+缺失文件保持擦除态，短/长文件和其它读取错误会在 guest 执行前拒绝启动。属性只能在
+machine 初始化前设置，正常 QEMU 退出时写回完整 backing。默认为空，因此默认运行完全
+以内存为后端。该文件只保存片上 Flash，不保存 SRAM 或外设状态。默认 `system_reset` 是
+warm reset，会保留 SRAM/Flash；`cold-reset=on` 会在每次 reset 时清空 ITCM、DTCM、AXI
+SRAM、D2/D3 SRAM，但仍保留片上和外部 Flash。
 
 `vin-mv` 是外部电源输入，默认 `24000` mV。它既可在启动参数中设置，也可通过 QMP
 `qom-set` 对 `/machine` 的 `vin-mv` 属性运行时修改；修改会立即重算 VIN ADC 分压和
@@ -1957,7 +1991,7 @@ BMI088 的当前数据面遵循以下轻量时序契约：写 accel `ACC_CONF[3:
 
 加速度计 FIFO 使用真实的 `FIFO_LENGTH(0x24..0x25)`、`FIFO_DATA(0x26)`、`FIFO_DOWNS(0x45)`、`FIFO_CONFIG_0(0x48)` 与 `FIFO_CONFIG_1(0x49)` 数据面：启用 `ACC_EN` 后，co-sim 已接受的样本以 `0x84 + XYZ little-endian` 的 7-byte frame 写入 1024-byte FIFO；`FIFO_DOWNS[6:4]` 按 `2^k` 对输入采样降采样；`mode=0` 为 stream，`mode=1` 为 stop-at-full。配置变化会插入基础 `0x48` config frame，溢出会以不占 FIFO 容量的 skip frame 报告，FIFO 清空时可在同一 burst 返回 `0x44 + 3-byte sensor-time`；一次未读完整的 accel frame 在下一次 FIFO transaction 从帧首重读。`0x7e=0xb0` 清空 accel FIFO。陀螺仪使用 `FIFO_STATUS(0x0e)`、`FIFO_CONFIG_0(0x3d)`、`FIFO_CONFIG_1(0x3e)` 与 `FIFO_DATA(0x3f)`：`0x40` 为 stop-at-full、`0x80` 为 stream，数据以 8-byte frame 存储：6-byte XYZ little-endian rate 后跟 2-byte sampled interrupt field；未读完整 gyro frame 在下一次 transaction 被丢弃。FIFO 只在 host/co-sim 提供样本时推进，不创建额外高频 QEMU timer，因此默认实时路径没有额外事件负担。
 
-当前未实现 accel FIFO 的 INT tag、sample-drop frame 和 FIFO 中断引脚映射，也未实现 gyro FIFO 的外部 tag 与精确 watermark/full interrupt 时序；不能将这些状态当作完整器件级 FIFO 验证。
+当前已支持 accel FIFO 溢出时的 `0x40 + skip count` 帧；独立的 sample-drop frame、INT tag 和 FIFO 中断引脚映射仍未实现。gyro FIFO 的外部 tag 与精确 watermark/full interrupt 时序也未实现；不能将这些状态当作完整器件级 FIFO 验证。
 
 soft-reset 使用真实 BMI088 寄存器：accel `0x7E=0xB6`，gyro `0x14=0xB6`；两者都会恢复对应 die 的寄存器、量程、ODR 和数据状态。
 
@@ -2113,10 +2147,14 @@ worker backend 的加载接口与 QEMU wire 解耦：
 按 worker 创建、不会共享全局状态；重复名称、空名称、未知名称和不可调用目标均明确
 失败。backend 至少实现 `step(dt)`、`set_motor(index, value)`、
 `reset_motor(index)`、`set_motor_enabled(index, enabled)`、
-`set_motor_dm(index, command)` 和 `motor_feedback(index)`；可选 `reset()`、`close()`，
-或 `imu_timestamp_ns`（后者启用外部时间戳映射）。直接 factory 优先于 registry
-initializer，二者不能同时指定。`run-worker.sh` 仍按 `--engine` 选择 uv、MuJoCo
-extra 或已 source 的 ROS2 Python；自定义 backend 不改变 v1/v2 协议和时钟 owner。
+`set_motor_dm(index, command)` 和 `motor_feedback(index)`，且这些成员必须可调用；
+可选 `reset()`、`close()` 在存在时也必须可调用。可选字段 `imu_timestamp_ns` 启用
+外部时间戳映射。worker 在 CLI 解析和直接 `run()` 入口均拒绝非有限或非正的
+`--rate`、`--connect-timeout`，并在发送 v1/v2 RESET 或首次 `step()` 前校验 factory
+返回值。拒绝时若 backend 提供可调用 `close()` 则尝试关闭，并关闭 worker 已打开的
+socket。该检查只验证方法可调用，不验证签名、返回值形状或仿真物理行为。直接 factory
+优先于 registry initializer，二者不能同时指定。`run-worker.sh` 仍按 `--engine` 选择 uv、
+MuJoCo extra 或已 source 的 ROS2 Python；自定义 backend 不改变 v1/v2 协议和时钟 owner。
 
 ## 6. v2 plant/control interface（当前最小实现）
 
@@ -2421,7 +2459,8 @@ with that outer step. It does not require a new ODR-accepted sample on every
 step. The SPI core and BMI088 chip model remain independent of this token.
 
 The BMI088 implementation is intentionally a functional/partial device model:
-accel FIFO INT tag, sample-drop frame, FIFO interrupt and real DRDY pin
+the accel overflow skip-count frame is modeled, while the distinct sample-drop
+frame, accel FIFO INT tag, FIFO interrupt and real DRDY pin
 mapping, gyro external tag, and exact watermark/full interrupt timing remain
 unsupported. The signal layer provides configurable independent noise, static
 bias, ODR acceptance, first-order bandwidth filtering, temperature drift around
@@ -2870,7 +2909,8 @@ control-enumeration sequence, propagate DATA PID/toggle, retain async
 completion, model PHY/VBUS, or attach a host controller to the DM-MC02
 Device-mode window.
 
-`test-dm-usb-qemu-adapter` is now `13/13`. Its cases use a real QOM bus to
+At the time of this 2026-09-01 slice, `test-dm-usb-qemu-adapter` was `13/13`.
+Its cases use a real QOM bus to
 verify SETUP/OUT/short-IN and NAK/STALL mapping, pre-reset rejection, async
 packet cancellation, address-0 to address-13 routing across a completed
 `SET_ADDRESS`, and the immediate PIO composition:
@@ -2909,7 +2949,8 @@ or asynchronous completion queue. It is a reusable QEMU composition building
 block for a future host-role profile, not a claim that the current DM-MC02
 Device-mode port can host USB devices.
 
-`test-dm-usb-qemu-adapter` is now `13/13`; lifecycle coverage asserts initial
+At the time of this 2026-09-01 slice, `test-dm-usb-qemu-adapter` was `13/13`;
+lifecycle coverage asserts initial
 attach, HPRT0 W1C/reset behavior, reset address clearing without a false
 disconnect, a true detach/re-attach cycle, and controller-driven control
 transfers across that lifecycle boundary.
@@ -2959,14 +3000,16 @@ guest MMIO -> DmStm32H7OtgHost -> channel transport/data path
            -> DmUsbHostQemuTransport -> QEMU USB device
 ```
 
-`stm32h723-usb-host-test` (`2/2`) uses a real QEMU `usb-kbd` to assert root
+At the time of this 2026-09-01 slice, `stm32h723-usb-host-test` (`2/2`)
+used a real QEMU `usb-kbd` to assert root
 port attach/reset, IRQ 77/NVIC pending delivery, virtual SOF progression, and
 an EP0 `GET_DESCRIPTOR` setup/data transfer through the mapped FIFO and host
 channel registers. It reads `HPRT0.SPD` before advancing the virtual clock, so
 the assertion advances exactly one frame at 125 us for High-Speed or 1 ms for
 Full/Low-Speed. Release QEMU relink, the adjacent host/controller/adapter
 regressions, DM-MC02 USB qtest, and the serial QEMU smoke suite (`80/80`) also
-pass. This proves one machine composition and synchronous QEMU
+passed then. Current aggregate counts are recorded in `CAPABILITIES.md` and
+the latest gate report. This proves one machine composition and synchronous QEMU
 device route, not device enumeration, hubs, generic bulk/interrupt scheduling,
 async packets, FIFO arbitration, PHY/VBUS/electrical timing, host USB
 passthrough, or any host capability on `dm-mc02`.
@@ -3598,7 +3641,8 @@ automatic source fallback, oscillator settling, or timer bus power gating.
 ## 2026-09-01 Reusable NOR Flash raw-image persistence adapter
 
 `cosim/dm_nor_flash_persistence.[ch]` is a board-independent host-side adapter
-for caller-owned NOR storage. `dm_nor_flash_persistence_load(path, storage,
+for caller-owned Flash storage, including external NOR and on-chip Flash bytes.
+`dm_nor_flash_persistence_load(path, storage,
 storage_size)` and `_save(...)` operate on the complete byte array and require
 the file length to equal `storage_size` exactly. The file format is therefore a
 raw image with exact device geometry: no header, metadata, padding, or
@@ -3625,13 +3669,24 @@ image. During the normal-shutdown notifier, a configured non-empty path saves
 the complete image and reports failures as warnings. An empty default path is
 guarded before these calls and performs no disk I/O.
 
+The DM-MC02 internal `flash-file` property uses the same adapter directly with
+the SoC-owned `DmMc02SocMemory.flash` bytes and its profile geometry. The
+property is immutable after machine initialization. A missing file retains the
+SoC's erased `0xff` image; a size mismatch or other load error rejects machine
+initialization before guest execution. Normal shutdown saves the exact image
+through the adapter and reports write failure. This path does not accept the
+former partial-image behavior.
+
 This interface is lifecycle persistence only. It does not provide real Flash
 latency, ECC, crash/abnormal-termination persistence, or power-loss atomicity;
 save is performed only on normal QEMU exit and is not an atomic power-fail-safe
 commit protocol.
 
 The isolated `dm_nor_flash_persistence_smoke` checks disabled/not-found,
-round-trip bytes, exact-size rejection without mutation, and I/O error results.
+round-trip bytes, short/long exact-size rejection without mutation, and save I/O
+errors. The direct internal Flash qtest checks load/program/normal-quit
+save/reload and the runtime property lock; the Flash smoke rejects both short
+and overlong machine images with a bounded process deadline.
 The direct OSPI boundary smoke checks the 8 MiB W25Q64 raw image loaded at
 startup and saved after a normal QMP `quit`; `tools/run-ospi-smoke.sh` then
 checks the exact output size and bytes. These tests establish the adapter and
@@ -3681,7 +3736,7 @@ storage, 256-byte pages, 4 KiB sectors, and JEDEC ID `ef 40 17`. The
 
 During machine initialization, the board adapter copies the selected profile
 into the reusable `DmMc02OspiFlashConfig`. Production `DmMc02Ospi` uses the
-board-independent `DmMc02SsiNor` adapter; the realized QEMU `w25q64`/`m25p80`
+board-independent `DmMc02SsiNor` adapter; the realized QOM `dm-w25q64`
 device owns its backing storage and command state. The profile only selects
 composition. The OSPI register window is present for every profile. A Flash
 memory region is added only when the profile has a Flash and advertises memory
@@ -3706,9 +3761,8 @@ direct ARM/QEMU composition gates.
 
 ## NOR erase granularity
 
-The following caller-owned `DmNorFlash` API is retained only as an explicit
-host test fixture (`DM_MC02_OSPI_TEST_FIXTURE=1`); it is not a production
-alternative to QEMU `m25p80`. Within that fixture, `dm_nor_flash_erase()` is
+The following caller-owned `DmNorFlash` API is shared by the production
+`dm-w25q64` device and explicit host fixtures. `dm_nor_flash_erase()` is
 the reusable erase boundary. The caller supplies an
 address and an erase size; the size must be non-zero, no smaller than the
 configured sector size, an integer multiple of that sector size, and a divisor
@@ -3725,10 +3779,10 @@ do not know W25Q opcodes, OSPI registers, board wiring, or persistence. A
 future NOR device with different legal granularities can reuse the same core
 provided its adapter binds those sizes explicitly.
 
-The DM-MC02 OCTOSPI adapter maps W25Q64 commands `0x20` to sector erase,
+The independent W25Q64 device maps commands `0x20` to sector erase,
 `0x52` to 32 KiB block erase, `0xd8` to 64 KiB block erase, and `0xc7` to chip
 erase. The first three commands consume the address phase; chip erase is a
-no-address command and executes after its instruction phase. The adapter only
+no-address command and executes at CS rising. The device only
 translates the command and delegates geometry/status to `DmNorFlash`.
 `dm_nor_flash_smoke` is the isolated core gate and `run-ospi-smoke.sh` is the
 direct register/board gate. Erase latency, asynchronous WIP, suspend/resume,
@@ -3737,9 +3791,12 @@ this interface.
 
 ## Reusable NOR storage core
 
+Production command decoding belongs to `dm-w25q64`; legacy host OSPI/SPI
+framing adapters remain fixtures only. No board policy enters this core.
+
 `cosim/dm_nor_flash.[ch]` is the board- and QEMU-independent storage semantic
-layer used by the OSPI adapter. The producer is a command/framing adapter such
-as OCTOSPI or a future SPI target; the boundary is the geometry, status and
+layer used by the independent NOR device and host fixtures. The producer is
+the device command decoder; the boundary is the geometry, status and
 operation API; the consumer is the caller-owned byte backing store. The core
 does not allocate storage, know a bus line mode, or own a board profile.
 
@@ -3764,16 +3821,20 @@ reset preservation and invalid-length/out-of-range atomicity. OSPI remains the
 direct-consumer gate and must continue to pass independently before a generic
 SPI Flash framing adapter is added.
 
-## QEMU SSI m25p80 adapter
+## QEMU SSI independent W25Q64 adapter
 
 `DmMc02SsiNor` is a board-independent adapter from an owner-provided QEMU SSI
-bus parent to a realized standard `w25q64`/`m25p80` device. Its public
+bus parent to a realized project-owned `dm-w25q64` device. Its public
 operations are initialization with expected geometry/JEDEC identity,
 active-low CS selection, one-byte transfer, and device reset. The adapter does
-not implement NOR commands, own backing storage, or expose m25p80 private state.
-The realized m25p80 device owns the 8 MiB storage; narrow accessors provide only
-the storage pointer, size, and JEDEC identity needed by a memory-mapped alias
-and the lifecycle persistence adapter.
+not implement NOR commands or own backing storage. The realized device owns
+the 8 MiB storage; `dm_w25q64_storage/size` provide a borrowed view for the
+memory-mapped alias and lifecycle persistence. The adapter instantiates only
+`dm-w25q64`; it has no type-selection parameter or duplicate size cache.
+Expected 8 MiB geometry and ID ef:40:17 are checked before realization.
+JEDEC wire behavior is checked by the isolated SSI test, not initialization.
+Reset aborts the device transaction before deasserting CS, so it cannot
+accidentally commit a pending program. Device storage is not component VMState.
 
 `DmMc02Ospi` remains the STM32H723 OCTOSPI register boundary. It translates the
 guest `CR`, `DLR`, `CCR`, `IR`, `AR`, `DR`, and `FCR` transactions into SSI byte
@@ -3784,14 +3845,23 @@ DM-MC02 path covers JEDEC/status/WREN, page program, normal/fast/quad reads,
 storage view. Unsupported line-mode electrical timing, DTR, asynchronous WIP,
 ECC and complete OCTOSPI protocol semantics remain outside this contract.
 
-QEMU's m25p80 boundary is locally patched for W25Q-compatible WEL consumption
-after successful program/erase and for erase-block address alignment. A
+Official m25p80/flash.h have no local modifications. The independent device
+commits WREN/program/erase on CS rising, consumes WEL after successful writes,
+and aligns erase addresses. A
 rejected oversized or invalid OCTOSPI transaction does not reach the die and
 does not clear WEL. `DM_MC02_OSPI_TEST_FIXTURE=1` is a host-only compatibility
-fixture that retains the earlier caller-owned `DmNorFlash` implementation; it
+fixture that uses the same caller-owned `DmNorFlash` storage core; it
 is not a production fallback.
 
-The direct `run-ospi-smoke.sh` gate checks the realized `w25q64` ID and geometry,
+The isolated `test-dm-w25q64` drives real QOM/SSI/CS. The byte profile has one
+dummy token for 0b/6b and Fxh mode plus two dummy tokens for eb. QE, lane timing,
+continuous-read, protection, SFDP, software reset commands and asynchronous
+busy periods are unsupported; unknown opcodes produce LOG_UNIMP and no writes.
+Read addresses wrap at 8 MiB. Program uses a bounded 256-byte input latch with
+last-byte-wins wrap, then applies NOR 1-to-0 once at CS rising. Device reset
+aborts pending writes, clears WEL and preserves storage. Migration is blocked.
+
+The direct `run-ospi-smoke.sh` gate checks the realized `dm-w25q64` ID and geometry,
 read/program/erase behavior, missing-WREN protection, non-aligned erase,
 maximum-DLR rejection, memory-mapped reads, DMA endpoint use, and persistence.
 
@@ -6138,3 +6208,25 @@ Tool-local memory/diagnostic readers return only decoded values. They do not
 accept or return a placeholder receive buffer: transport buffering is owned
 by the upstream client. The firmware RTF collector's readers return an integer
 tick count and an `(integer timeout_count, diagnostics_text)` pair respectively.
+# 0.54 Rebuild source package boundary
+
+`tools/dm_mc02_source_package.py create PACKAGE` snapshots current project
+source, the nested QEMU fork at `qemu.lock`'s `fork_commit`, and the four
+Meson wrap Git sources actually used by the ARM project build. QEMU's tracked
+`subprojects/packagefiles` files are also materialized under each wrap named
+by `patch_directory`; the original QEMU paths remain in the package. It rejects
+tracked changes inside the nested fork/wrap sources, an untracked QEMU file,
+or a mismatched fork/wrap revision. Outer tracked edits and untracked project
+files are included; ignored build, cache and environment paths are excluded.
+The manifest records per-path kind, mode, size and SHA-256, the outer/fork/base
+identities, observed dependencies and tool versions, and the read-only Release
+ELF size/hash without copying firmware into the package.
+
+`verify PACKAGE` checks member set, path safety, modes and bytes against the
+manifest. `restore PACKAGE NEW_DIRECTORY` refuses an existing destination,
+materializes the source under `NEW_DIRECTORY/project`, and rechecks every
+restored path. Symlink targets must stay inside the project tree. The package
+contains no Git object database: restore is a source tree, not a new Git fork.
+It does not include installed system packages, Python wheels, the firmware
+ELF or existing binaries. QEMU-07 owns fresh dependency admission and build
+verification.

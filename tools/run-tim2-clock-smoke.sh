@@ -19,7 +19,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-tim2-clock.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-tim2-clock.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/tim2-clock.elf"
 qemu_pid=''

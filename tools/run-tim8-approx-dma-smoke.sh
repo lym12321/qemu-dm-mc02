@@ -8,7 +8,7 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'blocked: arm-none-eabi-gcc is required' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-tim8-approx-dma.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-tim8-approx-dma.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/tim8-approx-dma.elf"
 qemu_pid=''

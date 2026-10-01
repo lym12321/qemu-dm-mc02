@@ -39,7 +39,7 @@ PY
 
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'blocked: arm-none-eabi-gcc is required for QEMU integration' >&2; exit 2; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 2; }
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-adc-analog.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-adc-analog.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 cosim_socket="$run_dir/cosim.sock"
 guest_elf="$run_dir/adc-analog.elf"

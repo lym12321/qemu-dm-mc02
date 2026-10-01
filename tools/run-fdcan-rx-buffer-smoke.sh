@@ -8,7 +8,7 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || exit 1
 [[ -x "$qemu_bin" ]] || exit 1
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-fdcan-rx-buffer.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-fdcan-rx-buffer.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 can_socket="$run_dir/can1.sock"
 guest_elf="$run_dir/rx-buffer.elf"

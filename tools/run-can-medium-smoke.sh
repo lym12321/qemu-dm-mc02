@@ -9,7 +9,7 @@ command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'blocked: arm-no
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-can-medium.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-can-medium.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/can-medium.elf"
 qemu_pid=''

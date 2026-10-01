@@ -31,7 +31,7 @@ case "$build_type" in
 esac
 
 if [[ ! -x "$source_dir/configure" ]]; then
-    printf '%s\n' "QEMU source is missing: run tools/bootstrap-qemu.sh --download --ref <fixed tag-or-commit>" >&2
+    printf '%s\n' "QEMU source is missing: run git submodule update --init qemu/upstream" >&2
     exit 1
 fi
 [[ -x "$root_dir/.venv/bin/python" && -x "$root_dir/.venv/bin/ninja" ]] || {
@@ -40,7 +40,7 @@ fi
 }
 export PATH="$root_dir/.venv/bin:$PATH"
 if ! rg -q "dm_mc02.c" "$source_dir/hw/arm/meson.build" || [[ ! -f "$source_dir/hw/arm/dm_mc02.c" ]]; then
-    printf '%s\n' 'blocked: QEMU tree is not patched with dm_mc02; run tools/apply-qemu-patch.sh' >&2
+    printf '%s\n' 'blocked: wrong QEMU source; restore the pinned qemu/upstream submodule' >&2
     exit 1
 fi
 mkdir -p "$build_dir"

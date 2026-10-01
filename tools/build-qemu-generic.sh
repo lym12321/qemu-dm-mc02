@@ -7,7 +7,7 @@ source_dir="$root_dir/qemu/upstream"
 build_dir="$root_dir/build/qemu-generic"
 
 [[ -x "$source_dir/configure" ]] || {
-    printf '%s\n' 'blocked: QEMU source is missing; run tools/bootstrap-qemu.sh first' >&2
+    printf '%s\n' 'blocked: run git submodule update --init qemu/upstream first' >&2
     exit 1
 }
 [[ -x "$root_dir/.venv/bin/ninja" ]] || {

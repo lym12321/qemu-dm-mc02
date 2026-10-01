@@ -15,7 +15,7 @@ command -v uv >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-v2-telemetry-backpressure.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-telemetry-backpressure.XXXXXX")
 cosim_socket="$run_dir/cosim.sock"
 qtest_socket="$run_dir/qtest.sock"
 qmp_socket="$run_dir/qmp.sock"

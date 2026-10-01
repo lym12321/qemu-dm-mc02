@@ -14,7 +14,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 1
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-firmware-rtf-lifecycle.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-firmware-rtf-lifecycle.XXXXXX")
 guest_bin="$run_dir/idle.bin"
 qemu_wrapper="$run_dir/qemu-wrapper.sh"
 exit_wrapper="$run_dir/exit-wrapper.sh"

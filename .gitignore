@@ -7,8 +7,7 @@
 **/__pycache__/
 *.py[cod]
 
-# The QEMU fork is a separate Git repository pinned by qemu.lock.
-/qemu/upstream/
+# qemu/upstream is a tracked submodule pinned alongside qemu.lock.
 
 # Runtime and probe artifacts
 /config-temp/

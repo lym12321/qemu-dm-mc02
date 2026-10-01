@@ -19,7 +19,7 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-adc-jauto-dma.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-adc-jauto-dma.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/adc-jauto-dma.elf"
 qemu_pid=''

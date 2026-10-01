@@ -14,7 +14,7 @@ if [[ ! -x "$elf" || "$root_dir/smoke/dm_mc02_bmi088_smoke.c" -nt "$elf" ||
       "$root_dir/smoke/dm_mc02_bmi088_smoke.ld" -nt "$elf" ]]; then
     "$script_dir/build-bmi088-smoke.sh" >/dev/null
 fi
-run_dir=$(mktemp -d "$root_dir/output.bmi088-smoke.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.bmi088-smoke.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 qemu_pid=''
 cleanup() {

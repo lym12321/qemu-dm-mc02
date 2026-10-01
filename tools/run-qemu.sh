@@ -27,7 +27,7 @@ if ((smoke)); then
     command -v timeout >/dev/null 2>&1 || { printf '%s\n' 'blocked: timeout is required for bounded smoke' >&2; exit 1; }
     printf 'QEMU version: '; "$qemu_bin" --version | sed -n '1p'
     "$qemu_bin" -machine help >/dev/null
-    sock_dir=$(mktemp -d "$root_dir/output.qemu-smoke.XXXXXX")
+    sock_dir=$(mktemp -d "/tmp/dm-qemu.qemu-smoke.XXXXXX")
     cleanup_smoke() {
         rm -f -- "$sock_dir/qmp.sock"
         rmdir -- "$sock_dir"

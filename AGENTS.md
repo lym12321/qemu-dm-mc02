@@ -2,6 +2,16 @@
 
 ## Scope
 
+- Git delivery uses `main` plus the `dm-mc02/v8.2.2` QEMU branch in the same
+  GitHub repository. `qemu/upstream` is a pinned submodule; its gitlink and
+  `qemu.lock` fork_commit must agree. Never bootstrap an official tag in its
+  place or maintain a parallel patch/source tree. Validate a fresh checkout.
+
+- Pending-commit source delivery explicitly selects `create --allow-worktree`.
+  Nested HEAD is the base, not the delivered identity: record tracked diff,
+  new/deleted paths and per-file hashes. Default creation rejects dirty QEMU
+  sources. Exclude ROM worktrees and reject source changes during packaging.
+
 - This file applies to the whole `dm-mc02-qemu` project.
 - Treat this document as a living project contract. When a new layer, reusable
   interface, backend, or verification rule is introduced, update this file in
@@ -17,6 +27,17 @@
   when the decision changes.
 
 ## Truth, Reuse, and Production Boundaries
+
+- The user's 2026-09-29 NOR decision supersedes the previous m25p80 reuse
+  decision: use one independent `dm-w25q64` production device, QEMU QOM/SSI,
+  and the shared NOR storage core. Keep upstream m25p80.c/flash.h unchanged.
+  Prove device isolation and real SSI consumer behavior before OCTOSPI
+  integration. Legacy host OSPI fixtures are not production-device evidence.
+  Document synchronous completion, quad byte-token approximation, and absent
+  protection, physical timing and migration; do not duplicate other stacks.
+- The fixed NOR adapter must not grow a type factory or duplicate device
+  geometry state. Validate expected configuration before realization; test
+  wire identity at the SSI boundary instead of adding initialization probes.
 
 - Resolve behavioral conflicts in this order: reproducible physical-board
   traces, vendor reference material/errata/HAL/CMSIS, observable `trobot`
@@ -37,6 +58,13 @@
   revision. A build or test must not select a sibling source tree implicitly.
   Record local patches and the intended upstream replacement in
   `ARCHITECTURE.md`.
+- Source-delivery snapshots use `tools/dm_mc02_source_package.py` and preserve
+  the outer project files, the pinned nested QEMU fork and selected pinned
+  Meson wrap sources with per-path hashes. For a wrap with `patch_directory`,
+  the QEMU-owned Meson overlay must be materialized into that wrap's build
+  source in the package. The read-only firmware ELF is
+  identified by hash, not bundled. A verified source restore is only the
+  QEMU-06 gate; a fresh configure/build/test in that restore is QEMU-07.
 - Keep QEMU build ownership explicit: generic ARMv7-M code cannot depend on
   STM32H723, DM-MC02, or co-simulation sources. STM32H723 sources require a
   dedicated feature symbol, DM-MC02 composition requires a separate one, and
@@ -48,6 +76,15 @@
 
 ## Time, Performance, and Support Claims
 
+- `CAPABILITIES.md` is the canonical current capability/evidence matrix. Every
+  row must name exactly one bounded status (`supported`, `approximation`,
+  `fixture`, `unsupported`, or `unverified`), its public boundary,
+  implementation, current evidence, limits, and next gate. `README.md` may
+  summarize and link to it but must not maintain a second rolling feature list.
+- A historical checklist, old test count, component VMState result, short smoke,
+  or adapter-compatible external API must not silently promote a matrix status.
+  Update the matrix in the same change whenever production behavior, evidence,
+  or a stated limitation changes.
 - All deterministic behavior uses monotonic virtual nanoseconds. Wall-clock is
   allowed only for explicit pacing, host I/O deadlines, startup measurement and
   performance reporting; it must never prove guest timing or alter a replay.
@@ -77,11 +114,36 @@
   select at least one FreeRTOS tick. QEMU stderr uses a temporary file. Cleanup
   is bounded TERM, KILL/reap, QMP disconnect, file close and directory removal;
   lifecycle tests identify a process with both PID and Linux start time.
+- The simulation worker rejects non-finite or non-positive `rate` and
+  `connect-timeout` values before opening sockets. It validates a backend
+  factory result before sending RESET or stepping: `step`, `set_motor`,
+  `reset_motor`, `set_motor_enabled`, `set_motor_dm`, and `motor_feedback` must
+  be callable. Optional `reset` and `close` members must also be callable when
+  present. Rejected instances are closed when possible, and worker startup
+  admission closes any sockets it opened before rejecting the backend.
 - A feature is supported only after its isolated lower-layer test, direct
   consumer boundary test, and relevant firmware integration test pass. Snapshot
   or migration support additionally requires complete VMState coverage. Never
   infer USB host, passthrough, physical timing, complete DMA arbitration, or
   migration support from a fixture or a smoke test.
+
+## External Worker Backend Admission
+
+- The worker owns motor-backend contract validation. `BackendRegistry` remains
+  protocol-neutral and only owns backend names and factories.
+- CLI parsing and direct `run()` calls both reject non-finite or non-positive
+  `rate` and `connect-timeout` before any socket connection or backend factory
+  call.
+- Direct factories and registry factories share the same instance check. The
+  required callable method set is `step`, `set_motor`, `reset_motor`,
+  `set_motor_enabled`, `set_motor_dm`, and `motor_feedback`. Optional `reset`
+  and `close` must be callable when exposed; optional `imu_timestamp_ns` opts
+  into external timestamp mapping.
+- Admission checks method callability only; they do not introspect signatures
+  or prove returned values and plant behavior. A rejected instance is closed if
+  its `close` member is callable, and sockets acquired by worker startup are
+  closed before the error reaches the caller. Validation must finish before
+  v1/v2 RESET is sent or `step()` is invoked.
 
 ## USB Host Role Boundary
 
@@ -147,6 +209,10 @@
   during device/machine initialization and saved during an explicit normal
   shutdown hook; Flash command, reset, DMA, and telemetry hot paths must not
   perform file I/O.
+- DM-MC02 internal `flash-file` borrows the SoC-owned Flash RAM through this
+  adapter. A missing image keeps the erased bytes; a size or I/O error rejects
+  machine initialization before guest execution. Lock this path after machine
+  initialization so the shutdown save cannot silently target a different file.
 - This adapter is functional lifecycle persistence, not a power-fail-safe
   durability protocol. Do not claim crash recovery, atomic power-loss commit,
   real Flash latency, or ECC behavior without a separate contract and tests.
@@ -310,6 +376,11 @@ fallback; otherwise the error will propagate into every dependent layer.
   timing, FIFO, and physical-layer models.
 
 ## Canonical Test Gate
+
+- Linux smoke Unix sockets use private `mktemp -d /tmp/dm-qemu.*.XXXXXX`
+  directories, not paths under the source/build root. Keep per-script traps
+  and process cleanup ownership. Deep source restores must not exceed
+  sockaddr_un path limits before the guest runs; test at the deep root too.
 
 - `tools/dm_mc02_test_gate.py` is the authoritative aggregate entry. New tests
   must belong to exactly one of its Meson, native Host CTest, complete pytest,
@@ -490,6 +561,18 @@ fallback; otherwise the error will propagate into every dependent layer.
   `RCC_RSR.WWDG1RSTF`. The timing unit, direct qtest and component VMState are
   independent gates; passing the component state contract does not claim
   complete reset domains or silicon-level timing.
+
+## H723 ADC Conversion Deadline Boundary
+
+- ADC1/2 regular and injected rank timing is chip-owned: `CFGR.RES` selects
+  16.5, 14.5, 12.5 or 10.5 processing clocks for 16, 14, 12 or 10 bits;
+  add the channel's SMPR sampling clocks, then ceil the integer half-cycle
+  duration to virtual nanoseconds. The board and DMA consumer must not
+  substitute a fixed conversion period.
+- EOC/JEOC and direct DMA memory writes must remain pending until that rank
+  deadline. Verify the ADC-only producer before the ADC-to-DMA consumer;
+  this digital deadline does not establish analog acquisition, SAR physics or
+  DMA bus-cycle fidelity.
 
 ## H723 DMA FIFO Overflow Transaction Boundary
 

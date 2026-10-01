@@ -9,7 +9,7 @@ command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'blocked: arm-no
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-iwdg.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-iwdg.XXXXXX")
 cleanup() {
     if [[ -n "${qemu_pid:-}" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
         kill "$qemu_pid" 2>/dev/null || true

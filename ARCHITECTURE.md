@@ -1,4 +1,17 @@
-# 0.51 STM32H723 SoC RAM ownership and migration registration
+# DM-MC02 QEMU Architecture Contract
+
+## Source publication
+
+The GitHub repository `lym12321/qemu-dm-mc02` owns both `main` (project tools,
+shared cores and documentation) and `dm-mc02/v8.2.2` (QEMU fork, retaining
+official upstream ancestry). `qemu/upstream` is a Git submodule pinned to the
+same fork commit recorded by `qemu.lock`. Standard Git submodule initialization
+is the only acquisition path; no official-tag bootstrap or second patch tree.
+Builds consume this path even in source archives without Git metadata.
+README is the single user guide; PLAN/REVIEW contain current state, and dated
+reports/history are evidence, not a second capability matrix.
+
+## 0.51 STM32H723 SoC RAM ownership and migration registration
 
 The reusable STM32H723 memory composition owns the backing bytes for the
 internal Flash and CPU-visible RAM windows. Dynamic bytes use QEMU's canonical
@@ -26,13 +39,13 @@ reset behavior. A future machine composite must restore RAM blocks before
 consumers such as CPU execution, DMA, FDCAN and other peripherals can depend on
 their contents, and must define the remaining child restore order first.
 
-# 0.50 STM32H723 OCTOSPI/OCTOSPIM state boundary
+## 0.50 STM32H723 OCTOSPI/OCTOSPIM state boundary
 
 The external Flash path is layered as `DmMc02Ospi` register semantics ->
-`DmMc02SsiNor` adapter -> QEMU's standard `w25q64/m25p80`. The OSPI controller
+`DmMc02SsiNor` adapter -> project-owned `dm-w25q64` over QEMU SSI. The OSPI controller
 owns its register mirror, indirect transaction cursors, bounded RX/TX staging,
 DLR-derived continuation state and the memory-mapped access gate. The SSI/NOR
-device owns NOR command semantics, backing bytes and its native QEMU VMState.
+device owns NOR command semantics and backing bytes; it is explicitly unmigratable.
 No second production NOR state machine is introduced.
 
 The version-1 OSPI component VMState serializes only controller-owned dynamic
@@ -46,16 +59,14 @@ Validation rejects impossible cursor/length and active-command combinations.
 Normal post-load derives `memory_mapped` from `CR.FMODE` and restores active-low
 SSI CS only when the controller was midway through page program. Raw post-load
 performs validation but no projection, allowing a parent composite to restore
-the standard Flash child and all wiring before one projection. `OCTOSPIM` is a
+the Flash child and all wiring before one projection. `OCTOSPIM` is a
 separate register-only component. These descriptions remain unregistered from
 the DM-MC02 machine, so they do not establish whole-machine snapshot/migration.
 
 The isolated gate is `test-dm-ospi-vmstate` (`6/6`); direct gates are the
 existing OSPI and alternate-board profile smokes. The remaining restore risks
-are standard Flash child/backing-storage semantics, OSPI/DMA/CPU/IRQ ordering,
+are the unmigratable NOR child/backing-storage semantics, OSPI/DMA/CPU/IRQ ordering,
 board reset composition and full line-mode/DTR/async-WIP timing.
-
-# DM-MC02 QEMU Architecture Contract
 
 ## 0.49 DM-MC02 board power state boundary
 
@@ -153,8 +164,9 @@ co-simulation state restoration.
 
 This document is normative for the QEMU backend. It constrains design choices,
 not just the current implementation. `AGENTS.md` defines the development
-workflow, `INTERFACES.md` defines public data contracts, `PLAN.md` records
-incremental work, and `REVIEW.md` records evidence and residual risk.
+workflow, `INTERFACES.md` defines public data contracts, `CAPABILITIES.md`
+records the canonical current support/evidence matrix, `PLAN.md` records
+incremental work, and `REVIEW.md` records findings and residual risk.
 
 ## Product Contract
 
@@ -192,7 +204,7 @@ Dependencies point only downward through a narrow public interface.
 | STM32H723 SoC | CPU-visible register semantics, clocks, reset, DMA requests, peripheral data paths | DM-MC02 pins, power rails, motor policy or external process state |
 | DM-MC02 profile | pin/AF map, rails, peripheral instances, IRQ routes and external-device composition | generic peripheral state machines or protocol codecs |
 | Reusable devices/adapters | BMI088, transceiver behavior, protocol codecs and time/command/state adapters | QEMU machine internals or a particular board profile |
-| External backend | MuJoCo, Gazebo, ROS 2, SocketCAN, replay and test fixtures | QEMU private state and board-private packet formats |
+| External backend | MuJoCo and ROS 2 adapters, SocketCAN bridge, replay and test fixtures; Gazebo integration remains unverified | QEMU private state and board-private packet formats |
 | User tooling | CLI, stable QMP diagnostics, profiling and launch profiles | modeled peripheral behavior |
 
 Every implementation slice records its owner, producer, boundary, consumer,
@@ -200,11 +212,34 @@ clock domain, reset owner, minimum isolated test and immediate integration
 gate. Board profiles may pass data and callbacks into a reusable component but
 may not inspect or mutate its private state.
 
+### H723 internal Flash image persistence
+
+`DmMc02SocMemory` remains the sole owner of internal Flash RAM bytes and
+initializes them to the erased value. The DM-MC02 `flash-file` property carries
+only a host path; machine initialization and the normal-shutdown notifier use
+`cosim/dm_nor_flash_persistence.[ch]` directly against the borrowed SoC RAM and
+the profile's exact Flash geometry. The adapter stays independent of QOM,
+register semantics and board policy.
+
+A missing file is accepted and preserves the erased image. A configured file
+with a size mismatch or another load error rejects machine initialization
+before guest execution; partial images are never copied. The property becomes
+immutable after machine initialization so loading and shutdown saving refer to
+the same path. An empty path performs no I/O. Normal QEMU shutdown saves the
+complete image and reports save errors; command, reset and DMA paths do no file
+I/O. This is not crash recovery, power-loss atomicity, ECC/erase timing or
+machine migration.
+
+The isolated persistence test asserts short/long image rejection without
+mutating caller storage. The direct `dm-mc02-memory-test` covers exact image
+load, Flash programming, normal-QMP-quit save and reload; `run-flash-smoke.sh`
+checks short/long machine-start rejection with a bounded process deadline.
+
 ## Reuse and Replacement Policy
 
 QEMU is the canonical production implementation for the following generic
 facilities: `MemoryRegion`, IRQ/Clock/timer, `CharBackend`, `USBBus`/`USBPort`/
-`USBPacket`, `CanBusState`/`CanBusClientState`, SSI devices including `m25p80`,
+`USBPacket`, `CanBusState`/`CanBusClientState`, SSI bus/CS infrastructure,
 and VMState. A local model is allowed only for a register-facing STM32H723
 wrapper or a behavior QEMU does not supply.
 
@@ -212,9 +247,9 @@ wrapper or a behavior QEMU does not supply.
 | --- | --- | --- |
 | USB host transactions | QEMU USB core and host-controller integration | H723 DWC2 register wrapper; existing host stack only as a named fixture until removed |
 | USB device role on DM-MC02 | H723 device controller and endpoint wrapper | DM-MC02 remains device-only; no host bus or passthrough is mapped into its device MMIO window |
-| W25Q64/NOR die | QEMU `m25p80` behind SSI | H723 OCTOSPI/OCTOSPIM controller and board routing |
+| W25Q64/NOR die | QEMU QOM/SSI and shared NOR storage core | Independent `dm-w25q64` device; H723 OCTOSPI/OCTOSPIM controller and board routing |
 | CAN transport | QEMU standard CAN bus and optional SocketCAN backend | H723 FDCAN registers/message RAM; local medium only as deterministic test fixture |
-| External physics | MuJoCo/Gazebo/ROS 2 implementations | protocol-neutral time/command/state adapter and DM-MC02 mapping |
+| External physics | MuJoCo and ROS 2 implementations; a future Gazebo model may use the ROS 2 adapter | protocol-neutral time/command/state adapter and DM-MC02 mapping |
 | Renode infrastructure | the pinned Renode submodule | project-specific H723/board adapters only; no second canonical Infrastructure tree |
 
 ### CAN transport boundary (2026-09-01)
@@ -305,8 +340,10 @@ component stream. Invalid state/version returns before runtime synchronization;
 the VMState mechanism may still have written ordinary fields before reporting
 the error, so this is not a transactional rollback guarantee.
 
-The isolated contract test is `4/4`, with DWC2 core `7/7`, QEMU USB adapter
-`13/13`, DM-MC02 USB qtest `10/10`, and the ARM system target relink passing.
+At the time of this 2026-09-02 component slice, the isolated contract test
+was `4/4`, with DWC2 core `7/7`, QEMU USB adapter `13/13`, DM-MC02 USB qtest
+`10/10`, and the ARM system target relink passing. Current aggregate evidence
+is recorded in `CAPABILITIES.md` and the latest canonical gate report.
 The component is deliberately not registered with the DM-MC02 machine. A
 whole-machine snapshot claim remains blocked on the control core, CPU/IRQ/NVIC,
 RAM, DMA/DMAMUX, USB bus/PHY, scheduler and co-simulation queue restore order.
@@ -370,12 +407,51 @@ sources belong to test targets. Third-party code has one canonical pinned
 source. Local modifications state their upstream base and exit condition in
 the associated decision record.
 
-The current QEMU upstream base is v8.2.2. The DM-MC02 NOR migration carries a
-small local patch in `hw/block/m25p80.c` for W25Q-compatible WEL consumption
-after successful program/erase and address alignment for block erase, plus
-narrow realized-device accessors in `include/hw/block/flash.h`. These changes
-are generic m25p80 behavior, are covered by the DM-MC02 OSPI boundary smoke,
-and must be re-audited against upstream before changing the QEMU baseline.
+The current QEMU upstream base is v8.2.2. The user's 2026-09-29 decision
+replaces the previous patched-m25p80 route with `dm-w25q64`, an independent
+QOM SSI device, sharing `cosim/dm_nor_flash.c` storage semantics. Upstream
+`hw/block/m25p80.c` and `include/hw/block/flash.h` are restored byte-for-byte
+to that base. This bounded exception avoids changing other upstream NOR
+devices; it does not authorize a second production NOR path or other custom
+transport stacks. The device owns bytes and transaction state; the adapter
+borrows storage for alias/persistence. Its fixed-device initialization validates
+expected geometry/ID before realization; wire identity belongs to the SSI test,
+not a redundant runtime self-test. No type factory or duplicate size cache.
+Program/erase commit synchronously at CS rising. Quad commands are a logical
+byte profile without QE/lane timing, protection, or physical busy latency.
+The device is explicitly unmigratable. See the dated release report for
+vendor references, isolation, direct-consumer evidence and remaining limits.
+
+`qemu.lock` is the single revision record for the upstream base and nested
+`qemu/upstream` fork. The fork commit contains the local H723/DM-MC02 changes;
+the full fork source is the canonical owner, not a second tracked patch tree.
+`tools/dm_mc02_source_package.py` packages the current outer project files,
+the tracked fork source and the exact wrap revisions of `dtc`,
+`keycodemapdb`, `berkeley-softfloat-3` and `berkeley-testfloat-3` used by the
+ARM project gate. The Berkeley wrap `patch_directory` overlays from the QEMU
+fork are materialized into those two wrap source trees; a wrap Git revision
+alone lacks their `meson.build` entry points. It records the fork delta hash
+and observed build tools and
+dependencies, but excludes generated build trees, virtual environments, ROM
+submodule bytes and the external read-only firmware ELF. ROM gitlinks remain
+in QEMU source metadata; this ARM build does not require those ROM submodules.
+The package manifest hashes every included path, and restore verifies the
+materialized tree. This source gate does not establish a clean build; QEMU-07
+must configure, build and run the canonical gate from an isolated restore.
+
+For the explicitly requested pending-commit release, `create --allow-worktree`
+includes QEMU tracked edits, additions and deletions. Manifest schema 2 records
+the real HEAD/base, worktree diff hash and added/deleted paths, in addition to
+all file hashes. No commit is fabricated and `qemu.lock` keeps the real base.
+Default creation retains the clean-source requirement. Changes while building
+the archive are rejected. Final commit delivery requires nested commit, lock
+update, outer commit, and a new package; it is not the same snapshot identity.
+
+Smoke runtime socket paths are independent of source-root length: Linux
+scripts use private standard `mktemp -d /tmp/dm-qemu.*.XXXXXX` directories,
+with the existing script-owned cleanup traps. This fixes the observed deep
+restore AF_UNIX path overflow at bind/connect; it adds no transport protocol
+or QEMU workaround. Both normal-root and deep-root full gates must pass.
 
 The reproducible build profiles are explicit: `tools/build-qemu.sh` owns the
 DM-MC02 Release profile (`arm-softmmu` with `--with-devices-arm=dm-mc02`),
@@ -544,6 +620,12 @@ Every support claim requires all of the following evidence:
 4. Registration in the authoritative test runner; an unregistered script is
    not a regression gate.
 
+The current claim must also be represented by exactly one status in
+`CAPABILITIES.md`: `supported`, `approximation`, `fixture`, `unsupported`, or
+`unverified`. The status applies only to the row's named boundary. README and
+historical plans may link to that row but must not maintain a competing current
+feature inventory or promote a claim from an old test count.
+
 `tools/dm_mc02_test_gate.py` owns the authoritative project gate. It builds
 before taking binary identities, then runs four disjoint inventories: selected
 DM Meson unit/qtests, native Host CTest entries selected with
@@ -570,11 +652,24 @@ interfaces and cannot depend on QOM paths, board-private structs, or a CAN/USB
 fixture. Compatibility changes require a versioned interface and a migration
 test; `v1` stays available until its documented deprecation decision.
 
+The simulation worker owns motor-backend admission. It rejects non-finite or
+non-positive `rate` and `connect-timeout` values before connecting, then checks
+both direct-factory and registry-factory instances before sending RESET or
+calling `step()`. The required callable methods are `step`, `set_motor`,
+`reset_motor`, `set_motor_enabled`, `set_motor_dm`, and `motor_feedback`;
+optional `reset` and `close` members must be callable when present. The generic
+`BackendRegistry` stays protocol-neutral. Admission validates callability only,
+not signatures, output shape, or plant fidelity. On rejection, the worker
+attempts to close the returned backend and closes sockets acquired during
+startup.
+
 Remaining migration candidates are tracked in `PLAN.md`: custom USB host
-transaction layers and whole-machine VMState. The NOR die and CAN transport
-migrations are complete; their residual limitations remain documented above
-and in `INTERFACES.md`. These entries are not evidence that the corresponding
-complete physical or host-passthrough capability already exists.
+transaction layers and whole-machine VMState. Replacement of the production
+CAN transport with upstream QEMU `CanBusState` is complete. NOR now follows
+the independent-device decision above; this is not VMState migration.
+Their residual limitations remain documented above, in `INTERFACES.md`, and in
+the current capability matrix. These entries are not evidence that the
+corresponding complete physical or host-passthrough capability already exists.
 The ADC1/ADC2 common window is a separate `DmMc02AdcCommon` component rather
 than a third ADC instance or duplicated machine fields. Its CSR is a live
 projection of the two ADC status producers, and its CCR is the sole common
@@ -709,6 +804,22 @@ resolved from the master's sampling phase and `CCR.DELAY`. The peer admission
 carries the trigger source, edge, event count, timestamp and common-generated
 conversion ID. Exact per-edge event-count queueing and injected common-data
 packing remain outside the support claim.
+
+## 2026-09-27 H723 ADC rank processing-time correction
+
+ADC1/2 `CFGR.RES` is the chip-owned processing-time selector. The existing
+regular and injected rank schedulers both add 16.5/14.5/12.5/10.5 ADC clocks
+for 16/14/12/10-bit resolution to the channel's SMPR sampling duration.
+Their shared integer half-cycle conversion rounds each absolute virtual
+deadline up to nanoseconds. ST's local H7 HAL gives the 16-bit 16.5-clock
+maximum and the LL ADC header gives the 12/10-bit processing times; 14.5 is
+the corresponding intermediate resolution step. QEMU's previous fixed 8.5
+clocks matched neither the Release firmware's 16-bit setting nor its two
+32.5-clock sampling ranks. At 1.5 MHz, each such rank now takes 32,667 ns
+instead of 27,334 ns. ADC EOC/JEOC owns the completion event; DMAMUX/DMA
+observes only the published request and never supplies a timing correction.
+This is a deterministic digital deadline, not an analog aperture, SAR,
+bus-arbitration or physical-board timing model.
 
 ## 2026-09-02 ADC12 regular-interleaved cadence decision
 

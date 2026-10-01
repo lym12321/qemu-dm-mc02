@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
-run_dir=$(mktemp -d "$root_dir/output.dm-mc02-usb-pipe.XXXXXX")
+run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-usb-pipe.XXXXXX")
 qmp_socket="$run_dir/qmp.sock"
 usb_socket="$run_dir/usb.sock"
 guest_elf="$run_dir/usb-pipe.elf"
