@@ -32,14 +32,17 @@ static void test_hpre_table(void)
     }
 }
 
-static void test_core_and_hclk_are_independent(void)
+static void test_d1cpre_precedes_hpre(void)
 {
     const uint32_t d1cfgr = (0xau << 8) | 0x8u;
 
     CHECK(dm_stm32h7_d1_core_divider(d1cfgr) == 8);
     CHECK(dm_stm32h7_d1_hpre_divider(d1cfgr) == 2);
     CHECK(dm_stm32h7_cpu_clock_hz(480000000, d1cfgr) == 60000000);
-    CHECK(dm_stm32h7_hclk_hz(480000000, d1cfgr) == 240000000);
+    /* ST CMSIS SystemCoreClockUpdate(): SYSCLK / D1CPRE / HPRE. */
+    CHECK(dm_stm32h7_hclk_hz(480000000, d1cfgr) == 30000000);
+    CHECK(dm_stm32h7_apb1_hz(30000000, 0x540) == 15000000);
+    CHECK(dm_stm32h7_apb2_hz(30000000, 0x540) == 7500000);
 }
 
 static void test_apb_and_timer_tables(void)
@@ -67,8 +70,6 @@ static void test_apb_and_timer_tables(void)
           hclk_hz);
     CHECK(dm_stm32h7_apb1_timer_clock_hz(hclk_hz, 0x50, 1u << 15) ==
           hclk_hz);
-    CHECK(dm_stm32h7_apb1_timer_clock_hz(hclk_hz, 0x50, 1u << 15) ==
-          hclk_hz);
     CHECK(dm_stm32h7_apb1_timer_clock_hz(hclk_hz, 0x60, 1u << 15) ==
           hclk_hz / 2);
     CHECK(dm_stm32h7_apb1_timer_clock_hz(hclk_hz, 0x70, 1u << 15) ==
@@ -80,7 +81,7 @@ static void test_apb_and_timer_tables(void)
 int main(void)
 {
     test_hpre_table();
-    test_core_and_hclk_are_independent();
+    test_d1cpre_precedes_hpre();
     test_apb_and_timer_tables();
     puts("clock tree smoke: PASS");
     return 0;

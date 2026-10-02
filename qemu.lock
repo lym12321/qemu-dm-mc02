@@ -6,4 +6,4 @@ upstream_commit=11aa0b1ff115b86160c4d37e7c37e6a6b13b77ea
 upstream_tree=80f407003fe86b57bb6b5bf57b7804bfe3b2205f
 fork_base_commit=86eb36aa65ceeaaa40ac2cb1029f2df5f2d06223
 fork_branch=dm-mc02/v8.2.2
-fork_commit=1ee606afbbc907982aa08f57b842b3114d0d7dda
+fork_commit=107e40bfb67d2a3520e23d5dabd1e64c452f60c1
