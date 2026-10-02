@@ -96,6 +96,7 @@ uint64_t dm_mc02_pwr_rcc_cpu_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_hclk_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_apb1_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_apb2_clock_hz(const DmMc02PwrRcc *state);
+uint64_t dm_mc02_pwr_rcc_apb3_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_apb1_timer_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_apb2_timer_clock_hz(const DmMc02PwrRcc *state);
 

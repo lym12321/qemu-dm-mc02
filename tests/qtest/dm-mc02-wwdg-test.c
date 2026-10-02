@@ -9,6 +9,9 @@
 #define WWDG_CFR        (WWDG_BASE + 0x04)
 #define WWDG_SR         (WWDG_BASE + 0x08)
 #define RCC_RSR         0x580244d0ull
+#define RCC_CFGR        0x58024410ull
+#define RCC_D1CFGR      0x58024418ull
+#define RCC_D2CFGR      0x5802441cull
 #define PPB_BASE        0xe000e000ull
 #define NVIC_ISPR0      (PPB_BASE + 0x200)
 
@@ -111,6 +114,47 @@ static void test_prescaler_change_preserves_counter(void)
     qtest_quit(qts);
 }
 
+static void assert_tick_after(QTestState *qts, uint64_t tick_ns)
+{
+    wwdg_start(qts, WWDG_CFR_W, WWDG_CR_T);
+    qtest_clock_step(qts, tick_ns - 1);
+    g_assert_cmphex(qtest_readl(qts, WWDG_CR) & WWDG_CR_T, ==, 0x7f);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, WWDG_CR) & WWDG_CR_T, ==, 0x7e);
+}
+
+static void test_apb3_prescaler(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    /* ST LL_RCC_CALC_PCLK3_FREQ: HCLK 64 MHz / D1PPRE 2 = 32 MHz. */
+    qtest_writel(qts, RCC_D1CFGR, 4u << 4);
+    assert_tick_after(qts, 128000);
+    qtest_quit(qts);
+}
+
+static void test_apb1_and_timpre_do_not_clock_wwdg(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    /* ST LL_APB3_GRP1_PERIPH_WWDG1: neither PCLK1 nor TIMPRE applies. */
+    qtest_writel(qts, RCC_D2CFGR, 7u << 4);
+    qtest_writel(qts, RCC_CFGR, 1u << 15);
+    assert_tick_after(qts, 64000);
+    qtest_quit(qts);
+}
+
+static void test_d1_clock_chain(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    /* CMSIS SystemCoreClockUpdate + LL_RCC_CALC_PCLK3_FREQ:
+     * HSI 64 MHz / D1CPRE 8 / HPRE 2 / D1PPRE 4 = PCLK3 1 MHz. */
+    qtest_writel(qts, RCC_D1CFGR, (0xau << 8) | (5u << 4) | 8u);
+    assert_tick_after(qts, 4096000);
+    qtest_quit(qts);
+}
+
 static void test_window_violation_and_timeout_reset_reason(void)
 {
     QTestState *qts = qtest_init("-machine dm-mc02");
@@ -144,6 +188,10 @@ int main(int argc, char **argv)
                     test_defaults_and_early_wakeup);
     g_test_add_func("/dm-mc02/wwdg/prescaler-phase",
                     test_prescaler_change_preserves_counter);
+    g_test_add_func("/dm-mc02/wwdg/apb3-prescaler", test_apb3_prescaler);
+    g_test_add_func("/dm-mc02/wwdg/apb1-timpre-independent",
+                    test_apb1_and_timpre_do_not_clock_wwdg);
+    g_test_add_func("/dm-mc02/wwdg/d1-clock-chain", test_d1_clock_chain);
     g_test_add_func("/dm-mc02/wwdg/window-and-timeout-reset",
                     test_window_violation_and_timeout_reset_reason);
     return g_test_run();

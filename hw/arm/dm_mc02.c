@@ -2308,9 +2308,11 @@ static void dm_mc02_clock_changed(void *opaque, uint64_t hz)
     apb2_timer_hz = dm_mc02_pwr_rcc_apb2_timer_clock_hz(&s->pwr_rcc);
     s->apb1_timer_clock_hz = apb1_timer_hz;
     s->apb2_timer_clock_hz = apb2_timer_hz;
-    /* WWDG1 follows the board's APB1 clock.  The component preserves the
+    /* ST LL_APB3_GRP1_PERIPH_WWDG1: WWDG1 uses PCLK3, without TIMPRE.
+     * The component preserves the
      * visible counter when this RCC-derived frequency changes. */
-    dm_mc02_wwdg_set_clock_hz(&s->wwdg1, apb1_timer_hz);
+    dm_mc02_wwdg_set_clock_hz(&s->wwdg1,
+                            dm_mc02_pwr_rcc_apb3_clock_hz(&s->pwr_rcc));
     /* A zero rate is a real readiness state.  Propagate it so a disabled or
      * unavailable RCC source cannot leave timer consumers running at the
      * previous frequency. */
@@ -2948,7 +2950,7 @@ static void dm_mc02_init(MachineState *machine)
     memory_region_add_subregion(system_memory, soc->iwdg1_base,
                                 &s->iwdg1.iomem);
     dm_mc02_wwdg_init(&s->wwdg1, OBJECT(machine),
-                      clock_get_hz(s->apb1_timerclk));
+                      dm_mc02_pwr_rcc_apb3_clock_hz(&s->pwr_rcc));
     memory_region_add_subregion(system_memory, soc->wwdg1_base,
                                 &s->wwdg1.iomem);
     if (!dm_mc02_usb_init(&s->usb_hs, OBJECT(machine), serial_hd(10),

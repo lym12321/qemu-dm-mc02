@@ -377,6 +377,17 @@ uint64_t dm_mc02_pwr_rcc_apb2_clock_hz(const DmMc02PwrRcc *state)
         dm_mc02_reg_load(state->rcc_regs, RCC_D2CFGR, sizeof(uint32_t)));
 }
 
+uint64_t dm_mc02_pwr_rcc_apb3_clock_hz(const DmMc02PwrRcc *state)
+{
+    uint32_t d1cfgr = dm_mc02_reg_load(state->rcc_regs, RCC_D1CFGR,
+                                     sizeof(uint32_t));
+    unsigned prescaler = (d1cfgr >> 4) & 7u;
+
+    /* ST LL_RCC_CALC_PCLK3_FREQ: D1PPRE 0..3=/1, 4..7=/2,/4,/8,/16. */
+    return dm_mc02_pwr_rcc_hclk_hz(state) /
+           (prescaler < 4 ? 1u : 1u << (prescaler - 3));
+}
+
 uint64_t dm_mc02_pwr_rcc_apb1_timer_clock_hz(const DmMc02PwrRcc *state)
 {
     uint64_t hclk_hz = dm_mc02_pwr_rcc_hclk_hz(state);
