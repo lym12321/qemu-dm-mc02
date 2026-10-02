@@ -13,6 +13,11 @@
 #define TIM2_CR1           (TIM2_BASE + 0x00)
 #define SPI2_BASE          0x40003800ull
 #define SPI2_CR1           (SPI2_BASE + 0x00)
+#define CORDIC_BASE        0x58004400ull
+#define CORDIC_CSR         (CORDIC_BASE + 0x00)
+#define CORDIC_WDATA       (CORDIC_BASE + 0x04)
+#define CORDIC_RDATA       (CORDIC_BASE + 0x08)
+#define USB_GRXFSIZ        0x40040024ull
 #define FDCAN_MSG_RAM      0x4000ac55ull
 #define DTCM_MAGIC         0xa55a5aa5u
 #define GPIO_POWER_OUTPUTS ((1u << (13 * 2)) | (1u << (14 * 2)) | \
@@ -28,10 +33,14 @@ static void set_bool(QTestState *qts, const char *property, bool value)
 static void test_warm_reset_reprojects_board_state(void)
 {
     QTestState *qts = qtest_init("-machine dm-mc02");
+    uint32_t rx_fifo_reset = qtest_readl(qts, USB_GRXFSIZ);
 
     qtest_writel(qts, DTCM_BASE, DTCM_MAGIC);
     qtest_writel(qts, TIM2_CR1, 1);
     qtest_writel(qts, SPI2_CR1, 1);
+    qtest_writel(qts, CORDIC_CSR, 1u << 19); /* Paired result pending. */
+    qtest_writel(qts, CORDIC_WDATA, 0x20000000);
+    qtest_writel(qts, USB_GRXFSIZ, 77);
     qtest_writeb(qts, FDCAN_MSG_RAM, 0xa5);
     set_bool(qts, "user-key", true);
     set_bool(qts, "electrical-power", true);
@@ -45,6 +54,9 @@ static void test_warm_reset_reprojects_board_state(void)
     g_assert_cmphex(qtest_readl(qts, DTCM_BASE), ==, DTCM_MAGIC);
     g_assert_cmphex(qtest_readl(qts, TIM2_CR1), ==, 0);
     g_assert_cmphex(qtest_readl(qts, SPI2_CR1), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, CORDIC_CSR), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, CORDIC_RDATA), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, USB_GRXFSIZ), ==, rx_fifo_reset);
     g_assert_cmphex(qtest_readb(qts, FDCAN_MSG_RAM), ==, 0);
 
     /* Board CS deassertion and external key input are re-projected after

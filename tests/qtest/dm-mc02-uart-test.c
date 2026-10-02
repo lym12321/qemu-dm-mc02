@@ -46,6 +46,61 @@
 #define DMA_BAUD_DIVIDER 0xffffu
 #define UART_RX_BAUD_DIVIDER 64u
 #define UART_RX_FRAME_NS 10000u
+#define RCC_BASE          0x58024400u
+
+static void test_kernel_clock_sources(void)
+{
+    static const struct {
+        unsigned source, hsi_div, apb1, apb2;
+        uint64_t usart16, usart234578;
+    } cases[] = {
+        { 0, 1, 5, 4, 16000000, 8000000 },
+        { 1, 1, 5, 4, 96000000, 96000000 },
+        { 2, 1, 5, 4, 60000000, 60000000 },
+        { 3, 1, 5, 4, 32000000, 32000000 },
+        { 4, 1, 5, 4, 4000000, 4000000 },
+        { 5, 1, 5, 4, 32768, 32768 },
+        { 6, 1, 5, 4, 0, 0 },
+        { 0, 1, 4, 5, 8000000, 16000000 },
+        { 3, 2, 5, 4, 16000000, 16000000 },
+    };
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    /* ST LL_RCC_GetUSARTClockFreq: PCLK2/PCLK1, PLL2Q, PLL3Q,
+     * HSI, CSI, LSE. Ported from the redundant UART-clock shell fixture. */
+    for (size_t i = 0; i < ARRAY_SIZE(cases); ++i) {
+        QDict *response;
+        const char *properties[] = {
+            "usart16-kernel-clock-hz", "usart234578-kernel-clock-hz",
+        };
+        uint64_t expected[] = { cases[i].usart16, cases[i].usart234578 };
+
+        qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+        qtest_writel(qts, RCC_BASE + 0x28,
+                     2u | (2u << 4) | (2u << 12) | (2u << 20));
+        qtest_writel(qts, RCC_BASE + 0x30, 39u | (3u << 16));
+        qtest_writel(qts, RCC_BASE + 0x38, 15u | (1u << 16));
+        qtest_writel(qts, RCC_BASE + 0x40, 19u | (3u << 16));
+        qtest_writel(qts, RCC_BASE + 0x2c,
+                     (1u << 17) | (1u << 20) | (1u << 23));
+        qtest_writel(qts, RCC_BASE + 0x1c,
+                     (cases[i].apb1 << 4) | (cases[i].apb2 << 8));
+        qtest_writel(qts, RCC_BASE, 1u | (1u << 7) | (1u << 16) |
+                     (1u << 24) | (1u << 26) | (1u << 28) |
+                     (cases[i].hsi_div << 3));
+        qtest_writel(qts, RCC_BASE + 0x70, 1u);
+        qtest_writel(qts, RCC_D2CCIP2R,
+                     (cases[i].source << 3) | cases[i].source);
+        for (size_t j = 0; j < ARRAY_SIZE(properties); ++j) {
+            response = qtest_qmp(qts,
+                "{ 'execute': 'qom-get', 'arguments': { 'path': '/machine', "
+                "'property': %s } }", properties[j]);
+            g_assert_cmpuint(qdict_get_int(response, "return"), ==, expected[j]);
+            qobject_unref(response);
+        }
+    }
+    qtest_quit(qts);
+}
 
 static size_t read_ringbuf(QTestState *qts, uint8_t *buffer, size_t capacity)
 {
@@ -206,6 +261,8 @@ static void test_uart_rx_wire_overrun(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-mc02/uart/kernel-clock-sources",
+                    test_kernel_clock_sources);
     g_test_add_func("/dm-mc02/uart/dma-tx-backpressure",
                     test_uart_dma_tx_backpressure);
     g_test_add_func("/dm-mc02/uart/rx-wire-overrun",
