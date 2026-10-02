@@ -19,7 +19,13 @@
 *.elf
 *.o
 
-# Reports keep their reviewed README; raw logs and generated identity dumps do
-# not belong to the source baseline.
-/reports/**/*.log
-/reports/**/inputs*.txt
+# Internal development records and local validation output are not published.
+*.md
+!/README.md
+!/docs/USAGE.md
+!/LICENSE*.md
+!/COPYING*.md
+/docs/history/
+/reports/
+/result
+/result-*

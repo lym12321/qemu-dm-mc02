@@ -1,6 +1,6 @@
-# DM-MC02 QEMU 用户与开发手册
+# DM-MC02 QEMU 使用手册
 
-本手册说明如何获取、构建、运行和验证项目，以及如何按现有分层继续开发。README 是项目入口；当前功能状态和证据只维护在 [`CAPABILITIES.md`](../CAPABILITIES.md)，本手册中的命令示例不构成额外的能力声明。
+本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；固件 ELF 由用户另行提供。
 
 ## Contents
 
@@ -15,19 +15,53 @@
 - [外部仿真 worker](#external-simulation-worker)
 - [测试与性能](#testing-and-performance)
 - [更新与源码包](#update-and-source-package)
-- [开发流程](#development-workflow)
 - [故障排查](#troubleshooting)
-- [目录与权威文档](#repository-map)
+- [目录](#repository-map)
 
 ## Project scope
 
-项目基于固定的 QEMU v8.2.2 fork，提供 STM32H723 与 DM-MC02 的分层仿真模型。依赖链为 `STM32H723 → DM-MC02 → 器件/驱动 → 外部 plant → 工具`；通用行为留在可复用层，板级组合由 DM-MC02 profile 负责。
+项目基于固定的 QEMU v8.2.2 fork，提供 STM32H723 与 DM-MC02 的数字外设模型，面向固件功能验证。
 
-本项目不依赖 Renode。`trobot/` 是只读外部固件输入，不随仓库发布，也不应为绕过仿真缺陷而修改。芯片完整性、物理总线、闭环和迁移等边界请查阅[能力矩阵](../CAPABILITIES.md)，不要从单个 smoke 或组件测试推断未覆盖能力。
+项目不依赖 Renode，也不分发 `trobot/` 固件。模型不覆盖完整芯片、电气/物理总线时序或整机 snapshot/live migration。USB 的 DM-MC02 profile 使用 Device 角色，不提供该板的 USB Host 或设备透传。外部后端示例用于连接与协议验证；真实机构闭环和具体固件的完整业务就绪仍需用户验证。
 
 ## Environment
 
-已验证宿主为 **Ubuntu 24.04 x86_64**，要求 Python 3.11 或更新版本。Windows 和 macOS 原生构建不在当前验收范围。
+支持 **Linux x86_64**，推荐使用下面的 Nix 环境；也提供 Ubuntu 24.04 系统依赖方案。Windows、macOS 和 ARM 宿主原生构建未验证。
+
+### Nix
+
+按 [Nix 官方安装说明](https://nix.dev/install-nix.html)安装 Nix。若尚未启用 flakes，在 `~/.config/nix/nix.conf` 中加入以下配置，保留已有的其他设置：
+
+```ini
+experimental-features = nix-command flakes
+```
+
+获取源码后运行：
+
+```bash
+nix develop
+bash tools/build-qemu.sh
+```
+
+也可以不进入交互 shell，直接构建：
+
+```bash
+nix develop --command bash tools/build-qemu.sh
+```
+
+`flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包。
+
+构建和运行都在 `nix develop` 内执行，包括 QEMU、测试、worker 和 Python 环境同步。`nix develop` 中的 `PYTHON` 指向固定的 Nix Python；同步项目测试环境使用：
+
+```bash
+uv sync --locked --group dev --python "$PYTHON"
+```
+
+退出 shell 用 `exit`。更换机器后使用同一 `flake.lock` 可恢复相同工具和依赖版本。普通 Nix profile 中只有编译器并不足以构建本项目；请使用这里的完整 shell，使编译器、GLib、zlib 与 pkg-config 保持一致。MuJoCo Python 包通过项目 extra 按需安装；Nix shell 提供其 C++ 运行库，并默认使用 `MUJOCO_GL=disable` 运行无渲染后端。ROS 2 需要另行安装和配置。
+
+### Ubuntu
+
+以下最小依赖已在干净 Ubuntu Base 24.04.5 容器中完成从零构建与 machine 启动验证。
 
 构建 QEMU 本身所需的系统包：
 
@@ -46,7 +80,11 @@ sudo apt-get install -y \
 
 这里 `build-essential` 提供 C/C++ 编译器和链接工具；GLib、zlib 是当前 ARM QEMU profile 的必需开发库；`ninja-build` 提供构建后端；Git 用于检出仓库与固定的 QEMU 子模块。
 
-QEMU `configure` 会在 `build/qemu/pyvenv` 创建自己的 Python 环境，并从 QEMU 源码携带的 wheel 安装锁定 Meson 1.2.3。干净 Ubuntu 上 `python3-venv` 提供 venv/ensurepip bootstrap，系统已有 pip 与 setuptools 时 QEMU 可以跳过 ensurepip。Meson 不从 apt 或项目 Python 环境安装。项目级 Meson 命令通过 `tools/meson` 调用这份 QEMU 锁定版本，避免为同一个 build tree 再装一份 Meson。
+`zlib1g` 只是运行库；编译所需的 `zlib.h`、链接文件和 pkg-config 元数据由 **`zlib1g-dev`** 提供。DM-MC02 构建脚本先检查元数据，再用所选 `CC`、`CFLAGS`、`LDFLAGS` 与 `PKG_CONFIG` 的 zlib 参数实际编译/链接探针；探针不执行，失败会在 QEMU configure 前显示编译器诊断。
+
+在 Nix shell 外，两个 QEMU 构建脚本使用 `/usr/bin:/bin`，默认 `CC=/usr/bin/cc`、`CXX=/usr/bin/c++`、`PKG_CONFIG=/usr/bin/pkg-config` 和 `PYTHON=/usr/bin/python3`；在 Nix shell 内则保留 Nix 的工具与依赖环境。显式 `CC` 等覆盖值会保留，须使用与其匹配的开发库。
+
+QEMU `configure` 会在 `build/qemu/pyvenv` 创建 Python 环境，并从源码携带的 wheel 安装固定的 Meson 1.2.3。Ubuntu 的 `python3-venv` 用于这一配置过程；Nix shell 已提供可用 Python，无需该 apt 包。项目级 Meson 命令通过 `tools/meson` 调用 QEMU 自己的版本。
 
 因此，**只构建并运行 QEMU 不需要 `uv`**。`uv` 管理的是项目 Python 测试环境和可选 worker 依赖；当前 dev group 只安装 pytest，不重复安装 Meson 或 Ninja。需要运行完整回归门禁时，额外安装：
 
@@ -64,7 +102,7 @@ CMake/CTest 构建 Host 测试，ARM GCC/binutils 构建测试 guest，ripgrep �
 uv sync --locked --group dev --python /usr/bin/python3
 ```
 
-当前 profile 使用 `--enable-fdt=internal`、`--disable-capstone`、`--disable-slirp` 和 `--disable-docs`，因此不需要系统 libfdt、Capstone、slirp 或 Sphinx。Pixman 是可选依赖：没有 `libpixman-1-dev` 时，QEMU 会关闭依赖 pixman 的通用显示设备；DM-MC02 的默认 headless 使用不依赖它。如需这些通用显示设备，可额外安装：
+当前 profile 使用内部 FDT，并关闭 Capstone、slirp、文档及 SDL/GTK 图形界面，因此不需要对应系统开发包或 Sphinx。Pixman 是可选依赖：没有 `libpixman-1-dev` 时，QEMU 会关闭依赖 pixman 的通用显示设备；DM-MC02 的默认 headless 使用不依赖它。如需这些通用显示设备，可额外安装：
 
 ```bash
 sudo apt-get install -y libpixman-1-dev
@@ -95,16 +133,18 @@ git clone --branch main git@github.com:lym12321/qemu-dm-mc02.git
 以下命令均从仓库根目录执行：
 
 ```bash
-PYTHON=/usr/bin/python3 bash tools/build-qemu.sh
+bash tools/build-qemu.sh
 ```
 
-运行完整工程测试还需要上节的 CMake、ARM 工具链、ripgrep 和 `uv` 环境：
+Nix shell 已包含测试所需的 CMake、ARM 工具链、ripgrep 和 uv；Ubuntu 用户请先安装上一节的额外依赖。构建 Host 测试程序：
 
 ```bash
-uv sync --locked --group dev --python /usr/bin/python3
+uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"
 cmake -S . -B build/host -DCMAKE_BUILD_TYPE=Release
 cmake --build build/host --parallel 4
 ```
+
+如果 `build/host` 之前使用了另一套工具链，CMake 会保留缓存中的编译器。先保留旧目录再重新配置，例如 `mv -T build/host "build/host.backup-$(date +%Y%m%d-%H%M%S)"`，然后运行上面的 CMake 命令。全新 checkout 无需这一步。
 
 构建产物：
 
@@ -116,6 +156,8 @@ cmake --build build/host --parallel 4
 | `.venv/` | 由 `uv` 管理的 pytest 和项目 Python 工具环境 |
 
 QEMU 默认构建为 Release、`arm-softmmu` 和 DM-MC02 设备 profile。调试构建可运行 `QEMU_BUILD_TYPE=debugoptimized bash tools/build-qemu.sh`；性能测量前应重建 Release。`tools/build-qemu-generic.sh` 用于检查通用 ARM 复用边界，不是运行 DM-MC02 固件的入口。
+
+构建目录中的 `.dm-toolchain` 记录 configure 输入。旧目录没有此记录、所选工具/flags 改变或设置 `QEMU_RECONFIGURE=1` 时，脚本重新执行完整 QEMU configure，以更新缓存 compiler 和 Meson 入口；通常无需手动删除构建目录。
 
 ## First validation
 
@@ -175,7 +217,7 @@ target remote localhost:1234
 
 内部 Flash 镜像先加载，之后 `-kernel` 仍会装载 ELF 段，因此 ELF 覆盖范围内的持久化字节可能被改写。请将需保留的数据放在 ELF 段以外。零填充文件不是擦除态镜像。
 
-外部 NOR 是项目独立的 `dm-w25q64`，通过 QEMU QOM/SSI 和共享存储核心接入；官方 `m25p80.c` 与 `flash.h` 保持上游内容。当前命令执行是同步模型，quad 字节映射属于近似；保护、真实忙时序及器件迁移等限制以[能力矩阵](../CAPABILITIES.md)为准。
+外部 NOR 使用项目独立的 `dm-w25q64` 器件。命令同步完成，quad 使用字节级映射；保护、真实忙时序及器件迁移未支持。
 
 ## Serial, QMP and GDB
 
@@ -198,7 +240,7 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
   -serial none -serial file:build/runtime/usart1.log
 ```
 
-FDCAN 使用固定 84 字节帧，经项目 chardev/socket 连接；它不是文本串口，也不是直接的 SocketCAN 设备。帧布局、时间戳 owner、排队与背压规则见 [`INTERFACES.md`](../INTERFACES.md)。
+FDCAN 使用固定 84 字节二进制帧，经项目 chardev/socket 连接；它不是文本串口，也不是直接的 SocketCAN 设备。使用仓库的 worker 处理该通道，接入 Linux CAN 时使用 worker 的 `--socketcan` 参数。
 
 ### QMP
 
@@ -249,14 +291,18 @@ worker 支持的常用选择：
 | 已有 Linux CAN 接口 | `--socketcan can0 --fdcan /path/to/fdcan.sock` |
 | 自定义 plant | `--backend package:create_backend` 或 `--backend-registry package:register --engine name` |
 
-MuJoCo 示例只验证 adapter 和测试模型，不代表已完成 Release 固件闭环。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。自定义 backend 的必需方法、参数校验、错误释放和时间语义见 [`INTERFACES.md`](../INTERFACES.md)。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
+MuJoCo 示例只验证 adapter 和测试模型，不代表已完成 Release 固件闭环。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
 
 ## Testing and performance
 
 ### Canonical test gate
 
+完整门禁中的 MuJoCo Python 行为测试需要安装 `mujoco` extra；仅同步 `dev` 时，该测试会跳过并使完整门禁返回 BLOCKED。基础 QEMU 构建和最小 guest smoke 不需要此 extra：
+
 ```bash
-PYTHON=/usr/bin/python3 python3 tools/dm_mc02_test_gate.py --jobs 4
+uv sync --locked --group dev --extra mujoco --python "${PYTHON:-/usr/bin/python3}"
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
+python3 tools/dm_mc02_test_gate.py --jobs 4
 ```
 
 统一门禁执行 QEMU/Meson 测试、原生 Host CTest、完整 pytest 和 shell smoke。它会创建 `build/test-results/qemu-gate/<run>/summary.json`，并保存各阶段日志、退出码、动态测试分母及测试前后的关键二进制 SHA-256。可通过 `--report-dir /absolute/path` 指定报告根目录。
@@ -292,7 +338,7 @@ bash tools/run-release-rtf-gate.sh
 
 `1.0x` 是目标；标准 gate 允许已记录的 `0.999x` 采样容差，但仍报告每轮精确 RTF、启动延迟、CPU、RSS 和 watchdog 结果。启动阶段默认使用 10 秒总期限；启动超时、复位、断连、watchdog 增长或采样不一致必须失败退出。短 smoke、空载吞吐或一次运行都不能替代该门，也不能证明面向用户的 wall-clock pacing。
 
-已冻结的性能证据及其具体固件/宿主条件见 [`reports/2026-09-29-engineering-release/README.md`](../reports/2026-09-29-engineering-release/README.md)；条件不同的测量不能沿用其中结论。
+性能结果只适用于本次的固件、宿主负载和运行配置；启用外部后端或更换固件后需要重新测量。
 
 ## Update and source package
 
@@ -303,7 +349,7 @@ git pull --ff-only
 git submodule update --init --depth 1 qemu/upstream
 ```
 
-子模块通常处于 detached HEAD。修改 QEMU 前，在 `qemu/upstream` 中建立工作分支。先提交 QEMU fork 中的模型和测试，再更新外层仓库的子模块 gitlink 与 `qemu.lock` 中的 `fork_commit`，并核对两者指向同一提交。上游基线固定为 QEMU v8.2.2；升级版本需要重新审阅差异并通过相关下层、消费者和工程测试门。
+子模块通常处于 detached HEAD，这是固定版本的正常状态。更新后重新运行构建脚本；切换 Nix 与 Ubuntu 依赖环境时，脚本会自动刷新 QEMU configure 元数据。
 
 ### Create and restore a source package
 
@@ -317,14 +363,7 @@ python3 tools/dm_mc02_source_package.py restore \
   build/source-packages/source.tar.gz /absolute/path/to/new-restore
 ```
 
-默认创建要求 QEMU fork 源码干净。开发中的未提交改动只有在明确创建 worktree 快照时才可打包：
-
-```bash
-python3 tools/dm_mc02_source_package.py create \
-  build/source-packages/source-worktree.tar.gz --allow-worktree
-```
-
-worktree manifest 记录嵌套 HEAD 基线、tracked diff、新增/删除路径和逐文件哈希。若子模块是浅克隆，创建包前先补齐 fork 历史：
+默认创建要求 QEMU fork 源码干净。若子模块是浅克隆，创建包前先补齐 fork 历史：
 
 ```bash
 git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2
@@ -332,53 +371,61 @@ git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2
 
 源码包不含 `.git`、ROM 子模块工作树、构建二进制或固件；ELF 仅按哈希识别。restore 的目标目录必须不存在，源码落在其 `project/` 子目录。`verify` 证明包内容与 manifest 一致，不代表已独立构建或测试；完整验收要在恢复环境重新配置、构建并执行测试门。
 
-## Development workflow
-
-### Before changing code
-
-1. 读取从工作区根目录继承的 `AGENTS.md` 和本项目的 [`AGENTS.md`](../AGENTS.md)，并检查 `git status`。保留无关工作区改动。
-2. 根据 [`ARCHITECTURE.md`](../ARCHITECTURE.md) 确认代码所属层和依赖方向；根据 [`CAPABILITIES.md`](../CAPABILITIES.md)、[`INTERFACES.md`](../INTERFACES.md) 和 [`PLAN.md`](../PLAN.md) 确认公开契约、当前证据与下一道验证门。
-3. 选择一个层或一个 producer/boundary/consumer 切片，记录最窄隔离测试、直接消费者测试和预期限制。不要先堆端到端 workaround。
-
-### Make and verify a change
-
-依赖顺序是 STM32H723 通用芯片层、DM-MC02 板级组合、可复用器件/驱动、外部 plant、用户工具。先在行为所属层修复首个错误状态，再验证直接消费者；端到端 smoke 不能取代这两道下层门。
-
-QEMU 源码位于固定子模块。外层仓库记录 gitlink，不直接收纳第二份 QEMU 源码；嵌套改动提交后要同步 `qemu.lock` 的 fork 身份。Python QMP 工具复用 `tools/dm_mc02_qmp.py` 和 QEMU 自带 client；生产模型复用 QEMU QOM、IRQ、timer、SSI、NOR、USB/CAN 等既有设施，不能平行实现同一 production 行为。
-
-按风险先跑最窄测试和直接消费者门，再运行完整工程门：
-
-```bash
-PYTHON=/usr/bin/python3 python3 tools/dm_mc02_test_gate.py --jobs 4
-```
-
-如果行为、支持状态、证据或限制发生变化，同步更新 `CAPABILITIES.md`。公共 wire 或时间语义变化时更新 `INTERFACES.md`；架构边界变化时更新 `ARCHITECTURE.md`；未完成事项和下一门写入 `PLAN.md`，残余审查问题写入 `REVIEW.md`。测试结果必须对应实际构建产物，不能把 fixture、组件 VMState 或历史报告升级成更高层能力声明。
-
-### Project layer map
-
-| 层 | 主要位置 | 职责 |
-| --- | --- | --- |
-| STM32H723 与 QEMU target | `qemu/upstream/target/arm/`、`qemu/upstream/hw/arm/` | 芯片、CPU、寄存器、时钟、IRQ 与通用外设 |
-| DM-MC02 machine/profile | `qemu/upstream/hw/arm/dm_mc02*` | 外设实例、板级连线、电源与 pin map |
-| 公共模型与接口 | `cosim/`、相关 QEMU 可复用模块 | 协议中立数据模型、存储与 adapter 边界 |
-| 外部后端和工具 | `tools/` | worker、plant adapter、QMP、报告和验收工具 |
-| 隔离与集成证据 | `tests/`、`qemu/upstream/tests/`、`reports/` | 单元/边界/smoke 测试和冻结结果 |
-
 ## Troubleshooting
 
 | 现象 | 优先检查 |
 | --- | --- |
 | `unsupported machine type dm-mc02` | 启动 `build/qemu/qemu-system-arm`，不要使用系统 QEMU |
 | 找不到 `qemu/upstream/configure` | 初始化固定 QEMU 子模块并确认其 gitlink 与 `qemu.lock` 一致 |
-| QEMU 提示 Python venv/ensurepip 不可用 | 安装 `python3-venv`，并将 `PYTHON` 指向 Python 3.11+ |
-| QEMU 提示找不到 Ninja | 安装 `ninja-build`，确认 `ninja` 在 `PATH` 中 |
-| pytest 或项目 Python 环境不可用 | 安装 `uv` 后运行 `uv sync --locked --group dev --python /usr/bin/python3` |
+| QEMU 提示 Python venv/ensurepip 不可用 | Nix 使用本项目 shell；Ubuntu 安装 `python3-venv`，并将 `PYTHON` 指向 Python 3.11+ |
+| QEMU 提示找不到 Ninja | Nix 使用本项目 shell；Ubuntu 安装 `ninja-build` |
+| `fatal error: zlib.h: No such file or directory` 或 zlib 探针失败 | 检查编译器、sysroot 和 pkg-config 是否属于同一环境；Nix 使用完整 shell，Ubuntu 缺开发包时安装 `zlib1g-dev` |
+| 已有 `/usr/include/zlib.h`，但 `cc` 来自 `.nix-profile/bin` | 编译器与 apt 开发库混用；使用完整 `nix develop` 环境，或改用 Ubuntu 系统工具链 |
+| pytest 或项目 Python 环境不可用 | 使用所选环境的 Python 运行 `uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"` |
 | 测试 guest 编译失败 | 检查 `arm-none-eabi-gcc`、`arm-none-eabi-objcopy` 与 `binutils-arm-none-eabi` |
 | 终端没有 UART 文本 | 核对 `-serial` 顺序；槽位 0 是二进制 co-sim |
 | Unix socket 无法连接 | 确认服务端、路径权限和路径长度；每个进程使用独立短路径 |
 | RTF 采样失败 | 核对 ELF 哈希、`xTickCount`、watchdog、Release 构建、启动期限和宿主负载 |
 | ROS 2/MuJoCo smoke 被跳过 | 安装相应可选依赖；ROS 2 还需 source 系统环境 |
 | Flash 镜像没有保存 | 正常退出 QEMU，检查镜像精确尺寸、路径和 stderr |
+
+仅当 Ubuntu/Debian 上缺少 zlib 开发包时，在仓库根目录执行：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y zlib1g-dev
+PYTHON=/usr/bin/python3 QEMU_RECONFIGURE=1 bash tools/build-qemu.sh
+```
+
+若开发包已经安装，先保留现有构建树并收集实际失败命令；不要仅凭头文件报错推断缺包。在仓库根目录执行：
+
+```bash
+dpkg -L zlib1g-dev | grep '/zlib.h$'
+command -v cc
+cc --version
+printf '#include <zlib.h>\n' | /usr/bin/cc -E -x c - >/dev/null
+sed -n '/^\[binaries\]/,$p' build/qemu/config-meson.cross
+ninja -C build/qemu -v -j1 qemu-system-arm > /tmp/dm-mc02-build.log 2>&1
+```
+
+系统 `/usr/bin/cc` 的探针与 QEMU 实际编译器是两个独立观测。保存日志中第一个 `FAILED:` 的完整命令与 include 栈，核对自定义 `CC`、`CFLAGS`、`LDFLAGS`、`PKG_CONFIG_PATH`、sysroot 和缓存 compiler。
+
+当 `cc` 指向 `~/.nix-profile/bin/cc`，而 GLib/zlib 来自 `/usr` 时，说明构建混用了两套依赖。推荐更新源码后使用完整 Nix 环境：
+
+```bash
+nix develop --command bash tools/build-qemu.sh
+```
+
+脚本会重新选择编译器和开发库。运行生成的 QEMU 也使用 `nix develop`。如果选择 Ubuntu 系统工具链，可保留旧目录后重建：
+
+```bash
+mv -T build/qemu "build/qemu.nix-backup-$(date +%Y%m%d-%H%M%S)"
+PATH=/usr/bin:/bin CC=/usr/bin/cc CXX=/usr/bin/c++ \
+  PKG_CONFIG=/usr/bin/pkg-config PYTHON=/usr/bin/python3 \
+  bash tools/build-qemu.sh
+```
+
+更新后的脚本会自动迁移 configure 元数据；也可用 `QEMU_RECONFIGURE=1` 明确请求完整配置。仅执行 `meson setup --reconfigure` 不保证重新选择编译器。确认新构建可用后，再删除自己保留的旧备份。
 
 诊断 QEMU 未实现寄存器或 guest error 时，可创建输出目录后启用日志：
 
@@ -389,8 +436,6 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
   -d unimp,guest_errors -D build/runtime/qemu.log
 ```
 
-先定位首个错误状态，再判断 producer、边界、consumer 和测试预期是否一致；不要用固件特判或上层 fallback 隐藏尚未理解的下层问题。
-
 ## Repository map
 
 | 路径 | 用途 |
@@ -399,12 +444,5 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
 | `cosim/` | 板卡无关的 C 模型、wire protocol 与 transport adapter |
 | `tools/` | 构建、worker、QMP、RTF、源码包和测试 gate |
 | `tests/` | Host C、Python 与协议测试 |
-| `reports/`、`docs/history/` | 冻结验收记录与历史审查，不是当前支持矩阵 |
-
-项目权威文档：
-
-- [`CAPABILITIES.md`](../CAPABILITIES.md)：唯一当前能力与证据矩阵。
-- [`ARCHITECTURE.md`](../ARCHITECTURE.md)：分层、复用和真实性裁决。
-- [`INTERFACES.md`](../INTERFACES.md)：公共协议、时间与错误语义。
-- [`PLAN.md`](../PLAN.md) 与 [`REVIEW.md`](../REVIEW.md)：进度、后续工作和残余风险。
-- [`AGENTS.md`](../AGENTS.md)：项目级修改及验收约束。
+| `flake.nix`、`flake.lock` | Nix 环境与依赖锁定 |
+| `build/` | 本地构建产物、测试报告和运行文件 |

@@ -6,39 +6,47 @@
 
 | 快速入口 | 项目文档 |
 | --- | --- |
-| [用户与开发手册](docs/USER_AND_DEVELOPMENT_GUIDE.md) | [当前能力与证据](CAPABILITIES.md) |
-| [快速构建](#快速开始) | [架构契约](ARCHITECTURE.md) |
-| [测试方法](#验证) | [接口契约](INTERFACES.md) |
-| [开发进度](PLAN.md) | [审查与残余风险](REVIEW.md) |
+| [快速构建](#快速开始) | [详细使用手册](docs/USAGE.md) |
+| [运行固件](#运行固件) | [串口与调试](docs/USAGE.md#serial-qmp-and-gdb) |
+| [验证](#验证) | [故障排查](docs/USAGE.md#troubleshooting) |
 
 > [!IMPORTANT]
-> 这是可构建、可运行并带回归门禁的工程版本，不是完整 STM32H723 数字孪生。支持范围、证据和限制以 [`CAPABILITIES.md`](CAPABILITIES.md) 为准。完整业务 ready、真实机构闭环和整机 snapshot/live migration 尚未验证或支持。
+> 项目面向固件功能验证，采用数字外设模型和虚拟时间。它不提供完整 STM32H723 硅级时序、模拟电气行为或整机 snapshot/live migration。真实机构闭环和完整业务就绪需要针对具体固件与外部后端验证。
 
 ## 快速开始
 
-以下命令适用于 Ubuntu 24.04 x86_64。QEMU 构建的最小系统依赖和完整测试依赖分开列在[手册的环境准备](docs/USER_AND_DEVELOPMENT_GUIDE.md#environment)。单独构建 QEMU 不需要 `uv`。
+推荐在 **Linux x86_64 的 Nix 环境**中构建。仓库的 `flake.lock` 固定编译器、GLib、zlib、Python 和构建/测试工具的来源；无需安装对应的 apt 开发包。先[安装 Nix 并启用 flakes](docs/USAGE.md#nix)，然后运行：
 
 ```bash
 git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
 cd qemu-dm-mc02
 git submodule update --init --depth 1 qemu/upstream
-PYTHON=/usr/bin/python3 bash tools/build-qemu.sh
+nix develop --command bash tools/build-qemu.sh
 ```
 
 构建后，项目专用 QEMU 位于 `build/qemu/qemu-system-arm`。系统自带的 QEMU 不含 `dm-mc02` machine。
 
+进入 `nix develop` 后，编译器和开发库均来自 Nix；运行时也使用同一环境。已有系统构建缓存会自动重新配置。也可按手册的 [Ubuntu 构建方法](docs/USAGE.md#ubuntu)使用系统依赖。只构建 QEMU 无需运行 `uv sync`。
+
 ## 验证
 
-机器列表检查不需要业务固件。smoke 和完整门禁需要手册[环境准备](docs/USER_AND_DEVELOPMENT_GUIDE.md#environment)中列出的测试工具链与 `uv` 环境。
+先进入 Nix 环境。机器列表和最小 guest smoke 不需要业务固件：
 
 ```bash
+nix develop
 build/qemu/qemu-system-arm -machine help
 bash tools/run-mc02-smoke.sh
-uv sync --locked --group dev --python /usr/bin/python3
+```
+
+完整门禁需要外部固件 ELF：
+
+```bash
+uv sync --locked --group dev --extra mujoco --python "$PYTHON"
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
 python3 tools/dm_mc02_test_gate.py --jobs 4
 ```
 
-统一门禁覆盖 QEMU/Meson 测试、Host CTest、pytest 和 shell smoke，并生成带日志与二进制身份的报告。完整说明见[手册中的测试与性能章节](docs/USER_AND_DEVELOPMENT_GUIDE.md#testing-and-performance)。
+门禁覆盖 QEMU/Meson 测试、Host CTest、pytest 和 shell smoke，并在本地生成日志与报告。完整说明见[测试与性能](docs/USAGE.md#testing-and-performance)。
 
 ## 运行固件
 
@@ -51,7 +59,7 @@ build/qemu/qemu-system-arm -machine dm-mc02 \
   -serial none -monitor stdio
 ```
 
-串口映射、Flash 镜像、GDB/QMP 调试和外部 worker 的配置见[用户与开发手册](docs/USER_AND_DEVELOPMENT_GUIDE.md)。
+在前面进入的 Nix shell 中执行上述命令。串口映射、Flash 镜像、GDB/QMP 调试和外部 worker 的配置见[使用手册](docs/USAGE.md)。
 
 ## 项目结构
 
@@ -61,12 +69,11 @@ build/qemu/qemu-system-arm -machine dm-mc02 \
 | `cosim/` | 板卡无关的协议、数据模型与 transport adapter |
 | `tools/` | 构建、QMP、worker、性能采样、源码包和统一测试门禁 |
 | `tests/` | Host、Python 与协议测试 |
-| `reports/`、`docs/history/` | 冻结验收证据和历史审查记录 |
+| `flake.nix`、`flake.lock` | 固定的 Nix 构建与测试环境 |
+| `docs/USAGE.md` | 环境、运行、验证和故障排查 |
 
-依赖方向为 `STM32H723 → DM-MC02 → 器件/驱动 → 外部 plant → 工具`。项目不依赖 Renode；设计约束和当前未完成工作分别见 [`ARCHITECTURE.md`](ARCHITECTURE.md) 与 [`PLAN.md`](PLAN.md)。
+项目基于固定 QEMU v8.2.2 fork，不依赖 Renode。QEMU 源码由子模块提供，GitHub 的源码 ZIP 不包含该子模块，请使用 Git clone。
 
-## 开发与许可
-
-修改前请阅读工作区和项目级 [`AGENTS.md`](AGENTS.md)，并按层推进：先验证器件或芯片边界，再接入直接消费者，最后运行相关工程门。完整工作流见[开发手册](docs/USER_AND_DEVELOPMENT_GUIDE.md#development-workflow)。
+## 许可
 
 QEMU 许可证和源码声明见 [QEMU fork 的 COPYING 文件](https://github.com/lym12321/qemu-dm-mc02/blob/dm-mc02/v8.2.2/COPYING)。第三方代码保留其各自版权和许可证；本项目不重新许可这些依赖，也不包含外部固件授权。
