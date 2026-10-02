@@ -32,7 +32,9 @@ uint64_t dm_stm32h7_cpu_clock_hz(uint64_t sysclk_hz, uint32_t d1cfgr)
 
 uint64_t dm_stm32h7_hclk_hz(uint64_t sysclk_hz, uint32_t d1cfgr)
 {
-    return sysclk_hz / dm_stm32h7_d1_hpre_divider(d1cfgr);
+    /* ST CMSIS SystemCoreClockUpdate(): D1CPRE precedes HPRE for AXI/AHB. */
+    return dm_stm32h7_cpu_clock_hz(sysclk_hz, d1cfgr) /
+           dm_stm32h7_d1_hpre_divider(d1cfgr);
 }
 
 static uint64_t dm_stm32h7_d2_apb_divider(uint32_t d2cfgr,

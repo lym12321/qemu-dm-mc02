@@ -2878,11 +2878,11 @@ static void test_common_clock_hpre_modes(void)
             QTestState *qts = qtest_init(
                 "-machine dm-mc02,adc-accurate-timing=on");
             uint32_t ckmode = (uint32_t)mode + 1u;
-            uint64_t clock_hz = 64000000u / hpre_dividers[i];
+            uint64_t clock_hz = 64000000u / 8u / hpre_dividers[i];
             int64_t period_ns;
 
-            /* D1CPRE=/8 affects only the CPU.  Synchronous CKMODE=01/10/11
-             * must use HCLK=64 MHz / HPRE / {1,2,4}, rather than CPU. */
+            /* ST CMSIS SystemCoreClockUpdate(): HCLK follows D1CPRE then
+             * HPRE. RM0468 ADC_CCR.CKMODE selects HCLK / {1,2,4}. */
             clock_hz /= ckmode_dividers[mode];
             period_ns = (18 * INT64_C(1000000000) + clock_hz - 1) /
                         clock_hz;

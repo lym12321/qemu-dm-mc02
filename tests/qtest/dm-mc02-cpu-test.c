@@ -38,6 +38,7 @@
 #define RCC_RSR_PINRSTF       (1u << 22)
 #define RCC_RSR_PORRSTF       (1u << 23)
 #define RCC_RSR_SFTRSTF       (1u << 24)
+#define RCC_BASE              0x58024400ull
 #define TEST_EXTERNAL_IRQ     28
 #define TEST_EXTI_IRQ         40
 
@@ -181,6 +182,41 @@ static void test_external_irq_and_systick_virtual_time(void)
     g_assert_cmphex(qtest_readl(qts, NVIC_ISER0), ==, 0);
     g_assert_cmphex(qtest_readl(qts, NVIC_ISPR0), ==, 0);
 
+    qtest_quit(qts);
+}
+
+static void test_d1_clock_chain(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "usart16-kernel-clock-hz"), ==, 64000000);
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "usart234578-kernel-clock-hz"), ==, 64000000);
+    /* ST CMSIS SystemCoreClockUpdate and LL_RCC_CALC_PCLK{1,2}_FREQ:
+     * HSE 24 MHz / 2 * 40 = SYSCLK 480 MHz; D1CPRE /8, HPRE /2
+     * give CPU 60 MHz, HCLK 30 MHz, PCLK1 15 MHz, PCLK2 7.5 MHz. */
+    qtest_writel(qts, RCC_BASE + 0x28, 2u | (2u << 4));
+    qtest_writel(qts, RCC_BASE + 0x30, 39u);
+    qtest_writel(qts, RCC_BASE + 0x2c, 1u << 16); /* PLL1 DIVP enable. */
+    qtest_writel(qts, RCC_BASE, 1u | (1u << 16) | (1u << 24));
+    qtest_writel(qts, RCC_BASE + 0x10, 3u);
+    qtest_writel(qts, RCC_BASE + 0x18, (0xau << 8) | 8u);
+    qtest_writel(qts, RCC_BASE + 0x1c, (4u << 4) | (5u << 8));
+    qtest_writel(qts, RCC_BASE + 0x54, 0); /* USART selects PCLK. */
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "usart16-kernel-clock-hz"), ==, 7500000);
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "usart234578-kernel-clock-hz"), ==, 15000000);
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "apb1-timer-clock-hz"), ==, 30000000);
+    g_assert_cmpuint(qom_get_uint(qts, "/machine",
+                        "apb2-timer-clock-hz"), ==, 15000000);
+    qtest_writel(qts, SYST_RVR, 59);
+    qtest_writel(qts, SYST_CVR, 0);
+    qtest_writel(qts, SYST_CSR, SYST_CSR_ENABLE | SYST_CSR_CLKSOURCE);
+    qtest_clock_step(qts, 1000);
+    g_assert_true(qtest_readl(qts, SYST_CSR) & SYST_CSR_COUNTFLAG);
     qtest_quit(qts);
 }
 
@@ -328,6 +364,7 @@ int main(int argc, char **argv)
                     test_armv7m_children_and_irq_width);
     g_test_add_func("/dm-mc02/armv7m/external-irq-and-systick-time",
                     test_external_irq_and_systick_virtual_time);
+    g_test_add_func("/dm-mc02/armv7m/d1-clock-chain", test_d1_clock_chain);
     g_test_add_func("/dm-mc02/armv7m/gpio-exti-reaches-native-nvic",
                     test_gpio_exti_reaches_native_nvic);
     g_test_add_func("/dm-mc02/armv7m/sysresetreq-software-reset-reason",
