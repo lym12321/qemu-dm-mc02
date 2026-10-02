@@ -2345,18 +2345,15 @@ static uint64_t dm_mc02_adc_prescaler(uint32_t ccr)
 static void dm_mc02_adc_common_clock_changed(void *opaque, uint32_t ccr)
 {
     DmMc02MachineState *s = opaque;
-    uint64_t kernel_hz;
     uint64_t clock_hz;
     unsigned ckmode = (ccr >> DM_MC02_ADC_COMMON_CCR_CKMODE_SHIFT) & 3u;
 
-    kernel_hz = dm_mc02_pwr_rcc_adc_kernel_clock_hz(&s->pwr_rcc);
-    if (!kernel_hz) {
-        clock_hz = 0;
-    } else if (ckmode == 0) {
-        clock_hz = kernel_hz / dm_mc02_adc_prescaler(ccr);
+    if (ckmode == 0) {
+        clock_hz = dm_mc02_pwr_rcc_adc_kernel_clock_hz(&s->pwr_rcc) /
+                   dm_mc02_adc_prescaler(ccr);
     } else {
-        /* Synchronous ADC clock modes derive from HCLK.  HCLK has its own
-         * HPRE divider; it must not be inferred from the CPU-only D1CPRE. */
+        /* ST LL_ADC_CLOCK_SYNC_PCLK_DIV{1,2,4}: the synchronous source
+         * is AHB (SYSCLK / D1CPRE / HPRE), independent of ADCSEL. */
         clock_hz = dm_mc02_pwr_rcc_hclk_hz(&s->pwr_rcc);
         if (ckmode == 2) {
             clock_hz /= 2;

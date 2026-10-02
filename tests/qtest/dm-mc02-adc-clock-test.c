@@ -309,6 +309,9 @@ static void test_common_clock_hpre_modes(void)
                         clock_hz;
             qtest_writel(qts, RCC_D1CFGR,
                          (0xau << 8) | hpre_cases[i]);
+            /* The asynchronous ADCSEL path is unavailable. ST LL ADC
+             * synchronous modes still select the valid AHB clock. */
+            qtest_writel(qts, RCC_D3CCIPR, 3u << RCC_D3CCIPR_ADCSEL_SHIFT);
             assert_one_conversion_at(qts,
                                      ckmode << ADC_CCR_CKMODE_SHIFT,
                                      period_ns);
