@@ -40,5 +40,6 @@ if [[ ! -f "$build_dir/build.ninja" || ! -f "$build_dir/.dm-toolchain" ||
     printf '%s\n' "$toolchain_identity" > "$build_dir/.dm-toolchain"
 fi
 
+qemu_normalize_meson_defaults "$build_dir/config-meson.cross"
 ninja -C "$build_dir" qemu-system-arm
 printf 'Generic ARM QEMU build ready: %s\n' "$build_dir/qemu-system-arm"

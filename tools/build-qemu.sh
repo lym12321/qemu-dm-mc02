@@ -101,6 +101,7 @@ if [[ ! -x "$build_dir/pyvenv/bin/meson" || ! -f "$meson_identity" ||
       "$(<"$meson_identity")" != "$("$build_dir/pyvenv/bin/meson" --version)" ]]; then
     configure_qemu
 fi
+qemu_normalize_meson_defaults "$build_dir/config-meson.cross"
 # Existing build directories may have been created by an older version of
 # this script with different Meson options.  Reconfigure only when the
 # requested options differ or the caller explicitly asks for it; ordinary

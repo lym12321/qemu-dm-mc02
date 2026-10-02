@@ -13,6 +13,16 @@ else
     export PYTHON=${PYTHON:-/usr/bin/python3}
 fi
 
+qemu_normalize_meson_defaults() {
+    # QEMU 8.2 configure writes werror=true for Git sources even with
+    # --disable-werror. Meson 1.2 can reapply that native-file default on
+    # regeneration, so keep it consistent with both project build profiles.
+    local native_file=$1
+    if [[ -f "$native_file" ]]; then
+        sed -i 's/^werror = true$/werror = false/' "$native_file"
+    fi
+}
+
 qemu_toolchain_identity() {
     local name
     for name in PATH CC CXX PKG_CONFIG PYTHON CFLAGS CXXFLAGS OBJCFLAGS LDFLAGS \
