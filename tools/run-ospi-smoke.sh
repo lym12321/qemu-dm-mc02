@@ -10,18 +10,9 @@ command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is requi
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-ospi.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/ospi.elf"
 flash_file="$run_dir/ospi.flash"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
@@ -37,19 +28,13 @@ with open(sys.argv[1], "wb") as stream:
     stream.write(image)
 PY
 
-"$qemu_bin" -machine "dm-mc02,ospi2-flash-file=$flash_file" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 --expect-qemu-quit \
+    --socket qmp \
+    --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine "dm-mc02,ospi2-flash-file=$flash_file" \
     -kernel "$guest_elf" -nodefaults \
     -display none -monitor none -serial none \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 300); do
-    [[ -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" ]] || { sed -n '1,80p' "$run_dir/qemu.stderr" >&2; exit 1; }
-
-python3 - "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import sys
@@ -108,8 +93,6 @@ else:
 command("quit")
 sock.close()
 PY
-wait "$qemu_pid"
-qemu_pid=''
 python3 - "$flash_file" <<'PY'
 import os
 import sys

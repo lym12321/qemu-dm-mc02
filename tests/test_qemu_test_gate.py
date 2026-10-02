@@ -190,9 +190,13 @@ def test_repository_smoke_inventory_has_one_stable_non_wrapper_set() -> None:
         path.name for path in gate.discover_smoke_scripts(PROJECT_ROOT / "tools")
     ]
 
-    assert len(smoke_scripts) == 94
+    assert smoke_scripts
     assert smoke_scripts == sorted(set(smoke_scripts))
     assert all("renode" not in name.lower() for name in smoke_scripts)
+    # New register/timing coverage belongs in libqtest. Do not freeze the
+    # number of integration scripts as a measure of hardware correctness.
+    assert "run-cold-reset-smoke.sh" not in smoke_scripts
+    assert "run-iwdg-smoke.sh" not in smoke_scripts
 
 
 def test_public_status_and_sha_helpers_are_deterministic(tmp_path: Path) -> None:

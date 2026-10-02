@@ -17,36 +17,14 @@ if [[ ! -x "$elf" || "$root_dir/smoke/dm_mc02_bmi088_fifo_smoke.c" -nt "$elf" ||
         -o "$elf" "$root_dir/smoke/dm_mc02_bmi088_fifo_smoke.c"
 fi
 
-run_dir=$(mktemp -d "/tmp/dm-qemu.bmi088-fifo-smoke.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
-cosim_socket="$run_dir/cosim.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -f -- "$qmp_socket" "$cosim_socket" "$run_dir/qemu.stderr"
-    rmdir -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine "$machine" -kernel "$elf" -nodefaults -display none \
-    -monitor none -S -chardev "socket,id=cosim,path=$cosim_socket,server=on,wait=off" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 --expect-qemu-quit \
+    --socket cosim --socket qmp \
+    --wait-socket qmp --wait-socket cosim \
+    --python-arg "{qmp}" --python-arg "{cosim}" -- \
+    "$qemu_bin" -machine "$machine" -kernel "$elf" -nodefaults -display none \
+    -monitor none -S -chardev "socket,id=cosim,path={cosim},server=on,wait=off" \
     -serial chardev:cosim \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 100); do
-    [[ -S "$qmp_socket" && -S "$cosim_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" && -S "$cosim_socket" ]] || {
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit 1
-}
-
-python3 - "$qmp_socket" "$cosim_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import socket
@@ -178,17 +156,3 @@ qmp_command("quit")
 qmp.close()
 cosim.close()
 PY
-
-exit_status=0
-for _ in $(seq 1 200); do
-    if ! kill -0 "$qemu_pid" 2>/dev/null; then
-        wait "$qemu_pid" || exit_status=$?
-        break
-    fi
-    sleep 0.01
-done
-if kill -0 "$qemu_pid" 2>/dev/null; then
-    printf '%s\n' 'QEMU did not exit cleanly after QMP quit' >&2
-    exit 1
-fi
-exit "$exit_status"

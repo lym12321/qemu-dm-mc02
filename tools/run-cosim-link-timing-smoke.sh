@@ -11,18 +11,8 @@ command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is requi
 [[ -x "$qemu_bin" ]] || { printf 'blocked: existing QEMU binary not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/dm-mc02-cosim-timing.XXXXXX")
-chardev_socket="$run_dir/cosim.sock"
-qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/timing.elf"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
@@ -30,15 +20,14 @@ arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -Wl,-T,"$root_dir/smoke/dm_mc02_cosim_link_readback_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_cosim_timing_smoke.c"
 
-"$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket chardev --socket qmp \
+    --python-arg "{chardev}" --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
     -display none -monitor none -S \
-    -chardev "socket,id=cosim,path=$chardev_socket,server=on,wait=off" \
+    -chardev "socket,id=cosim,path={chardev},server=on,wait=off" \
     -serial chardev:cosim \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-timeout 20s python3 - "$chardev_socket" "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import socket

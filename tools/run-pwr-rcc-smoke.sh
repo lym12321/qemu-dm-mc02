@@ -8,35 +8,15 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 elf="$root_dir/build/smoke/dm_mc02_pwr_rcc_smoke.elf"
 
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 1; }
-command -v timeout >/dev/null 2>&1 || { printf '%s\n' 'blocked: timeout is required' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 [[ -x "$elf" ]] || "$script_dir/build-pwr-rcc-smoke.sh" >/dev/null
 
-run_dir=$(mktemp -d "${TMPDIR:-/tmp}/dm-mc02-pwr-rcc.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -f -- "$qmp_socket" "$run_dir/qemu.stderr"
-    rmdir -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine dm-mc02 -kernel "$elf" -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 10 \
+    --socket qmp \
+    --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$elf" -nodefaults \
     -display none -monitor none -serial none \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 100); do
-    [[ -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" ]] || { sed -n '1,80p' "$run_dir/qemu.stderr" >&2; exit 1; }
-
-timeout 10s python3 - "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import sys

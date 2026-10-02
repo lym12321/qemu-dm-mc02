@@ -771,9 +771,4 @@ if(BUILD_TESTING)
              COMMAND dm_mc02_dma_fifo_dbm_endpoint_smoke)
     set_tests_properties(dm_mc02_dma_fifo_dbm_endpoint_smoke PROPERTIES
                          TIMEOUT 5)
-    add_test(NAME dm_mc02_qemu_smoke_suite
-             COMMAND bash
-                     "${CMAKE_CURRENT_SOURCE_DIR}/tools/run-qemu-smoke-suite.sh")
-    set_tests_properties(dm_mc02_qemu_smoke_suite
-                         PROPERTIES TIMEOUT 900 LABELS gate-external)
 endif()

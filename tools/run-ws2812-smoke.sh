@@ -6,22 +6,20 @@ export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 command -v arm-none-eabi-gcc >/dev/null || { echo 'blocked: arm-none-eabi-gcc is required' >&2; exit 1; }
 command -v python3 >/dev/null || { echo 'blocked: python3 is required' >&2; exit 1; }
-command -v timeout >/dev/null || { echo 'blocked: timeout is required' >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { echo "blocked: QEMU not found: $qemu_bin" >&2; exit 1; }
 run_dir=$(mktemp -d "${TMPDIR:-/tmp}/dm-mc02-ws2812.XXXXXX")
-trap '[[ -n ${qemu_pid:-} ]] && kill "$qemu_pid" 2>/dev/null || true; rm -rf -- "$run_dir"' EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -mfloat-abi=soft -ffreestanding -fno-builtin \
   -fno-stack-protector -nostdlib -Wl,--build-id=none \
   -Wl,-T,"$root_dir/smoke/dm_mc02_ws2812_smoke.ld" \
   -o "$run_dir/ws2812.elf" "$root_dir/smoke/dm_mc02_ws2812_smoke.c"
-qemu_bin="$qemu_bin" run_dir="$run_dir" "$qemu_bin" -machine dm-mc02 -kernel "$run_dir/ws2812.elf" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 8 --expect-qemu-quit \
+  --socket cosim --socket qmp \
+  --python-arg "{cosim}" --python-arg "{qmp}" -- \
+  "$qemu_bin" -machine dm-mc02 -kernel "$run_dir/ws2812.elf" \
   -nodefaults -display none -monitor none \
-  -chardev "socket,id=cosim,path=$run_dir/cosim.sock,server=on,wait=off" -serial chardev:cosim \
-  -qmp "unix:$run_dir/qmp.sock,server=on,wait=off" >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 200); do [[ -S "$run_dir/cosim.sock" && -S "$run_dir/qmp.sock" ]] && break; sleep .01; done
-[[ -S "$run_dir/cosim.sock" ]] || { sed -n '1,80p' "$run_dir/qemu.stderr" >&2; exit 1; }
-timeout 8s python3 - "$run_dir/cosim.sock" "$run_dir/qmp.sock" <<'PY'
+  -chardev "socket,id=cosim,path={cosim},server=on,wait=off" -serial chardev:cosim \
+  -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import socket, struct, sys
 c, q = sys.argv[1:]
@@ -47,5 +45,4 @@ if updated!=(0xe70591,0xe7,0,0,0): raise RuntimeError('updated WS2812 frame: %r'
 print('WS2812 update: rgb=%06x brightness=%d'%updated[:2])
 z=QmpSession(q, timeout=2); z.command("quit"); z.close()
 PY
-for _ in $(seq 1 100); do if ! kill -0 "$qemu_pid" 2>/dev/null; then wait "$qemu_pid"; echo 'RESULT: WS2812 telemetry smoke passed'; exit 0; fi; sleep .01; done
-echo 'QEMU did not exit after QMP quit' >&2; exit 1
+echo 'RESULT: WS2812 telemetry smoke passed'

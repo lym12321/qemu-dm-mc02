@@ -20,18 +20,8 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.stm32h723-usb-host-bulk.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/usb-host-bulk.elf"
-serial_socket="$run_dir/usb-serial.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
@@ -51,24 +41,15 @@ arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     "$root_dir/firmware/dm_stm32h7_usb_host_bulk.c" \
     -lgcc
 
-"$qemu_bin" -S -machine stm32h723-usb-host -kernel "$guest_elf" \
-    -chardev "socket,id=serial,path=$serial_socket,server=on,wait=off" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket serial --socket qmp \
+    --wait-socket qmp --wait-socket serial \
+    --python-arg "{qmp}" --python-arg "{serial}" -- \
+    "$qemu_bin" -S -machine stm32h723-usb-host -kernel "$guest_elf" \
+    -chardev "socket,id=serial,path={serial},server=on,wait=off" \
     -device usb-serial,bus=usb-bus.0,port=1,chardev=serial,always-plugged=on \
     -nodefaults -display none -monitor none -serial none \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 300); do
-    [[ -S "$qmp_socket" && -S "$serial_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" && -S "$serial_socket" ]] || {
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit 1
-}
-
-python3 - "$qmp_socket" "$serial_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import socket

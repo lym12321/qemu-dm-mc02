@@ -20,41 +20,21 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-rs485.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
-uart_socket="$run_dir/uart2.sock"
 guest_elf="$run_dir/rs485.elf"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
     -Wl,--build-id=none -Wl,-T,"$root_dir/smoke/dm_mc02_rs485_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_rs485_smoke.c"
 
-"$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket uart --socket qmp \
+    --python-arg "{uart}" --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
     -display none -monitor none -S -serial none -serial none \
-    -chardev "socket,id=uart2,path=$uart_socket,server=on,wait=off" \
-    -serial chardev:uart2 -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 300); do
-    [[ -S "$uart_socket" && -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$uart_socket" && -S "$qmp_socket" ]] || {
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    printf '%s\n' 'RESULT: blocked (QEMU chardev/QMP socket missing)' >&2
-    exit 1
-}
-
-python3 - "$uart_socket" "$qmp_socket" <<'PY'
+    -chardev "socket,id=uart2,path={uart},server=on,wait=off" \
+    -serial chardev:uart2 -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import socket

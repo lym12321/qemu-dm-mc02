@@ -235,22 +235,13 @@ def _property_value(test: dict[str, Any], name: str) -> Any:
     return None
 
 
-def _has_label(test: dict[str, Any], label: str) -> bool:
-    value = _property_value(test, "LABELS")
-    if isinstance(value, str):
-        return label in value.split(";")
-    if isinstance(value, list):
-        return label in value
-    return False
-
-
 def _select_host_tests(document: Any) -> list[dict[str, Any]]:
     if not isinstance(document, dict) or not isinstance(document.get("tests"), list):
         raise RuntimeError("CTest introspection is missing the tests list")
     selected = [
         test
         for test in document["tests"]
-        if isinstance(test, dict) and not _has_label(test, "gate-external")
+        if isinstance(test, dict)
     ]
     if not selected:
         raise RuntimeError("native Host CTest selection is empty")
@@ -458,8 +449,6 @@ def _run_host_tests(root: Path, jobs: int, report: Path) -> CollectionResult:
         "ctest",
         "--test-dir",
         str(root / "build" / "host"),
-        "-LE",
-        "gate-external",
         "--no-tests=error",
         "--output-on-failure",
         "--output-junit",

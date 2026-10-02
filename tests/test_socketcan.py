@@ -22,6 +22,24 @@ class SocketCanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             function(*args, **kwargs)
 
+    def test_classic_extended_rtr_and_fd_codec_round_trips(self):
+        frames = [
+            mod.CanFrame(0x123, data=b"12345678", timestamp_ns=17),
+            mod.CanFrame(0x1ABCDE, mod.WIRE_EXTENDED | mod.WIRE_RTR,
+                         dlc=4, data=b"ABCD"),
+            mod.CanFrame(0x456, mod.WIRE_FD | mod.WIRE_BRS,
+                         data=bytes(range(64)), timestamp_ns=99),
+        ]
+        for frame in frames:
+            with self.subTest(frame=frame):
+                self.assertEqual(
+                    mod.unpack_wire_frame(mod.pack_wire_frame(frame)), frame)
+                # SocketCAN does not carry the co-simulation timestamp.
+                can_frame = mod.CanFrame(frame.can_id, frame.flags, frame.dlc,
+                                         frame.data)
+                self.assertEqual(
+                    mod.unpack_can_frame(mod.pack_can_frame(frame)), can_frame)
+
     def test_frame_and_wire_validation(self):
         self.assertValueError(mod.CanFrame, 0x800)
         self.assertValueError(

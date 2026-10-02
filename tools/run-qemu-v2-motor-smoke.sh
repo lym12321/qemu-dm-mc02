@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 
 [[ -x "$qemu_bin" ]] || {
@@ -10,36 +11,13 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
     exit 77
 }
 
-run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-motor.XXXXXX")
-cosim_socket="$run_dir/cosim.sock"
-qemu_pid=''
-cleanup() {
-    local status=$?
-    if (( status != 0 )) && [[ -f "$run_dir/qemu.stderr" ]]; then
-        sed -n '1,120p' "$run_dir/qemu.stderr" >&2
-    fi
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-    return "$status"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine dm-mc02,cosim-motor-loopback=on \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket cosim \
+    --python-arg "{cosim}" -- \
+    "$qemu_bin" -machine dm-mc02,cosim-motor-loopback=on \
     -nodefaults -display none -monitor none -S \
-    -chardev "socket,id=cosim,path=$cosim_socket,server=on,wait=off" \
-    -serial chardev:cosim >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 300); do
-    [[ -S "$cosim_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$cosim_socket" ]] || exit 1
-
-python3 - "$cosim_socket" <<'PY'
+    -chardev "socket,id=cosim,path={cosim},server=on,wait=off" \
+    -serial chardev:cosim <<'PY'
 import math
 import socket
 import struct

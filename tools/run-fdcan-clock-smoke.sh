@@ -20,18 +20,9 @@ command -v python3 >/dev/null 2>&1 || {
 }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-fdcan-clock.XXXXXX")
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 for source in 0 1 2 3; do
-    qmp_socket="$run_dir/qmp-$source.sock"
     guest_elf="$run_dir/fdcan-clock-$source.elf"
     arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
         -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
@@ -39,21 +30,11 @@ for source in 0 1 2 3; do
         -D FDCAN_SOURCE="$source" -o "$guest_elf" \
         "$root_dir/smoke/dm_mc02_fdcan_clock_smoke.c"
 
-    "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
+    python3 "$script_dir/dm_mc02_test_harness.py" --expect-qemu-quit \
+        --socket qmp --python-arg "{qmp}" --python-arg "$source" -- \
+        "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
         -display none -monitor none -serial none -S \
-        -qmp "unix:$qmp_socket,server=on,wait=off" \
-        >/dev/null 2>"$run_dir/qemu-$source.stderr" &
-    qemu_pid=$!
-    for _ in $(seq 1 300); do
-        [[ -S "$qmp_socket" ]] && break
-        sleep 0.01
-    done
-    [[ -S "$qmp_socket" ]] || {
-        sed -n '1,80p' "$run_dir/qemu-$source.stderr" >&2
-        exit 1
-    }
-
-    python3 - "$qmp_socket" "$source" <<'PY'
+        -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import sys
 
@@ -83,8 +64,6 @@ print("FDCAN source %d: %d Hz" % (source, clock))
 command("quit")
 sock.close()
 PY
-    wait "$qemu_pid" || true
-    qemu_pid=''
 done
 
 printf '%s\n' 'RESULT: FDCAN RCC kernel-clock source smoke passed'

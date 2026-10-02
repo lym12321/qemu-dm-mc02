@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
+export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 
 command -v python3 >/dev/null 2>&1 || {
@@ -14,39 +15,17 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-uart-rx-timing.XXXXXX")
-qtest_socket="$run_dir/qtest.sock"
-uart_socket="$run_dir/uart1.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine dm-mc02 -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket qtest --socket uart \
+    --wait-socket qtest \
+    --python-arg "{qtest}" --python-arg "{uart}" -- \
+    "$qemu_bin" -machine dm-mc02 -nodefaults \
     -display none -monitor none \
     -accel qtest \
-    -qtest "unix:$qtest_socket,server=on,wait=on" \
+    -qtest "unix:{qtest},server=on,wait=on" \
     -serial none \
-    -chardev "socket,id=uart1,path=$uart_socket,server=on,wait=off" \
-    -serial chardev:uart1 \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 300); do
-    [[ -S "$qtest_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qtest_socket" ]] || {
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit 1
-}
-
-python3 - "$qtest_socket" "$uart_socket" <<'PY'
+    -chardev "socket,id=uart1,path={uart},server=on,wait=off" \
+    -serial chardev:uart1 <<'PY'
 import select
 import socket
 import sys

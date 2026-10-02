@@ -5,6 +5,12 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
+if (( $# == 0 )); then
+    for mode in on off; do
+        bash "${BASH_SOURCE[0]}" "$mode"
+    done
+    exit 0
+fi
 spi_dma_endpoint=${1:-on}
 case "$spi_dma_endpoint" in
     on|off) ;;
@@ -18,37 +24,22 @@ command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is requi
 [[ -x "$qemu_bin" ]] || { printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2; exit 1; }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-spi2-dma.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/spi2-dma.elf"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
     -Wl,--build-id=none -Wl,-T,"$root_dir/smoke/dm_mc02_spi2_dma_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_spi2_dma_smoke.c"
 
-"$qemu_bin" -machine "dm-mc02,spi-dma-endpoint=$spi_dma_endpoint" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket qmp \
+    --python-arg "{qmp}" --python-arg "$spi_dma_endpoint" -- \
+    "$qemu_bin" -machine "dm-mc02,spi-dma-endpoint=$spi_dma_endpoint" \
     -kernel "$guest_elf" -nodefaults \
     -display none -monitor none -serial none \
     -d guest_errors -D /tmp/dm-mc02-spi2-dma.log \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 300); do
-    [[ -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" ]] || { sed -n '1,80p' "$run_dir/qemu.stderr" >&2; exit 1; }
-
-python3 - "$qmp_socket" "$spi_dma_endpoint" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re
 import sys

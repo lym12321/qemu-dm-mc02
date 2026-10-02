@@ -16,23 +16,8 @@ command -v arm-none-eabi-gcc >/dev/null 2>&1 || {
 }
 
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-v2-reset.XXXXXX")
-cosim_socket="$run_dir/cosim.sock"
-qmp_socket="$run_dir/qmp.sock"
 guest_elf="$run_dir/reset.elf"
-qemu_pid=''
-cleanup() {
-    local status=$?
-    if (( status != 0 )) && [[ -f "$run_dir/qemu.stderr" ]]; then
-        sed -n '1,120p' "$run_dir/qemu.stderr" >&2
-    fi
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-    return "$status"
-}
-trap cleanup EXIT
+trap 'rm -rf -- "$run_dir"' EXIT
 
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -fno-stack-protector -nostdlib -nostartfiles -Wl,--gc-sections \
@@ -40,23 +25,15 @@ arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin \
     -Wl,-T,"$root_dir/smoke/dm_mc02_cosim_link_readback_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_cosim_link_readback_smoke.c"
 
-"$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket qmp --socket cosim \
+    --wait-socket cosim --wait-socket qmp \
+    --python-arg "{cosim}" --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults \
     -display none -monitor none \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    -chardev "socket,id=cosim,path=$cosim_socket,server=on,wait=off" \
-    -serial chardev:cosim >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 300); do
-    [[ -S "$cosim_socket" && -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$cosim_socket" && -S "$qmp_socket" ]] || {
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit 1
-}
-
-python3 - "$cosim_socket" "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" \
+    -chardev "socket,id=cosim,path={cosim},server=on,wait=off" \
+    -serial chardev:cosim <<'PY'
 from dm_mc02_qmp import QmpSession
 import socket
 import struct

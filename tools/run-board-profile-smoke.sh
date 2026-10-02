@@ -15,37 +15,12 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-board-profile.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -f -- "$qmp_socket"
-    rm -f -- "$run_dir/qemu.stderr"
-    rmdir -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine dm-mc02,board-profile=STM32H723-EVAL \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket qmp \
+    --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02,board-profile=STM32H723-EVAL \
     -nodefaults -display none -monitor none -serial none -S \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 50); do
-    [[ -S "$qmp_socket" ]] && break
-    sleep 0.02
-done
-if [[ ! -S "$qmp_socket" ]]; then
-    printf '%s\n' 'RESULT: alternate board profile QMP socket was not created' >&2
-    sed -n '1,40p' "$run_dir/qemu.stderr" >&2
-    exit 1
-fi
-
-python3 - "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import sys
 

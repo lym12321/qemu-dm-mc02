@@ -14,48 +14,20 @@ command -v python3 >/dev/null 2>&1 || {
     printf '%s\n' 'blocked: python3 is required' >&2
     exit 1
 }
-command -v timeout >/dev/null 2>&1 || {
-    printf '%s\n' 'blocked: timeout is required' >&2
-    exit 1
-}
 [[ -x "$qemu_bin" ]] || {
     printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2
     exit 77
 }
 [[ -x "$elf" ]] || "$script_dir/build-bmi088-smoke.sh" >/dev/null
 
-run_dir=$(mktemp -d "${TMPDIR:-/tmp}/dm-mc02-cosim-link.XXXXXX")
-chardev_socket="$run_dir/cosim.sock"
-qmp_socket="$run_dir/qmp.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" -machine dm-mc02 -kernel "$elf" -nodefaults \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 10 --expect-qemu-quit \
+    --socket chardev --socket qmp \
+    --python-arg "{chardev}" --python-arg "{qmp}" --python-arg "{qemu_pid}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$elf" -nodefaults \
     -display none -monitor none \
-    -chardev "socket,id=cosim,path=$chardev_socket,server=on,wait=off" \
+    -chardev "socket,id=cosim,path={chardev},server=on,wait=off" \
     -serial chardev:cosim \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 200); do
-    [[ -S "$chardev_socket" && -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-if [[ ! -S "$chardev_socket" || ! -S "$qmp_socket" ]]; then
-    printf '%s\n' 'QEMU did not create the native chardev/QMP sockets' >&2
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit 1
-fi
-
-timeout 10s python3 - "$chardev_socket" "$qmp_socket" "$qemu_pid" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import os
 import socket
@@ -188,21 +160,4 @@ qmp.close()
 qmp.close()
 PY
 
-exit_status=0
-for _ in $(seq 1 100); do
-    if ! kill -0 "$qemu_pid" 2>/dev/null; then
-        wait "$qemu_pid" || exit_status=$?
-        break
-    fi
-    sleep 0.01
-done
-if kill -0 "$qemu_pid" 2>/dev/null; then
-    printf '%s\n' 'QEMU did not exit cleanly after QMP quit' >&2
-    exit 1
-fi
-if ((exit_status != 0)); then
-    printf 'QEMU exit status: %d\n' "$exit_status" >&2
-    sed -n '1,80p' "$run_dir/qemu.stderr" >&2
-    exit "$exit_status"
-fi
 printf '%s\n' 'RESULT: QEMU-native co-sim link smoke passed'

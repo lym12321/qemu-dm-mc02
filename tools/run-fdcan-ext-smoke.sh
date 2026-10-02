@@ -9,22 +9,21 @@ command -v arm-none-eabi-gcc >/dev/null
 command -v python3 >/dev/null
 [[ -x "$qemu_bin" ]]
 run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-fdcan-ext.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"; can_socket="$run_dir/can.sock"; guest_elf="$run_dir/ext.elf"
-qemu_pid=''
-cleanup() { [[ -n "$qemu_pid" ]] && kill "$qemu_pid" 2>/dev/null || true; wait "$qemu_pid" 2>/dev/null || true; rm -rf -- "$run_dir"; }
-trap cleanup EXIT
+guest_elf="$run_dir/ext.elf"
+trap 'rm -rf -- "$run_dir"' EXIT
+
 arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -ffreestanding -fno-builtin -fno-stack-protector \
   -nostdlib -nostartfiles -Wl,--gc-sections -Wl,--build-id=none \
   -Wl,-T,"$root_dir/smoke/dm_mc02_fdcan_ext_smoke.ld" -o "$guest_elf" \
   "$root_dir/smoke/dm_mc02_fdcan_ext_smoke.c"
-"$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults -display none -monitor none \
+
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket can --socket qmp \
+    --python-arg "{can}" --python-arg "{qmp}" -- \
+    "$qemu_bin" -machine dm-mc02 -kernel "$guest_elf" -nodefaults -display none -monitor none \
   -serial none -serial none -serial none -serial none -serial none -serial none -serial none \
-  -chardev "socket,id=can,path=$can_socket,server=on,wait=off" -serial chardev:can \
-  -qmp "unix:$qmp_socket,server=on,wait=off" >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-for _ in $(seq 1 300); do [[ -S "$can_socket" && -S "$qmp_socket" ]] && break; sleep 0.01; done
-[[ -S "$can_socket" && -S "$qmp_socket" ]]
-python3 - "$can_socket" "$qmp_socket" <<'PY'
+  -chardev "socket,id=can,path={can},server=on,wait=off" -serial chardev:can \
+  -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re, socket, struct, sys, time
 can_path, qmp_path = sys.argv[1:]

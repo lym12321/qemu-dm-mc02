@@ -14,32 +14,13 @@ command -v python3 >/dev/null 2>&1 || {
     exit 77
 }
 
-run_dir=$(mktemp -d "/tmp/dm-qemu.dm-mc02-bmi088-drift.XXXXXX")
-qmp_socket="$run_dir/qmp.sock"
-qemu_pid=''
-cleanup() {
-    if [[ -n "$qemu_pid" ]] && kill -0 "$qemu_pid" 2>/dev/null; then
-        kill "$qemu_pid" 2>/dev/null || true
-        wait "$qemu_pid" 2>/dev/null || true
-    fi
-    rm -rf -- "$run_dir"
-}
-trap cleanup EXIT
-
-"$qemu_bin" \
+python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
+    --socket qmp \
+    --python-arg "{qmp}" -- \
+    "$qemu_bin" \
     -machine 'dm-mc02,imu-temperature-c=35,imu-temp-coeff-gyro-dps-per-c=0.1:-0.2:0.3,imu-temp-coeff-accel-g-per-c=0.01:0.02:-0.03,imu-bias-random-walk-gyro-dps-per-sqrt-s=0.4:0.5:0.6,imu-bias-random-walk-accel-g-per-sqrt-s=0.007:0.008:0.009' \
     -nodefaults -display none -monitor none -serial none -S \
-    -qmp "unix:$qmp_socket,server=on,wait=off" \
-    >/dev/null 2>"$run_dir/qemu.stderr" &
-qemu_pid=$!
-
-for _ in $(seq 1 300); do
-    [[ -S "$qmp_socket" ]] && break
-    sleep 0.01
-done
-[[ -S "$qmp_socket" ]] || { sed -n '1,80p' "$run_dir/qemu.stderr" >&2; exit 1; }
-
-python3 - "$qmp_socket" <<'PY'
+    -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
 import sys
 
