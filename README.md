@@ -46,7 +46,7 @@ export DM_MC02_ELF=/absolute/path/to/trobot.elf
 python3 tools/dm_mc02_test_gate.py --jobs 4
 ```
 
-门禁覆盖 QEMU/Meson 测试、Host CTest、pytest 和 shell smoke，并在本地生成日志与报告。完整说明见[测试与性能](docs/USAGE.md#testing-and-performance)。
+门禁执行回归验证并在本地生成日志与报告。硬件语义以 ST 资料及实板观测为依据，测试通过不代表完整芯片准确性。完整说明见[测试与性能](docs/USAGE.md#testing-and-performance)。
 
 ## 运行固件
 

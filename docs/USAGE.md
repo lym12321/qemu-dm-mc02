@@ -161,13 +161,12 @@ QEMU 默认构建为 Release、`arm-softmmu` 和 DM-MC02 设备 profile。调试
 
 ## First validation
 
-不需要外部业务固件即可检查 machine 注册。后面三个 guest smoke 还需要完整测试依赖中的 ARM 工具链：
+不需要外部业务固件即可检查 machine 注册。下面的 guest integration 还需要 ARM 工具链：
 
 ```bash
 build/qemu/qemu-system-arm -machine help
 bash tools/run-mc02-smoke.sh
 bash tools/run-ospi-smoke.sh
-bash tools/run-flash-smoke.sh
 ```
 
 smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后先重新构建。`tools/run-qemu.sh --smoke` 只探测通用空 machine，不会启动业务固件。
@@ -216,6 +215,8 @@ target remote localhost:1234
 空路径禁用磁盘 I/O。指定路径但文件不存在时保留 `0xff` 擦除态。初始化后路径不可修改；正常 QEMU shutdown 才保存完整镜像，崩溃或 `kill -9` 不保证保存，也没有掉电原子性。
 
 内部 Flash 镜像先加载，之后 `-kernel` 仍会装载 ELF 段，因此 ELF 覆盖范围内的持久化字节可能被改写。请将需保留的数据放在 ELF 段以外。零填充文件不是擦除态镜像。
+
+内部 Flash 编程支持 H723 HAL 使用的 256-bit Flash word：启用 `PG` 后，从 32 字节对齐地址连续写入八个 32-bit word，收齐并校验后提交。部分写入不会改变持久化内容；非连续、跨 word、其它写宽、force-write、未擦除 word 的重复编程和 0→1 编程会报错。`SR1` 只读，使用 `CCR1` 清除已建模 flags。编程完成同步执行；ECC、真实编程延迟、完整 `QW/WBNE/FW` 行为和掉电恢复未实现。由于没有 ECC 记录，已写入全 `0xff` 的 word 无法与擦除态区分。
 
 外部 NOR 使用项目独立的 `dm-w25q64` 器件。命令同步完成，quad 使用字节级映射；保护、真实忙时序及器件迁移未支持。
 
@@ -295,6 +296,14 @@ MuJoCo 示例只验证 adapter 和测试模型，不代表已完成 Release 固�
 
 ## Testing and performance
 
+日常修改优先运行受影响的原生测试，例如内部 Flash：
+
+```bash
+tools/meson test -C build/qemu --print-errorlogs qtest-arm/dm-mc02-memory-test
+```
+
+该命令复用已有 qtest，不需要业务固件。修改模型后先构建 QEMU；完整回归用于发布和涉及多个入口的变更。
+
 ### Canonical test gate
 
 完整门禁中的 MuJoCo Python 行为测试需要安装 `mujoco` extra；仅同步 `dev` 时，该测试会跳过并使完整门禁返回 BLOCKED。基础 QEMU 构建和最小 guest smoke 不需要此 extra：
@@ -305,11 +314,13 @@ export DM_MC02_ELF=/absolute/path/to/trobot.elf
 python3 tools/dm_mc02_test_gate.py --jobs 4
 ```
 
-统一门禁执行 QEMU/Meson 测试、原生 Host CTest、完整 pytest 和 shell smoke。它会创建 `build/test-results/qemu-gate/<run>/summary.json`，并保存各阶段日志、退出码、动态测试分母及测试前后的关键二进制 SHA-256。可通过 `--report-dir /absolute/path` 指定报告根目录。
+统一门禁执行 QEMU/Meson 测试、原生 Host CTest、完整 pytest 和 shell integration。它会创建 `build/test-results/qemu-gate/<run>/summary.json`，并保存各阶段日志、退出码、动态测试分母及测试前后的关键二进制 SHA-256。可通过 `--report-dir /absolute/path` 指定报告根目录。
+
+这是回归门，不是硅级验证。寄存器、IRQ、时钟和虚拟时间用例优先使用 QEMU 原生 libqtest；外部进程测试共享 QEMU 启动、socket、超时和清理逻辑。关键硬件断言注明 ST CMSIS/HAL/LL 或 RM0468 来源；实板观测仍需独立核对。
 
 | 退出码 | 含义 |
 | ---: | --- |
-| 0 | PASS |
+| 0 | 回归 PASS |
 | 1 | FAIL |
 | 2 | 参数错误 |
 | 78 | BLOCKED（依赖或环境不足） |
