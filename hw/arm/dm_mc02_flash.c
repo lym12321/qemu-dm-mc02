@@ -8,6 +8,7 @@
  */
 #include "qemu/osdep.h"
 #include "hw/arm/dm_mc02_flash.h"
+#include "qemu/log.h"
 
 #define FLASH_ACR             0x00
 #define FLASH_KEYR1           0x04
@@ -44,6 +45,7 @@
 #define FLASH_CR_PG           (1u << 1)
 #define FLASH_OPTCR_OPTLOCK   (1u << 0)
 #define FLASH_CR_SER          (1u << 2)
+#define FLASH_CR_FW           (1u << 6)
 #define FLASH_CR_START        (1u << 7)
 #define FLASH_CR_SNB_SHIFT    8
 #define FLASH_CR_SNB_MASK     (0x7u << FLASH_CR_SNB_SHIFT)
@@ -72,6 +74,25 @@ static void dm_mc02_flash_store(uint8_t *regs, hwaddr offset, uint32_t value,
     }
 }
 
+static void dm_mc02_flash_clear_program(DmMc02Flash *s)
+{
+    s->program_address = 0;
+    s->program_count = 0;
+    memset(s->program_data, 0xff, sizeof(s->program_data));
+}
+
+static void dm_mc02_flash_reject_program(DmMc02Flash *s, const char *reason)
+{
+    uint32_t sr = dm_mc02_flash_load(s->regs, FLASH_SR1, sizeof(sr));
+
+    /* The modeled programming subset uses PGSERR for rejected sequences;
+     * it does not claim silicon error classification for unsupported FW,
+     * bus widths, ECC or programming an already programmed flash word. */
+    qemu_log_mask(LOG_GUEST_ERROR, "dm-mc02 Flash: %s\n", reason);
+    dm_mc02_flash_clear_program(s);
+    dm_mc02_flash_store(s->regs, FLASH_SR1, sr | FLASH_SR_PGSERR, sizeof(sr));
+}
+
 static uint64_t dm_mc02_flash_program_read(void *opaque, hwaddr offset,
                                            unsigned size)
 {
@@ -92,28 +113,51 @@ static void dm_mc02_flash_program_write(void *opaque, hwaddr offset,
                                         uint64_t value, unsigned size)
 {
     DmMc02Flash *s = opaque;
-    bool invalid = false;
+    uint32_t sr = dm_mc02_flash_load(s->regs, FLASH_SR1, sizeof(sr));
 
-    if (size > sizeof(value) || offset > s->storage_size ||
-        size > s->storage_size - offset) {
+    if (sr & FLASH_SR_PGSERR) {
         return;
     }
-    for (unsigned i = 0; i < size; ++i) {
-        uint8_t requested = (uint8_t)(value >> (i * 8));
-        uint8_t old = s->storage[offset + i];
-
-        if ((requested & (uint8_t)~old) != 0) {
-            invalid = true;
+    /* ST stm32h7xx_hal_flash.c HAL_FLASH_Program(), H72x/3x branch:
+     * one 256-bit-aligned flash word, eight consecutive 32-bit stores.
+     * Other write-buffer/force-write sequences are deliberately rejected. */
+    if (size != sizeof(uint32_t) || (offset & 3) ||
+        offset > s->storage_size || size > s->storage_size - offset) {
+        dm_mc02_flash_reject_program(s, "unsupported or unaligned bus write");
+        return;
+    }
+    if (!s->program_count) {
+        if ((offset & (DM_MC02_FLASH_WORD_SIZE - 1)) ||
+            DM_MC02_FLASH_WORD_SIZE > s->storage_size - offset) {
+            dm_mc02_flash_reject_program(s, "flash word is not 256-bit aligned");
+            return;
         }
-        s->storage[offset + i] = old & requested;
+        s->program_address = offset;
+    } else if (offset != s->program_address + s->program_count) {
+        dm_mc02_flash_reject_program(s, "nonconsecutive or crossing flash word");
+        return;
     }
-    if (invalid) {
-        uint32_t sr = dm_mc02_flash_load(s->regs, FLASH_SR1,
-                                          sizeof(uint32_t));
+    stl_le_p(s->program_data + s->program_count, value);
+    s->program_count += sizeof(uint32_t);
+    if (s->program_count != DM_MC02_FLASH_WORD_SIZE) {
+        return;
+    }
 
-        dm_mc02_flash_store(s->regs, FLASH_SR1, sr | FLASH_SR_PGSERR,
-                            sizeof(uint32_t));
+    /* Admit erased words only. This also rejects every 0->1 request before
+     * changing NVM. No ECC is modeled, so repeated programming is rejected
+     * rather than pretending that additional 1->0 writes are supported.
+     * Without ECC metadata, an earlier all-0xff program is indistinguishable
+     * from an erased word. */
+    for (unsigned i = 0; i < DM_MC02_FLASH_WORD_SIZE; ++i) {
+        if (s->storage[s->program_address + i] != 0xff) {
+            dm_mc02_flash_reject_program(s, "programming would require erase");
+            return;
+        }
     }
+    memcpy(s->storage + s->program_address, s->program_data,
+           DM_MC02_FLASH_WORD_SIZE);
+    dm_mc02_flash_clear_program(s);
+    dm_mc02_flash_store(s->regs, FLASH_SR1, sr | FLASH_SR_EOP, sizeof(sr));
 }
 
 static const MemoryRegionOps dm_mc02_flash_program_ops = {
@@ -122,6 +166,10 @@ static const MemoryRegionOps dm_mc02_flash_program_ops = {
     .endianness = DEVICE_LITTLE_ENDIAN,
     .valid.min_access_size = 1,
     .valid.max_access_size = 8,
+    .valid.unaligned = true,
+    .impl.min_access_size = 1,
+    .impl.max_access_size = 8,
+    .impl.unaligned = true,
 };
 
 static void dm_mc02_flash_erase_sector(DmMc02Flash *s, uint32_t cr)
@@ -160,6 +208,22 @@ static void dm_mc02_flash_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
+    /* The modeled control path uses the HAL's aligned 32-bit accesses.
+     * Smaller writes must not bypass LOCK or runtime overlay projection. */
+    const hwaddr command_registers[] = {
+        FLASH_KEYR1, FLASH_OPTKEYR, FLASH_CR1, FLASH_CCR1,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(command_registers); ++i) {
+        hwaddr reg = command_registers[i];
+
+        if (offset < reg + sizeof(uint32_t) && offset + size > reg &&
+            (offset != reg || size != sizeof(uint32_t))) {
+            qemu_log_mask(LOG_UNIMP,
+                          "dm-mc02 Flash: unsupported partial command write\n");
+            return;
+        }
+    }
+
     if (size == sizeof(uint32_t) && offset == FLASH_KEYR1) {
         if (value32 == FLASH_KEY1) {
             s->key1_seen = true;
@@ -192,12 +256,18 @@ static void dm_mc02_flash_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
 
-    if (size == sizeof(uint32_t) && offset == FLASH_SR1) {
-        /* Status flags are cleared by writing one; there are no synthetic
-         * error/busy flags in this boot model. */
+    if (offset >= FLASH_SR1 && offset < FLASH_SR1 + sizeof(uint32_t)) {
+        /* SR1 is read-only. ST HAL __HAL_FLASH_CLEAR_FLAG_BANK1 writes
+         * FLASH_CCR1, not FLASH_SR1. */
+        return;
+    }
+
+    if (size == sizeof(uint32_t) && offset == FLASH_CCR1) {
         uint32_t old = dm_mc02_flash_load(s->regs, FLASH_SR1,
                                           sizeof(uint32_t));
-        dm_mc02_flash_store(s->regs, FLASH_SR1, old & ~value32,
+        dm_mc02_flash_store(s->regs, FLASH_SR1,
+                            old & ~(value32 & (FLASH_SR_EOP |
+                                              FLASH_SR_PGSERR)),
                             sizeof(uint32_t));
         return;
     }
@@ -207,9 +277,18 @@ static void dm_mc02_flash_write(void *opaque, hwaddr offset, uint64_t value,
                                           sizeof(uint32_t));
         uint32_t next = value32;
 
-        /* LOCK is sticky until the documented key sequence. */
+        /* A locked control register cannot enable programming or erase. */
         if (old & FLASH_CR_LOCK) {
-            next |= FLASH_CR_LOCK;
+            return;
+        }
+        if ((next & FLASH_CR_FW) ||
+            ((next & FLASH_CR_PG) && (next & FLASH_CR_SER))) {
+            dm_mc02_flash_reject_program(s, "unsupported FW or PG+SER sequence");
+            return;
+        }
+        if (s->program_count &&
+            ((next & FLASH_CR_LOCK) || !(next & FLASH_CR_PG))) {
+            dm_mc02_flash_reject_program(s, "incomplete flash word discarded");
         }
         dm_mc02_flash_store(s->regs, FLASH_CR1, next, sizeof(uint32_t));
         dm_mc02_flash_sync_runtime(s);
@@ -247,6 +326,7 @@ void dm_mc02_flash_init(DmMc02Flash *state, Object *owner,
     state->storage = storage;
     state->storage_size = storage_size;
     state->storage_region = storage_region;
+    dm_mc02_flash_clear_program(state);
 
     /* Reset values relevant to HAL_FLASH_Unlock/Lock and option handling. */
     dm_mc02_flash_store(state->regs, FLASH_CR1, FLASH_CR_LOCK,
@@ -300,6 +380,7 @@ void dm_mc02_flash_reset(DmMc02Flash *state)
     memset(state->regs, 0, sizeof(state->regs));
     state->key1_seen = false;
     state->optkey_seen = false;
+    dm_mc02_flash_clear_program(state);
     dm_mc02_flash_store(state->regs, FLASH_CR1, FLASH_CR_LOCK,
                         sizeof(uint32_t));
     dm_mc02_flash_store(state->regs, FLASH_OPTCR, FLASH_OPTCR_OPTLOCK,

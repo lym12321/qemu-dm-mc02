@@ -60,16 +60,21 @@ static void save_state(const DmMc02Flash *state)
     qemu_fclose(file);
 }
 
-static int load_state(DmMc02Flash *state)
+static int load_state_version(DmMc02Flash *state, int version)
 {
     QEMUFile *file = open_test_file(false);
-    int ret = vmstate_load_state(file, dm_mc02_flash_vmstate(), state, 1);
+    int ret = vmstate_load_state(file, dm_mc02_flash_vmstate(), state, version);
 
     if (!ret) {
         g_assert_cmpint(qemu_file_get_error(file), ==, 0);
     }
     qemu_fclose(file);
     return ret;
+}
+
+static int load_state(DmMc02Flash *state)
+{
+    return load_state_version(state, 2);
 }
 
 static void init_target(DmMc02Flash *state, uint8_t *storage,
@@ -162,6 +167,83 @@ static void test_rejects_truncated_state_without_rebuilding_overlay(void)
     g_assert_cmpuint(sync_count, ==, 0);
 }
 
+static void test_pending_word_round_trip_and_admission(void)
+{
+    DmMc02Flash source;
+    DmMc02Flash restored;
+    MemoryRegion storage_region;
+    uint8_t storage[0x1000];
+
+    init_target(&source, storage, &storage_region);
+    stl_le_p(source.regs + FLASH_CR1_OFFSET, FLASH_CR_PG);
+    source.program_address = 0x100;
+    source.program_count = 4;
+    memset(source.program_data, 0xff, sizeof(source.program_data));
+    stl_le_p(source.program_data, 0x12345678);
+    save_state(&source);
+
+    init_target(&restored, storage, &storage_region);
+    sync_count = 0;
+    g_assert_cmpint(load_state(&restored), ==, 0);
+    g_assert_cmpuint(restored.program_address, ==, source.program_address);
+    g_assert_cmpuint(restored.program_count, ==, source.program_count);
+    g_assert_cmpmem(restored.program_data, sizeof(restored.program_data),
+                    source.program_data, sizeof(source.program_data));
+    g_assert_cmpuint(sync_count, ==, 1);
+
+    /* Destination geometry must be checked before rebuilding the overlay. */
+    init_target(&restored, storage, &storage_region);
+    restored.storage_size = 0x110;
+    sync_count = 0;
+    g_assert_cmpint(load_state(&restored), ==, -EINVAL);
+    g_assert_cmpuint(sync_count, ==, 0);
+
+    /* Neither a complete word nor a non-32-bit pending count is saveable. */
+    source.program_count = 2;
+    QEMUFile *file = open_test_file(true);
+    g_assert_cmpint(vmstate_save_state(file, dm_mc02_flash_vmstate(),
+                                       &source, NULL), ==, -EINVAL);
+    qemu_fclose(file);
+
+    source.program_count = 4;
+    stl_le_p(source.regs + 0x10, 1u << 18); /* SR1.PGSERR forbids pending. */
+    file = open_test_file(true);
+    g_assert_cmpint(vmstate_save_state(file, dm_mc02_flash_vmstate(),
+                                       &source, NULL), ==, -EINVAL);
+    qemu_fclose(file);
+}
+
+static void test_v1_normalizes_missing_pending_buffer(void)
+{
+    DmMc02Flash source;
+    DmMc02Flash restored;
+    MemoryRegion storage_region;
+    uint8_t storage[0x1000];
+    QEMUFile *file = open_test_file(true);
+
+    memset(&source, 0, sizeof(source));
+    stl_le_p(source.regs + FLASH_CR1_OFFSET, FLASH_CR_PG);
+    /* v1's exact wire layout: register bytes, key1_seen, optkey_seen. */
+    qemu_put_buffer(file, source.regs, sizeof(source.regs));
+    qemu_put_byte(file, 0);
+    qemu_put_byte(file, 0);
+    qemu_put_byte(file, QEMU_VM_EOF);
+    qemu_fclose(file);
+
+    init_target(&restored, storage, &storage_region);
+    restored.program_address = 0x100;
+    restored.program_count = 4;
+    memset(restored.program_data, 0, sizeof(restored.program_data));
+    sync_count = 0;
+    g_assert_cmpint(load_state_version(&restored, 1), ==, 0);
+    g_assert_cmpuint(restored.program_address, ==, 0);
+    g_assert_cmpuint(restored.program_count, ==, 0);
+    for (unsigned i = 0; i < sizeof(restored.program_data); ++i) {
+        g_assert_cmphex(restored.program_data[i], ==, 0xff);
+    }
+    g_assert_cmpuint(sync_count, ==, 1);
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf("%s/dm-flash-vmstate.XXXXXX",
@@ -178,6 +260,10 @@ int main(int argc, char **argv)
                     test_locked_state_disables_program_overlay);
     g_test_add_func("/dm-flash-vmstate/reject-truncated",
                     test_rejects_truncated_state_without_rebuilding_overlay);
+    g_test_add_func("/dm-flash-vmstate/pending-word",
+                    test_pending_word_round_trip_and_admission);
+    g_test_add_func("/dm-flash-vmstate/v1-empty-buffer",
+                    test_v1_normalizes_missing_pending_buffer);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

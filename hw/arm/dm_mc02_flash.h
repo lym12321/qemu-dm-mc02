@@ -1,11 +1,9 @@
 /*
  * Minimal STM32H723 FLASH_R peripheral model for the DM-MC02 machine.
  *
- * The memory itself is provided by the machine's ROM region at 0x08000000.
- * The mapped program region is backed by RAM so firmware self-programming and
- * bootloader tests can run without a second device model.  Register writes
- * implement the common unlock/sector-erase path; timing and ECC remain
- * intentionally out of scope.
+ * NVM bytes belong to the SoC's RAM-backed, read-only execution region. This
+ * controller borrows it for unlock, sector erase and HAL-style 256-bit word
+ * programming; timing, force-write and ECC remain out of scope.
  */
 #ifndef HW_ARM_DM_MC02_FLASH_H
 #define HW_ARM_DM_MC02_FLASH_H
@@ -16,6 +14,7 @@
 #include <stdint.h>
 
 #define DM_MC02_FLASH_REG_REGION_SIZE 0x400
+#define DM_MC02_FLASH_WORD_SIZE 32
 
 typedef struct DmMc02Flash {
     MemoryRegion iomem;
@@ -26,10 +25,17 @@ typedef struct DmMc02Flash {
     size_t storage_size;
     MemoryRegion *storage_region;
     /* Enabled only while FLASH_CR1.PG is active.  Normal instruction/data
-     * reads stay on the RAM-backed region; this overlay makes programming
-     * writes obey NOR 1->0 semantics without slowing the hot path. */
+     * reads stay on the RAM-backed region; the overlay buffers program
+     * writes until one complete flash word can be committed. */
     MemoryRegion program_window;
     bool program_enabled;
+    /* HAL_FLASH_Program() writes an aligned H723 flash word as eight
+     * consecutive 32-bit stores.  These bytes are not committed NVM until
+     * the whole word is present.  Unlike runtime wiring, this pending
+     * producer state belongs in component VMState. */
+    uint32_t program_address;
+    uint8_t program_count;
+    uint8_t program_data[DM_MC02_FLASH_WORD_SIZE];
 } DmMc02Flash;
 
 void dm_mc02_flash_init(DmMc02Flash *state, Object *owner,
