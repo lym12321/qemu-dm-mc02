@@ -21,21 +21,6 @@
 #include <math.h>
 
 #define DM_MC02_OUTER_SIZE       4u
-#define DM_MC02_V2_VERSION        DM_MC02_V2_WIRE_VERSION
-#define DM_MC02_V2_HEADER_SIZE    DM_MC02_V2_WIRE_HEADER_SIZE
-#define DM_MC02_V2_MAX_PAYLOAD    DM_MC02_V2_WIRE_MAX_PAYLOAD
-#define DM_MC02_V2_IMU_PAYLOAD_SIZE 60u
-#define DM_MC02_V2_PAYLOAD_HEADER_SIZE 4u
-#define DM_MC02_V2_SECTION_HEADER_SIZE 8u
-#define DM_MC02_V2_SECTION_IMU_SAMPLE 1u
-#define DM_MC02_V2_SECTION_MOTOR_COMMAND 2u
-#define DM_MC02_V2_SECTION_ADC_INPUT 3u
-#define DM_MC02_V2_SECTION_ADC_VOLTAGE 4u
-#define DM_MC02_V2_SECTION_MOTOR_STATE 5u
-#define DM_MC02_V2_STEP_DONE 6u
-#define DM_MC02_V2_TELEMETRY 7u
-#define DM_MC02_V2_MOTOR_STATE 8u
-#define DM_MC02_V2_SECTION_PAYLOAD_MARKER UINT16_C(0x5343)
 #define DM_MC02_IMU_PAYLOAD_SIZE 24u
 #define DM_MC02_TLM_PAYLOAD_SIZE 12u
 #define DM_MC02_COSIM_TX_RETRY_NS UINT64_C(1000000)
@@ -53,16 +38,9 @@ enum {
     DM_MC02_FRAME_ADC_PIN_VOLTAGE = DM_MC02_WIRE_FRAME_ADC_VOLTAGE,
 };
 
-enum {
-    DM_MC02_V2_RESET = 1,
-    DM_MC02_V2_STEP = 2,
-    DM_MC02_V2_STEP_ACK = 3,
-    DM_MC02_V2_DIAGNOSTICS = 4,
-    DM_MC02_V2_RESET_ACK = 5,
-};
-
 #define DM_MC02_COSIM_MAX_FRAME_BODY \
-    (DM_MC02_V2_HEADER_SIZE + 4u + DM_MC02_V2_MAX_PAYLOAD)
+    (DM_MC02_V2_WIRE_HEADER_SIZE + DM_MC02_V2_WIRE_BODY_PREFIX_SIZE + \
+     DM_MC02_V2_WIRE_MAX_PAYLOAD)
 
 static uint16_t get16le(const uint8_t *p)
 {
@@ -214,7 +192,7 @@ static bool validate_frame(DmMc02CosimLink *link, uint16_t type,
         /* A chardev session chooses its protocol on the first RESET.  Do not
          * let a legacy RESET downgrade an active v2 session: the peer would
          * then continue sending v2 frames that the validator silently drops. */
-        if (link->rx_protocol_version == DM_MC02_V2_VERSION) {
+        if (link->rx_protocol_version == DM_MC02_V2_WIRE_VERSION) {
             return false;
         }
         /* RESET starts a new RX session and establishes its ordering baseline. */
@@ -226,7 +204,7 @@ static bool validate_frame(DmMc02CosimLink *link, uint16_t type,
         link->rx_last_virtual_time_ns = virtual_time_ns;
         return true;
     }
-    if (link->rx_protocol_version == DM_MC02_V2_VERSION) {
+    if (link->rx_protocol_version == DM_MC02_V2_WIRE_VERSION) {
         return false;
     }
     if (link->rx_initialized &&
@@ -495,7 +473,7 @@ static void send_v2_reset_ack(DmMc02CosimLink *link, uint64_t step_id,
         link->tx_dropped++;
         return;
     }
-    send_v2_frame(link, DM_MC02_V2_RESET_ACK, step_id, t_sim_ns, 0, 0,
+    send_v2_frame(link, DM_MC02_V2_WIRE_RESET_ACK, step_id, t_sim_ns, 0, 0,
                   payload, sizeof(payload));
 }
 
@@ -515,7 +493,7 @@ static void send_v2_step_ack(DmMc02CosimLink *link, uint64_t step_id,
         link->tx_dropped++;
         return;
     }
-    send_v2_frame(link, DM_MC02_V2_STEP_ACK, step_id, t_sim_ns, dt_ns, 0,
+    send_v2_frame(link, DM_MC02_V2_WIRE_STEP_ACK, step_id, t_sim_ns, dt_ns, 0,
                   payload, sizeof(payload));
 }
 
@@ -536,7 +514,7 @@ static void send_v2_diagnostics(DmMc02CosimLink *link, uint64_t step_id,
         link->tx_dropped++;
         return;
     }
-    send_v2_frame(link, DM_MC02_V2_DIAGNOSTICS, step_id, t_sim_ns, 0, 0,
+    send_v2_frame(link, DM_MC02_V2_WIRE_DIAGNOSTICS, step_id, t_sim_ns, 0, 0,
                   payload, sizeof(payload));
 }
 
@@ -560,7 +538,7 @@ static bool send_v2_step_done(DmMc02CosimLink *link,
         link->tx_dropped++;
         return false;
     }
-    return send_v2_frame(link, DM_MC02_V2_STEP_DONE, token->step_id,
+    return send_v2_frame(link, DM_MC02_V2_WIRE_STEP_DONE, token->step_id,
                          token->t_sim_ns, token->dt_ns, 0,
                          payload, sizeof(payload));
 }
@@ -611,7 +589,7 @@ static void cosim_retry_step_done(DmMc02CosimLink *link)
 
 static bool v2_imu_payload_valid(const uint8_t *payload, size_t payload_len)
 {
-    if (payload_len != DM_MC02_V2_IMU_PAYLOAD_SIZE) {
+    if (payload_len != DM_MC02_V2_WIRE_IMU_PAYLOAD_SIZE) {
         return false;
     }
     for (unsigned i = 0; i < 12; ++i) {
@@ -709,7 +687,7 @@ static bool v2_step_payload_valid(const uint8_t *payload, size_t payload_len)
                                              &section_count, &marker)) {
         return false;
     }
-    offset = DM_MC02_V2_PAYLOAD_HEADER_SIZE;
+    offset = DM_MC02_V2_WIRE_PAYLOAD_HEADER_SIZE;
     for (unsigned i = 0; i < section_count; ++i) {
         DmMc02V2WireSection section;
 
@@ -718,14 +696,14 @@ static bool v2_step_payload_valid(const uint8_t *payload, size_t payload_len)
             return false;
         }
         switch (section.type) {
-        case DM_MC02_V2_SECTION_IMU_SAMPLE:
+        case DM_MC02_V2_WIRE_SECTION_IMU_SAMPLE:
             if (has_imu || !v2_imu_payload_valid(section.payload,
                                                  section.payload_len)) {
                 return false;
             }
             has_imu = true;
             break;
-        case DM_MC02_V2_SECTION_ADC_INPUT:
+        case DM_MC02_V2_WIRE_SECTION_ADC_INPUT:
         {
             DmMc02V2AdcInputPayload value;
 
@@ -738,7 +716,7 @@ static bool v2_step_payload_valid(const uint8_t *payload, size_t payload_len)
             has_adc = true;
             break;
         }
-        case DM_MC02_V2_SECTION_ADC_VOLTAGE:
+        case DM_MC02_V2_WIRE_SECTION_ADC_VOLTAGE:
         {
             DmMc02V2AdcVoltagePayload value;
 
@@ -751,14 +729,14 @@ static bool v2_step_payload_valid(const uint8_t *payload, size_t payload_len)
             has_adc = true;
             break;
         }
-        case DM_MC02_V2_SECTION_MOTOR_COMMAND:
+        case DM_MC02_V2_WIRE_SECTION_MOTOR_COMMAND:
             if (has_motor || !v2_motor_command_payload_valid(
                                   section.payload, section.payload_len)) {
                 return false;
             }
             has_motor = true;
             break;
-        case DM_MC02_V2_SECTION_MOTOR_STATE:
+        case DM_MC02_V2_WIRE_SECTION_MOTOR_STATE:
             /* State is an endpoint response, never a STEP input. */
             return false;
         default:
@@ -774,7 +752,7 @@ static bool v2_step_payload_valid(const uint8_t *payload, size_t payload_len)
 static bool v2_step_payload_has_motor(const uint8_t *payload,
                                       size_t payload_len)
 {
-    size_t offset = DM_MC02_V2_PAYLOAD_HEADER_SIZE;
+    size_t offset = DM_MC02_V2_WIRE_PAYLOAD_HEADER_SIZE;
     uint16_t section_count;
     uint16_t marker;
 
@@ -790,8 +768,8 @@ static bool v2_step_payload_has_motor(const uint8_t *payload,
                                           &section)) {
             return false;
         }
-        if (section.type == DM_MC02_V2_SECTION_MOTOR_COMMAND ||
-            section.type == DM_MC02_V2_SECTION_MOTOR_STATE) {
+        if (section.type == DM_MC02_V2_WIRE_SECTION_MOTOR_COMMAND ||
+            section.type == DM_MC02_V2_WIRE_SECTION_MOTOR_STATE) {
             return true;
         }
     }
@@ -882,7 +860,7 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
             return false;
         }
     }
-    offset = DM_MC02_V2_PAYLOAD_HEADER_SIZE;
+    offset = DM_MC02_V2_WIRE_PAYLOAD_HEADER_SIZE;
     for (unsigned i = 0; i < section_count; ++i) {
         DmMc02V2WireSection section;
 
@@ -891,17 +869,17 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
             return false;
         }
 
-        if (section.type == DM_MC02_V2_SECTION_ADC_INPUT ||
-            section.type == DM_MC02_V2_SECTION_ADC_VOLTAGE) {
+        if (section.type == DM_MC02_V2_WIRE_SECTION_ADC_INPUT ||
+            section.type == DM_MC02_V2_WIRE_SECTION_ADC_VOLTAGE) {
             adc_sections++;
-        } else if (section.type == DM_MC02_V2_SECTION_IMU_SAMPLE) {
+        } else if (section.type == DM_MC02_V2_WIRE_SECTION_IMU_SAMPLE) {
             imu_section = true;
-        } else if (section.type == DM_MC02_V2_SECTION_MOTOR_COMMAND) {
+        } else if (section.type == DM_MC02_V2_WIRE_SECTION_MOTOR_COMMAND) {
             motor_command_payload = section.payload;
             motor_command_len = section.payload_len;
         }
     }
-    offset = DM_MC02_V2_PAYLOAD_HEADER_SIZE;
+    offset = DM_MC02_V2_WIRE_PAYLOAD_HEADER_SIZE;
     if (!link->imu_time_base_valid) {
         imu_schedule_session(link, t_sim_ns);
     }
@@ -966,7 +944,7 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
             link->v2_retry_motor_state_valid = true;
         }
     }
-    offset = DM_MC02_V2_PAYLOAD_HEADER_SIZE;
+    offset = DM_MC02_V2_WIRE_PAYLOAD_HEADER_SIZE;
     for (unsigned i = 0; i < section_count; ++i) {
         DmMc02V2WireSection section;
 
@@ -974,7 +952,7 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
                                           &section)) {
             return false;
         }
-        if (section.type == DM_MC02_V2_SECTION_IMU_SAMPLE) {
+        if (section.type == DM_MC02_V2_WIRE_SECTION_IMU_SAMPLE) {
             if (link->imu_handler &&
                 !imu_dispatch(link, section.payload,
                               get32le(section.payload + 56),
@@ -982,7 +960,7 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
                               step_id, dt_ns)) {
                 accepted = false;
             }
-        } else if (section.type == DM_MC02_V2_SECTION_ADC_INPUT) {
+        } else if (section.type == DM_MC02_V2_WIRE_SECTION_ADC_INPUT) {
             DmMc02V2AdcInputPayload value;
             DmMc02CosimAdcSample sample;
 
@@ -1024,7 +1002,7 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
                               MIN(imu_due, sample.due_qemu_ns));
                 }
             }
-        } else if (section.type == DM_MC02_V2_SECTION_ADC_VOLTAGE) {
+        } else if (section.type == DM_MC02_V2_WIRE_SECTION_ADC_VOLTAGE) {
             DmMc02V2AdcVoltagePayload value;
             DmMc02CosimAdcSample sample;
 
@@ -1080,22 +1058,22 @@ static bool validate_v2_frame(DmMc02CosimLink *link, uint16_t kind,
     if (link->rx_protocol_version == DM_MC02_WIRE_VERSION) {
         return false;
     }
-    if (kind != DM_MC02_V2_RESET && kind != DM_MC02_V2_STEP &&
-        kind != DM_MC02_V2_DIAGNOSTICS) {
+    if (kind != DM_MC02_V2_WIRE_RESET && kind != DM_MC02_V2_WIRE_STEP &&
+        kind != DM_MC02_V2_WIRE_DIAGNOSTICS) {
         return false;
     }
-    if ((kind == DM_MC02_V2_RESET || kind == DM_MC02_V2_DIAGNOSTICS) &&
+    if ((kind == DM_MC02_V2_WIRE_RESET || kind == DM_MC02_V2_WIRE_DIAGNOSTICS) &&
         payload_len != 0) {
         return false;
     }
-    if (kind == DM_MC02_V2_STEP &&
+    if (kind == DM_MC02_V2_WIRE_STEP &&
         !v2_step_payload_valid(payload, payload_len)) {
         return false;
     }
-    if (kind == DM_MC02_V2_RESET) {
+    if (kind == DM_MC02_V2_WIRE_RESET) {
         v2_validator_reset(link);
-        link->rx_protocol_version = DM_MC02_V2_VERSION;
-        link->rx_last_protocol_version = DM_MC02_V2_VERSION;
+        link->rx_protocol_version = DM_MC02_V2_WIRE_VERSION;
+        link->rx_last_protocol_version = DM_MC02_V2_WIRE_VERSION;
         link->v2_session_id = flags;
         link->v2_initialized = true;
         link->v2_last_step_id = step_id;
@@ -1108,7 +1086,7 @@ static bool validate_v2_frame(DmMc02CosimLink *link, uint16_t kind,
     if (flags != link->v2_session_id) {
         return false;
     }
-    if (kind == DM_MC02_V2_STEP) {
+    if (kind == DM_MC02_V2_WIRE_STEP) {
         if (link->v2_retry_pending) {
             if (step_id != link->v2_retry_step_id ||
                 t_sim_ns != link->v2_retry_t_sim_ns ||
@@ -1162,7 +1140,7 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
     dt_ns = decoded.header.dt_ns;
     flags = decoded.header.session_id;
     payload = decoded.payload;
-    if (kind == DM_MC02_V2_STEP && link->v2_initialized &&
+    if (kind == DM_MC02_V2_WIRE_STEP && link->v2_initialized &&
         !link->v2_retry_pending && flags == link->v2_session_id &&
         step_id == link->v2_last_step_id) {
         if (!v2_step_is_duplicate(link, step_id, t_sim_ns, dt_ns,
@@ -1178,14 +1156,14 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
             send_v2_step_done_cached(link);
         }
         if (link->v2_last_motor_state_len) {
-            send_v2_frame(link, DM_MC02_V2_MOTOR_STATE, step_id,
+            send_v2_frame(link, DM_MC02_V2_WIRE_MOTOR_STATE, step_id,
                           t_sim_ns, dt_ns, 0,
                           link->v2_last_motor_state_payload,
                           link->v2_last_motor_state_len);
         }
         return true;
     }
-    if (kind == DM_MC02_V2_STEP &&
+    if (kind == DM_MC02_V2_WIRE_STEP &&
         v2_step_session_valid(link, step_id, t_sim_ns, dt_ns)) {
         /* The unsupported-endpoint fast path must not turn malformed input
          * into a committed step.  Validate the complete section structure and
@@ -1222,11 +1200,11 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
                            dt_ns, flags, payload)) {
         return false;
     }
-    if (kind == DM_MC02_V2_RESET) {
+    if (kind == DM_MC02_V2_WIRE_RESET) {
         imu_schedule_session(link, t_sim_ns);
         send_v2_reset_ack(link, step_id, t_sim_ns);
         send_telemetry(link, true);
-    } else if (kind == DM_MC02_V2_STEP) {
+    } else if (kind == DM_MC02_V2_WIRE_STEP) {
         /* The first six floats of ImuSampleV2 are the physical sample. Bias
          * fields remain plant metadata; the board model applies its own
          * configured sensor effects before exposing BMI088 raw data. */
@@ -1263,7 +1241,7 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
                          accepted ? DM_MC02_V2_STATUS_OK :
                                     DM_MC02_V2_STATUS_QUEUE_FULL);
         if (accepted && motor_state_len) {
-            send_v2_frame(link, DM_MC02_V2_MOTOR_STATE, step_id, t_sim_ns,
+            send_v2_frame(link, DM_MC02_V2_WIRE_MOTOR_STATE, step_id, t_sim_ns,
                           dt_ns, 0, motor_state_payload, motor_state_len);
         }
     } else {
@@ -1338,7 +1316,7 @@ static bool process_frame(DmMc02CosimLink *link, const uint8_t *frame,
     uint64_t virtual_time_ns;
 
     if (frame_len >= 8 && get32le(frame) == DM_MC02_WIRE_MAGIC &&
-        get16le(frame + 4) == DM_MC02_V2_VERSION) {
+        get16le(frame + 4) == DM_MC02_V2_WIRE_VERSION) {
         return process_v2_frame(link, frame, frame_len);
     }
     if (!dm_mc02_wire_decode(&decoded, frame, frame_len)) {
@@ -1417,18 +1395,18 @@ static void parse_rx(DmMc02CosimLink *link)
         if (frame_len >= 8 &&
             get32le(frame_start + DM_MC02_OUTER_SIZE) == DM_MC02_WIRE_MAGIC &&
             get16le(frame_start + DM_MC02_OUTER_SIZE + 4) ==
-                DM_MC02_V2_VERSION &&
-            frame_len >= 4u + DM_MC02_V2_HEADER_SIZE &&
-            get32le(frame_start + 12) <= DM_MC02_V2_MAX_PAYLOAD &&
-            4u + DM_MC02_V2_HEADER_SIZE +
+                DM_MC02_V2_WIRE_VERSION &&
+            frame_len >= 4u + DM_MC02_V2_WIRE_HEADER_SIZE &&
+            get32le(frame_start + 12) <= DM_MC02_V2_WIRE_MAX_PAYLOAD &&
+            4u + DM_MC02_V2_WIRE_HEADER_SIZE +
                 get32le(frame_start + 12) == frame_len &&
             !cosim_control_can_queue(
                 link,
                 (get16le(frame_start + DM_MC02_OUTER_SIZE + 6) ==
-                     DM_MC02_V2_STEP && link->motor_step_handler &&
+                     DM_MC02_V2_WIRE_STEP && link->motor_step_handler &&
                  v2_step_payload_has_motor(
                      frame_start + DM_MC02_OUTER_SIZE + 4u +
-                         DM_MC02_V2_HEADER_SIZE,
+                         DM_MC02_V2_WIRE_HEADER_SIZE,
                      get32le(frame_start + 12))) ? 2u : 1u)) {
             return;
         }
@@ -1447,7 +1425,7 @@ static int cosim_can_receive(void *opaque)
 {
     DmMc02CosimLink *link = opaque;
 
-    if (link->rx_protocol_version == DM_MC02_V2_VERSION &&
+    if (link->rx_protocol_version == DM_MC02_V2_WIRE_VERSION &&
         !cosim_control_can_queue(link, 1)) {
         return 0;
     }
@@ -1652,7 +1630,7 @@ static void cosim_clear_tx(DmMc02CosimLink *link)
 static void send_telemetry(DmMc02CosimLink *link, bool force)
 {
     uint8_t wire[DM_MC02_OUTER_SIZE + DM_MC02_WIRE_HEADER_SIZE +
-                 DM_MC02_V2_HEADER_SIZE +
+                 DM_MC02_V2_WIRE_HEADER_SIZE +
                  DM_MC02_V2_BOARD_TELEMETRY_PAYLOAD_SIZE] = { 0 };
     DmMc02CosimTelemetry telemetry = { 0 };
     uint64_t virtual_time_ns;
@@ -1682,7 +1660,7 @@ static void send_telemetry(DmMc02CosimLink *link, bool force)
         }
         virtual_time_ns = link->tx_last_virtual_time_ns + 1;
     }
-    if (link->rx_protocol_version == DM_MC02_V2_VERSION) {
+    if (link->rx_protocol_version == DM_MC02_V2_WIRE_VERSION) {
         DmMc02V2WireFrame frame = {
             .header = {
                 .version = DM_MC02_V2_WIRE_VERSION,
@@ -1782,19 +1760,19 @@ void dm_mc02_cosim_link_reset(DmMc02CosimLink *link)
     link->telemetry_pending = false;
     cosim_clear_tx(link);
     if (link->enabled && link->opened) {
-        if (protocol_version == DM_MC02_V2_VERSION) {
+        if (protocol_version == DM_MC02_V2_WIRE_VERSION) {
             virtual_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
             /* The peer observes this RESET as the start of the new session.
              * Keep the native validator in the same state so its first STEP
              * after RESET/RESET_ACK is accepted without requiring a second
              * host-generated RESET. */
-            link->rx_protocol_version = DM_MC02_V2_VERSION;
-            link->rx_last_protocol_version = DM_MC02_V2_VERSION;
+            link->rx_protocol_version = DM_MC02_V2_WIRE_VERSION;
+            link->rx_last_protocol_version = DM_MC02_V2_WIRE_VERSION;
             link->v2_session_id = next_v2_session_id(link);
             link->v2_initialized = true;
             link->v2_last_step_id = 0;
             link->v2_last_t_sim_ns = virtual_time_ns;
-            send_v2_frame(link, DM_MC02_V2_RESET, 0,
+            send_v2_frame(link, DM_MC02_V2_WIRE_RESET, 0,
                           virtual_time_ns, 0, 0,
                           NULL, 0);
             send_v2_reset_ack(link, 0, virtual_time_ns);
@@ -1885,15 +1863,15 @@ static void cosim_event(void *opaque, QEMUChrEvent event)
         link->telemetry_pending = false;
         link->opened = true;
         cosim_flush_tx(link);
-        if (reconnect && protocol_version == DM_MC02_V2_VERSION) {
+        if (reconnect && protocol_version == DM_MC02_V2_WIRE_VERSION) {
             virtual_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-            link->rx_protocol_version = DM_MC02_V2_VERSION;
-            link->rx_last_protocol_version = DM_MC02_V2_VERSION;
+            link->rx_protocol_version = DM_MC02_V2_WIRE_VERSION;
+            link->rx_last_protocol_version = DM_MC02_V2_WIRE_VERSION;
             link->v2_session_id = next_v2_session_id(link);
             link->v2_initialized = true;
             link->v2_last_step_id = 0;
             link->v2_last_t_sim_ns = virtual_time_ns;
-            send_v2_frame(link, DM_MC02_V2_RESET, 0, virtual_time_ns,
+            send_v2_frame(link, DM_MC02_V2_WIRE_RESET, 0, virtual_time_ns,
                           0, 0, NULL, 0);
             send_v2_reset_ack(link, 0, virtual_time_ns);
         } else if (reconnect) {

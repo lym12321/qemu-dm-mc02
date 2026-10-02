@@ -14,17 +14,21 @@
 
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
+#include "../../../../cosim/dm_mc02_v2_wire.h"
+#include "../../../../cosim/dm_mc02_v2_payload.h"
 
 #include <stdbool.h>
 #include <stdint.h>
 
 #define DM_MC02_COSIM_TX_QUEUE_SIZE 8
 /* 4-byte outer length + v2 magic/header + a bounded control payload. */
-#define DM_MC02_COSIM_TX_FRAME_SIZE (4 + 4 + 36 + 512)
+#define DM_MC02_COSIM_TX_FRAME_SIZE \
+    (4u + DM_MC02_V2_WIRE_BODY_PREFIX_SIZE + DM_MC02_V2_WIRE_HEADER_SIZE + \
+     DM_MC02_V2_WIRE_MAX_PAYLOAD)
 #define DM_MC02_COSIM_IMU_QUEUE_SIZE 64
 #define DM_MC02_COSIM_ADC_QUEUE_SIZE 64
-#define DM_MC02_COSIM_V2_RETRY_PAYLOAD_SIZE 512
-#define DM_MC02_COSIM_V2_MOTOR_STATE_PAYLOAD_SIZE 512
+#define DM_MC02_COSIM_V2_RETRY_PAYLOAD_SIZE DM_MC02_V2_WIRE_MAX_PAYLOAD
+#define DM_MC02_COSIM_V2_MOTOR_STATE_PAYLOAD_SIZE DM_MC02_V2_WIRE_MAX_PAYLOAD
 
 typedef void DmMc02CosimImuHandler(void *opaque, const float gyro[3],
                                    const float accel[3],
@@ -34,15 +38,16 @@ typedef void DmMc02CosimImuHandler(void *opaque, const float gyro[3],
 
 /* ADC_INPUT payload is: channel:u16, raw:u16, reserved:u32. */
 #define DM_MC02_COSIM_FRAME_ADC_INPUT 5u
-#define DM_MC02_COSIM_ADC_INPUT_PAYLOAD_SIZE 8u
+#define DM_MC02_COSIM_ADC_INPUT_PAYLOAD_SIZE DM_MC02_V2_ADC_INPUT_PAYLOAD_SIZE
 
 /* ADC_PIN_VOLTAGE payload is: channel:u16, flags:u16, voltage_uv:u32,
  * reserved:u32.  A zero flags value is accepted for simple sources;
  * PIN_OVERRIDE is an explicit external-override annotation. */
 #define DM_MC02_COSIM_FRAME_ADC_PIN_VOLTAGE 6u
-#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_PAYLOAD_SIZE 12u
-#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_FLAG_PIN_OVERRIDE 1u
-#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_MAX_UV 3300000u
+#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_PAYLOAD_SIZE DM_MC02_V2_ADC_VOLTAGE_PAYLOAD_SIZE
+#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_FLAG_PIN_OVERRIDE \
+    DM_MC02_V2_ADC_VOLTAGE_FLAG_PIN_OVERRIDE
+#define DM_MC02_COSIM_ADC_PIN_VOLTAGE_MAX_UV DM_MC02_V2_ADC_VOLTAGE_MAX_UV
 
 typedef void DmMc02CosimAdcInputHandler(void *opaque, uint16_t channel,
                                         uint16_t raw);
