@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(dm_mc02_qemu_probe VERSION 0.1.0 LANGUAGES C)
+project(dm_mc02_qemu VERSION 0.1.0 LANGUAGES C)
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(GLIB2 REQUIRED IMPORTED_TARGET glib-2.0)
@@ -7,12 +7,6 @@ pkg_check_modules(GLIB2 REQUIRED IMPORTED_TARGET glib-2.0)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
-
-add_executable(dm_mc02_probe
-    src/dm_mc02_machine.c
-)
-target_include_directories(dm_mc02_probe PRIVATE include)
-target_compile_options(dm_mc02_probe PRIVATE -Wall -Wextra -Wpedantic)
 
 # The QEMU-native source needs QEMU's internal headers and is built from the
 # pinned QEMU source tree; this target only keeps the integration source visible
