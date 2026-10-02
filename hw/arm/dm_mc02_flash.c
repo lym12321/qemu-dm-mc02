@@ -232,6 +232,7 @@ static void dm_mc02_flash_write(void *opaque, hwaddr offset, uint64_t value,
                                              sizeof(uint32_t));
             dm_mc02_flash_store(s->regs, FLASH_CR1, cr & ~FLASH_CR_LOCK,
                                 sizeof(uint32_t));
+            dm_mc02_flash_sync_runtime(s);
             s->key1_seen = false;
         } else {
             s->key1_seen = false;

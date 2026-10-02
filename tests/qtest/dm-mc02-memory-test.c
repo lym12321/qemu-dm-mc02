@@ -206,6 +206,18 @@ static void test_internal_flash_word_transaction(void)
     g_assert_cmphex(qtest_readl(qts, address + 32), ==, UINT32_MAX);
     qtest_writel(qts, address, 0);
     g_assert_cmphex(qtest_readl(qts, address), ==, value);
+
+    /* HAL_FLASH_Unlock only clears LOCK through KEYR1, preserving PG.
+     * Unlock must reproject the program window without a later CR1 write. */
+    flash_unlock(qts);
+    qtest_writel(qts, FLASH_CR1, FLASH_CR_LOCK | FLASH_CR_PG);
+    flash_unlock(qts);
+    g_assert_cmphex(qtest_readl(qts, FLASH_CR1), ==, FLASH_CR_PG);
+    for (unsigned i = 0; i < 8; ++i) {
+        qtest_writel(qts, address + 32 + 4 * i, value + i);
+    }
+    g_assert_cmphex(qtest_readl(qts, address + 32), ==, value);
+    g_assert_cmphex(qtest_readl(qts, FLASH_SR1), ==, FLASH_SR_EOP);
     qtest_quit(qts);
 }
 
