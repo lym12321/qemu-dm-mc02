@@ -27,6 +27,14 @@ enum DmMc02V2WireKind {
     DM_MC02_V2_WIRE_MOTOR_STATE = 8,
 };
 
+enum DmMc02V2WireSectionType {
+    DM_MC02_V2_WIRE_SECTION_IMU_SAMPLE = 1,
+    DM_MC02_V2_WIRE_SECTION_MOTOR_COMMAND = 2,
+    DM_MC02_V2_WIRE_SECTION_ADC_INPUT = 3,
+    DM_MC02_V2_WIRE_SECTION_ADC_VOLTAGE = 4,
+    DM_MC02_V2_WIRE_SECTION_MOTOR_STATE = 5,
+};
+
 typedef struct DmMc02V2WireFrameHeader {
     uint16_t version;
     uint16_t kind;
