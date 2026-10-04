@@ -285,7 +285,7 @@ import sys
 
 report = json.loads(Path(sys.argv[1]).read_text())
 assert report["status"] == "failed", report
-assert "deadline" in report["error"] or "timeout" in report["error"], report
+assert report["error_type"] == "StartupTimeoutError", report
 print("Missing application ready: bounded failure confirmed")
 PY
 # The panel is another direct consumer of the same runtime, with native GDB
