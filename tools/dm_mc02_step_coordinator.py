@@ -3,6 +3,12 @@
 from __future__ import annotations
 
 import heapq
+from pathlib import Path
+import sys
+
+# Direct tools execution and importlib consumers resolve the same package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sim.core.clock import check_time
 
 try:
     from dm_mc02_motor_adapter import DmMotorBusAdapter, MotorBackend, MotorCommand
@@ -59,8 +65,7 @@ class StepCoordinator:
         return command
 
     def advance(self, t_sim_ns: int, dt_seconds: float):
-        if self.last_time_ns is not None and t_sim_ns <= self.last_time_ns:
-            raise ValueError("simulation time must increase strictly")
+        check_time(t_sim_ns, self.last_time_ns)
         while self.pending and self.pending[0][0] <= t_sim_ns:
             _, _, command = heapq.heappop(self.pending)
             self.motor_adapter.apply(self.backend, command)

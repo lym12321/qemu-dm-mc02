@@ -86,6 +86,7 @@ def _inputs(elf: Path, qemu: Path) -> dict:
         "dm_mc02_motor_adapter.py", "dm_mc02_step_protocol.py",
         "dm_mc02_socketcan.py", "dm_mc02_qmp.py",
         "dm_mc02_firmware_rtf.py", "dm_mc02_test_harness.py")]
+    paths += sorted((ROOT / "sim").rglob("*.py"))
     result = {}
     for path in paths:
         with path.open("rb") as stream:
