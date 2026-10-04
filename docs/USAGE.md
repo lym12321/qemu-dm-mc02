@@ -18,6 +18,15 @@ LED 的 `ws2812-dma` 来源是既有 DMA 波形观察近似；`gpio-latch` 来�
 映射成白/黑，适合初期调试。它不表示实际引脚电气驱动，应结合 GPIO mode 和 output mask
 检查。AF/analog、电气波形和全局 CPU/plant 锁步仍未由这个接口验证。
 
+Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是现有
+`tools.dm_mc02_qmp.QmpSession`。`snapshot()` 校验原生对象；`digital("gpio.B0")`、
+`digital("key")` 读取采样值，`digital("led")` 判断 RGB 是否非零。`set_gpio("B0", 1)`、
+`set_key(True)`、`set_vin(24000)` 注入公开输入，`pause()`/`resume()`/`reset()` 使用
+原生 QMP。调用方负责 QMP 的期限和关闭；这些 API 不判断应用是否已启动。
+
+外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
+socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
+
 ## Contents
 
 - [项目范围](#project-scope)

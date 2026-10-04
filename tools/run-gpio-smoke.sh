@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
+export PYTHONPATH="$root_dir:$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || {
@@ -36,6 +36,7 @@ python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
     -display none -monitor none -serial none \
     -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
+from sim.boards import QemuBoard
 import re
 import sys
 
@@ -56,6 +57,18 @@ expected = [0x47495031,
 if words[:len(expected)] != expected:
     raise RuntimeError("GPIO marker/readback mismatch: %r expected %r" %
                        (words[:len(expected)], expected))
+board = QemuBoard(sock)
+board.pause()
+state = board.snapshot()
+assert state["gpio"]["A"] == {
+    "moder": 1, "sampled": 0x8000, "odr": 0x0202, "output_mask": 1}, state
+assert state["gpio"]["C"] == {
+    "moder": 0x55555555, "sampled": 9, "odr": 9, "output_mask": 0xffff}, state
+assert state["key"] == {"pin": "A15", "pressed": False, "level": 1}, state
+board.set_key(True)
+assert board.digital("key") == 0
+board.set_key(False)
+assert board.digital("key") == 1
 print("RESULT: STM32H7 GPIO A-E bank smoke passed")
 print("  marker/readback:", " ".join("0x%08x" % x for x in words[:len(expected)]))
 command("quit")
