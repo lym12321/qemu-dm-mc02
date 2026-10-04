@@ -61,7 +61,7 @@ const DmMc02SocProfile dm_mc02_stm32h723_soc = {
     .iwdg1_base = 0x58004800,
     .wwdg1_base = 0x50003000,
     .usb_hs_base = 0x40040000,
-    .cordic_base = 0x58004400,
+    .cordic_base = 0x48024400,
 };
 
 const DmMc02SocProfile *dm_mc02_soc_stm32h723(void)
