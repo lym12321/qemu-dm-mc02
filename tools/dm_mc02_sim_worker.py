@@ -530,11 +530,13 @@ class FramedSocket:
 
     def receive(self) -> list[tuple[int, int, int, bytes]]:
         frames = []
-        while True:
-            try:
-                data = self.sock.recv(4096)
-            except BlockingIOError:
-                break
+        # Return after one read so a continuously readable peer cannot
+        # prevent the caller from servicing other sockets or its deadline.
+        try:
+            data = self.sock.recv(4096)
+        except BlockingIOError:
+            pass
+        else:
             if not data:
                 raise ConnectionError("QEMU co-sim socket closed")
             self.buffer.extend(data)
@@ -568,13 +570,18 @@ class StepFramedSocket(FramedSocket):
         self.pending_frames: deque[step_protocol.StepFrame] = deque()
 
     def receive(self) -> list[step_protocol.StepFrame]:
-        frames: list[step_protocol.StepFrame] = list(self.pending_frames)
-        self.pending_frames.clear()
-        while True:
-            try:
-                data = self.sock.recv(4096)
-            except BlockingIOError:
-                break
+        if self.pending_frames:
+            # Finish the previous decoded batch before reading more bytes.
+            # ACK waits may return its suffix here for the DONE/reset wait.
+            frames = list(self.pending_frames)
+            self.pending_frames.clear()
+            return frames
+        frames: list[step_protocol.StepFrame] = []
+        try:
+            data = self.sock.recv(4096)
+        except BlockingIOError:
+            pass
+        else:
             if not data:
                 raise ConnectionError("QEMU co-sim socket closed")
             self.buffer.extend(data)
@@ -619,11 +626,11 @@ class CanStream:
 
     def receive(self) -> list[tuple[int, int, int, int, bytes]]:
         frames = []
-        while True:
-            try:
-                data = self.sock.recv(4096)
-            except BlockingIOError:
-                break
+        try:
+            data = self.sock.recv(4096)
+        except BlockingIOError:
+            pass
+        else:
             if not data:
                 raise ConnectionError("QEMU FDCAN socket closed")
             self.buffer.extend(data)
@@ -734,6 +741,18 @@ class DatagramQueue:
                 raise TimeoutError("SocketCAN interface is not writable")
 
 
+def _report_cleanup_error(primary: BaseException, name: str,
+                          error: BaseException) -> None:
+    diagnostic = (f"cleanup {name}.close() failed: "
+                  f"{type(error).__name__}: {error}")
+    primary.add_note(diagnostic)
+    try:
+        print(f"dm_mc02_sim_worker: {diagnostic}", file=sys.stderr)
+    except BaseException as exc:
+        primary.add_note(f"cleanup diagnostic output failed: "
+                         f"{type(exc).__name__}: {exc}")
+
+
 def connect_unix(path: str, timeout: float) -> socket.socket:
     deadline = time.monotonic() + timeout
     last_error: OSError | None = None
@@ -743,9 +762,15 @@ def connect_unix(path: str, timeout: float) -> socket.socket:
             sock.connect(path)
             sock.setblocking(False)
             return sock
-        except OSError as exc:
+        except BaseException as exc:
+            try:
+                sock.close()
+            except BaseException as error:
+                _report_cleanup_error(exc, "Unix connection", error)
+                raise exc
+            if not isinstance(exc, OSError):
+                raise
             last_error = exc
-            sock.close()
             time.sleep(0.01)
     raise TimeoutError(f"cannot connect to {path}: {last_error}")
 
@@ -1366,33 +1391,41 @@ def create_engine(args: argparse.Namespace):
             load_registry(registry, args.backend_registry)
         engine = registry.create(args.engine, args)
 
-    invalid_required = [
-        name for name in BACKEND_REQUIRED_METHODS
-        if not callable(getattr(engine, name, None))
-    ]
-    invalid_optional = []
-    for name in BACKEND_OPTIONAL_METHODS:
-        member = getattr(engine, name, _MISSING_BACKEND_MEMBER)
-        if (member is not _MISSING_BACKEND_MEMBER and
-                not callable(member)):
-            invalid_optional.append(name)
-    if invalid_required or invalid_optional:
-        problems = []
-        if invalid_required:
-            problems.append(
-                "missing callable methods: " + ", ".join(invalid_required))
-        if invalid_optional:
-            problems.append(
-                "optional methods must be callable when present: " +
-                ", ".join(invalid_optional))
-        close = getattr(engine, "close", None)
+    close = _MISSING_BACKEND_MEMBER
+    try:
+        # Resolve cleanup before inspecting other plugin-owned attributes.
+        close = getattr(engine, "close", _MISSING_BACKEND_MEMBER)
+        invalid_required = [
+            name for name in BACKEND_REQUIRED_METHODS
+            if not callable(getattr(engine, name, None))
+        ]
+        invalid_optional = []
+        for name in BACKEND_OPTIONAL_METHODS:
+            member = (close if name == "close" else
+                      getattr(engine, name, _MISSING_BACKEND_MEMBER))
+            if (member is not _MISSING_BACKEND_MEMBER and
+                    not callable(member)):
+                invalid_optional.append(name)
+        if invalid_required or invalid_optional:
+            problems = []
+            if invalid_required:
+                problems.append(
+                    "missing callable methods: " + ", ".join(invalid_required))
+            if invalid_optional:
+                problems.append(
+                    "optional methods must be callable when present: " +
+                    ", ".join(invalid_optional))
+            raise TypeError("invalid backend instance: " + "; ".join(problems))
+        return engine
+    except BaseException as exc:
         if callable(close):
             try:
                 close()
-            except Exception as exc:
-                problems.append(f"backend close() failed: {exc}")
-        raise TypeError("invalid backend instance: " + "; ".join(problems))
-    return engine
+            except BaseException as error:
+                _report_cleanup_error(exc, "backend", error)
+        else:
+            exc.add_note("backend cleanup unavailable: no callable close obtained")
+        raise
 
 
 def engine_uses_external_time(engine) -> bool:
@@ -1402,11 +1435,13 @@ def engine_uses_external_time(engine) -> bool:
 
 def run(args: argparse.Namespace) -> int:
     _validate_worker_timing(args)
-    cosim_sock = connect_unix(args.cosim, args.connect_timeout)
+    cosim_sock = None
     can_sock = None
     socketcan_sock = None
     engine = None
+    primary_error = None
     try:
+        cosim_sock = connect_unix(args.cosim, args.connect_timeout)
         cosim = (StepFramedSocket(cosim_sock) if args.protocol == "v2"
                  else FramedSocket(cosim_sock))
         can_sock = (connect_unix(args.fdcan, args.connect_timeout)
@@ -1417,214 +1452,196 @@ def run(args: argparse.Namespace) -> int:
         engine = create_engine(args)
         motor_adapter = DmMotorBusAdapter.from_namespace(args)
         coordinator = StepCoordinator(engine, motor_adapter)
-    except Exception:
-        # Preserve the admission failure while attempting every cleanup.
-        if engine is not None:
-            close = getattr(engine, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:
-                    pass
-        for resource in (socketcan_sock, can_sock, cosim_sock):
-            if resource is not None:
-                try:
-                    resource.close()
-                except OSError:
-                    pass
-        raise
-
-    cosim_sock.setblocking(False)
-    # The initial telemetry timestamp is the best available common clock
-    # origin for v1. v2 deliberately starts the plant clock at zero and
-    # reports QEMU's current clock in RESET_ACK payload metadata.
-    clock_base_ns = 0
-    v2_tx_validator = None
-    v2_rx_validator = None
-    qemu_timestamp_mapper = None
-    if args.protocol == "v1":
-        # QEMU emits its initial snapshot synchronously on chardev open. Keep
-        # a short grace window for scheduling, but do not impose a large
-        # startup stall on endpoints that intentionally omit telemetry.
-        if select.select([cosim_sock], [], [], 0.02)[0]:
-            for kind, _, timestamp_ns, payload in cosim.receive():
-                if kind == TELEMETRY and len(payload) == 12:
-                    clock_base_ns = max(clock_base_ns, timestamp_ns)
-        # Establish the QEMU RX ordering baseline before the first IMU sample.
-        cosim.send(protocol_frame(RESET, 0, clock_base_ns))
-    else:
-        # A non-zero session ID prevents delayed frames from an earlier
-        # machine reset from being accepted by the new QEMU epoch.  The
-        # legacy zero-ID mode remains available to direct callers and old
-        # smoke clients.
-        session_id = step_protocol.generate_session_id()
-        v2_tx_validator = step_protocol.StepSessionValidator(
-            step_protocol.DIRECTION_HOST_TO_QEMU)
-        v2_rx_validator = step_protocol.StepSessionValidator(
-            step_protocol.DIRECTION_QEMU_TO_HOST,
-            require_step_done=args.wait_step_done)
-        reset_frame = step_protocol.StepFrame(
-            step_protocol.StepHeader(step_protocol.STEP_VERSION,
-                                     step_protocol.RESET, 0, 0, 0, 0,
-                                     session_id),
-            b"")
-        v2_tx_validator.accept(reset_frame)
-        v2_rx_validator.begin_reset(reset_frame.header.step_id,
-                                    reset_frame.header.t_sim_ns,
-                                    session_id)
-        cosim.send(step_protocol.encode_step_frame(reset_frame))
-        reset_ack_frame = wait_v2_response(
-            cosim, v2_rx_validator, step_protocol.RESET_ACK, 0, 0)
-        reset_ack = step_protocol.decode_reset_ack_payload(
-            reset_ack_frame.payload)
-        qemu_timestamp_mapper = QemuTimestampMapper(
-            reset_ack.virtual_time_ns, 0)
-    if args.protocol == "v1":
-        qemu_timestamp_mapper = QemuTimestampMapper(
-            clock_base_ns, clock_base_ns)
-    dt = 1.0 / args.rate
-    integer_rate = (int(args.rate) if args.rate.is_integer() else 0)
-    sequence = 0
-    imu_frames = 0
-    virtual_time_ns = clock_base_ns
-    external_timestamp_mapper = (
-        ExternalTimestampMapper(clock_base_ns)
-        if engine_uses_external_time(engine) else None)
-    wall_origin = time.monotonic_ns()
-
-    def reset_v2_worker_session(reset: V2SessionReset) -> None:
-        """Align host-side state with QEMU's unsolicited reset epoch."""
-        nonlocal clock_base_ns, external_timestamp_mapper, imu_frames
-        nonlocal sequence, virtual_time_ns, wall_origin
-        nonlocal qemu_timestamp_mapper
-
-        reset_frame = step_protocol.StepFrame(
-            step_protocol.StepHeader(
-                step_protocol.STEP_VERSION, step_protocol.RESET, 0,
-                reset.step_id, reset.t_sim_ns, 0, reset.session_id),
-            b"")
-        v2_tx_validator.reset()
-        v2_tx_validator.accept(reset_frame)
-        coordinator.reset()
-        if hasattr(engine, "reset"):
-            engine.reset()
-        clock_base_ns = reset.t_sim_ns
-        virtual_time_ns = reset.t_sim_ns
+        cosim_sock.setblocking(False)
+        # The initial telemetry timestamp is the best available common clock
+        # origin for v1. v2 deliberately starts the plant clock at zero and
+        # reports QEMU's current clock in RESET_ACK payload metadata.
+        clock_base_ns = 0
+        v2_tx_validator = None
+        v2_rx_validator = None
+        qemu_timestamp_mapper = None
+        if args.protocol == "v1":
+            # QEMU emits its initial snapshot synchronously on chardev open. Keep
+            # a short grace window for scheduling, but do not impose a large
+            # startup stall on endpoints that intentionally omit telemetry.
+            if select.select([cosim_sock], [], [], 0.02)[0]:
+                for kind, _, timestamp_ns, payload in cosim.receive():
+                    if kind == TELEMETRY and len(payload) == 12:
+                        clock_base_ns = max(clock_base_ns, timestamp_ns)
+            # Establish the QEMU RX ordering baseline before the first IMU sample.
+            cosim.send(protocol_frame(RESET, 0, clock_base_ns))
+        else:
+            # A non-zero session ID prevents delayed frames from an earlier
+            # machine reset from being accepted by the new QEMU epoch.  The
+            # legacy zero-ID mode remains available to direct callers and old
+            # smoke clients.
+            session_id = step_protocol.generate_session_id()
+            v2_tx_validator = step_protocol.StepSessionValidator(
+                step_protocol.DIRECTION_HOST_TO_QEMU)
+            v2_rx_validator = step_protocol.StepSessionValidator(
+                step_protocol.DIRECTION_QEMU_TO_HOST,
+                require_step_done=args.wait_step_done)
+            reset_frame = step_protocol.StepFrame(
+                step_protocol.StepHeader(step_protocol.STEP_VERSION,
+                                         step_protocol.RESET, 0, 0, 0, 0,
+                                         session_id),
+                b"")
+            v2_tx_validator.accept(reset_frame)
+            v2_rx_validator.begin_reset(reset_frame.header.step_id,
+                                        reset_frame.header.t_sim_ns,
+                                        session_id)
+            cosim.send(step_protocol.encode_step_frame(reset_frame))
+            reset_ack_frame = wait_v2_response(
+                cosim, v2_rx_validator, step_protocol.RESET_ACK, 0, 0)
+            reset_ack = step_protocol.decode_reset_ack_payload(
+                reset_ack_frame.payload)
+            qemu_timestamp_mapper = QemuTimestampMapper(
+                reset_ack.virtual_time_ns, 0)
+        if args.protocol == "v1":
+            qemu_timestamp_mapper = QemuTimestampMapper(
+                clock_base_ns, clock_base_ns)
+        dt = 1.0 / args.rate
+        integer_rate = (int(args.rate) if args.rate.is_integer() else 0)
         sequence = 0
         imu_frames = 0
-        wall_origin = time.monotonic_ns()
+        virtual_time_ns = clock_base_ns
         external_timestamp_mapper = (
             ExternalTimestampMapper(clock_base_ns)
             if engine_uses_external_time(engine) else None)
-        qemu_timestamp_mapper = QemuTimestampMapper(
-            reset.t_sim_ns, reset.t_sim_ns)
+        wall_origin = time.monotonic_ns()
 
-    def complete_v2_reset(reset: V2SessionReset) -> None:
-        # RESET already changed the RX validator. Wait for its ACK before
-        # rebuilding the plant/session. Repeated RESET replaces the session
-        # but never renews this handshake's budget.
-        deadline = time.monotonic() + V2_STEP_RESPONSE_TIMEOUT_SEC
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("timed out waiting for v2 RESET_ACK")
+        def reset_v2_worker_session(reset: V2SessionReset) -> None:
+            """Align host-side state with QEMU's unsolicited reset epoch."""
+            nonlocal clock_base_ns, external_timestamp_mapper, imu_frames
+            nonlocal sequence, virtual_time_ns, wall_origin
+            nonlocal qemu_timestamp_mapper
+
+            reset_frame = step_protocol.StepFrame(
+                step_protocol.StepHeader(
+                    step_protocol.STEP_VERSION, step_protocol.RESET, 0,
+                    reset.step_id, reset.t_sim_ns, 0, reset.session_id),
+                b"")
+            v2_tx_validator.reset()
+            v2_tx_validator.accept(reset_frame)
+            coordinator.reset()
+            if hasattr(engine, "reset"):
+                engine.reset()
+            clock_base_ns = reset.t_sim_ns
+            virtual_time_ns = reset.t_sim_ns
+            sequence = 0
+            imu_frames = 0
+            wall_origin = time.monotonic_ns()
+            external_timestamp_mapper = (
+                ExternalTimestampMapper(clock_base_ns)
+                if engine_uses_external_time(engine) else None)
+            qemu_timestamp_mapper = QemuTimestampMapper(
+                reset.t_sim_ns, reset.t_sim_ns)
+
+        def complete_v2_reset(reset: V2SessionReset) -> None:
+            # RESET already changed the RX validator. Wait for its ACK before
+            # rebuilding the plant/session. Repeated RESET replaces the session
+            # but never renews this handshake's budget.
+            deadline = time.monotonic() + V2_STEP_RESPONSE_TIMEOUT_SEC
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError("timed out waiting for v2 RESET_ACK")
+                try:
+                    wait_v2_response(
+                        cosim, v2_rx_validator, step_protocol.RESET_ACK,
+                        reset.step_id, reset.t_sim_ns, timeout=remaining,
+                        service_io=service_worker_io, interrupt_on_reset=True)
+                except V2SessionReset as latest_reset:
+                    reset = latest_reset
+                    continue
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("timed out waiting for v2 RESET_ACK")
+                break
+            reset_v2_worker_session(reset)
+
+        def wait_v2_step_response(expected_kind: int, step_id: int,
+                                  timestamp_ns: int,
+                                  allow_queue_full: bool = False,
+                                  timeout: float = V2_STEP_RESPONSE_TIMEOUT_SEC):
             try:
-                wait_v2_response(
-                    cosim, v2_rx_validator, step_protocol.RESET_ACK,
-                    reset.step_id, reset.t_sim_ns, timeout=remaining,
-                    service_io=service_worker_io, interrupt_on_reset=True)
-            except V2SessionReset as latest_reset:
-                reset = latest_reset
-                continue
-            if time.monotonic() >= deadline:
-                raise TimeoutError("timed out waiting for v2 RESET_ACK")
-            break
-        reset_v2_worker_session(reset)
+                return wait_v2_response(
+                    cosim, v2_rx_validator, expected_kind, step_id, timestamp_ns,
+                    timeout=timeout, allow_queue_full=allow_queue_full,
+                    service_io=service_worker_io)
+            except V2SessionReset as reset:
+                complete_v2_reset(reset)
+                return False
 
-    def wait_v2_step_response(expected_kind: int, step_id: int,
-                              timestamp_ns: int,
-                              allow_queue_full: bool = False,
-                              timeout: float = V2_STEP_RESPONSE_TIMEOUT_SEC):
-        try:
-            return wait_v2_response(
-                cosim, v2_rx_validator, expected_kind, step_id, timestamp_ns,
-                timeout=timeout, allow_queue_full=allow_queue_full,
-                service_io=service_worker_io)
-        except V2SessionReset as reset:
-            complete_v2_reset(reset)
-            return False
-
-    if can_sock:
-        can_sock.setblocking(False)
-    if socketcan_sock:
-        socketcan_sock.setblocking(False)
-
-    def service_worker_io(timeout: float) -> None:
-        """Service transport without consuming v2 replies or advancing plant."""
-        readable = [cosim_sock]
-        writable = []
         if can_sock:
-            readable.append(can_sock)
+            can_sock.setblocking(False)
         if socketcan_sock:
-            readable.append(socketcan_sock)
-        if cosim.tx_pending:
-            writable.append(cosim_sock)
-        if can and can.tx_pending:
-            writable.append(can_sock)
-        if socketcan_tx and socketcan_tx.tx_pending:
-            writable.append(socketcan_sock)
-        ready, writable_ready, _ = select.select(readable, writable, [], timeout)
-        if cosim_sock in writable_ready:
-            cosim.flush()
-        if can_sock and can_sock in writable_ready:
-            can.flush()
-        if socketcan_sock and socketcan_sock in writable_ready:
-            socketcan_tx.flush()
-        if can_sock in ready:
-            can_frames = can.receive()
-            if args.verbose and can_frames:
-                print("received CAN frames", len(can_frames), flush=True)
-            for can_id, flags, dlc, timestamp_ns, data in can_frames:
-                mapped_timestamp_ns = qemu_timestamp_mapper.map(
-                    timestamp_ns, virtual_time_ns)
-                if socketcan_sock:
-                    socketcan_tx.send(
-                        CanFrame(can_id, flags, dlc, data,
-                                 mapped_timestamp_ns))
-                command = coordinator.submit_can(
-                    can_id, flags, data[:min(dlc, 8)],
-                    mapped_timestamp_ns, virtual_time_ns)
-                if command is not None:
-                    if args.verbose:
-                        print("motor command", command.mode,
-                              "index", command.index, flush=True)
-        if socketcan_sock in ready:
-            try:
-                frame = unpack_can_frame(
-                    socketcan_sock.recv(72), timestamp_ns=virtual_time_ns)
-            except ValueError as exc:
-                if args.verbose:
-                    print(f"socketcan: ignored frame: {exc}",
-                          file=sys.stderr, flush=True)
-            else:
-                if can:
-                    can.send(
-                        frame.can_id, frame.flags, frame.dlc,
-                        qemu_timestamp_mapper.unmap(
-                            frame.timestamp_ns,
-                            qemu_timestamp_mapper.qemu_origin_ns),
-                        frame.data)
-        if cosim_sock in ready:
-            if args.protocol == "v1":
-                for kind, _, _, payload in cosim.receive():
-                    if kind == TELEMETRY and args.verbose:
-                        if len(payload) == 12:
-                            rgb, brightness, buzzer, flags, _ = \
-                                struct.unpack("<IIBBH", payload)
-                            print("telemetry rgb=%06x brightness=%d buzzer=%d flags=%02x" %
-                                  (rgb, brightness, buzzer, flags), flush=True)
+            socketcan_sock.setblocking(False)
 
-    try:
+        def service_worker_io(timeout: float) -> None:
+            """Service transport without consuming v2 replies or advancing plant."""
+            readable = [cosim_sock]
+            writable = []
+            if can_sock:
+                readable.append(can_sock)
+            if socketcan_sock:
+                readable.append(socketcan_sock)
+            if cosim.tx_pending:
+                writable.append(cosim_sock)
+            if can and can.tx_pending:
+                writable.append(can_sock)
+            if socketcan_tx and socketcan_tx.tx_pending:
+                writable.append(socketcan_sock)
+            ready, writable_ready, _ = select.select(readable, writable, [], timeout)
+            if cosim_sock in writable_ready:
+                cosim.flush()
+            if can_sock and can_sock in writable_ready:
+                can.flush()
+            if socketcan_sock and socketcan_sock in writable_ready:
+                socketcan_tx.flush()
+            if can_sock in ready:
+                can_frames = can.receive()
+                if args.verbose and can_frames:
+                    print("received CAN frames", len(can_frames), flush=True)
+                for can_id, flags, dlc, timestamp_ns, data in can_frames:
+                    mapped_timestamp_ns = qemu_timestamp_mapper.map(
+                        timestamp_ns, virtual_time_ns)
+                    if socketcan_sock:
+                        socketcan_tx.send(
+                            CanFrame(can_id, flags, dlc, data,
+                                     mapped_timestamp_ns))
+                    command = coordinator.submit_can(
+                        can_id, flags, data[:min(dlc, 8)],
+                        mapped_timestamp_ns, virtual_time_ns)
+                    if command is not None:
+                        if args.verbose:
+                            print("motor command", command.mode,
+                                  "index", command.index, flush=True)
+            if socketcan_sock in ready:
+                try:
+                    frame = unpack_can_frame(
+                        socketcan_sock.recv(72), timestamp_ns=virtual_time_ns)
+                except ValueError as exc:
+                    if args.verbose:
+                        print(f"socketcan: ignored frame: {exc}",
+                              file=sys.stderr, flush=True)
+                else:
+                    if can:
+                        can.send(
+                            frame.can_id, frame.flags, frame.dlc,
+                            qemu_timestamp_mapper.unmap(
+                                frame.timestamp_ns,
+                                qemu_timestamp_mapper.qemu_origin_ns),
+                            frame.data)
+            if cosim_sock in ready:
+                if args.protocol == "v1":
+                    for kind, _, _, payload in cosim.receive():
+                        if kind == TELEMETRY and args.verbose:
+                            if len(payload) == 12:
+                                rgb, brightness, buzzer, flags, _ = \
+                                    struct.unpack("<IIBBH", payload)
+                                print("telemetry rgb=%06x brightness=%d buzzer=%d flags=%02x" %
+                                      (rgb, brightness, buzzer, flags), flush=True)
+
         while args.frames == 0 or imu_frames < args.frames:
             service_worker_io(0)
             gyro, accel = coordinator.advance(virtual_time_ns, dt)
@@ -1714,7 +1731,8 @@ def run(args: argparse.Namespace) -> int:
                             if done_retries >= V2_STEP_DONE_MAX_RETRIES:
                                 raise
                             done_retries += 1
-                            cosim.send(step_wire)
+                            if not cosim.tx_pending:
+                                cosim.send(step_wire)
                             continue
                         break
                     if done_response is False:
@@ -1740,15 +1758,30 @@ def run(args: argparse.Namespace) -> int:
             can.drain()
         if socketcan_tx:
             socketcan_tx.drain()
+    except BaseException as exc:
+        primary_error = exc
+        raise
     finally:
-        close = getattr(engine, "close", None)
-        if callable(close):
-            close()
-        cosim_sock.close()
-        if can_sock:
-            can_sock.close()
-        if socketcan_sock:
-            socketcan_sock.close()
+        cleanup_errors = []
+        # A failing backend must not prevent any transport from closing.
+        # Catch interrupts here as well, then propagate after every attempt.
+        for name, resource in (("backend", engine),
+                               ("SocketCAN", socketcan_sock),
+                               ("CAN", can_sock), ("co-sim", cosim_sock)):
+            if resource is None:
+                continue
+            try:
+                close = getattr(resource, "close", None)
+                if callable(close):
+                    close()
+            except BaseException as exc:
+                cleanup_errors.append((name, exc))
+        for name, error in cleanup_errors:
+            reported_error = (primary_error if primary_error is not None
+                              else cleanup_errors[0][1])
+            _report_cleanup_error(reported_error, name, error)
+        if cleanup_errors and primary_error is None:
+            raise cleanup_errors[0][1]
     return 0
 
 
@@ -1758,4 +1791,6 @@ if __name__ == "__main__":
     except (BufferError, ConnectionError, OSError, TimeoutError, TypeError,
             ValueError, RuntimeError, SocketCANError) as exc:
         print(f"dm_mc02_sim_worker: {exc}", file=sys.stderr)
+        for note in getattr(exc, "__notes__", ()):
+            print(f"dm_mc02_sim_worker: {note}", file=sys.stderr)
         raise SystemExit(1)

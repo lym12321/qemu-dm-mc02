@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import importlib.util
+import io
+import errno
 from pathlib import Path
 import socket
 import sys
 import struct
 import unittest
+from contextlib import redirect_stderr
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -84,6 +87,306 @@ class ResetClient:
     def call_async(self, request):
         del request
         return self.future
+
+
+class ClosingBackend(worker.NullEngine):
+    """Real null plant with an independently observable resource owner."""
+
+    def __init__(self):
+        super().__init__(1)
+        self.close_calls = 0
+        self.step_calls = 0
+        self.close_error = None
+        self.step_error = None
+
+    def step(self, dt):
+        self.step_calls += 1
+        if self.step_error is not None:
+            raise self.step_error
+        return super().step(dt)
+
+    def close(self):
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class WorkerRunTests(unittest.TestCase):
+    """Real worker protocol paths must release every acquired resource."""
+
+    def setUp(self):
+        self.sockets = []
+        self.peers = []
+        for _ in range(3):
+            owned, peer = socket.socketpair()
+            self.sockets.append(owned)
+            self.peers.append(peer)
+            peer.settimeout(0.2)
+            self.addCleanup(owned.close)
+            self.addCleanup(peer.close)
+        self.engine = ClosingBackend()
+        connections = dict(zip(("cosim", "can"), self.sockets))
+        self.enterContext(patch.object(
+            worker, "connect_unix", lambda path, timeout: connections[path]))
+        # A stream fd suffices to verify the SocketCAN resource lifecycle;
+        # these cases make no assertions about Linux raw CAN behavior.
+        self.enterContext(patch.object(
+            worker, "open_socketcan", lambda interface: self.sockets[2]))
+        self.enterContext(patch.object(
+            worker, "load_factory", lambda spec: lambda args: self.engine))
+        self.enterContext(patch.object(
+            worker.step_protocol, "generate_session_id", lambda: 123))
+        with patch.object(sys, "argv", [
+                "worker", "--cosim", "cosim", "--fdcan", "can",
+                "--socketcan", "test", "--protocol", "v2",
+                "--backend", "tests:factory", "--motor-count", "1",
+                "--frames", "1"]):
+            self.args = worker.parse_args()
+
+    def _reset_ack(self, reserved=0):
+        protocol = worker.step_protocol
+        return protocol.build_step_frame(
+            protocol.RESET_ACK, 0, 0, flags=123,
+            payload=struct.pack("<IIQII", 0, protocol.CAPABILITY_MASK,
+                                10_000_000_000, 0, reserved))
+
+    def _assert_closed(self, close_calls=1):
+        self.assertEqual([sock.fileno() for sock in self.sockets], [-1] * 3)
+        self.assertEqual(self.engine.close_calls, close_calls)
+        for peer in self.peers:
+            # RESET/STEP already written to co-sim may precede the EOF.
+            while peer.recv(4096):
+                pass
+
+    def test_initial_reset_timeout_closes_all_resources(self):
+        # Cross the actual wait's deadline without a wall-clock sleep.
+        with patch.object(worker.time, "monotonic", side_effect=[0.0, 3.0]):
+            with self.assertRaisesRegex(TimeoutError, "v2 response"):
+                worker.run(self.args)
+        self.assertEqual(self.engine.step_calls, 0)
+        self._assert_closed()
+
+    def test_initial_reset_invalid_ack_closes_all_resources(self):
+        self.peers[0].sendall(self._reset_ack(reserved=1))
+        with self.assertRaisesRegex(worker.step_protocol.StepProtocolError,
+                                    "RESET_ACK reserved field"):
+            worker.run(self.args)
+        self.assertEqual(self.engine.step_calls, 0)
+        self._assert_closed()
+
+    def test_initial_reset_eof_closes_all_resources(self):
+        # Half-close retains the peer's read side so EOF remains observable.
+        self.peers[0].shutdown(socket.SHUT_WR)
+        with self.assertRaisesRegex(ConnectionError, "co-sim socket closed"):
+            worker.run(self.args)
+        self.assertEqual(self.engine.step_calls, 0)
+        self._assert_closed()
+
+    def test_initial_reset_interrupt_closes_all_resources(self):
+        interrupted = KeyboardInterrupt("RESET interrupted")
+        self.engine.close_error = RuntimeError("backend close failed")
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), patch.object(
+                worker.select, "select", side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                worker.run(self.args)
+        self.assertIs(raised.exception, interrupted)
+        self.assertIn("backend close failed", diagnostic.getvalue())
+        self.assertEqual(self.engine.step_calls, 0)
+        self._assert_closed()
+
+    def test_factory_interrupt_closes_already_acquired_transports(self):
+        with patch.object(worker, "load_factory", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                worker.run(self.args)
+        # The factory never returned a backend for the worker to own.
+        self._assert_closed(close_calls=0)
+
+    def test_backend_close_error_after_success_still_closes_transports(self):
+        protocol = worker.step_protocol
+        self.peers[0].sendall(self._reset_ack() + protocol.build_step_frame(
+            protocol.STEP_ACK, 1, 1_000_000, dt_ns=1_000_000, flags=123,
+            payload=bytes(16)))
+        self.engine.close_error = RuntimeError("backend close failed")
+        try:
+            raise ValueError("unrelated caller exception")
+        except ValueError:
+            # A caller's active except block is not a worker primary error.
+            with self.assertRaisesRegex(RuntimeError, "backend close failed"):
+                worker.run(self.args)
+        self.assertEqual(self.engine.step_calls, 1)
+        self._assert_closed()
+
+    def test_runtime_error_is_preserved_when_backend_close_also_fails(self):
+        self.peers[0].sendall(self._reset_ack())
+        primary = RuntimeError("plant step failed")
+        self.engine.step_error = primary
+        self.engine.close_error = RuntimeError("backend close failed")
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic):
+            with self.assertRaises(RuntimeError) as raised:
+                worker.run(self.args)
+        self.assertIs(raised.exception, primary)
+        self.assertIn("backend close failed", diagnostic.getvalue())
+        self.assertEqual(self.engine.step_calls, 1)
+        self._assert_closed()
+
+    def test_multiple_close_errors_preserve_primary_and_close_remaining_socket(self):
+        class FailingCloseSocket(socket.socket):
+            def close(self):
+                was_open = self.fileno() != -1
+                super().close()
+                if was_open:
+                    raise OSError("CAN close failed")
+
+        # Preserve a real CAN fd; only its post-close diagnostic is injected.
+        can = FailingCloseSocket(fileno=self.sockets[1].detach())
+        self.sockets[1] = can
+        self.addCleanup(can.close)
+        connections = dict(zip(("cosim", "can"), self.sockets))
+        self.peers[0].sendall(self._reset_ack())
+        primary = RuntimeError("plant step failed")
+        self.engine.step_error = primary
+        self.engine.close_error = RuntimeError("backend close failed")
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), patch.object(
+                worker, "connect_unix", lambda path, timeout: connections[path]):
+            with self.assertRaises(RuntimeError) as raised:
+                worker.run(self.args)
+        self.assertIs(raised.exception, primary)
+        self.assertIn("backend close failed", diagnostic.getvalue())
+        self.assertIn("CAN close failed", diagnostic.getvalue())
+        self._assert_closed()
+
+    def test_closed_stderr_cannot_replace_primary_during_cleanup(self):
+        self.peers[0].sendall(self._reset_ack())
+        primary = RuntimeError("plant step failed")
+        self.engine.step_error = primary
+        self.engine.close_error = RuntimeError("backend close failed")
+        diagnostic = io.StringIO()
+        diagnostic.close()
+        with redirect_stderr(diagnostic):
+            with self.assertRaises(RuntimeError) as raised:
+                worker.run(self.args)
+        self.assertIs(raised.exception, primary)
+        self.assertTrue(any("backend close failed" in note
+                            for note in primary.__notes__))
+        self._assert_closed()
+
+
+class WorkerConnectionTests(unittest.TestCase):
+    """Connection setup owns real fds until it returns them to the worker."""
+
+    def _socket(self):
+        class SetupSocket(socket.socket):
+            connect_error = None
+            configure_error = None
+            close_error = None
+            close_calls = 0
+
+            def connect(self, path):
+                if self.connect_error is not None:
+                    raise self.connect_error
+
+            def setblocking(self, flag):
+                if self.configure_error is not None:
+                    raise self.configure_error
+                super().setblocking(flag)
+
+            def close(self):
+                was_open = self.fileno() != -1
+                super().close()
+                if was_open:
+                    self.close_calls += 1
+                    if self.close_error is not None:
+                        raise self.close_error
+
+        owned, peer = socket.socketpair()
+        sock = SetupSocket(fileno=owned.detach())
+        self.addCleanup(sock.close)
+        self.addCleanup(peer.close)
+        peer.settimeout(0.2)
+        return sock, peer
+
+    def test_connection_setup_interrupt_closes_owned_fd(self):
+        for phase in ("connect", "configure"):
+            with self.subTest(phase=phase):
+                sock, peer = self._socket()
+                primary = KeyboardInterrupt(phase + " interrupted")
+                setattr(sock, phase + "_error", primary)
+                with patch.object(worker.socket, "socket", return_value=sock):
+                    with self.assertRaises(KeyboardInterrupt) as raised:
+                        worker.connect_unix("fixture", 1.0)
+                self.assertIs(raised.exception, primary)
+                self.assertEqual(sock.fileno(), -1)
+                self.assertEqual(sock.close_calls, 1)
+                self.assertEqual(peer.recv(1), b"")
+
+    def test_connection_close_failure_preserves_error_and_stops_retry(self):
+        sock, peer = self._socket()
+        primary = OSError(errno.ECONNREFUSED, "fixture refused")
+        sock.connect_error = primary
+        sock.close_error = OSError("fixture close failed")
+        diagnostic = io.StringIO()
+        with redirect_stderr(diagnostic), \
+                patch.object(worker.socket, "socket", return_value=sock) as create, \
+                patch.object(worker.time, "sleep") as sleep:
+            with self.assertRaises(OSError) as raised:
+                worker.connect_unix("fixture", 1.0)
+        self.assertIs(raised.exception, primary)
+        self.assertTrue(any("fixture close failed" in note
+                            for note in primary.__notes__))
+        self.assertIn("fixture close failed", diagnostic.getvalue())
+        self.assertEqual(create.call_count, 1)
+        sleep.assert_not_called()
+        self.assertEqual(sock.close_calls, 1)
+        self.assertEqual(peer.recv(1), b"")
+
+    def test_retry_closes_failed_socket_and_transfers_success(self):
+        first, peer = self._socket()
+        second, unused_peer = self._socket()
+        first.connect_error = OSError(errno.ECONNREFUSED, "fixture refused")
+        with patch.object(worker.socket, "socket", side_effect=[first, second]), \
+                patch.object(worker.time, "monotonic", side_effect=[0.0, 0.0, 0.01]), \
+                patch.object(worker.time, "sleep") as sleep:
+            returned = worker.connect_unix("fixture", 0.05)
+        self.assertIs(returned, second)
+        self.assertEqual(first.close_calls, 1)
+        self.assertEqual(peer.recv(1), b"")
+        self.assertNotEqual(second.fileno(), -1)
+        self.assertFalse(second.getblocking())
+        self.assertEqual(second.close_calls, 0)
+        sleep.assert_called_once_with(0.01)
+
+    def test_retry_deadline_does_not_retain_failed_socket(self):
+        sock, peer = self._socket()
+        sock.connect_error = OSError(errno.ECONNREFUSED, "fixture refused")
+        with patch.object(worker.socket, "socket", return_value=sock) as create, \
+                patch.object(worker.time, "monotonic", side_effect=[0.0, 0.0, 0.02]), \
+                patch.object(worker.time, "sleep"):
+            with self.assertRaisesRegex(TimeoutError, "cannot connect.*fixture refused"):
+                worker.connect_unix("fixture", 0.01)
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(sock.close_calls, 1)
+        self.assertEqual(peer.recv(1), b"")
+
+    def test_worker_second_connection_interrupt_closes_both_owners(self):
+        cosim, cosim_peer = self._socket()
+        can, can_peer = self._socket()
+        interrupted = KeyboardInterrupt("CAN connect interrupted")
+        can.connect_error = interrupted
+        with patch.object(sys, "argv", [
+                "worker", "--cosim", "fixture", "--fdcan", "can", "--frames", "1"]):
+            args = worker.parse_args()
+        with patch.object(worker.socket, "socket", side_effect=[cosim, can]), \
+                patch.object(worker, "create_engine") as factory:
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                worker.run(args)
+        self.assertIs(raised.exception, interrupted)
+        factory.assert_not_called()
+        self.assertEqual((cosim.close_calls, can.close_calls), (1, 1))
+        self.assertEqual(cosim_peer.recv(1), b"")
+        self.assertEqual(can_peer.recv(1), b"")
 
 
 class WorkerTransportTests(unittest.TestCase):

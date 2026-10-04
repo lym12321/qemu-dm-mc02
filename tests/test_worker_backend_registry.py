@@ -6,9 +6,9 @@ import argparse
 import importlib.util
 import io
 from pathlib import Path
+import socket
 import sys
 from contextlib import redirect_stderr
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -216,28 +216,136 @@ def test_present_non_callable_close_is_rejected(monkeypatch):
         worker.create_engine(config(backend="tests:factory"))
 
 
-def test_worker_closes_connected_socket_before_any_reset_on_invalid_backend(
-        monkeypatch):
-    class FakeSocket:
-        def __init__(self):
-            self.closed = False
+@pytest.mark.parametrize("member,error", [
+    ("step", RuntimeError("required method getter failed")),
+    ("reset", KeyboardInterrupt("optional method getter interrupted")),
+])
+def test_method_getter_failure_closes_returned_backend_and_preserves_error(
+        monkeypatch, member, error):
+    class FailingGetterBackend(CompleteBackend):
+        def __getattribute__(self, name):
+            if name == member:
+                raise error
+            return super().__getattribute__(name)
 
-        def close(self):
-            self.closed = True
-
-    backend = IncompleteBackend()
-    sock = FakeSocket()
-    sent_frames = []
-    monkeypatch.setattr(worker, "connect_unix", lambda *args: sock)
-    monkeypatch.setattr(
-        worker, "FramedSocket",
-        lambda unused_sock: SimpleNamespace(send=sent_frames.append))
+    backend = FailingGetterBackend(config())
     monkeypatch.setattr(worker, "load_factory",
                         lambda spec: lambda args: backend)
 
-    with pytest.raises(TypeError, match="invalid backend instance"):
-        worker.run(config(backend="tests:factory"))
+    with pytest.raises(type(error)) as raised:
+        worker.create_engine(config(backend="tests:factory"))
 
+    assert raised.value is error
     assert backend.close_calls == 1
-    assert sock.closed
-    assert sent_frames == []
+
+
+@pytest.mark.parametrize("closed_stderr", [False, True])
+def test_admission_error_survives_close_interrupt_and_diagnostic_failure(
+        monkeypatch, closed_stderr):
+    class FailingCloseBackend(IncompleteBackend):
+        def close(self):
+            super().close()
+            raise KeyboardInterrupt("backend release interrupted")
+
+    backend = FailingCloseBackend()
+    monkeypatch.setattr(worker, "load_factory",
+                        lambda spec: lambda args: backend)
+    diagnostic = io.StringIO()
+    if closed_stderr:
+        diagnostic.close()
+
+    with redirect_stderr(diagnostic):
+        # Capture the regression's leaked interrupt so pytest can still
+        # report all acquisition failures instead of aborting the test run.
+        with pytest.raises(BaseException) as raised:
+            worker.create_engine(config(backend="tests:factory"))
+
+    assert isinstance(raised.value, TypeError)
+    assert "missing callable methods: step" in str(raised.value)
+    assert backend.close_calls == 1
+    assert any("KeyboardInterrupt: backend release interrupted" in note
+               for note in raised.value.__notes__)
+    if closed_stderr:
+        assert any("diagnostic output failed" in note
+                   for note in raised.value.__notes__)
+    else:
+        assert "KeyboardInterrupt: backend release interrupted" in diagnostic.getvalue()
+
+
+def test_unreadable_close_is_not_looked_up_again_for_cleanup(monkeypatch):
+    error = RuntimeError("close getter failed")
+
+    class UnreadableCloseBackend(CompleteBackend):
+        close_lookups = 0
+
+        @property
+        def close(self):
+            self.close_lookups += 1
+            raise error
+
+    backend = UnreadableCloseBackend(config())
+    monkeypatch.setattr(worker, "load_factory",
+                        lambda spec: lambda args: backend)
+
+    with pytest.raises(RuntimeError) as raised:
+        worker.create_engine(config(backend="tests:factory"))
+
+    assert raised.value is error
+    assert backend.close_lookups == 1
+    assert backend.close_calls == 0
+    assert any("close" in note and "unavailable" in note
+               for note in error.__notes__)
+
+
+def test_accepted_backend_resolves_close_once_without_closing(monkeypatch):
+    class CountCloseLookupBackend(CompleteBackend):
+        close_lookups = 0
+
+        @property
+        def close(self):
+            self.close_lookups += 1
+            return super().close
+
+    backend = CountCloseLookupBackend(config())
+    monkeypatch.setattr(worker, "load_factory",
+                        lambda spec: lambda args: backend)
+
+    assert worker.create_engine(config(backend="tests:factory")) is backend
+    assert backend.close_lookups == 1
+    assert backend.close_calls == 0
+
+
+def test_worker_closes_connected_sockets_before_reset_on_backend_getter_failure(
+        monkeypatch):
+    error = RuntimeError("backend step getter failed")
+
+    class FailingGetterBackend(CompleteBackend):
+        @property
+        def step(self):
+            raise error
+
+    backend = FailingGetterBackend(config())
+    pairs = [socket.socketpair() for _ in range(3)]
+    socks, peers = zip(*pairs)
+    try:
+        # Raw CAN behavior is outside this lifecycle boundary; a real fd
+        # still proves that each successfully acquired transport is released.
+        monkeypatch.setattr(worker, "connect_unix", lambda path, timeout:
+                            socks[0] if path == "cosim" else socks[1])
+        monkeypatch.setattr(worker, "open_socketcan", lambda interface: socks[2])
+        monkeypatch.setattr(worker, "load_factory",
+                            lambda spec: lambda args: backend)
+
+        with pytest.raises(RuntimeError) as raised:
+            worker.run(config(backend="tests:factory", cosim="cosim",
+                              fdcan="can", socketcan="test", protocol="v2"))
+
+        assert raised.value is error
+        assert backend.close_calls == 1
+        assert [sock.fileno() for sock in socks] == [-1, -1, -1]
+        for peer in peers:
+            peer.settimeout(0.2)
+            assert peer.recv(4096) == b""  # EOF with no RESET/CAN wire.
+    finally:
+        for sock in (*socks, *peers):
+            sock.close()

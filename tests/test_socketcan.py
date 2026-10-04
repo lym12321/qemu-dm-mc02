@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import importlib.util
+import errno
+import os
 from pathlib import Path
 import socket
 import sys
 import unittest
+from unittest.mock import patch
 
 
 MODULE = Path(__file__).resolve().parents[1] / "tools" / "dm_mc02_socketcan.py"
@@ -15,6 +18,119 @@ assert SPEC is not None and SPEC.loader is not None
 mod = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = mod
 SPEC.loader.exec_module(mod)
+
+
+class SetupSocket(socket.socket):
+    """Real fd with only CAN setup calls isolated; no vcan/physical CAN claim."""
+
+    def __init__(self, *, fileno, failed_stage=None, setup_error=None,
+                 close_error=None):
+        super().__init__(fileno=fileno)
+        self.failed_stage = failed_stage
+        self.setup_error = setup_error
+        self.close_error = close_error
+        self.close_calls = 0
+
+    def setsockopt(self, *args):
+        if self.failed_stage == "setsockopt":
+            raise self.setup_error
+
+    def bind(self, address):
+        if self.failed_stage == "bind":
+            raise self.setup_error
+
+    def close(self):
+        self.close_calls += 1
+        super().close()
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class SocketCanOpenTests(unittest.TestCase):
+    def setup_socket(self, **kwargs):
+        acquired, peer = socket.socketpair()
+        sock = SetupSocket(fileno=acquired.detach(), **kwargs)
+        # Base close keeps teardown independent of injected close diagnostics.
+        self.addCleanup(socket.socket.close, sock)
+        self.addCleanup(peer.close)
+        return sock, sock.fileno()
+
+    def assert_closed_once(self, sock, fd):
+        self.assertEqual(sock.close_calls, 1)
+        self.assertEqual(sock.fileno(), -1)
+        with self.assertRaises(OSError) as raised:
+            os.fstat(fd)
+        self.assertEqual(raised.exception.errno, errno.EBADF)
+
+    def assert_setup_interrupt_cleanup(self, stage):
+        primary = KeyboardInterrupt(f"interrupted {stage}")
+        sock, fd = self.setup_socket(failed_stage=stage, setup_error=primary)
+        with patch.object(mod.socket, "socket", return_value=sock):
+            with self.assertRaises(KeyboardInterrupt) as raised:
+                mod.open_socketcan("fixture")
+        self.assertIs(raised.exception, primary)
+        self.assert_closed_once(sock, fd)
+
+    def test_setsockopt_interrupt_closes_fd_and_preserves_exception(self):
+        self.assert_setup_interrupt_cleanup("setsockopt")
+
+    def test_bind_interrupt_closes_fd_and_preserves_exception(self):
+        self.assert_setup_interrupt_cleanup("bind")
+
+    def test_bind_oserror_retains_socketcan_mapping_and_cause(self):
+        primary = OSError(errno.ENODEV, "no such CAN device")
+        sock, fd = self.setup_socket(failed_stage="bind", setup_error=primary)
+        with patch.object(mod.socket, "socket", return_value=sock):
+            with self.assertRaisesRegex(
+                    mod.SocketCANError, "interface is unavailable: fixture") as raised:
+                mod.open_socketcan("fixture", enable_fd=False)
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assert_closed_once(sock, fd)
+
+    def assert_mapped_failure_survives_close(self, cleanup):
+        primary = OSError(errno.ENODEV, "no such CAN device")
+        sock, fd = self.setup_socket(
+            failed_stage="bind", setup_error=primary, close_error=cleanup)
+        with patch.object(mod.socket, "socket", return_value=sock):
+            # Catch cleanup interrupts too, so a regression is a failing test
+            # instead of aborting collection of the remaining lifecycle cases.
+            with self.assertRaises(BaseException) as raised:
+                mod.open_socketcan("fixture")
+        self.assertIsInstance(raised.exception, mod.SocketCANError)
+        self.assertIn("interface is unavailable", str(raised.exception))
+        self.assertIs(raised.exception.__cause__, primary)
+        notes = "\n".join(getattr(raised.exception, "__notes__", ()))
+        self.assertIn("cleanup", notes)
+        self.assertIn(str(cleanup), notes)
+        self.assert_closed_once(sock, fd)
+
+    def test_close_error_cannot_replace_mapped_setup_failure(self):
+        self.assert_mapped_failure_survives_close(OSError("close failed"))
+
+    def test_close_interrupt_cannot_replace_mapped_setup_failure(self):
+        self.assert_mapped_failure_survives_close(KeyboardInterrupt("close interrupted"))
+
+    def test_constructor_failure_does_not_close_nonexistent_socket(self):
+        primary = OSError(errno.ENODEV, "socket construction failed")
+        with patch.object(mod.socket, "socket", side_effect=primary) as constructor:
+            with self.assertRaises(mod.SocketCANError) as raised:
+                mod.open_socketcan("fixture")
+        self.assertIs(raised.exception.__cause__, primary)
+        constructor.assert_called_once_with(socket.AF_CAN, socket.SOCK_RAW,
+                                            socket.CAN_RAW)
+        constructor.return_value.close.assert_not_called()
+        self.assertFalse(getattr(raised.exception, "__notes__", ()))
+
+    def test_success_transfers_open_fd_to_caller(self):
+        sock, fd = self.setup_socket()
+        with patch.object(mod.socket, "socket", return_value=sock):
+            returned = mod.open_socketcan("fixture")
+        self.assertIs(returned, sock)
+        self.assertEqual(sock.close_calls, 0)
+        self.assertEqual(sock.fileno(), fd)
+        os.fstat(fd)
+        returned.close()
+        self.assert_closed_once(sock, fd)
 
 
 class SocketCanTests(unittest.TestCase):

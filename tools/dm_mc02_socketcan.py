@@ -204,6 +204,7 @@ def _require_socketcan() -> None:
 def open_socketcan(interface: str, *, enable_fd: bool = True) -> socket.socket:
     """Open and bind a raw SocketCAN interface, with clear host errors."""
     _require_socketcan()
+    sock = None
     try:
         sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
         if enable_fd:
@@ -211,14 +212,24 @@ def open_socketcan(interface: str, *, enable_fd: bool = True) -> socket.socket:
             sock.setsockopt(socket.SOL_CAN_RAW, option, 1)
         sock.bind((interface,))
         return sock
-    except OSError as exc:
-        try:
-            sock.close()
-        except UnboundLocalError:
-            pass
-        if exc.errno in (errno.ENODEV, errno.ENXIO):
-            raise SocketCANError(f"SocketCAN interface is unavailable: {interface}") from exc
-        raise SocketCANError(f"cannot open SocketCAN interface {interface}: {exc}") from exc
+    except BaseException as exc:
+        primary = exc
+        if isinstance(exc, OSError):
+            if exc.errno in (errno.ENODEV, errno.ENXIO):
+                primary = SocketCANError(
+                    f"SocketCAN interface is unavailable: {interface}")
+            else:
+                primary = SocketCANError(
+                    f"cannot open SocketCAN interface {interface}: {exc}")
+        if sock is not None:
+            try:
+                sock.close()
+            except BaseException as error:
+                primary.add_note(f"cleanup SocketCAN.close() failed: "
+                                 f"{type(error).__name__}: {error}")
+        if primary is exc:
+            raise
+        raise primary from exc
 
 
 def _send_all(sock: Any, payload: bytes) -> None:
