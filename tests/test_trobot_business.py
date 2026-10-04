@@ -317,7 +317,7 @@ def test_bench_trace_event_budget_is_explicit(
 
     engine = bench.BenchEngine.__new__(bench.BenchEngine)
     engine.trace = StringIO()
-    engine.data = SimpleNamespace(time=0.001)
+    engine.physics = SimpleNamespace(time_s=0.001)
     engine.events = limit - 1
     engine.max_events = limit
     engine.record("step", dt=.001)

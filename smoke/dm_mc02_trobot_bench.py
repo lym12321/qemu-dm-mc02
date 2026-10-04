@@ -23,7 +23,7 @@ class BenchEngine(MujocoEngine):
             raise BufferError(f"business bench trace exceeded {self.max_events} events")
         self.events += 1
         self.trace.write(json.dumps(dict(
-            event=event, plant_time_s=float(self.data.time),
+            event=event, plant_time_s=self.time_s,
             wall_time_ns=time.monotonic_ns(), **fields)) + "\n")
 
     def step(self, dt):

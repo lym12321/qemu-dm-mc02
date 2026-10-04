@@ -582,6 +582,32 @@ IMU derived state 对应当前关节状态；这一步不会增加 plant 时间�
 
 MuJoCo worker smoke 验证 adapter 和测试模型；下文的 MotorTest 另验证实际固件电机组件的数据边界。普通 Release 的固定单转子业务使用上面的 [business fixture](#trobot-release-business-fixture) 入口。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
 
+具名物理接口使用锁定的 MuJoCo 3.12.0，可独立于 QEMU 和 CAN 调用：
+
+```python
+from sim.physics import MujocoPhysics
+
+plant = MujocoPhysics.from_xml_path(
+    "smoke/dm_mc02_mujoco_smoke.xml",
+    joints={"test_joint": "motor0"},
+    imus={"imu": ("imu_gyro", "imu_accel")},
+)
+plant.set_joint_effort("test_joint", 0.005)  # Nm
+plant.step(1_000_000)  # ns, one native solver step
+print(plant.get_joint_state("test_joint"))  # rad, rad/s
+print(plant.get_body_pose("test_body"))  # world metres, body quaternion wxyz
+print(plant.get_imu("imu"))  # site-local rad/s and proper acceleration m/s²
+```
+
+绑定只接受 hinge 与直接、单位 gear、即时且无隐式限幅的 motor；IMU 必须是同一 site 的
+原生 gyro/accelerometer 配对，不支持延迟、历史采样、filter 或 noise。缺失或不支持的绑定
+在运行前明确拒绝；旧 worker 沿用惯用传感器名，缺失传感器不再静默输出零。
+getter 读取最近一次初始化、reset 或完成 step 的状态；改变力矩后须 step 才产生新的 IMU。
+模型中其它原生负载或 actuator 仍会参与动力学，设置的力矩不代表总关节合力矩。
+原生数值异常或无效目标状态会报错，后续推进与观察须先 reset；失败不提供回滚。
+`time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
+不建立 QEMU 时间屏障。四轮底盘、固件 IMU 闭环和物理标定仍需分别验证。
+
 BMI088 的完整 raw burst/FIFO data 消费通知携带实际样本身份；默认字节、部分读取或跨样本混合不产生完整消费确认。raw 目前逐字节读取寄存器，没有已验证的硬件 shadow snapshot。`--wait-step-done` 用于 BMI088 消费门：输入已接受后，器件未接收该样本或未读来源被覆盖/器件复位，会返回失败 DONE（status=2），并报告真实已消费和缺失掩码。严格等待会立即报错，适用于传感器已经配置、每个样本都应被完整读取的场景；默认模式继续按 ACK 推进。来源按实际读取身份匹配，跨会话重用外部序号不会误确认；完成响应按 ACK 顺序发送，并保留最近结果供重放。此门不提供 CPU/电机全局锁步。SPI 独立组件的 v1 状态恢复会清除缺失的来源身份，SPI/BMI088 组合的旧 v1 快照拒绝；这些组件状态不代表整机迁移。
 
 v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，每次等待 0.25 秒，初次发送后最多重试三次；收到 `QUEUE_FULL` 后按 1 毫秒间隔重试，仍受同一个 2 秒期限约束。重试沿用原始输入，不重复推进 plant；准入发送尚未完成时先完成原发送。等待 ACK、DONE 或队列恢复时，CAN/SocketCAN 仍可双向转发。`--wait-step-done` 另有每次 2 秒、最多四次的完成等待；超时重试仍计入次数。重放尚未发送完时，先继续原发送；发送队列空才重放同一 STEP，不重复推进 plant。完成等待的时间另计。准入超时报 `STEP_ACK admission timed out`，附带 STEP 编号、时间、最后状态、队列深度和静默重试次数，便于定位未回应或队列持续占满。

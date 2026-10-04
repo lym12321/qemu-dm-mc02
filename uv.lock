@@ -44,7 +44,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "mujoco", marker = "extra == 'mujoco'", specifier = ">=3.2,<4" },
+    { name = "mujoco", marker = "extra == 'mujoco'", specifier = "==3.12.0" },
     { name = "pyyaml", specifier = "==6.0.3" },
 ]
 provides-extras = ["mujoco"]

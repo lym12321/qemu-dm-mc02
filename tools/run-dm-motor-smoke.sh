@@ -189,7 +189,7 @@ try:
                                             (p_expected, v_expected, effort_expected)):
                     if not math.isclose(actual, expected, rel_tol=0, abs_tol=1e-9):
                         raise RuntimeError(f'rotor state differs from analytic oracle at {ordinal}: {(position, velocity, effort)}')
-                if not math.isclose(engine.data.time, steps * .001, rel_tol=0, abs_tol=1e-12):
+                if not math.isclose(engine.time_s, steps * .001, rel_tol=0, abs_tol=1e-12):
                     raise RuntimeError('plant step clock drifted')
                 state = adapter.state(engine, 0, steps * 1_000_000)
                 feedback_id, feedback = adapter.encode_feedback(state)

@@ -29,7 +29,7 @@ from sim.transports import (
     connect_unix as transport_connect_unix, send_datagram,
 )
 from sim.core import StepResult
-from sim.physics import integrate_rotor
+from sim.physics import MujocoPhysics, integrate_rotor
 
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
@@ -731,7 +731,7 @@ class NullEngine:
 
 
 class MujocoEngine:
-    """Optional MuJoCo adapter with conservative sensor-name conventions."""
+    """Legacy motor policy and units over the named public physics boundary."""
 
     def __init__(self, model_path: str, motor_count: int, timestep: float,
                  torque_limit: float = DM_DEFAULT_T_MAX):
@@ -740,27 +740,43 @@ class MujocoEngine:
         except ImportError as exc:  # pragma: no cover - depends on host setup
             raise RuntimeError(
                 "MuJoCo engine requires `uv pip install mujoco`") from exc
-        self.mujoco = mujoco
-        self.model = mujoco.MjModel.from_xml_path(str(Path(model_path)))
-        self.model.opt.timestep = timestep
-        self.data = mujoco.MjData(self.model)
-        self.motor_count = min(motor_count, self.model.nu)
+        if (isinstance(timestep, bool) or not isinstance(timestep, (int, float))
+                or not math.isfinite(timestep) or timestep <= 0):
+            raise ValueError("MuJoCo timestep must be finite and positive")
+        if type(motor_count) is not int or motor_count < 0:
+            raise ValueError("MuJoCo motor_count must be a nonnegative integer")
+        model = mujoco.MjModel.from_xml_path(str(Path(model_path)))
+        model.opt.timestep = timestep
+        self.motor_count = min(motor_count, model.nactuator)
+        # Native metadata is used only for legacy configuration discovery. The
+        # complete model is then transferred to the sole runtime solver owner.
+        self.joint_names = tuple(mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_JOINT, int(model.actuator_trnid[a, 0]))
+            for a in range(self.motor_count))
+        actuator_names = tuple(mujoco.mj_id2name(
+            model, mujoco.mjtObj.mjOBJ_ACTUATOR, a) for a in range(self.motor_count))
+        if len(set(self.joint_names)) != self.motor_count:
+            raise ValueError("MuJoCo legacy motors must bind distinct named hinge joints")
+
+        def sensor_name(names):
+            return next((name for name in names if mujoco.mj_name2id(
+                model, mujoco.mjtObj.mjOBJ_SENSOR, name) >= 0), None)
+        gyro = sensor_name(("imu_gyro", "gyro"))
+        accel = sensor_name(("imu_accel", "accelerometer", "accel"))
+        if gyro is None or accel is None:
+            raise ValueError("MuJoCo legacy model requires named native gyro and accelerometer")
+        self.physics = MujocoPhysics(
+            model, joints=dict(zip(self.joint_names, actuator_names)),
+            imus={"imu": (gyro, accel)})
         self.motor_values = [0.0] * self.motor_count
         self.legacy_values = [0.0] * self.motor_count
         self.torque_limit = torque_limit
         self.enabled = [False] * self.motor_count
         self.dm_commands: list[dict | None] = [None] * self.motor_count
-        self.gyro_sensor = self._find_sensor(("imu_gyro", "gyro"))
-        self.accel_sensor = self._find_sensor(("imu_accel", "accelerometer", "accel"))
-        self.mujoco.mj_forward(self.model, self.data)
 
-    def _find_sensor(self, names: tuple[str, ...]) -> int | None:
-        for name in names:
-            sensor_id = self.mujoco.mj_name2id(
-                self.model, self.mujoco.mjtObj.mjOBJ_SENSOR, name)
-            if sensor_id >= 0:
-                return sensor_id
-        return None
+    @property
+    def time_s(self) -> float:
+        return self.physics.time_s
 
     def set_motor(self, index: int, value: float) -> None:
         if 0 <= index < self.motor_count:
@@ -768,16 +784,16 @@ class MujocoEngine:
             self.legacy_values[index] = value
             self.motor_values[index] = legacy_motor_effort(
                 value, self.enabled[index], self.torque_limit)
-            self.data.ctrl[index] = self.motor_values[index]
+            self.physics.set_joint_effort(
+                self.joint_names[index], self.motor_values[index])
 
     def reset(self) -> None:
         """Reset MuJoCo state without reloading the model or its sensors."""
-        self.data = self.mujoco.MjData(self.model)
+        self.physics.reset()
         self.motor_values = [0.0] * self.motor_count
         self.legacy_values = [0.0] * self.motor_count
         self.enabled = [False] * self.motor_count
         self.dm_commands = [None] * self.motor_count
-        self.mujoco.mj_forward(self.model, self.data)
 
     def set_motor_enabled(self, index: int, enabled: bool) -> None:
         if 0 <= index < self.motor_count:
@@ -785,17 +801,18 @@ class MujocoEngine:
             if self.dm_commands[index] is None:
                 self.motor_values[index] = legacy_motor_effort(
                     self.legacy_values[index], enabled, self.torque_limit)
-                self.data.ctrl[index] = self.motor_values[index]
+                self.physics.set_joint_effort(
+                    self.joint_names[index], self.motor_values[index])
             elif not enabled:
                 self.motor_values[index] = 0.0
-                self.data.ctrl[index] = 0.0
+                self.physics.set_joint_effort(self.joint_names[index], 0.0)
 
     def set_motor_dm(self, index: int, command: dict) -> None:
         if 0 <= index < self.motor_count:
             self.dm_commands[index] = command
             if not self.enabled[index]:
                 self.motor_values[index] = 0.0
-                self.data.ctrl[index] = 0.0
+                self.physics.set_joint_effort(self.joint_names[index], 0.0)
 
     def reset_motor(self, index: int) -> None:
         if 0 <= index < self.motor_count:
@@ -806,12 +823,8 @@ class MujocoEngine:
     def _joint_state(self, index: int) -> tuple[float, float]:
         if not 0 <= index < self.motor_count:
             return (0.0, 0.0)
-        joint = int(self.model.actuator_trnid[index, 0])
-        if not 0 <= joint < self.model.njnt:
-            return (0.0, 0.0)
-        dof = int(self.model.jnt_dofadr[joint])
-        qpos = int(self.model.jnt_qposadr[joint])
-        return (float(self.data.qpos[qpos]), float(self.data.qvel[dof]))
+        state = self.physics.get_joint_state(self.joint_names[index])
+        return state.position_rad, state.velocity_rad_s
 
     def motor_feedback(self, index: int) -> tuple[float, float, float]:
         if not 0 <= index < self.motor_count:
@@ -819,23 +832,11 @@ class MujocoEngine:
         position, velocity = self._joint_state(index)
         return (position, velocity, self.motor_values[index])
 
-    def _sensor(self, sensor_id: int | None) -> tuple[float, float, float]:
-        if sensor_id is None:
-            return (0.0, 0.0, 0.0)
-        adr = self.model.sensor_adr[sensor_id]
-        dim = self.model.sensor_dim[sensor_id]
-        values = self.data.sensordata[adr:adr + dim]
-        return tuple(float(values[i]) if i < len(values) else 0.0
-                     for i in range(3))
-
     def step(self, dt: float) -> tuple[tuple[float, float, float],
                                          tuple[float, float, float]]:
-        if not math.isfinite(dt) or dt <= 0.0:
+        if (isinstance(dt, bool) or not isinstance(dt, (int, float))
+                or not math.isfinite(dt) or dt <= 0.0):
             raise ValueError("MuJoCo step dt must be finite and positive")
-        # The worker's virtual clock is the plant clock.  Update MuJoCo's
-        # integration interval for each boundary so variable-rate callers do
-        # not silently accumulate time at the startup rate.
-        self.model.opt.timestep = dt
         for index, command in enumerate(self.dm_commands):
             if command is None:
                 applied = legacy_motor_effort(
@@ -849,15 +850,11 @@ class MujocoEngine:
                     applied = dm_mit_effort(command, position, velocity,
                                             self.torque_limit)
             self.motor_values[index] = applied
-            self.data.ctrl[index] = applied
-        self.mujoco.mj_step(self.model, self.data)
-        # MuJoCo 3.12 computes derived pose/sensors before integrating qpos and
-        # qvel. Refresh them at the target state without advancing plant time.
-        self.mujoco.mj_forward(self.model, self.data)
-        gyro_rad = self._sensor(self.gyro_sensor)
-        accel_ms2 = self._sensor(self.accel_sensor)
-        return (tuple(v * 180.0 / math.pi for v in gyro_rad),
-                tuple(v / 9.80665 for v in accel_ms2))
+            self.physics.set_joint_effort(self.joint_names[index], applied)
+        self.physics.step_seconds(dt)
+        imu = self.physics.get_imu("imu")
+        return (tuple(v * 180.0 / math.pi for v in imu.gyro_rad_s),
+                tuple(v / 9.80665 for v in imu.accel_m_s2))
 
 
 class Ros2Engine:

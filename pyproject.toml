@@ -7,7 +7,7 @@ dependencies = ["PyYAML==6.0.3"]
 
 [project.optional-dependencies]
 mujoco = [
-    "mujoco>=3.2,<4",
+    "mujoco==3.12.0",
 ]
 
 [dependency-groups]
