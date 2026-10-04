@@ -29,6 +29,7 @@ from sim.transports import (
     connect_unix as transport_connect_unix, send_datagram,
 )
 from sim.core import StepResult
+from sim.physics import integrate_rotor
 
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
@@ -722,9 +723,9 @@ class NullEngine:
                                         self.torque_limit)
             else:
                 applied = 0.0
-            acceleration = (applied - self.damping * self.motors.velocity[index]) / self.inertia
-            self.motors.velocity[index] += acceleration * dt
-            self.motors.position[index] += self.motors.velocity[index] * dt
+            self.motors.position[index], self.motors.velocity[index] = integrate_rotor(
+                self.motors.position[index], self.motors.velocity[index], applied,
+                dt, self.inertia, self.damping)
             self.motors.torque[index] = applied
         return (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)
 
@@ -1046,8 +1047,10 @@ def _validate_worker_timing(args: argparse.Namespace) -> None:
         raise ValueError("connect-timeout must be finite and positive")
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv=None, *, configure_parser=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    if configure_parser is not None:
+        configure_parser(parser)
     parser.add_argument("--cosim", required=True,
                         help="QEMU co-sim Unix socket")
     parser.add_argument("--protocol", choices=("v1", "v2"), default="v1",
@@ -1106,7 +1109,7 @@ def parse_args() -> argparse.Namespace:
                         help="stop after this many IMU frames (0 = forever)")
     parser.add_argument("--connect-timeout", type=float, default=10.0)
     parser.add_argument("--verbose", action="store_true")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         _validate_worker_timing(args)
     except ValueError as exc:

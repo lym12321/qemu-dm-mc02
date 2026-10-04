@@ -696,3 +696,33 @@ EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被
 | `tests/` | Host C、Python 与协议测试 |
 | `flake.nix`、`flake.lock` | Nix 环境与依赖锁定 |
 | `build/` | 本地构建产物、测试报告和运行文件 |
+
+## Virtual CAN and M3508
+
+`sim/core` 提供板卡无关的 session/participant 协调器；`sim/transports` 保留有界的
+stream/datagram 队列。`sim/fabric` 在主机侧按时间戳、固定延迟和准入顺序交付 CAN 帧，
+可配置 loopback、drop predicate 和日志 sink。已有 worker 入口与默认电机协议保持兼容。
+
+连接已有 QEMU co-sim 和 FDCAN Unix socket 时，可使用专用 M3508 入口：
+
+```bash
+python3 tools/run-can-worker.py --cosim /path/to/cosim.sock --fdcan /path/to/can.sock \
+  --protocol v2 --realtime --m3508-id 1 --m3508-id 5
+python3 tools/run-can-worker.py --help
+```
+
+ESC ID 可重复指定，但必须互不重复且在 1–8；可添加 `--socketcan can0` 接入已有 Linux
+CAN 接口。参数 `--can-delay-ns` 默认 0，`--m3508-timeout-ms` 默认 100，
+`--torque-per-amp` 默认 0.02 Nm/A。配置在连接前校验；消息或发送队列耗尽时明确失败。
+
+M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输出 `0x201`–`0x208`
+转子角度、转子 RPM、电流与温度反馈。固件负责减速比换算。当前使用未标定的简单转子
+(J=0.02 kg·m²、阻尼 0.08 Nm/(rad/s))、固定 25°C、命令电流代替实际电流测量。
+默认每虚拟毫秒反馈，较大 step 只发送最新样本；100 ms 命令超时后零驱动并继续反馈。
+这些是公开的模型近似；C620 手册没有提供这里使用的数值超时保证。
+
+每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
+命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。
+RESET 保留 transport 的 partial bytes，并更新 QEMU/worker 时间原点。CAN wire 没有
+session 标识，因此不提供跨 reset 的 CAN 历史输入隔离。这个调度不提供位级仲裁、
+真实电气总线、CPU 全局锁步或实物电机标定。
