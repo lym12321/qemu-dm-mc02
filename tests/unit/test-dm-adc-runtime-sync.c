@@ -23,6 +23,7 @@
 #define ADC_DR 0x40
 #define ADC_JSQR 0x4c
 #define ADC_JDR1 0x80
+#define ADC_CALFACT_RES13 0xc4
 #define ADC_ISR_EOC (1u << 2)
 #define ADC_ISR_JEOC (1u << 5)
 #define ADC_CR_ADEN (1u << 0)
@@ -51,6 +52,7 @@ typedef struct AdcObserver {
     unsigned starts;
     unsigned triggers;
     unsigned samples;
+    uint16_t sample_value;
     unsigned irq_calls;
     int irq_level;
 } AdcObserver;
@@ -126,9 +128,9 @@ static void observe_sample(void *opaque, unsigned adc_index,
 {
     AdcObserver *observer = opaque;
 
-    (void)sample;
     g_assert_cmpuint(adc_index, ==, 0);
     observer->samples++;
+    observer->sample_value = sample->value;
 }
 
 static void observe_irq(void *opaque, int line, int level)
@@ -207,7 +209,9 @@ static void save_state(const DmMc02Adc *state)
 static int load_state(DmMc02Adc *state)
 {
     QEMUFile *file = open_test_file(false);
-    int ret = vmstate_load_state(file, dm_mc02_adc_vmstate(), state, 1);
+    const VMStateDescription *description = dm_mc02_adc_vmstate();
+    int ret = vmstate_load_state(file, description, state,
+                                 description->version_id);
 
     if (!ret) {
         g_assert_cmpint(qemu_file_get_error(file), ==, 0);
@@ -287,6 +291,7 @@ static void test_supported_resolution_deadlines(void)
         { 1500000, 4, { 27334, 26667, 26000, 25334 } },
         { 1500000, 7, { 546000, 545334, 544667, 544000 } },
     };
+    static const uint16_t results[] = { 0x0100, 0x0040, 0x0010, 0x0004 };
 
     for (unsigned test = 0; test < ARRAY_SIZE(cases); test++) {
         for (unsigned code = 0; code < 4; code++) {
@@ -325,7 +330,7 @@ static void test_supported_resolution_deadlines(void)
                 adc_clock_ns++;
                 g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
                 g_assert_true(mmio_read(&state, ADC_ISR, 4) & flag);
-                g_assert_cmphex(get_reg(state.regs, data_reg), ==, 0x0100);
+                g_assert_cmphex(get_reg(state.regs, data_reg), ==, results[code]);
                 g_assert_cmpint(observer.irq_level, ==, 1);
                 g_assert_cmpuint(observer.samples, ==, injected ? 0 : 1);
                 g_assert_cmpuint(dm_adc_test_dma_requests, ==, injected ? 0 : 1);
@@ -334,6 +339,57 @@ static void test_supported_resolution_deadlines(void)
                 free_adc(&state);
                 qemu_free_irq(irq);
             }
+        }
+    }
+}
+
+static void test_resolution_results(void)
+{
+    /* Fixed ST LL __LL_ADC_CONVERT_DATA_RESOLUTION (V5_V90) and
+     * __LL_ADC_DIGITAL_SCALE: canonical raw16 retains its high bits.
+     * Calibration is the existing raw16 approximation, not silicon trim. */
+    static const struct {
+        unsigned code;
+        uint16_t raw;
+        uint16_t offset;
+        uint16_t result;
+    } cases[] = {
+        { 3, 0x0000, 0, 0x0000 },
+        { 0, 0xffff, 0, 0xffff },
+        { 1, 0xffff, 0, 0x3fff },
+        { 2, 0xffff, 0, 0x0fff },
+        { 3, 0xffff, 0, 0x03ff },
+        { 0, 0xabcd, 0, 0xabcd },
+        { 1, 0xabcd, 0, 0x2af3 },
+        { 2, 0xabcd, 0, 0x0abc },
+        { 3, 0xabcd, 0, 0x02af },
+        { 3, 0xabcd, 0x3d, 0x02ae },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+        for (unsigned injected = 0; injected < 2; ++injected) {
+            DmMc02Adc state;
+            AdcObserver observer = { 0 };
+            unsigned data_reg = injected ? ADC_JDR1 : ADC_DR;
+            uint32_t start = injected ? ADC_CR_JADSTART : ADC_CR_ADSTART;
+
+            init_mmio_adc(&state);
+            dm_mc02_adc_set_channel_raw(&state, 0, cases[i].raw);
+            mmio_write(&state, ADC_CALFACT_RES13, cases[i].offset, 4);
+            mmio_write(&state, ADC_CFGR, ADC_CFGR_JQDIS |
+                        (cases[i].code << ADC_CFGR_RES_SHIFT), 4);
+            dm_mc02_adc_set_regular_sample_callback(&state, 0,
+                                                    observe_sample, &observer);
+            mmio_write(&state, ADC_CR, ADC_CR_ADEN | start, 4);
+            adc_clock_ns = 100; /* (1.5 + 8.5) clocks at 100 MHz, or less. */
+            g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+            g_assert_cmphex(mmio_read(&state, data_reg, 4), ==, cases[i].result);
+            g_assert_cmphex(state.external_values[0], ==, cases[i].raw);
+            if (!injected) {
+                g_assert_cmpuint(observer.samples, ==, 1);
+                g_assert_cmphex(observer.sample_value, ==, cases[i].result);
+            }
+            free_adc(&state);
         }
     }
 }
@@ -560,6 +616,7 @@ static void test_rearms_paused_regular_rank_after_load(void)
     adc_clock_ns = 0;
     dm_mc02_adc_init(&source, NULL, "adc-vmstate-source");
     source.regs[ADC_CR] = ADC_CR_ADEN | ADC_CR_ADSTART;
+    source.regs[ADC_CFGR] = 3u << ADC_CFGR_RES_SHIFT;
     source.conversion_active = true;
     source.current_rank = 0;
     source.rank_remaining_half_cycles = 5;
@@ -583,6 +640,8 @@ static void test_rearms_paused_regular_rank_after_load(void)
     adc_clock_ns += deadline;
     g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
     g_assert_true(restored.regs[ADC_ISR] & ADC_ISR_EOC);
+    g_assert_cmphex(restored.sample_values[0], ==, 0x0100);
+    g_assert_cmphex(mmio_read(&restored, ADC_DR, 4), ==, 0x0004);
 
     free_adc(&restored);
     free_adc(&source);
@@ -597,6 +656,7 @@ static void test_rearms_paused_injected_rank_after_load(void)
     adc_clock_ns = 0;
     dm_mc02_adc_init(&source, NULL, "adc-vmstate-source");
     source.regs[ADC_CR] = ADC_CR_ADEN | ADC_CR_JADSTART;
+    source.regs[ADC_CFGR] = 3u << ADC_CFGR_RES_SHIFT;
     source.regs[ADC_JSQR] = 0; /* One injected rank. */
     source.injected_conversion_active = true;
     source.current_injected_rank = 0;
@@ -619,7 +679,8 @@ static void test_rearms_paused_injected_rank_after_load(void)
     adc_clock_ns += deadline;
     g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
     g_assert_true(restored.regs[ADC_ISR] & ADC_ISR_JEOC);
-    g_assert_cmpuint(restored.regs[ADC_JDR1 + 1], !=, 0);
+    g_assert_cmphex(restored.sample_values[0], ==, 0x0100);
+    g_assert_cmphex(mmio_read(&restored, ADC_JDR1, 4), ==, 0x0004);
 
     free_adc(&restored);
     free_adc(&source);
@@ -682,6 +743,8 @@ int main(int argc, char **argv)
                     test_resolution_mmio_readback);
     g_test_add_func("/dm-adc/resolution/supported-deadlines",
                     test_supported_resolution_deadlines);
+    g_test_add_func("/dm-adc/resolution/results",
+                    test_resolution_results);
     g_test_add_func("/dm-adc/resolution/unsupported-starts-preserve-results",
                     test_unsupported_resolution_starts_preserve_results);
     g_test_add_func("/dm-adc/resolution/unsupported-external-boundaries",

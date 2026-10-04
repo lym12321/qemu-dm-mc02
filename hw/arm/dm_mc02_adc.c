@@ -922,6 +922,15 @@ static uint16_t adc_channel_value(const DmMc02Adc *s, unsigned channel,
            s->sample_values[fallback_rank] : 0;
 }
 
+static uint16_t adc_result_value(const DmMc02Adc *s, uint16_t raw,
+                                  unsigned channel)
+{
+    /* ST LL __LL_ADC_CONVERT_DATA_RESOLUTION (V5_V90): canonical 16-bit
+     * data to supported RES codes 0..3 shifts by 0/2/4/6 after calibration. */
+    return adc_apply_calibration(s, raw, channel) >>
+           (2 * dm_mc02_adc_resolution_code(s));
+}
+
 static uint16_t adc_rank_value(const DmMc02Adc *s, unsigned rank)
 {
     unsigned channel;
@@ -934,15 +943,14 @@ static uint16_t adc_rank_value(const DmMc02Adc *s, unsigned rank)
         channel = adc_sequence_channel(s, rank + 1u);
         raw = adc_channel_value(s, channel, rank);
     }
-    return adc_apply_calibration(s, raw, channel);
+    return adc_result_value(s, raw, channel);
 }
 
 static uint16_t adc_injected_rank_value(const DmMc02Adc *s, unsigned rank)
 {
     unsigned channel = adc_injected_sequence_channel(s, rank + 1u);
 
-    return adc_apply_calibration(s, adc_channel_value(s, channel, rank),
-                                 channel);
+    return adc_result_value(s, adc_channel_value(s, channel, rank), channel);
 }
 
 static void adc_stop_timer(DmMc02Adc *s)

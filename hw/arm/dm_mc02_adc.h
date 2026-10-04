@@ -24,6 +24,7 @@ typedef struct DmMc02AdcRegularSample {
     /* Non-zero only for a common-owned regular ADC pair. */
     uint64_t conversion_id;
     uint32_t rank;
+    /* Calibrated result at the configured resolution, as published to DR. */
     uint16_t value;
     uint64_t timestamp_ns;
 } DmMc02AdcRegularSample;
@@ -203,7 +204,7 @@ void dm_mc02_adc_set_dma_endpoint(DmMc02Adc *state, bool enabled);
  * becoming enabled.  DMA still owns stream selection, addresses and status. */
 void dm_mc02_adc_dma_stream_enabled(DmMc02Adc *state);
 
-/* Set the deterministic values emitted for conversion ranks 1 and 2. */
+/* Set canonical raw16 inputs for conversion ranks 1 and 2. */
 void dm_mc02_adc_set_samples(DmMc02Adc *state, uint16_t first,
                              uint16_t second);
 

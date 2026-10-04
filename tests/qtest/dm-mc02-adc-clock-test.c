@@ -7,6 +7,10 @@
  * 16/14/12/10-bit.  Sampling code 4 is 32.5 cycles; at 1.5 MHz the
  * rounded deadlines below are independent of the production timing helper. */
 static const int64_t resolution_rank_ns[] = { 27334, 26667, 26000, 25334 };
+/* ST LL __LL_ADC_CONVERT_DATA_RESOLUTION, canonical channel-4 raw16=43329. */
+static const uint16_t resolution_channel4[] = {
+    0xa941, 0x2a50, 0x0a94, 0x02a5,
+};
 
 static void test_16bit_rank_conversion_deadline(void)
 {
@@ -37,6 +41,7 @@ static void test_16bit_rank_conversion_deadline(void)
 static void test_resolution_processing_deadlines(void)
 {
     const uint32_t bases[] = { ADC1_BASE, ADC2_BASE };
+    const uint16_t fallback[] = { 0x0100, 0x0040, 0x0010, 0x0004 };
     QTestState *qts = qtest_init(
         "-machine dm-mc02,adc-accurate-timing=on");
 
@@ -72,7 +77,8 @@ static void test_resolution_processing_deadlines(void)
                 g_assert_true(qtest_readl(qts, base) & flag);
                 g_assert_false(qtest_readl(qts, base + 0x08) & start);
                 g_assert_cmphex(qtest_readl(qts, result), ==,
-                                adc == 0 ? 43329u : 0x0100u);
+                                adc == 0 ? resolution_channel4[resolution] :
+                                           fallback[resolution]);
             }
         }
     }
@@ -84,6 +90,8 @@ static void test_16bit_rank_dma_consumer_deadline(void)
     QTestState *qts = qtest_init(
         "-machine dm-mc02,adc-accurate-timing=on,adc-dma-endpoint=on");
     const uint32_t buffer = 0x20000100u;
+    /* ST LL __LL_ADC_DIGITAL_SCALE: each supported result's full scale. */
+    const uint16_t full_scale[] = { 0xffff, 0x3fff, 0x0fff, 0x03ff };
 
     /* Keep the existing registration path, and cover all four supported
      * resolutions at the actual ADC->direct DMA destination boundary. */
@@ -115,7 +123,7 @@ static void test_16bit_rank_dma_consumer_deadline(void)
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         qtest_clock_step(qts, 1);
         qtest_memread(qts, buffer, samples, sizeof(samples));
-        g_assert_cmphex(samples[0], ==, 43329u);
+        g_assert_cmphex(samples[0], ==, resolution_channel4[resolution]);
         g_assert_cmphex(samples[1], ==, 0x5aa5);
         g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 1);
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -127,7 +135,7 @@ static void test_16bit_rank_dma_consumer_deadline(void)
         g_assert_false(qtest_readl(qts, DMA1_LISR) & (1u << 21));
         qtest_clock_step(qts, 1);
         qtest_memread(qts, buffer, samples, sizeof(samples));
-        g_assert_cmphex(samples[1], ==, UINT16_MAX);
+        g_assert_cmphex(samples[1], ==, full_scale[resolution]);
         g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 2);
         g_assert_true(qtest_readl(qts, DMA1_LISR) & (1u << 21));
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
