@@ -226,8 +226,31 @@ CRC8 初值为 `0xff`，CRC16 初值为 `0xffff`，无最终 XOR。
 
 `payload` 保持不透明，调用者须按所选协议版本填入准确的数据。接口不判断 command
 是否受固件支持，不自动递增序号，不解析连续 UART 流，也不拥有 UART/socket。
-具体命令 schema、规则状态、定时发送、UART endpoint 与赛场仍待独立接入；
 不能把帧校验通过作为规则正确或真实裁判系统的验证。
+
+四种 outgoing payload 提供固定 2026 V1.1.0 schema：
+
+```python
+from sim.devices.referee import GameStatus, RobotStatus, PowerHeat, Buff, encode_message
+
+wire = encode_message(GameStatus(1, 4, 300, 0), sequence=7)
+# 0x0201：ID、等级、当前/最大 HP、冷却值、热量上限、功率上限、输出 bitmask
+status = RobotStatus(3, 1, 200, 200, 10, 100, 80, 7)
+wire = encode_message(status)
+wire = encode_message(PowerHeat(60, 0, 0))  # J、17mm 热量、42mm 热量
+wire = encode_message(Buff(0, 0, 0, 0, 0, 0x80))
+```
+
+比赛类型支持 1–5，阶段支持 0–5，剩余时间以秒填写；64-bit UNIX timestamp 必须显式
+提供，不从 QEMU/plant 时间推算。`RobotStatus.power_outputs` 使用 bits 0/1/2 表示
+gimbal/chassis/shooter；其余字段按官方 unsigned wire 宽度编码，不夹取数值，也不裁决
+机器人 ID、HP、百分比或赛事规则。`PowerHeat` 的前 8 个保留字节固定输出零。
+
+`Buff` 的 `remaining_energy` 是显式协议 bitmap，默认全量能量可填写 `0x80`；
+编码使用官方第 17 页的 8-byte packed struct，最后字段位于 offset 7。
+第 16 页表格将该偏移写为 6，与总长度/结构冲突；当前消费者结构也支持 offset 7。
+这四类编码不包含接收 payload parser、定时发送或规则状态。`0x0206` 等其它命令、
+UART endpoint 和赛场仍待独立接入。
 
 ## Contents
 
