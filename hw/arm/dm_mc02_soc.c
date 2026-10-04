@@ -90,6 +90,33 @@ bool dm_mc02_soc_validate_map(const DmMc02SocProfile *soc)
                                        DM_MC02_SOC_ADC_REGION_SIZE);
 }
 
+bool dm_mc02_soc_dma_sram_range_valid(const DmMc02SocProfile *soc,
+                                      hwaddr address, size_t bytes)
+{
+    if (!soc || !bytes) {
+        return false;
+    }
+    /* RM0468 Rev 3, section 2.1.6: DMA1/2 reach internal memories
+     * except ITCM/DTCM. This boundary covers modeled SRAM buffers only. */
+    const struct {
+        hwaddr base;
+        hwaddr size;
+    } regions[] = {
+        { soc->axi_sram_base, soc->axi_sram_size },
+        { soc->d2_sram_base, soc->d2_sram_size },
+        { soc->d3_sram_base, soc->d3_sram_size },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(regions); ++i) {
+        if (address >= regions[i].base &&
+            address - regions[i].base <= regions[i].size &&
+            bytes <= regions[i].size - (address - regions[i].base)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 void dm_mc02_soc_memory_init(DmMc02SocMemory *memory, Object *owner,
                              MemoryRegion *system_memory,
                              const DmMc02SocProfile *soc, Error **errp)

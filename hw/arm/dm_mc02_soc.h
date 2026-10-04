@@ -90,6 +90,11 @@ const DmMc02SocProfile *dm_mc02_soc_stm32h723(void);
 /* Validate the fixed-address portion of an SoC profile without side effects. */
 bool dm_mc02_soc_validate_map(const DmMc02SocProfile *soc);
 
+/* Modeled internal SRAM reachable by DMA1/2; excludes ITCM/DTCM.
+ * This range check does not model the bus matrix's timing or arbitration. */
+bool dm_mc02_soc_dma_sram_range_valid(const DmMc02SocProfile *soc,
+                                      hwaddr address, size_t bytes);
+
 void dm_mc02_soc_memory_init(DmMc02SocMemory *memory, Object *owner,
                              MemoryRegion *system_memory,
                              const DmMc02SocProfile *soc, Error **errp);

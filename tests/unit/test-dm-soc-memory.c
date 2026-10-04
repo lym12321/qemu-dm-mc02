@@ -34,9 +34,40 @@ static void test_profile_map_remains_valid(void)
     g_assert_true(dm_mc02_soc_validate_map(dm_mc02_soc_stm32h723()));
 }
 
+static void test_dma_sram_ranges(void)
+{
+    /* RM0468 Rev 3, section 2.1.6: DMA1/2 can reach AXI and AHB SRAM,
+     * not the CPU's TCM. Sizes are the H723 profile's modeled SRAM geometry. */
+    static const struct {
+        hwaddr address;
+        size_t bytes;
+        bool valid;
+    } cases[] = {
+        { 0x2400cde8, 144, true },
+        { 0x2404ffd0, 48, true },
+        { 0x2404ffd0, 49, false },
+        { 0x30007fd0, 48, true },
+        { 0x30007fd0, 49, false },
+        { 0x38003fd0, 48, true },
+        { 0x38003fd0, 49, false },
+        { 0x20000100, 144, false },
+        { 0x00000100, 144, false },
+        { UINT64_MAX - 10, 48, false },
+        { 0x24000000, 0, false },
+    };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(cases); ++i) {
+        g_assert_cmpint(dm_mc02_soc_dma_sram_range_valid(
+                        dm_mc02_soc_stm32h723(), cases[i].address,
+                        cases[i].bytes), ==, cases[i].valid);
+    }
+    g_assert_false(dm_mc02_soc_dma_sram_range_valid(NULL, 0x24000000, 48));
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-soc-memory/dma-sram-ranges", test_dma_sram_ranges);
     g_test_add_func("/dm-soc-memory/dynamic-regions-migratable",
                     test_dynamic_regions_are_migratable);
     g_test_add_func("/dm-soc-memory/profile-map-valid",

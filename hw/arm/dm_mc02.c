@@ -2496,7 +2496,6 @@ static bool dm_mc02_ws2812_decode(DmMc02MachineState *s,
     const hwaddr stream = DM_MC02_DMA_STREAM_BASE +
                           devices->ws2812_dma_stream *
                           DM_MC02_DMA_STREAM_STRIDE;
-    const unsigned waveform_bytes = DM_MC02_WS2812_TOTAL_BITS * 2;
     uint32_t cr;
     uint32_t ndtr;
     dma_addr_t m0ar;
@@ -2520,14 +2519,15 @@ static bool dm_mc02_ws2812_decode(DmMc02MachineState *s,
         ((cr >> DM_MC02_DMA_CR_MSIZE_SHIFT) & 3u) != DM_MC02_DMA_SIZE_16 ||
         ndtr < DM_MC02_WS2812_FIRST_BITS ||
         ndtr > DM_MC02_WS2812_TOTAL_BITS ||
-        m0ar < s->board->soc->d2_sram_base ||
-        m0ar > s->board->soc->d2_sram_base +
-                s->board->soc->d2_sram_size - waveform_bytes ||
         (m0ar & 1u)) {
         return false;
     }
 
     transfer_bytes = (size_t)ndtr * sizeof(uint16_t);
+    if (!dm_mc02_soc_dma_sram_range_valid(s->board->soc, m0ar,
+                                         transfer_bytes)) {
+        return false;
+    }
     result = dma_memory_read(&address_space_memory, m0ar, waveform,
                              transfer_bytes, MEMTXATTRS_UNSPECIFIED);
     if (result != MEMTX_OK) {

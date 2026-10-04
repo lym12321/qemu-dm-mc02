@@ -4,6 +4,8 @@
 #include "libqtest.h"
 #include "qapi/qmp/qdict.h"
 #include "hw/arm/dm_mc02_tim2.h"
+#include "qemu/bswap.h"
+#include "qemu/sockets.h"
 
 #define TIM2_BASE       0x40000000
 #define TIM2_CR1        (TIM2_BASE + 0x00)
@@ -774,9 +776,94 @@ static void test_tim8_rcr_gates_update_flag_only(void)
     qtest_quit(qts);
 }
 
+static uint32_t ws2812_read_rgb(int socket_fd, uint64_t not_before_ns)
+{
+    uint8_t wire[156];
+    uint8_t length[4];
+
+    for (unsigned frame = 0; frame < 16; ++frame) {
+        uint32_t size;
+
+        g_assert_cmpint(recv(socket_fd, length, sizeof(length), MSG_WAITALL),
+                        ==, sizeof(length));
+        size = ldl_le_p(length);
+        g_assert_cmpuint(size, >=, 28);
+        g_assert_cmpuint(size, <=, sizeof(wire));
+        g_assert_cmpint(recv(socket_fd, wire, size, MSG_WAITALL), ==, size);
+        g_assert_cmphex(ldl_le_p(wire), ==, 0x32434d44);
+        g_assert_cmpuint(lduw_le_p(wire + 4), ==, 1);
+        if (lduw_le_p(wire + 6) == 3 &&
+            ldq_le_p(wire + 20) >= not_before_ns) {
+            g_assert_cmpuint(size, ==, 40);
+            return ldl_le_p(wire + 28);
+        }
+    }
+    g_assert_not_reached();
+}
+
+static void test_ws2812_dma_sram_sources(void)
+{
+    /* RM0468 Rev 3, section 2.1.6, p110: DMA1/2 memory buses reach
+     * internal AXI/SRAM1/SRAM2/SRAM4, but cannot reach ITCM or DTCM.
+     * This checks the board's sampled DMA-buffer telemetry, not DMA cycles. */
+    static const struct {
+        uint32_t address;
+        uint32_t rgb;
+        unsigned transfers;
+        uint32_t expected;
+    } cases[] = {
+        { 0x30000100, 0x12ab34, 72, 0x12ab34 },
+        { 0x2400cde8, 0xab1234, 72, 0xab1234 },
+        { 0x20000100, 0x34ab12, 72, 0 },
+        { 0x2404ffd0, 0x563412, 24, 0x563412 },
+        { 0x2404ffe0, 0x123456, 24, 0 },
+        { 0x30007fd0, 0xabcdef, 24, 0xabcdef },
+        { 0x38000100, 0x123456, 72, 0x123456 },
+    };
+    const uint32_t dma2_s6 = 0x400204a0;
+    struct timeval timeout = { .tv_sec = 2 };
+    int socket_fd;
+    QTestState *qts = qtest_init_with_serial("-machine dm-mc02", &socket_fd);
+
+    g_assert_cmpint(setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO,
+                              &timeout, sizeof(timeout)), ==, 0);
+    g_assert_cmphex(ws2812_read_rgb(socket_fd, 0), ==, 0);
+    for (unsigned test = 0; test < ARRAY_SIZE(cases); ++test) {
+        uint8_t waveform[144] = { 0 };
+        uint32_t grb = ((cases[test].rgb >> 8) & 0xff) << 16 |
+                       (cases[test].rgb >> 16) << 8 |
+                       (cases[test].rgb & 0xff);
+
+        for (unsigned bit = 0; bit < 24; ++bit) {
+            stw_le_p(waveform + 2 * bit,
+                     (grb & (1u << (23 - bit))) ? 168 : 84);
+        }
+        g_test_message("WS2812 source 0x%08x, %u halfwords",
+                       cases[test].address, cases[test].transfers);
+        qtest_writel(qts, dma2_s6, 0);
+        qtest_memwrite(qts, cases[test].address, waveform,
+                       2 * cases[test].transfers);
+        qtest_writel(qts, dma2_s6 + 4, cases[test].transfers);
+        qtest_writel(qts, dma2_s6 + 12, cases[test].address);
+        qtest_writel(qts, dma2_s6, 1u | (1u << 6) | (1u << 10) |
+                     (1u << 11) | (1u << 13));
+        g_assert_true(qtest_readl(qts, dma2_s6) & 1u);
+        g_assert_cmphex(qtest_readl(qts, dma2_s6 + 12), ==,
+                        cases[test].address);
+        qtest_clock_step(qts, 10000000);
+        g_assert_cmphex(ws2812_read_rgb(socket_fd,
+                        (test + 1) * UINT64_C(10000000)), ==,
+                        cases[test].expected);
+    }
+    close(socket_fd);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-mc02/ws2812/dma-sram-sources",
+                    test_ws2812_dma_sram_sources);
     g_test_add_func("/dm-mc02/tim2/counter-freezes-disabled",
                     test_counter_freezes_when_disabled);
     g_test_add_func("/dm-mc02/tim2/dead-time-decoder-boundaries",
