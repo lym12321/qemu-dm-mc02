@@ -1278,12 +1278,15 @@ def engine_uses_external_time(engine) -> bool:
     return hasattr(engine, "imu_timestamp_ns")
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, *, can_factory=None) -> int:
     _validate_worker_timing(args)
+    if can_factory is not None and (not callable(can_factory) or not args.fdcan):
+        raise ValueError("CAN runtime factory requires callable factory and --fdcan")
     cosim_sock = None
     can_sock = None
     socketcan_sock = None
     engine = None
+    can_runtime = None
     primary_error = None
     try:
         cosim_sock = connect_unix(args.cosim, args.connect_timeout)
@@ -1297,6 +1300,11 @@ def run(args: argparse.Namespace) -> int:
         engine = create_engine(args)
         motor_adapter = DmMotorBusAdapter.from_namespace(args)
         coordinator = StepCoordinator(engine, motor_adapter)
+        if can_factory is not None:
+            can_runtime = can_factory(can, socketcan_tx)
+            if any(not callable(getattr(can_runtime, name, None)) for name in
+                   ("reset", "step", "ingest_qemu", "ingest_socketcan", "close")):
+                raise TypeError("CAN runtime requires reset/step/ingress/close methods")
         cosim_sock.setblocking(False)
         # The initial telemetry timestamp is the best available common clock
         # origin for v1. v2 deliberately starts the plant clock at zero and
@@ -1345,6 +1353,9 @@ def run(args: argparse.Namespace) -> int:
         if args.protocol == "v1":
             qemu_timestamp_mapper = QemuTimestampMapper(
                 clock_base_ns, clock_base_ns)
+        if can_runtime is not None:
+            can_runtime.reset(1 if args.protocol == "v1" else session_id,
+                              clock_base_ns, qemu_timestamp_mapper)
         dt = 1.0 / args.rate
         integer_rate = (int(args.rate) if args.rate.is_integer() else 0)
         sequence = 0
@@ -1381,6 +1392,9 @@ def run(args: argparse.Namespace) -> int:
                 if engine_uses_external_time(engine) else None)
             qemu_timestamp_mapper = QemuTimestampMapper(
                 reset.t_sim_ns, reset.t_sim_ns)
+            if can_runtime is not None:
+                can_runtime.reset(reset.session_id, reset.t_sim_ns,
+                                  qemu_timestamp_mapper)
 
         def complete_v2_reset(reset: V2SessionReset) -> None:
             # RESET already changed the RX validator. Wait for its ACK before
@@ -1448,6 +1462,11 @@ def run(args: argparse.Namespace) -> int:
                 if args.verbose and can_frames:
                     print("received CAN frames", len(can_frames), flush=True)
                 for can_id, flags, dlc, timestamp_ns, data in can_frames:
+                    if can_runtime is not None:
+                        can_runtime.ingest_qemu(
+                            CanFrame(can_id, flags, dlc, data, timestamp_ns),
+                            virtual_time_ns)
+                        continue
                     mapped_timestamp_ns = qemu_timestamp_mapper.map(
                         timestamp_ns, virtual_time_ns)
                     if socketcan_sock:
@@ -1463,14 +1482,17 @@ def run(args: argparse.Namespace) -> int:
                                   "index", command.index, flush=True)
             if socketcan_sock in ready:
                 try:
-                    frame = unpack_can_frame(
-                        socketcan_sock.recv(72), timestamp_ns=virtual_time_ns)
+                    raw = socketcan_sock.recv(72)
+                    if can_runtime is not None:
+                        can_runtime.ingest_socketcan(raw, virtual_time_ns)
+                    else:
+                        frame = unpack_can_frame(raw, timestamp_ns=virtual_time_ns)
                 except ValueError as exc:
                     if args.verbose:
                         print(f"socketcan: ignored frame: {exc}",
                               file=sys.stderr, flush=True)
                 else:
-                    if can:
+                    if can and can_runtime is None:
                         can.send(
                             frame.can_id, frame.flags, frame.dlc,
                             qemu_timestamp_mapper.unmap(
@@ -1518,6 +1540,8 @@ def run(args: argparse.Namespace) -> int:
             step_span_ns = max(ideal_time_ns - virtual_time_ns,
                                adc_count + 1)
             virtual_time_ns += step_span_ns
+            if can_runtime is not None:
+                can_runtime.step(step_span_ns)
             if args.protocol == "v1":
                 for input_index, (channel, raw) in enumerate(
                         args.adc_input_values):
@@ -1582,7 +1606,7 @@ def run(args: argparse.Namespace) -> int:
                         break
                     if done_response is False:
                         continue
-            if can and coordinator.active_indices:
+            if can and can_runtime is None and coordinator.active_indices:
                 send_dm_feedback(can, engine,
                                  sorted(coordinator.active_indices),
                                  virtual_time_ns, motor_adapter,
@@ -1610,7 +1634,7 @@ def run(args: argparse.Namespace) -> int:
         cleanup_errors = []
         # A failing backend must not prevent any transport from closing.
         # Catch interrupts here as well, then propagate after every attempt.
-        for name, resource in (("backend", engine),
+        for name, resource in (("CAN runtime", can_runtime), ("backend", engine),
                                ("SocketCAN", socketcan_sock),
                                ("CAN", can_sock), ("co-sim", cosim_sock)):
             if resource is None:

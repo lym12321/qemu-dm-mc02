@@ -269,6 +269,62 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(self.engine.step_calls, 0)
         self._assert_closed()
 
+    def test_can_runtime_routes_real_wire_without_legacy_motor_decode(self):
+        from sim.fabric import CanBus, CanFrame, VirtualCanDevice
+        from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+        from sim.fabric.runtime import CanRuntime
+
+        class Echo(VirtualCanDevice):
+            def receive(self, frame):
+                self.emit(CanFrame(0x201, data=b'feedback',
+                                   timestamp_ns=frame.timestamp_ns))
+
+        runtimes = []
+        def factory(can, tx):
+            bus = CanBus()
+            endpoint = QemuCanEndpoint(bus, can)
+            socket_endpoint = SocketCanEndpoint(bus, tx)
+            Echo(bus)
+            runtime = CanRuntime(bus, endpoint, socket_endpoint=socket_endpoint)
+            runtimes.append(runtime)
+            return runtime
+
+        protocol = worker.step_protocol
+        self.peers[0].sendall(self._reset_ack() + protocol.build_step_frame(
+            protocol.STEP_ACK, 1, 1_000_000, dt_ns=1_000_000, flags=123,
+            payload=bytes(16)))
+        # 0x200 is also a legacy float motor ID; exclusive Fabric routing is
+        # required. The literal is a C620 +16384 slot, not a legacy float.
+        self.peers[1].sendall(struct.pack('<IIB3xQ64s', 0x200, 0, 8,
+                                        10_000_000_000,
+                                        bytes.fromhex('4000000000000000')))
+        worker.run(self.args, can_factory=factory)
+        reply = worker.unpack_wire_frame(self.peers[1].recv(84))
+        self.assertEqual(reply, CanFrame(0x201, data=b'feedback',
+                                       timestamp_ns=10_000_000_000))
+        self.assertEqual(runtimes[0].t_sim_ns, 1_000_000)
+        self.assertTrue(runtimes[0].coordinator.closed)
+        self.assertEqual(self.engine.motors.torque, [0])
+        self._assert_closed()
+
+    def test_invalid_can_runtime_is_rejected_before_protocol_and_closed(self):
+        calls = []
+        runtime = SimpleNamespace(close=lambda: calls.append('close'))
+        with self.assertRaisesRegex(TypeError, 'CAN runtime requires'):
+            worker.run(self.args, can_factory=lambda can, tx: runtime)
+        self.assertEqual(calls, ['close'])
+        self.assertEqual(self.engine.step_calls, 0)
+        # All peers see EOF without any RESET/STEP or CAN bytes.
+        self.assertEqual(self.peers[0].recv(4096), b'')
+        self._assert_closed()
+
+    def test_can_runtime_factory_requires_fdcan_before_acquisition(self):
+        self.args.fdcan = None
+        with self.assertRaisesRegex(ValueError, 'requires callable factory'):
+            worker.run(self.args, can_factory=lambda can, tx: None)
+        self.assertEqual(self.engine.close_calls, 0)
+        self.assertTrue(all(sock.fileno() >= 0 for sock in self.sockets))
+
     def test_initial_reset_invalid_ack_closes_all_resources(self):
         self.peers[0].sendall(self._reset_ack(reserved=1))
         with self.assertRaisesRegex(worker.step_protocol.StepProtocolError,
@@ -477,6 +533,46 @@ class WorkerRunTests(unittest.TestCase):
             worker.run(self.args)
         self.assertEqual(clock.now, 1.0)
         self._assert_continuous_input_cleanup(observed, copies=4)
+
+    def _assert_fabric_wait_does_not_step(self, phase):
+        from sim.fabric import CanBus
+        from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+        from sim.fabric.runtime import CanRuntime
+        _, observed = self._continuous_input_fixture(phase)
+        runtimes = []
+        def factory(can, tx):
+            bus = CanBus()
+            runtime = CanRuntime(bus, QemuCanEndpoint(bus, can),
+                                 socket_endpoint=SocketCanEndpoint(bus, tx))
+            runtimes.append(runtime)
+            return runtime
+        # Strict DONE may wait longer than ACK; continuous ingress must hit
+        # the explicit bounded capacity rather than silently drop or step.
+        with self.assertRaises(BufferError if phase == 'done' else TimeoutError):
+            worker.run(self.args, can_factory=factory)
+        runtime = runtimes[0]
+        self.assertEqual(runtime.coordinator.step_id, 1)
+        self.assertEqual(runtime.t_sim_ns, 1_000_000)
+        self.assertEqual(runtime.bus.pending,
+                         self.sockets[1].reads + self.sockets[2].reads -
+                         (1 if phase == 'done' else 0))
+        if phase == 'done':
+            self.assertEqual(runtime.bus.pending, 256)
+        self.assertGreater(runtime.bus.pending, 2)
+        self.assertEqual(bytes(self.sockets[1].output), b'')
+        self.assertEqual(bytes(self.sockets[2].output), b'')
+        self.assertTrue(runtime.coordinator.closed)
+        self.assertEqual(len(observed.steps), 1)
+        self._assert_closed()
+
+    def test_fabric_ack_wait_only_enqueues_io(self):
+        self._assert_fabric_wait_does_not_step('ack')
+
+    def test_fabric_done_wait_rejects_continuous_input_at_capacity(self):
+        self._assert_fabric_wait_does_not_step('done')
+
+    def test_fabric_repeated_reset_wait_only_enqueues_io(self):
+        self._assert_fabric_wait_does_not_step('reset')
 
     def test_continuous_input_preserves_done_deadlines_and_io_service(self):
         clock, observed = self._continuous_input_fixture("done")

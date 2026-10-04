@@ -43,7 +43,9 @@ import time
 
 from dm_mc02_qmp import QmpSession
 from dm_mc02_sim_worker import (RESET, TELEMETRY, CanStream, FramedSocket, adc_voltage_frame,
-                                 imu_frame, protocol_frame)
+                                 imu_frame, protocol_frame, QemuTimestampMapper)
+from sim.fabric import CanBus, CanFrame, VirtualCanDevice
+from sim.fabric.endpoints import QemuCanEndpoint
 
 names = ['cosim', 'uart1', 'uart2', 'uart3', 'uart5', 'uart7', 'uart10', 'can1', 'can2', 'can3']
 qmp_path, *values = sys.argv[1:]
@@ -76,6 +78,24 @@ try:
     qmp = QmpSession(qmp_path, timeout=2)
     cosim = FramedSocket(sockets['cosim'])
     cans = {name: CanStream(sockets[name]) for name in names if name.startswith('can')}
+    buses = {name: CanBus() for name in cans}
+    endpoints = {name: QemuCanEndpoint(buses[name], stream) for name, stream in cans.items()}
+    for endpoint in endpoints.values():
+        endpoint.bind_mapper(QemuTimestampMapper(0, 0))
+
+    class Echo(VirtualCanDevice):
+        def __init__(self, bus, number):
+            self.number = number
+            self.exchanges = 0
+            super().__init__(bus, 'echo')
+
+        def receive(self, frame):
+            self.exchanges += 1
+            self.emit(CanFrame(0x320 + self.number, frame.flags, frame.dlc,
+                               bytes(i ^ 0x5a for i in range(frame.length)),
+                               frame.timestamp_ns))
+
+    fabric_echoes = {name: Echo(bus, int(name[-1]) - 1) for name, bus in buses.items()}
     buffers = {name: bytearray() for name in names if name.startswith('uart')}
     echoes = {}
     echo_seen = set()
@@ -177,6 +197,8 @@ try:
                 for kind, _, virtual_ns, payload in cosim.receive():
                     if kind == RESET:
                         seq, stamp = 0, 0
+                        for bus in buses.values():
+                            bus.reset()
                         cosim.send(protocol_frame(RESET, 0, 0))
                     else:
                         stamp = max(stamp, virtual_ns)
@@ -257,13 +279,16 @@ try:
             expected_data = bytes(i ^ 0xa5 for i in range(length))
             if (ident, flags, dlc, payload) != (0x120 + device, 0 if length == 8 else 12, 8 if length == 8 else 15, expected_data):
                 raise RuntimeError(f'{port} TX mismatch: {(ident, flags, dlc, payload)!r}')
-            cans[port].send(0x320 + device, flags, dlc, timestamp, bytes(i ^ 0x5a for i in range(length)))
+            endpoints[port].ingest(CanFrame(ident, flags, dlc, payload, timestamp), timestamp)
+            buses[port].step(max(buses[port].t_sim_ns, timestamp))
             cans[port].drain()
         if imu_profile is not None:
             cosim.send(imu_frame(*next_time(), *imu_profile))
     if not done:
         raise TimeoutError('firmware did not finish; last stage ' + last_stage)
     counts = Counter(r['name'] for r in rows if r['status'] == 'PASS')
+    if any(echo.exchanges != 2 for echo in fabric_echoes.values()):
+        raise RuntimeError('CAN Fabric did not complete classic and FD exchanges on every port')
     missing = required - counts.keys()
     failed = [r for r in rows if r['status'] == 'FAIL' or (r['status'] == 'SKIP' and r['name'] not in allowed_skips)]
     repeated = {n: c for n, c in counts.items() if c != (3 if n == 'control.rx' else 2 if n == 'task.stack' else 1)}

@@ -42,7 +42,7 @@ class _Attached:
     receive: Callable[[CanFrame], None]
 
 
-def _can_time(t_sim_ns: int, previous_ns: int | None = None) -> None:
+def check_can_time(t_sim_ns: int, previous_ns: int | None = None) -> None:
     check_time(t_sim_ns, previous_ns, strict=False)
     if t_sim_ns > 0xFFFFFFFFFFFFFFFF:
         raise ValueError("CAN time must fit the unsigned 64-bit timestamp")
@@ -62,7 +62,7 @@ class CanBus:
                  | None = None,
                  log: Callable[[CanDelivery], None] | None = None,
                  max_pending: int = 256, dispatch_budget: int = 256):
-        _can_time(delay_ns)
+        check_can_time(delay_ns)
         if type(loopback) is not bool:
             raise ValueError("loopback must be a boolean")
         if drop is not None and not callable(drop):
@@ -92,7 +92,7 @@ class CanBus:
 
     def has_due(self, t_sim_ns: int) -> bool:
         """Query due work without consuming frames or advancing virtual time."""
-        _can_time(t_sim_ns)
+        check_can_time(t_sim_ns)
         return bool(self._queue and self._queue[0][0] <= t_sim_ns)
 
     def attach(self, endpoint: CanEndpoint, name: str | None = None) -> None:
@@ -120,7 +120,7 @@ class CanBus:
         if not isinstance(frame, CanFrame):
             raise ValueError("CAN send requires a CanFrame")
         due_ns = frame.timestamp_ns + self.delay_ns
-        _can_time(due_ns)
+        check_can_time(due_ns)
         if len(self._queue) >= self.max_pending:
             raise BufferError("CAN pending frame capacity exhausted")
         heapq.heappush(self._queue, (due_ns, self._sequence, attached, frame))
@@ -129,7 +129,7 @@ class CanBus:
 
     def step(self, t_sim_ns: int) -> int:
         """Advance virtual delivery time, returning dispatched broadcast count."""
-        _can_time(t_sim_ns, self.t_sim_ns)
+        check_can_time(t_sim_ns, self.t_sim_ns)
         if self._dispatching:
             raise RuntimeError("CAN step cannot be called from a delivery callback")
         self.t_sim_ns = t_sim_ns
@@ -161,7 +161,7 @@ class CanBus:
 
     def reset(self, t_sim_ns: int = 0) -> None:
         """Clear logical delivery state while preserving borrowed wiring."""
-        _can_time(t_sim_ns)
+        check_can_time(t_sim_ns)
         if self._dispatching:
             raise RuntimeError("CAN reset cannot be called from a delivery callback")
         self._queue.clear()
