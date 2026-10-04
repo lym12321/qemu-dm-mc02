@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import importlib.util
+import math
 from pathlib import Path
 import struct
 import sys
@@ -192,6 +193,9 @@ class MotorProtocolTests(unittest.TestCase):
                  "smoke" / "dm_mc02_mujoco_smoke.xml")
         adapter = adapter_module.DmMotorBusAdapter(1, motor_protocol="dm-mit")
         engine = worker.MujocoEngine(str(model), 1, 0.001, torque_limit=2.0)
+        # MuJoCo's accelerometer reports proper acceleration at its site in
+        # the site's local frame (3.12 XML reference, sensor/accelerometer).
+        self.assertEqual(engine._sensor(engine.accel_sensor), (0.0, 0.0, 9.80665))
         command = adapter_module.MotorCommand("dm-control", 0, torque=0.005)
         adapter.apply(engine, command)
         engine.step(0.001)
@@ -204,13 +208,25 @@ class MotorProtocolTests(unittest.TestCase):
         for steps, position, velocity, time in (
                 (1, 0.00003, 0.03, 0.002), (99, 0.1515, 3.0, 0.101)):
             for _ in range(steps):
-                engine.step(0.001)
+                gyro, accel = engine.step(0.001)
             with self.subTest(time=time):
                 actual_position, actual_velocity, effort = engine.motor_feedback(0)
                 self.assertAlmostEqual(actual_position, position, places=10)
                 self.assertAlmostEqual(actual_velocity, velocity, places=10)
                 self.assertAlmostEqual(effort, 0.005, places=10)
                 self.assertAlmostEqual(engine.data.time, time, places=10)
+                # mj_step computes sensors before integration. A target-time
+                # observation requires native mj_forward afterwards, which
+                # recomputes them without advancing time (3.12 pipeline).
+                self.assertAlmostEqual(gyro[2], velocity * 180 / math.pi, places=10)
+                self.assertEqual(gyro[:2], (0.0, 0.0))
+                self.assertAlmostEqual(accel[0], 0.0, places=14)
+                self.assertAlmostEqual(accel[1], 0.0, places=14)
+                self.assertAlmostEqual(accel[2], 1.0, places=14)
+                body = engine.mujoco.mj_name2id(engine.model, engine.mujoco.mjtObj.mjOBJ_BODY,
+                                              "test_body")
+                self.assertAlmostEqual(engine.data.xquat[body][0], math.cos(position / 2), places=10)
+                self.assertAlmostEqual(engine.data.xquat[body][3], math.sin(position / 2), places=10)
         adapter.apply(engine, adapter_module.MotorCommand("dm-disable", 0))
         engine.step(0.001)
         position, velocity, effort = engine.motor_feedback(0)
@@ -222,6 +238,11 @@ class MotorProtocolTests(unittest.TestCase):
         adapter.apply(engine, replace(command, torque=9.0))
         engine.step(0.001)
         self.assertAlmostEqual(engine.motor_feedback(0)[2], 2.0, places=10)
+        engine.reset()
+        self.assertEqual(engine.data.time, 0.0)
+        self.assertEqual(engine._sensor(engine.gyro_sensor), (0.0, 0.0, 0.0))
+        self.assertEqual(engine._sensor(engine.accel_sensor), (0.0, 0.0, 9.80665))
+        self.assertEqual(tuple(engine.data.xquat[body]), (1.0, 0.0, 0.0, 0.0))
 
     def test_mujoco_business_bench_damping_and_stationary_imu(self):
         try:

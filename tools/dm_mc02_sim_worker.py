@@ -752,6 +752,7 @@ class MujocoEngine:
         self.dm_commands: list[dict | None] = [None] * self.motor_count
         self.gyro_sensor = self._find_sensor(("imu_gyro", "gyro"))
         self.accel_sensor = self._find_sensor(("imu_accel", "accelerometer", "accel"))
+        self.mujoco.mj_forward(self.model, self.data)
 
     def _find_sensor(self, names: tuple[str, ...]) -> int | None:
         for name in names:
@@ -776,6 +777,7 @@ class MujocoEngine:
         self.legacy_values = [0.0] * self.motor_count
         self.enabled = [False] * self.motor_count
         self.dm_commands = [None] * self.motor_count
+        self.mujoco.mj_forward(self.model, self.data)
 
     def set_motor_enabled(self, index: int, enabled: bool) -> None:
         if 0 <= index < self.motor_count:
@@ -849,6 +851,9 @@ class MujocoEngine:
             self.motor_values[index] = applied
             self.data.ctrl[index] = applied
         self.mujoco.mj_step(self.model, self.data)
+        # MuJoCo 3.12 computes derived pose/sensors before integrating qpos and
+        # qvel. Refresh them at the target state without advancing plant time.
+        self.mujoco.mj_forward(self.model, self.data)
         gyro_rad = self._sensor(self.gyro_sensor)
         accel_ms2 = self._sensor(self.accel_sensor)
         return (tuple(v * 180.0 / math.pi for v in gyro_rad),
