@@ -41,6 +41,25 @@ class PartialWriter:
         return count
 
 
+class ReceiveChunks:
+    """A readable stream must return to its owner after one recv opportunity."""
+
+    def __init__(self, chunks):
+        self.chunks = iter(chunks)
+        self.reads = 0
+        self.read_limit = 1
+
+    def recv(self, size):
+        assert size == 4096
+        self.reads += 1
+        if self.reads > self.read_limit:
+            raise AssertionError("receive drained a continuously readable socket")
+        return next(self.chunks)
+
+    def allow_read(self):
+        self.read_limit = self.reads + 1
+
+
 class StepFrameBatch:
     """Small receive stub for testing v2 control-frame ordering."""
 
@@ -258,6 +277,545 @@ class WorkerRunTests(unittest.TestCase):
         self.assertIn("CAN close failed", diagnostic.getvalue())
         self._assert_closed()
 
+    def _continuous_input_fixture(self, phase):
+        """Actual run/parser/queues; only fd readiness, IO and time are controlled."""
+        clock = SimpleNamespace(now=0.0)
+        observed = SimpleNamespace(reset_started=None, steps=[], writable=set())
+        test = self
+
+        def v2_wire(kind, step_id, timestamp, payload=b"", dt=0, session=123):
+            return struct.pack("<IIHHIQQQI", 40 + len(payload), 0x32434D44,
+                               2, kind, len(payload), step_id, timestamp,
+                               dt, session) + payload
+
+        class InputSocket(socket.socket):
+            def __init__(self, fd, index, peer):
+                super().__init__(fileno=fd)
+                self.index = index
+                self.peer = peer
+                self.reads = 0
+                self.turn_reads = 0
+                self.output = bytearray()
+                self.blocked = index != 0
+                self.first_step = True
+
+            def recv(self, size):
+                self.turn_reads += 1
+                if self.turn_reads > 1:
+                    raise AssertionError("continuous input prevented service return")
+                self.reads += 1
+                if self.index == 0:
+                    if self.reads == 1:
+                        data = test._reset_ack()
+                    elif phase == "done" and self.reads == 2:
+                        data = v2_wire(3, 1, 1_000_000, bytes(16), 1_000_000)
+                    elif phase == "reset":
+                        if observed.reset_started is None:
+                            observed.reset_started = clock.now
+                        data = v2_wire(1, 0, self.reads * 10_000_000,
+                                       session=122 + self.reads)
+                    else:
+                        data = v2_wire(7, self.reads, self.reads,
+                                       bytes(24))
+                elif self.index == 1:
+                    data = struct.pack("<IIB3xQ64s", 0x321, 0, 1,
+                                       10_001_000_000, b"q")
+                else:
+                    data = struct.pack("<IB3x8s", 0x456, 1, b"s")
+                self.peer.sendall(data)
+                return super().recv(size)
+
+            def send(self, data):
+                if self.index == 0 and self.first_step and \
+                        struct.unpack_from("<H", data, 10)[0] == 2:
+                    self.first_step = False
+                    self.blocked = True
+                    observed.steps.append(bytes(data))
+                if self.blocked:
+                    raise BlockingIOError
+                count = super().send(data)
+                self.output.extend(data[:count])
+                return count
+
+        for index, (owned, peer) in enumerate(zip(self.sockets, self.peers)):
+            sock = InputSocket(owned.detach(), index, peer)
+            self.sockets[index] = sock
+            self.addCleanup(sock.close)
+        connections = dict(zip(("cosim", "can"), self.sockets))
+        self.enterContext(patch.object(
+            worker, "connect_unix", lambda path, timeout: connections[path]))
+
+        def select_io(readable, writable, errors, timeout):
+            del errors
+            if self.engine.step_calls == 0:
+                return [], [], []
+            if phase == "reset":
+                # Repeated readable RESET does not reach a blocking wait;
+                # receipt/dispatch still takes real host time.
+                clock.now += 0.02
+            for sock in self.sockets:
+                sock.turn_reads = 0
+            if timeout:
+                clock.now += min(timeout, 0.125)
+            for sock in writable:
+                sock.blocked = False
+                observed.writable.add(sock.index)
+            # All ready directions retain a service opportunity despite
+            # indefinitely readable QEMU CAN and co-sim inputs.
+            return list(readable), list(writable), []
+
+        self.args.wait_step_done = phase == "done"
+        self.enterContext(patch.object(worker.time, "monotonic", lambda: clock.now))
+        self.enterContext(patch.object(worker.select, "select", select_io))
+        return clock, observed
+
+    def _assert_continuous_input_cleanup(self, observed, copies):
+        self.assertEqual(self.engine.step_calls, 1)
+        self.assertEqual(observed.writable, {0, 1, 2})
+        self.assertGreater(self.sockets[0].reads, 2)
+        self.assertGreater(self.sockets[1].reads, 1)
+        self.assertGreater(self.sockets[2].reads, 1)
+        self.assertEqual(bytes(self.sockets[0].output),
+                         self._reset_wire() + observed.steps[0] * copies)
+        # Literal bytes verify both forwarding directions and the existing
+        # RESET origin mapping. This stream fd does not model Linux raw CAN.
+        self.assertEqual(bytes(self.sockets[1].output), struct.pack(
+            "<IIB3xQ64s", 0x456, 0, 1, 10_001_000_000, b"s") *
+            self.sockets[2].reads)
+        self.assertEqual(bytes(self.sockets[2].output), struct.pack(
+            "<IB3x8s", 0x321, 1, b"q") * self.sockets[1].reads)
+        self._assert_closed()
+
+    def test_continuous_input_preserves_ack_deadline_and_io_service(self):
+        clock, observed = self._continuous_input_fixture("ack")
+        with self.assertRaisesRegex(TimeoutError,
+                                    "STEP_ACK admission timed out.*retries=3"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 1.0)
+        self._assert_continuous_input_cleanup(observed, copies=4)
+
+    def test_continuous_input_preserves_done_deadlines_and_io_service(self):
+        clock, observed = self._continuous_input_fixture("done")
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2 response"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 8.0)
+        self._assert_continuous_input_cleanup(observed, copies=4)
+
+    def test_continuous_input_preserves_repeated_reset_deadline_and_io_service(self):
+        clock, observed = self._continuous_input_fixture("reset")
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2"):
+            worker.run(self.args)
+        self.assertGreaterEqual(clock.now - observed.reset_started, 2.0)
+        self.assertLessEqual(clock.now - observed.reset_started, 2.02)
+        self._assert_continuous_input_cleanup(observed, copies=1)
+
+    def _strict_done_fixture(self, partial=False, recover=False, closed=False,
+                             backpressure=True):
+        """Inject socket writability and time, retaining the real run/queues."""
+        protocol = worker.step_protocol
+        clock = SimpleNamespace(now=0.0)
+        observations = SimpleNamespace(waits=[], pending=[], stream=None)
+        ack = protocol.build_step_frame(
+            protocol.STEP_ACK, 1, 1_000_000, dt_ns=1_000_000,
+            flags=123, payload=bytes(16))
+        done = protocol.build_step_frame(
+            protocol.STEP_DONE, 1, 1_000_000, dt_ns=1_000_000,
+            flags=123, payload=struct.pack("<IIIII", 0, 3, 0, 0, 0))
+        peer = self.peers[0]
+
+        class ReplaySocket(socket.socket):
+            def __init__(self, fd):
+                super().__init__(fileno=fd)
+                self.output = bytearray()
+                self.step_wire = None
+                self.replay_started = False
+                self.writable = False
+                self.close_calls = 0
+                self.done_sent = False
+
+            def send(self, data):
+                wire = bytes(data)
+                if self.step_wire is None and struct.unpack_from(
+                        "<H", wire, 10)[0] == protocol.STEP:
+                    self.step_wire = wire
+                elif self.step_wire is not None and backpressure and \
+                        not self.writable:
+                    if partial and not self.replay_started:
+                        self.replay_started = True
+                        count = super().send(wire[:7])
+                        self.output.extend(wire[:count])
+                        return count
+                    self.replay_started = True
+                    raise BlockingIOError
+                count = super().send(data)
+                self.output.extend(wire[:count])
+                if self.writable and not self.done_sent:
+                    # A recovered replay gets an idempotent ACK and DONE in
+                    # one real read, exercising parser/validator retention.
+                    peer.sendall(ack + done)
+                    self.done_sent = True
+                return count
+
+            def close(self):
+                if self.fileno() != -1:
+                    self.close_calls += 1
+                super().close()
+
+        sock = ReplaySocket(self.sockets[0].detach())
+        self.sockets[0] = sock
+        self.addCleanup(sock.close)
+        connections = dict(zip(("cosim", "can"), self.sockets))
+        self.enterContext(patch.object(
+            worker, "connect_unix", lambda path, timeout: connections[path]))
+        stream_class = worker.StepFramedSocket
+
+        def capture_stream(owned):
+            observations.stream = stream_class(owned)
+            return observations.stream
+
+        def select_io(readable, writable, errors, timeout):
+            del readable, errors
+            if timeout == 0:
+                return [], [], []
+            observations.waits.append(timeout)
+            observations.pending.append([
+                bytes(view) for view in observations.stream.tx_queue])
+            if recover and len(observations.waits) == 3:
+                # The first replay has survived two DONE timeouts. Resume
+                # its original bytes before this third deadline expires.
+                clock.now += 1.0
+                sock.writable = True
+                self.assertIn(sock, writable)
+                return [], [sock], []
+            clock.now += timeout
+            if closed and len(observations.waits) == 2:
+                clock.now -= 1.0
+                peer.shutdown(socket.SHUT_WR)
+                return [sock], [], []
+            return [], [], []
+
+        self.args.wait_step_done = True
+        peer.sendall(self._reset_ack() + ack)
+        self.enterContext(patch.object(worker, "StepFramedSocket", capture_stream))
+        self.enterContext(patch.object(worker.time, "monotonic", lambda: clock.now))
+        self.enterContext(patch.object(worker.select, "select", select_io))
+        return sock, clock, observations
+
+    def _assert_strict_done_pending(self, sock, observations, partial):
+        # The first wait follows an already transmitted/admitted STEP. Its
+        # first timeout permits one replay; later timeouts must keep one head.
+        suffix = sock.step_wire[7:] if partial else sock.step_wire
+        self.assertEqual(self.engine.step_calls, 1)
+        self.assertEqual(sock.close_calls, 1)
+        self._assert_closed()
+        self.assertEqual(observations.pending,
+                         [[]] + [[suffix]] * (len(observations.waits) - 1))
+
+    def test_strict_done_blocked_replay_is_not_copied_until_timeout(self):
+        sock, clock, observations = self._strict_done_fixture()
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2 response"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 8.0)
+        self.assertEqual(observations.waits, [2.0] * 4)
+        self._assert_strict_done_pending(sock, observations, partial=False)
+        self.assertEqual(bytes(sock.output), self._reset_wire() + sock.step_wire)
+
+    def test_strict_done_partial_replay_is_not_copied_until_timeout(self):
+        sock, clock, observations = self._strict_done_fixture(partial=True)
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2 response"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 8.0)
+        self.assertEqual(observations.waits, [2.0] * 4)
+        self._assert_strict_done_pending(sock, observations, partial=True)
+        self.assertEqual(bytes(sock.output),
+                         self._reset_wire() + sock.step_wire + sock.step_wire[:7])
+
+    def test_strict_done_blocked_replay_recovers_exactly_once(self):
+        sock, clock, observations = self._strict_done_fixture(recover=True)
+        self.assertEqual(worker.run(self.args), 0)
+        self.assertEqual(clock.now, 5.0)
+        self.assertEqual(observations.waits, [2.0] * 3)
+        self._assert_strict_done_pending(sock, observations, partial=False)
+        self.assertFalse(observations.stream.tx_pending)
+        self.assertEqual(bytes(sock.output), self._reset_wire() + sock.step_wire * 2)
+
+    def test_strict_done_partial_replay_recovers_exactly_once(self):
+        sock, clock, observations = self._strict_done_fixture(
+            partial=True, recover=True)
+        self.assertEqual(worker.run(self.args), 0)
+        self.assertEqual(clock.now, 5.0)
+        self.assertEqual(observations.waits, [2.0] * 3)
+        self._assert_strict_done_pending(sock, observations, partial=True)
+        self.assertFalse(observations.stream.tx_pending)
+        self.assertEqual(bytes(sock.output), self._reset_wire() + sock.step_wire * 2)
+
+    def test_strict_done_without_backpressure_preserves_three_replays(self):
+        sock, clock, observations = self._strict_done_fixture(backpressure=False)
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2 response"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 8.0)
+        self.assertEqual(observations.waits, [2.0] * 4)
+        self.assertEqual(observations.pending, [[]] * 4)
+        self.assertEqual(self.engine.step_calls, 1)
+        self.assertEqual(sock.close_calls, 1)
+        self._assert_closed()
+        self.assertEqual(bytes(sock.output), self._reset_wire() + sock.step_wire * 4)
+
+    def test_strict_done_pending_replay_closed_propagates_and_cleans_up(self):
+        sock, clock, observations = self._strict_done_fixture(closed=True)
+        with self.assertRaisesRegex(ConnectionError, "co-sim socket closed"):
+            worker.run(self.args)
+        self.assertEqual(clock.now, 3.0)
+        self.assertEqual(observations.waits, [2.0] * 2)
+        self._assert_strict_done_pending(sock, observations, partial=False)
+        self.assertEqual(bytes(sock.output), self._reset_wire() + sock.step_wire)
+
+    def _pending_reset_fixture(self, prefix=7, done_phase=False,
+                               outcome="recover"):
+        """Keep actual queues and protocol; control only socket IO and time."""
+        protocol = worker.step_protocol
+        clock = SimpleNamespace(now=0.0)
+        observed = SimpleNamespace(stream=None, pending=[], resets=[],
+                                   reset_started=None, latest_ack_sent=False,
+                                   new_waits=[])
+        peer = self.peers[0]
+        old_copies = 2 if done_phase else 1
+
+        def reply(kind, session, timestamp, payload=b"", dt=0):
+            return protocol.build_step_frame(
+                kind, 0 if kind in (protocol.RESET, protocol.RESET_ACK) else 1,
+                timestamp, dt_ns=dt, flags=session, payload=payload)
+
+        class PendingSocket(socket.socket):
+            def __init__(self, fd):
+                super().__init__(fileno=fd)
+                self.output = bytearray()
+                self.old_wire = None
+                self.new_wire = None
+                self.old_offset = 0
+                self.old_completed = 0
+                self.pending_started = False
+                self.writable = False
+                self.close_calls = 0
+
+            def send(self, data):
+                wire = bytes(data)
+                if self.old_wire is None:
+                    if struct.unpack_from("<H", wire, 10)[0] == protocol.RESET:
+                        count = super().send(data)
+                        self.output.extend(wire[:count])
+                        return count
+                    self.old_wire = wire
+                if self.old_completed < old_copies:
+                    # The first DONE-phase STEP has already been admitted;
+                    # its first timeout starts one exact partial replay.
+                    initial_done = done_phase and self.old_completed == 0
+                    if not initial_done and not self.writable:
+                        if not self.pending_started and prefix:
+                            count = super().send(wire[:prefix])
+                            self.output.extend(wire[:count])
+                            self.old_offset += count
+                            self.pending_started = True
+                            return count
+                        self.pending_started = True
+                        raise BlockingIOError
+                    count = super().send(data)
+                    self.output.extend(wire[:count])
+                    self.old_offset += count
+                    if self.old_offset == len(self.old_wire):
+                        self.old_completed += 1
+                        self.old_offset = 0
+                        if initial_done:
+                            peer.sendall(reply(protocol.STEP_ACK, 123,
+                                               1_000_000, bytes(16), 1_000_000))
+                    return count
+                self.new_wire = wire
+                count = super().send(data)
+                self.output.extend(wire[:count])
+                peer.sendall(reply(protocol.STEP_ACK, 125, 31_000_000,
+                                   bytes(16), 1_000_000))
+                if done_phase:
+                    peer.sendall(reply(protocol.STEP_DONE, 125, 31_000_000,
+                                       struct.pack("<IIIII", 0, 3, 0, 0, 0),
+                                       1_000_000))
+                return count
+
+            def close(self):
+                if self.fileno() != -1:
+                    self.close_calls += 1
+                super().close()
+
+        sock = PendingSocket(self.sockets[0].detach())
+        self.sockets[0] = sock
+        self.addCleanup(sock.close)
+        connections = dict(zip(("cosim", "can"), self.sockets))
+        self.enterContext(patch.object(
+            worker, "connect_unix", lambda path, timeout: connections[path]))
+        stream_class = worker.StepFramedSocket
+
+        def capture_stream(owned):
+            observed.stream = stream_class(owned)
+            return observed.stream
+
+        real_reset = self.engine.reset
+
+        def reset_backend():
+            self.assertTrue(observed.latest_ack_sent)
+            self.assertEqual(self.engine.step_calls, 1)
+            observed.resets.append(clock.now)
+            real_reset()
+
+        reset_stage = 0
+
+        def select_io(readable, writable, errors, timeout):
+            nonlocal reset_stage
+            del readable, errors
+            if timeout == 0:
+                return [], [], []
+            if done_phase and not sock.pending_started:
+                self.assertEqual(timeout, 2.0)
+                clock.now += timeout
+                return [], [], []
+            observed.pending.append([
+                bytes(view) for view in observed.stream.tx_queue])
+            if reset_stage < 2:
+                self.assertEqual(observed.resets, [])
+                self.assertEqual(self.engine.step_calls, 1)
+                clock.now += 0.1 if reset_stage == 0 else 0.4
+                if reset_stage == 0:
+                    observed.reset_started = clock.now
+                # No ACK for the intermediate session: only the latest
+                # marker may rebuild the backend, without renewing 2 s.
+                peer.sendall(reply(protocol.RESET, 124 + reset_stage,
+                                   20_000_000 + reset_stage * 10_000_000))
+                reset_stage += 1
+                return [sock], [], []
+            if reset_stage == 2:
+                reset_stage += 1
+                self.assertEqual(observed.resets, [])
+                self.assertEqual(self.engine.step_calls, 1)
+                if outcome == "timeout":
+                    clock.now += timeout
+                    return [], [], []
+                clock.now += 0.4
+                if outcome == "closed":
+                    peer.shutdown(socket.SHUT_WR)
+                else:
+                    peer.sendall(reply(
+                        protocol.RESET_ACK, 125, 30_000_000,
+                        struct.pack("<IIQII", 0, protocol.CAPABILITY_MASK,
+                                    10_030_000_000, 0, 0)))
+                    observed.latest_ack_sent = True
+                return [sock], [], []
+            # The ACK arrived while the old physical frame was blocked.
+            # Its unchanged suffix must now precede the new-session STEP.
+            self.assertEqual(len(observed.resets), 1)
+            self.assertEqual(self.engine.step_calls, 2)
+            observed.new_waits.append(timeout)
+            if outcome == "post_ack_stall":
+                clock.now += timeout
+                return [], [], []
+            self.assertIn(sock, writable)
+            clock.now += 0.05
+            sock.writable = True
+            return [], [sock], []
+
+        self.args.wait_step_done = done_phase
+        peer.sendall(self._reset_ack())
+        self.enterContext(patch.object(worker, "StepFramedSocket", capture_stream))
+        self.enterContext(patch.object(self.engine, "reset", reset_backend))
+        self.enterContext(patch.object(worker.time, "monotonic", lambda: clock.now))
+        self.enterContext(patch.object(worker.select, "select", select_io))
+        return sock, clock, observed
+
+    def _assert_pending_reset(self, sock, observed, prefix, done_phase=False,
+                              recovered=True):
+        self.assertEqual(sock.close_calls, 1)
+        self._assert_closed()
+        # Independent literal header oracle, including session and times.
+        self.assertEqual(struct.unpack("<IIHHIQQQI", sock.old_wire[:44]),
+                         (100, 0x32434D44, 2, 2, 60, 1, 1_000_000,
+                          1_000_000, 123))
+        suffix = sock.old_wire[prefix:]
+        self.assertEqual(observed.pending[:3], [[suffix]] * 3)
+        if recovered:
+            self.assertEqual(len(observed.resets), 1)
+            self.assertEqual(self.engine.step_calls, 2)
+            self.assertEqual(struct.unpack("<IIHHIQQQI", sock.new_wire[:44]),
+                             (100, 0x32434D44, 2, 2, 60, 1, 31_000_000,
+                              1_000_000, 125))
+            self.assertEqual(observed.pending[3:], [[suffix, sock.new_wire]])
+            copies = 2 if done_phase else 1
+            self.assertEqual(bytes(sock.output), self._reset_wire() +
+                             sock.old_wire * copies + sock.new_wire)
+            self.assertFalse(observed.stream.tx_pending)
+        else:
+            copies = 1 if done_phase else 0
+            self.assertEqual(bytes(sock.output), self._reset_wire() +
+                             sock.old_wire * copies + sock.old_wire[:prefix])
+
+    def test_pending_unstarted_step_survives_repeated_reset(self):
+        sock, clock, observed = self._pending_reset_fixture(prefix=0)
+        self.assertEqual(worker.run(self.args), 0)
+        self.assertAlmostEqual(clock.now, 0.95)
+        self._assert_pending_reset(sock, observed, prefix=0)
+
+    def test_pending_partial_step_survives_repeated_reset(self):
+        sock, clock, observed = self._pending_reset_fixture()
+        self.assertEqual(worker.run(self.args), 0)
+        self.assertAlmostEqual(clock.now, 0.95)
+        self._assert_pending_reset(sock, observed, prefix=7)
+
+    def test_pending_done_replay_survives_repeated_reset(self):
+        sock, clock, observed = self._pending_reset_fixture(done_phase=True)
+        self.assertEqual(worker.run(self.args), 0)
+        self.assertAlmostEqual(clock.now, 2.95)
+        self._assert_pending_reset(sock, observed, prefix=7, done_phase=True)
+
+    def test_pending_reset_timeout_keeps_original_handshake_budget(self):
+        sock, clock, observed = self._pending_reset_fixture(outcome="timeout")
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2"):
+            worker.run(self.args)
+        self.assertAlmostEqual(clock.now - observed.reset_started, 2.0)
+        self.assertEqual(observed.resets, [])
+        self.assertEqual(self.engine.step_calls, 1)
+        self._assert_pending_reset(sock, observed, prefix=7, recovered=False)
+
+    def test_pending_reset_eof_propagates_and_cleans_up(self):
+        sock, clock, observed = self._pending_reset_fixture(outcome="closed")
+        with self.assertRaisesRegex(ConnectionError, "co-sim socket closed"):
+            worker.run(self.args)
+        self.assertAlmostEqual(clock.now, 0.9)
+        self.assertEqual(observed.resets, [])
+        self.assertEqual(self.engine.step_calls, 1)
+        self._assert_pending_reset(sock, observed, prefix=7, recovered=False)
+
+    def test_pending_step_stall_after_reset_ack_keeps_both_frames(self):
+        sock, clock, observed = self._pending_reset_fixture(
+            outcome="post_ack_stall")
+        with self.assertRaisesRegex(TimeoutError, "STEP_ACK admission timed out"):
+            worker.run(self.args)
+        # Four silent ACK waits retain the pre-existing retry cap within
+        # this new STEP's independent absolute 2 s admission budget.
+        self.assertEqual(len(observed.new_waits), 4)
+        for wait in observed.new_waits:
+            self.assertAlmostEqual(wait, 0.25)
+        self.assertAlmostEqual(clock.now - observed.resets[0], 1.0)
+        self.assertEqual(len(observed.resets), 1)
+        self.assertEqual(self.engine.step_calls, 2)
+        self._assert_pending_reset(sock, observed, prefix=7, recovered=False)
+        new_wire = observed.pending[3][1]
+        self.assertEqual(struct.unpack("<IIHHIQQQI", new_wire[:44]),
+                         (100, 0x32434D44, 2, 2, 60, 1, 31_000_000,
+                          1_000_000, 125))
+        self.assertEqual(observed.pending[3:],
+                         [[sock.old_wire[7:], new_wire]] * 4)
+
+    @staticmethod
+    def _reset_wire():
+        # Independent fixed header oracle for the initial host RESET.
+        return struct.pack("<IIHHIQQQI", 40, 0x32434D44, 2, 1, 0, 0, 0, 0, 123)
+
     def test_closed_stderr_cannot_replace_primary_during_cleanup(self):
         self.peers[0].sendall(self._reset_ack())
         primary = RuntimeError("plant step failed")
@@ -390,6 +948,100 @@ class WorkerConnectionTests(unittest.TestCase):
 
 
 class WorkerTransportTests(unittest.TestCase):
+    @staticmethod
+    def _legacy_wire(seq=1):
+        # Independent legacy header; the payload is deliberately opaque.
+        return struct.pack("<IIHHIQQ", 29, 0x32434D44, 1, 3, 1,
+                           seq, seq * 10) + b"x"
+
+    @staticmethod
+    def _step_ack_wire(step_id=1):
+        # Independent fixed v2 ACK header and its four zero status fields.
+        return struct.pack("<IIHHIQQQI4I", 56, 0x32434D44, 2, 3, 16,
+                           step_id, step_id * 10, 10, 123, 0, 0, 0, 0)
+
+    def test_legacy_receive_returns_before_another_read(self):
+        sock = ReceiveChunks([self._legacy_wire()])
+        stream = worker.FramedSocket(sock)
+        self.assertEqual(stream.receive(), [(3, 1, 10, b"x")])
+        self.assertEqual(sock.reads, 1)
+
+    def test_v2_receive_returns_before_another_read(self):
+        sock = ReceiveChunks([self._step_ack_wire()])
+        frames = worker.StepFramedSocket(sock).receive()
+        self.assertEqual(len(frames), 1)
+        self.assertEqual((frames[0].header.kind, frames[0].header.step_id,
+                          frames[0].header.t_sim_ns, frames[0].payload),
+                         (3, 1, 10, bytes(16)))
+        self.assertEqual(sock.reads, 1)
+
+    def test_can_receive_returns_before_another_read(self):
+        wire = struct.pack("<IIB3xQ64s", 0x123, 0, 2, 10, b"ab")
+        sock = ReceiveChunks([wire])
+        self.assertEqual(worker.CanStream(sock).receive(),
+                         [(0x123, 0, 2, 10, b"ab")])
+        self.assertEqual(sock.reads, 1)
+
+    def test_stream_receive_retains_fragments_order_and_eof(self):
+        for stream_class, first, second in (
+                (worker.FramedSocket, self._legacy_wire(1),
+                 self._legacy_wire(2)),
+                (worker.StepFramedSocket, self._step_ack_wire(1),
+                 self._step_ack_wire(2)),
+                (worker.CanStream,
+                 struct.pack("<IIB3xQ64s", 1, 0, 1, 10, b"a"),
+                 struct.pack("<IIB3xQ64s", 2, 0, 1, 20, b"b"))):
+            with self.subTest(stream=stream_class.__name__):
+                sock = ReceiveChunks([
+                    first[:3], first[3:] + second[:7], second[7:], b""])
+                stream = stream_class(sock)
+                self.assertEqual(stream.receive(), [])
+                self.assertEqual(bytes(stream.buffer), first[:3])
+                sock.allow_read()
+                frames = stream.receive()
+                self.assertEqual(len(frames), 1)
+                self.assertEqual(bytes(stream.buffer), second[:7])
+                sock.allow_read()
+                next_frames = stream.receive()
+                self.assertEqual(len(next_frames), 1)
+                if stream_class is worker.StepFramedSocket:
+                    identities = [f.header.step_id for f in frames + next_frames]
+                else:
+                    identities = [f[1] if stream_class is worker.FramedSocket
+                                  else f[0] for f in frames + next_frames]
+                self.assertEqual(identities, [1, 2])
+                self.assertEqual(stream.buffer, b"")
+                sock.allow_read()
+                with self.assertRaisesRegex(ConnectionError, "socket closed"):
+                    stream.receive()
+
+    def test_v2_push_front_returns_old_batch_without_reading(self):
+        sock = ReceiveChunks([
+            self._step_ack_wire(1) + self._step_ack_wire(2),
+            self._step_ack_wire(3)])
+        stream = worker.StepFramedSocket(sock)
+        frames = stream.receive()
+        self.assertEqual([f.header.step_id for f in frames], [1, 2])
+        stream.push_front(frames[1:])
+        self.assertEqual(stream.receive(), frames[1:])
+        self.assertEqual(sock.reads, 1)
+        sock.allow_read()
+        self.assertEqual([f.header.step_id for f in stream.receive()], [3])
+        self.assertEqual(sock.reads, 2)
+
+    def test_stream_receive_rejects_invalid_chunk_without_another_read(self):
+        for stream_class, wire, message in (
+                (worker.FramedSocket, struct.pack("<I", 27), "frame length"),
+                (worker.StepFramedSocket,
+                 struct.pack("<I", 27), "frame length"),
+                (worker.CanStream,
+                 struct.pack("<IIB3xQ64s", 0x123, 0, 65, 10, b"x"),
+                 "DLC")):
+            with self.subTest(stream=stream_class.__name__):
+                stream = stream_class(ReceiveChunks([wire]))
+                with self.assertRaisesRegex(ValueError, message):
+                    stream.receive()
+
     @staticmethod
     def _ros2_engine_for_reset(future, timeout):
         engine = object.__new__(worker.Ros2Engine)
