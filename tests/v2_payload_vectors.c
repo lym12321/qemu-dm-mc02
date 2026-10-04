@@ -60,7 +60,8 @@ static bool decode_and_reencode(const char *name, const uint8_t *wire,
         if (!dm_mc02_v2_payload_decode_diagnostics(&value, wire, length)) return false;
         encoded_length = dm_mc02_v2_payload_encode_diagnostics(
             encoded, DM_MC02_V2_DIAGNOSTICS_PAYLOAD_SIZE, &value);
-    } else if (strcmp(name, "step_done") == 0) {
+    } else if (strcmp(name, "step_done") == 0 ||
+               strcmp(name, "step_done_missing") == 0) {
         DmMc02V2StepDonePayload value;
         if (!dm_mc02_v2_payload_decode_step_done(&value, wire, length)) return false;
         encoded_length = dm_mc02_v2_payload_encode_step_done(
@@ -89,6 +90,7 @@ static bool valid_vector(const char *name, const uint8_t *wire, size_t length)
         return dm_mc02_v2_payload_validate_diagnostics(wire, length);
     }
     if (strcmp(name, "step_done") == 0 ||
+        strcmp(name, "step_done_missing") == 0 ||
         strcmp(name, "invalid_step_done_mask") == 0) {
         return dm_mc02_v2_payload_validate_step_done(wire, length);
     }
@@ -138,8 +140,8 @@ int main(int argc, char **argv)
         vectors++;
     }
     fclose(file);
-    if (vectors != 7) {
-        fprintf(stderr, "FAIL: expected 7 v2 payload vectors, got %u\n", vectors);
+    if (vectors != 8) {
+        fprintf(stderr, "FAIL: expected 8 v2 payload vectors, got %u\n", vectors);
         return 1;
     }
     printf("RESULT: C/Python v2 payload vectors passed (%u vectors)\n", vectors);

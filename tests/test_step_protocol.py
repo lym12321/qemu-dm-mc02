@@ -17,6 +17,9 @@ protocol = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = protocol
 SPEC.loader.exec_module(protocol)
 
+FAILED_STEP_DONE = bytes.fromhex(
+    "0200000001000000020000000600000007000000")
+
 
 def test_step_header_round_trip_and_wire_layout():
     header = protocol.StepHeader(protocol.STEP_VERSION, protocol.STEP_ACK, 7,
@@ -590,7 +593,9 @@ def test_validator_supports_explicit_and_generated_session_ids():
                                       generate_session_id=True)
 
 
-def test_response_validator_requires_ack_before_matching_step_done():
+@pytest.mark.parametrize("payload", [_step_done_payload(), FAILED_STEP_DONE],
+                         ids=["success", "missing"])
+def test_response_validator_requires_ack_before_matching_step_done(payload):
     rx = protocol.StepSessionValidator(protocol.DIRECTION_QEMU_TO_HOST,
                                        require_step_done=True)
     rx.begin_reset(0, 0)
@@ -598,7 +603,7 @@ def test_response_validator_requires_ack_before_matching_step_done():
                                  payload=_reset_ack_payload()))
     with pytest.raises(protocol.StepProtocolError, match="no outstanding"):
         rx.accept(_directional_frame(protocol.STEP_DONE, 1, 10, 10,
-                                     _step_done_payload()))
+                                     payload))
 
 
 def test_response_validator_rejects_duplicate_done_and_out_of_order_steps():
@@ -623,16 +628,22 @@ def test_response_validator_rejects_duplicate_done_and_out_of_order_steps():
                                      _step_done_payload()))
 
 
-def test_response_validator_accepts_one_replayed_done_after_replayed_ack():
+@pytest.mark.parametrize("require_step_done, payload", [
+    (True, _step_done_payload()),
+    (True, FAILED_STEP_DONE),
+    (False, FAILED_STEP_DONE),
+], ids=["strict-success", "strict-missing", "advisory-missing"])
+def test_response_validator_accepts_one_replayed_done_after_replayed_ack(
+        require_step_done, payload):
     rx = protocol.StepSessionValidator(protocol.DIRECTION_QEMU_TO_HOST,
-                                       require_step_done=True)
+                                       require_step_done=require_step_done)
     rx.begin_reset(0, 0)
     rx.accept(_directional_frame(protocol.RESET_ACK, 0, 0,
                                  payload=_reset_ack_payload()))
     ack = _directional_frame(protocol.STEP_ACK, 1, 10, 10,
                              _step_ack_payload())
     done = _directional_frame(protocol.STEP_DONE, 1, 10, 10,
-                              _step_done_payload())
+                              payload)
 
     rx.accept(ack)
     rx.accept(done)
@@ -643,7 +654,24 @@ def test_response_validator_accepts_one_replayed_done_after_replayed_ack():
     rx.accept(done)
 
     # A second DONE without another replay ACK is a genuine duplicate.
-    with pytest.raises(protocol.StepProtocolError, match="outstanding"):
+    with pytest.raises(protocol.StepProtocolError, match="outstanding|duplicate"):
+        rx.accept(done)
+
+
+def test_optional_done_replay_permission_expires_on_new_ack():
+    rx = protocol.StepSessionValidator.qemu_to_host(require_step_done=False)
+    rx.begin_reset(0, 0)
+    rx.accept(_directional_frame(protocol.RESET_ACK, 0, 0,
+                                 payload=_reset_ack_payload()))
+    ack = _directional_frame(protocol.STEP_ACK, 1, 10, 10,
+                             _step_ack_payload())
+    done = _directional_frame(protocol.STEP_DONE, 1, 10, 10, FAILED_STEP_DONE)
+    rx.accept(ack)
+    rx.accept(done)
+    rx.accept(ack)
+    rx.accept(_directional_frame(protocol.STEP_ACK, 2, 20, 10,
+                                 _step_ack_payload()))
+    with pytest.raises(protocol.StepProtocolError, match="duplicate"):
         rx.accept(done)
 
 
@@ -852,7 +880,11 @@ def test_response_validator_allows_ack_pipeline_but_keeps_done_ordered():
                                  _step_ack_payload()))
     with pytest.raises(protocol.StepProtocolError, match="out of order"):
         rx.accept(_directional_frame(protocol.STEP_DONE, 2, 20, 10,
-                                     _step_done_payload()))
+                                     FAILED_STEP_DONE))
+    rx.accept(_directional_frame(protocol.STEP_DONE, 1, 10, 10,
+                                 FAILED_STEP_DONE))
+    rx.accept(_directional_frame(protocol.STEP_DONE, 2, 20, 10,
+                                 _step_done_payload()))
 
 
 def test_session_accepts_step_done():

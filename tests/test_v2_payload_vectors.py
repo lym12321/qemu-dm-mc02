@@ -33,7 +33,7 @@ def _encode_payload(name: str, decoded: object) -> bytes:
         return protocol.encode_step_ack_payload(decoded)
     if name == "diagnostics":
         return protocol.encode_diagnostics_payload(decoded)
-    if name == "step_done":
+    if name in ("step_done", "step_done_missing"):
         return protocol.encode_step_done_payload(decoded)
     return protocol.encode_board_telemetry_payload(decoded)
 
@@ -43,6 +43,7 @@ VALID_DECODERS = {
     "step_ack": protocol.decode_step_ack_payload,
     "diagnostics": protocol.decode_diagnostics_payload,
     "step_done": protocol.decode_step_done_payload,
+    "step_done_missing": protocol.decode_step_done_payload,
     "board_telemetry": protocol.decode_board_telemetry_payload,
 }
 

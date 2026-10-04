@@ -812,7 +812,7 @@ class StepSessionValidator:
                 if ack.status == previous_status:
                     # Every terminal status is idempotently replayable. An
                     # OK replay also permits QEMU's paired DONE replay.
-                    if ack.status == V2_STATUS_OK and self.require_step_done:
+                    if ack.status == V2_STATUS_OK:
                         self._replayed_done_record = record
                     return
                 if (previous_status != V2_STATUS_QUEUE_FULL or
@@ -826,6 +826,7 @@ class StepSessionValidator:
                   self._last_ack_t_sim_ns):
                 raise StepProtocolError(
                     "STEP_ACK step_id and t_sim_ns must increase strictly")
+            self._replayed_done_record = None
             self._last_ack_step_id, self._last_ack_t_sim_ns = record[:2]
             self._last_ack_dt_ns = header.dt_ns
             self._last_ack_status = ack.status
@@ -870,8 +871,17 @@ class StepSessionValidator:
                         "STEP_DONE has no matching STEP_ACK")
                 key = (header.step_id, header.t_sim_ns)
                 if key in self._optional_done_history:
+                    if (record == self._replayed_done_record and
+                            record == self._last_done_record):
+                        self._replayed_done_record = None
+                        return
                     raise StepProtocolError("duplicate STEP_DONE")
                 self._optional_done_history.add(key)
+                if record == (self._last_ack_step_id,
+                              self._last_ack_t_sim_ns, self._last_ack_dt_ns):
+                    self._last_done_record = record
+                if self._replayed_done_record == record:
+                    self._replayed_done_record = None
             return
         if header.kind == DIAGNOSTICS:
             decode_diagnostics_payload(payload)
