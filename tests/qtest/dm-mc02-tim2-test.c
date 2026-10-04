@@ -46,6 +46,7 @@
 #define ADC1_ISR        (ADC1_BASE + 0x00)
 #define ADC1_CR         (ADC1_BASE + 0x08)
 #define ADC1_CFGR       (ADC1_BASE + 0x0c)
+#define ADC1_SQR1       (ADC1_BASE + 0x30)
 
 #define TIM_CR1_CEN     (1u << 0)
 #define TIM_CR1_CMS_1   (1u << 5)
@@ -507,6 +508,7 @@ static void tim2_arm_adc_on_trgo(QTestState *qts, bool rising)
 
     /* TIM2_TRGO is regular ADC EXTSEL=11.  The ADC is only used here as the
      * machine's existing observable sink for the timer's internal OC1REF. */
+    qtest_writel(qts, ADC1_SQR1, 0); /* One result for each timer edge. */
     qtest_writel(qts, ADC1_CFGR,
                  (11u << ADC_CFGR_EXTSEL_SHIFT) |
                  (exten << ADC_CFGR_EXTEN_SHIFT));
@@ -518,7 +520,8 @@ static void test_stateful_ocref_compare_modes(void)
     QTestState *qts = qtest_init(
         "-machine dm-mc02,adc-accurate-timing=on");
     const unsigned compare_ns = 250;
-    const unsigned conversion_ns = 12000;
+    /* RM0468 Rev 3 Table 228: (1.5 + 8.5) cycles at 1.5 MHz. */
+    const unsigned conversion_ns = 6667;
 
     tim2_configure_fixture_clock(qts);
 
@@ -536,7 +539,7 @@ static void test_stateful_ocref_compare_modes(void)
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
-
+    tim2_configure_fixture_clock(qts);
     /* OC1M=010: establish the internal level high, then verify the falling
      * edge at the compare deadline.  This does not require CC1E. */
     qtest_writel(qts, TIM2_CCMR1, 5u << 4);
@@ -553,7 +556,7 @@ static void test_stateful_ocref_compare_modes(void)
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
-
+    tim2_configure_fixture_clock(qts);
     /* OC1M=011: two compare deadlines must produce alternating edges. */
     tim2_arm_adc_on_trgo(qts, true);
     /* Keep the second toggle beyond the 16-bit ADC rank deadline. */
