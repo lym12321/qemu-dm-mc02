@@ -1,6 +1,7 @@
 #include <stdint.h>
 
-#define CORDIC_BASE 0x58004400u
+/* ST STM32H723 CMSIS: D2 AHB2 base 0x48020000 plus 0x4400. */
+#define CORDIC_BASE 0x48024400u
 #define CORDIC_CSR  (*(volatile uint32_t *)(CORDIC_BASE + 0x00u))
 #define CORDIC_WDATA (*(volatile uint32_t *)(CORDIC_BASE + 0x04u))
 #define CORDIC_RDATA (*(volatile uint32_t *)(CORDIC_BASE + 0x08u))

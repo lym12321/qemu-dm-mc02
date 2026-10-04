@@ -77,7 +77,7 @@ for _ in range(3000):
     time.sleep(0.001)
 else:
     debug = command("human-monitor-command", {
-        "command-line": "xp /2wx 0x58000014"}) or ""
+        "command-line": "xp /2wx 0x58000088"}) or ""
     idr = gpioa_idr()
     raise RuntimeError("EXTI GPIO input edge was not observed: %r pr=%s idr=%r" %
                        (last, debug, idr))
@@ -101,7 +101,7 @@ else:
     raise RuntimeError("EXTI remapped GPIO input edge was not observed: %r "
                        "exticr=%r gpiob=%r rtsr=%r line_pr=%r" %
                        (last, reg(0x58000414), reg(0x58020410),
-                        reg(0x58000000), reg(0x58000014)))
+                        reg(0x58000000), reg(0x58000088)))
 if last[3] != (1 << 14) or not (reg(0x58020410) & (1 << 14)):
     raise RuntimeError("EXTI remapped GPIO input mismatch: %r gpiob=%r" %
                        (last, reg(0x58020410)))

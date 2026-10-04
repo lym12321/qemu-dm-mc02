@@ -35,7 +35,7 @@ static void configure_rx(uint32_t base, unsigned word)
      * These values exercise the optional duration-aware medium path. */
     REG(base, NBTP) = 2u | (28u << 8) | (9u << 16);
     REG(base, DBTP) = (2u << 16) | (28u << 8) | (9u << 4);
-    REG(base, RXF0C) = word | (3u << 16);
+    REG(base, RXF0C) = word * 4u | (3u << 16);
     REG(base, 0x0bcu) = 0;
     REG(base, CCCR) = 0;
 }
@@ -43,7 +43,7 @@ static void configure_rx(uint32_t base, unsigned word)
 static void configure_tx(uint32_t base)
 {
     REG(base, CCCR) = 1;
-    REG(base, TXBC) = 3u << 16;
+    REG(base, TXBC) = 3u << 24;
     REG(base, TXESC) = 0;
     REG(base, CCCR) = 0;
 }

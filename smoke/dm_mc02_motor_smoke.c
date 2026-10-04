@@ -81,9 +81,9 @@ void Reset_Handler(void)
 
     RESULT[0] = 0;
     FDCAN1_CCCR = 1u;
-    FDCAN1_TXBC = 3u << 16;
+    FDCAN1_TXBC = 3u << 24;
     FDCAN1_TXESC = 0;
-    FDCAN1_RXF0C = 32u | (8u << 16);
+    FDCAN1_RXF0C = 32u * 4u | (8u << 16);
     FDCAN1_RXESC = 0;
     FDCAN1_IE = 1u;
     FDCAN1_ILE = 1u;

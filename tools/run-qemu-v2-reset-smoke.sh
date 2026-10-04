@@ -35,6 +35,8 @@ python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
     -chardev "socket,id=cosim,path={cosim},server=on,wait=off" \
     -serial chardev:cosim <<'PY'
 from dm_mc02_qmp import QmpSession
+from dm_mc02_firmware_rtf import deadline_qmp_call
+import json
 import socket
 import struct
 import sys
@@ -217,5 +219,99 @@ if (frame_fields(continued_ack) != (3, step_time + 3) or
                        f"fields={frame_fields(continued_ack)} "
                        f"status={status(continued_ack)} "
                        f"session={frame_session_id(continued_ack)}")
+
+# Observe the native RX owner before resetting. sendall alone cannot prove
+# that QEMU has received a prefix on this independent chardev.
+def diagnostics():
+    value = qmp.command("qom-get", {
+        "path": "/machine", "property": "cosim-diagnostics"})
+    return {key: int(number) for key, number in
+            (field.split("=", 1) for field in value.split(","))}
+
+
+def await_diagnostics(predicate):
+    deadline = time.monotonic() + 2.0
+    while True:
+        observed = deadline_qmp_call(qmp, deadline, "RX observation", diagnostics)
+        if predicate(observed):
+            qmp.settimeout(2.0)
+            return observed
+        time.sleep(0.001)  # Host IO polling; not a virtual-time assertion.
+
+
+def read_reset_session():
+    marker = read_v2_frame(cosim, 1)
+    ack = read_v2_frame(cosim, 5)
+    session = frame_session_id(marker)
+    origin = frame_fields(marker)[1]
+    if (session == 0 or frame_session_id(ack) != session or
+            frame_fields(ack) != (5, origin)):
+        raise RuntimeError("partial RX reset handshake mismatch")
+    read_v2_frame(cosim, 7)
+    return session, origin
+
+
+qmp.command("stop")
+# Choose the allocator's next candidate as the peer's current session. The
+# next machine reset must skip it even though it was chosen by the host.
+runtime_session_id = diagnostics()["v2_next_session"] + 1
+cosim.sendall(v2_frame(1, 0, 0, flags=runtime_session_id))
+ack = read_v2_frame(cosim, 5)
+if frame_session_id(ack) != runtime_session_id:
+    raise RuntimeError("host-selected collision session was not established")
+read_v2_frame(cosim, 7)
+step_time = 0
+rx_cases = []
+for split in (2, 26, 59):  # Outer length, session header, IMU body.
+    old_wire = v2_frame(2, 5, step_time + 4, b"\x00" * 60,
+                        dt_ns=1, flags=runtime_session_id)
+    cosim.sendall(old_wire[:split])
+    before = await_diagnostics(lambda d: d["rx_buffered"] == split)
+    reset_count = 2 if split == 59 else 1
+    for _ in range(reset_count):
+        previous_session_id = runtime_session_id
+        qmp.command("system_reset")
+        runtime_session_id, origin = read_reset_session()
+        if runtime_session_id == previous_session_id:
+            raise RuntimeError("machine reset reused the previous session ID")
+        retained = diagnostics()
+        if retained["rx_buffered"] != split:
+            raise RuntimeError(f"machine reset lost RX prefix: {split}, {retained}")
+    new_wire = v2_frame(2, 1, origin + 1, b"\x00" * 60,
+                        dt_ns=1, flags=runtime_session_id)
+    cosim.sendall(old_wire[split:] + new_wire)
+    ack = read_v2_frame(cosim, 3)
+    if (frame_fields(ack) != (3, origin + 1) or status(ack) != 0 or
+            frame_session_id(ack) != runtime_session_id):
+        raise RuntimeError("new-session STEP after old suffix was not accepted")
+    after = await_diagnostics(lambda d: d["rx_buffered"] == 0)
+    if (after["rx_frames"] != before["rx_frames"] + 1 or
+            after["rx_bad_frames"] != before["rx_bad_frames"] + 1 or
+            after["rx_dropped_bytes"] != before["rx_dropped_bytes"] + len(old_wire)):
+        raise RuntimeError(f"old RX STEP was not rejected as one frame: {before}, {after}")
+    rx_cases.append({"split": split, "resets": reset_count,
+                     "retained": retained, "before": before, "after": after})
+    step_time = origin + 1
+
+# CLOSED creates a different byte stream: no old prefix may survive it.
+old_wire = v2_frame(2, 2, step_time + 1, b"\x00" * 60,
+                    dt_ns=1, flags=runtime_session_id)
+cosim.sendall(old_wire[:2])
+await_diagnostics(lambda d: d["rx_buffered"] == 2)
+cosim.close()
+closed = await_diagnostics(lambda d: d["opened"] == 0)
+if closed["rx_buffered"] != 0:
+    raise RuntimeError("CLOSED retained RX bytes from the old connection")
+cosim = connect(cosim_path)
+runtime_session_id, origin = read_reset_session()
+cosim.sendall(v2_frame(2, 1, origin + 1, b"\x00" * 60,
+                       dt_ns=1, flags=runtime_session_id))
+ack = read_v2_frame(cosim, 3)
+if (frame_fields(ack) != (3, origin + 1) or status(ack) != 0 or
+        frame_session_id(ack) != runtime_session_id):
+    raise RuntimeError("fresh connection did not accept its first STEP")
+print("RX_RESET_EVIDENCE: " + json.dumps({"cases": rx_cases, "closed": closed,
+                                        "reconnected": diagnostics()}, sort_keys=True))
+qmp.command("cont")
 print("RESULT: QEMU v2 runtime RESET/RESET_ACK smoke passed")
 PY

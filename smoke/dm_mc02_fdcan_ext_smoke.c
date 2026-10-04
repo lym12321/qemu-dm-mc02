@@ -24,15 +24,14 @@ void Reset_Handler(void)
 {
     REG(CCCR) = 1;
     REG(RXESC) = 0;
-    REG(RXF1C) = 32u | (2u << 16);
+    REG(RXF1C) = 32u * 4u | (2u << 16);
     /* Reject non-matching standard and extended frames, matching the
      * board's HAL_FDCAN_ConfigGlobalFilter() policy. */
     REG(GFC) = (2u << 4) | (2u << 2) | (1u << 1) | 1u;
     /* Extended dual-ID filter: EFID1=0x123456, EFID2=0x1abcde,
      * EFT=dual ID, EFEC=FIFO1. */
-    /* FLSSA is a 32-bit word address. Filter element 128 is therefore at
-     * word 128, i.e. byte offset 512 in message RAM. */
-    REG(XIDFC) = 128u | (1u << 16);
+    /* CMSIS FLESA_Pos=2: word 128 is encoded as byte offset 512. */
+    REG(XIDFC) = 128u * 4u | (1u << 16);
     MSGRAM[128] = 0x123456u | (6u << 29); /* FIFO1 + high priority */
     MSGRAM[129] = 0x1abcdeu | (1u << 30);
     REG(IE) = (1u << 4) | (1u << 8); /* RF1N + HPM notifications */

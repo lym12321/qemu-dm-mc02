@@ -70,7 +70,7 @@ void Reset_Handler(void)
 
     RESULT[0] = RESULT_TX;
     FDCAN1_CCCR = 1;             /* INIT; the model supplies CCE */
-    FDCAN1_TXBC = 3u << 16;      /* three TX FIFO elements at word 0 */
+    FDCAN1_TXBC = 3u << 24;      /* TFQS: three TX FIFO elements at word 0 */
     FDCAN1_TXESC = 0;             /* eight data bytes per element */
     FDCAN1_CCCR = 0;              /* enter normal operation before TX */
     tx[0] = 0x123u << 18;         /* standard ID */
@@ -82,12 +82,13 @@ void Reset_Handler(void)
     }
 
     FDCAN1_CCCR = 1;              /* re-enter INIT to configure RX */
-    FDCAN1_RXF0C = 32u | (3u << 16); /* RX FIFO at word 32 */
+    FDCAN1_RXF0C = 32u * 4u | (3u << 16); /* RX FIFO at word 32 */
     FDCAN1_RXESC = 0;
     /* Two exact standard-ID filters at message-RAM word 100.  Reject
      * non-matching standard/extended and remote frames, matching the board's
      * HAL_FDCAN_ConfigGlobalFilter() policy. */
-    FDCAN1_SIDFC = 100u | (2u << 16);
+    /* ST HAL FDCAN_CalculateRamBlockAddresses encodes word offsets << 2. */
+    FDCAN1_SIDFC = 100u * 4u | (2u << 16);
     MSGRAM[100] = (2u << 30) | (1u << 27) | (0x321u << 16) | 0x7ffu;
     MSGRAM[101] = (2u << 30) | (1u << 27) | (0x456u << 16) | 0x7ffu;
     FDCAN1_GFC = (2u << 4) | (2u << 2) | (1u << 1) | 1u;
@@ -104,7 +105,7 @@ void Reset_Handler(void)
     get_index = (FDCAN1_RXF0S >> 8) & 0x3f;
     FDCAN1_RXF0A = get_index;
     RESULT[5] = RESULT_RX;
-    FDCAN1_RXF0C = 64u | (3u << 16); /* move FIFO for a 64-byte FD element */
+    FDCAN1_RXF0C = 64u * 4u | (3u << 16); /* FIFO at word 64, 64-byte data */
     FDCAN1_RXESC = 7;                 /* 64 data bytes per element */
     while ((FDCAN1_RXF0S & 0x7fu) == 0) {
     }

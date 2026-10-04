@@ -46,12 +46,12 @@ void Reset_Handler(void)
     *filter = (0x321u << 16) | (7u << 27) | BUFFER_INDEX_STD;
     /* A second buffer acts as an ordered host-side release handshake. */
     filter[1] = (0x322u << 16) | (7u << 27) | BUFFER_INDEX_RELEASE;
-    FDCAN_SIDFC = (0x100u / 4u) | (2u << 16);
+    FDCAN_SIDFC = 0x100u | (2u << 16);
     /* Exact extended ID 0x1234567 -> Rx Buffer 32. EFT is ignored. */
     filter_ext[0] = (7u << 29) | 0x1234567u;
     filter_ext[1] = BUFFER_INDEX_EXT;
-    FDCAN_XIDFC = (0x120u / 4u) | (1u << 16);
-    FDCAN_RXBC = 0x200u / 4u;
+    FDCAN_XIDFC = 0x120u | (1u << 16);
+    FDCAN_RXBC = 0x200u;
     FDCAN_RXESC = 0;
     FDCAN_CCCR = 0;
     /* Polling keeps NDAT set while the host injects a duplicate frame. */

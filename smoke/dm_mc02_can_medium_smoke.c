@@ -26,9 +26,9 @@ static void configure_node(uint32_t base, uint32_t rx_word,
                            uint32_t tx_word)
 {
     *reg(base, FDCAN_CCCR) = 1u; /* INIT; model supplies CCE. */
-    *reg(base, FDCAN_RXF0C) = rx_word | (3u << 16);
+    *reg(base, FDCAN_RXF0C) = rx_word * 4u | (3u << 16);
     *reg(base, FDCAN_RXESC) = 0;
-    *reg(base, FDCAN_TXBC) = tx_word | (3u << 16);
+    *reg(base, FDCAN_TXBC) = tx_word * 4u | (3u << 24);
     *reg(base, FDCAN_CCCR) = 0; /* enter normal operation after setup */
 }
 
@@ -89,7 +89,7 @@ void Reset_Handler(void)
 
     /* Move FDCAN3's FIFO so the arbitration batch starts empty. */
     *reg(FDCAN3_BASE, FDCAN_CCCR) = 1;
-    *reg(FDCAN3_BASE, FDCAN_RXF0C) = 80u | (3u << 16);
+    *reg(FDCAN3_BASE, FDCAN_RXF0C) = 80u * 4u | (3u << 16);
     *reg(FDCAN3_BASE, FDCAN_CCCR) = 0;
 
     /* QEMU's standard bus is an immediate broadcast. A single TXBAR write

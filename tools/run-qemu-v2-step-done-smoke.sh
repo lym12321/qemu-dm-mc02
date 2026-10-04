@@ -140,7 +140,8 @@ if done_values != (0, 3, 0, 0, 0):
 cosim.sendall(step_wire)
 retry_ack = read_v2(cosim, STEP_ACK)
 retry_done = read_v2(cosim, STEP_DONE)
-if fields(retry_ack) != (STEP_ACK, 7) or fields(retry_done) != (STEP_DONE, 7):
+if (fields(retry_ack) != (STEP_ACK, 7) or
+        fields(retry_done) != (STEP_DONE, 7) or payload(retry_done) != payload(done)):
     raise RuntimeError("consumed STEP was not replayed idempotently")
 
 response = qmp.command("human-monitor-command", {
@@ -149,5 +150,55 @@ words = [int(value, 16) for value in re.findall(
     r"0x([0-9a-fA-F]{8})", response)]
 if not words or words[0] != MARKER or words[10] != 0 or words[11] != 0:
     raise RuntimeError("guest did not consume both BMI088 raw bursts")
-print("RESULT: QEMU v2 STEP_DONE guest BMI088 consumption smoke passed")
+# The guest completed its real raw reads and now sleeps. A distinct wire sample
+# with the same sensor timestamp is rejected by both configured 100 Hz dies.
+# Admission succeeds, but this input must not occupy a token forever.
+def imu_step(step_id, host_ns, sensor_ns):
+    data = struct.pack("<12f", 1.0, -2.0, 3.0, 0.5, -1.0, 1.0,
+                       0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+    return v2_frame(STEP, step_id, host_ns,
+                    data + struct.pack("<QI", sensor_ns, 1), dt=1)
+
+
+def response(wanted_kind, wanted_step):
+    body = read_v2(cosim)
+    # Telemetry may be published between control responses.
+    while fields(body)[0] not in (STEP_ACK, STEP_DONE):
+        body = read_v2(cosim)
+    if fields(body) != (wanted_kind, wanted_step):
+        raise RuntimeError("control response order mismatch: %r" % (fields(body),))
+    return body
+
+
+rejected = imu_step(8, 2, 1)
+cosim.sendall(rejected)
+if struct.unpack_from("<I", payload(response(STEP_ACK, 8)))[0] != 0:
+    raise RuntimeError("ODR-rejected input was not admitted")
+failed = response(STEP_DONE, 8)
+if struct.unpack("<IIIII", payload(failed)) != (2, 0, 3, 0, 0):
+    raise RuntimeError("ODR-rejected input did not terminate with missing dies")
+cosim.sendall(rejected)
+response(STEP_ACK, 8)
+if payload(response(STEP_DONE, 8)) != payload(failed):
+    raise RuntimeError("failed terminal replay changed bytes")
+
+# An accepted raw source remains unread. A later source replaces both raw
+# registers; only the older STEP may terminate, after the newer ACK.
+cosim.sendall(imu_step(9, 3, 10_000_001))
+response(STEP_ACK, 9)
+cosim.sendall(imu_step(10, 4, 20_000_001))
+response(STEP_ACK, 10)
+if struct.unpack("<IIIII", payload(response(STEP_DONE, 9))) != (2, 0, 3, 0, 0):
+    raise RuntimeError("superseded raw source remained pending")
+
+# Wire RESET invalidates tokens but leaves physical sensor bytes. Reusing peer
+# sample/STEP numbers cannot attribute those bytes to the new rejected input.
+cosim.sendall(v2_frame(RESET, 0, 0))
+if fields(read_v2(cosim, RESET_ACK)) != (RESET_ACK, 0):
+    raise RuntimeError("restart RESET_ACK mismatch")
+cosim.sendall(imu_step(7, 1, 20_000_001))
+response(STEP_ACK, 7)
+if struct.unpack("<IIIII", payload(response(STEP_DONE, 7))) != (2, 0, 3, 0, 0):
+    raise RuntimeError("retained old bytes were assigned to a reused peer ID")
+print("RESULT: QEMU v2 STEP_DONE consume/reject/overwrite/restart smoke passed")
 PY

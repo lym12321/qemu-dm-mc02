@@ -30,7 +30,7 @@ static void wait_tec(uint32_t target)
 static void configure_tx(void)
 {
     REG(FDCAN1, CCCR) = 1u;
-    REG(FDCAN1, TXBC) = 3u << 16;
+    REG(FDCAN1, TXBC) = 3u << 24;
     REG(FDCAN1, TXESC) = 0u;
     MSGRAM[0] = 0x321u << 18;
     MSGRAM[1] = 8u << 16;
@@ -42,7 +42,7 @@ static void configure_tx(void)
 static void configure_receiver(void)
 {
     REG(FDCAN2, CCCR) = 1u;
-    REG(FDCAN2, RXF0C) = 32u | (1u << 16);
+    REG(FDCAN2, RXF0C) = 32u * 4u | (1u << 16);
     REG(FDCAN2, RXESC) = 0u;
     REG(FDCAN2, CCCR) = 0u;
 }

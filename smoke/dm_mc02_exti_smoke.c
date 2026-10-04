@@ -3,7 +3,7 @@
 #define EXTI_RTSR1  (*(volatile uint32_t *)0x58000000u)
 #define EXTI_FTSR1  (*(volatile uint32_t *)0x58000004u)
 #define EXTI_SWIER1 (*(volatile uint32_t *)0x58000008u)
-#define EXTI_PR1    (*(volatile uint32_t *)0x58000014u)
+#define EXTI_PR1    (*(volatile uint32_t *)0x58000088u)
 #define EXTI_C1IMR1 (*(volatile uint32_t *)0x58000080u)
 #define SYSCFG_EXTICR4 (*(volatile uint32_t *)0x58000414u)
 #define NVIC_ISER1  (*(volatile uint32_t *)0xe000e104u)

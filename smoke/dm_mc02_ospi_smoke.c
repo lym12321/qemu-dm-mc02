@@ -72,13 +72,17 @@ static void write_enable(void)
 
 static void quad_page_program(uint32_t address, const uint32_t *data)
 {
+    const uint8_t *bytes = (const uint8_t *)data;
+
     ospi_indirect();
     OSPI_DLR = 15;
     OSPI_CCR = 0;
     OSPI_IR = W25Q_QUAD_PP;
     OSPI_AR = address;
-    for (uint32_t i = 0; i < 4; ++i) {
-        OSPI_DR = data[i];
+    /* ST HAL_OSPI_Transmit polls SR before every byte written to DR. */
+    for (uint32_t i = 0; i < 16; ++i) {
+        (void)OSPI_SR;
+        OSPI_DR8 = bytes[i];
     }
 }
 
