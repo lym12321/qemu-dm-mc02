@@ -55,10 +55,11 @@ static int load_state(DmMc02Bmi088Spi *state, int version_id)
     return ret;
 }
 
-static void consume_sentinel(void *opaque)
+static void consume_sentinel(void *opaque, uint64_t sample_sequence)
 {
     g_assert_not_reached();
     (void)opaque;
+    (void)sample_sequence;
 }
 
 static void prepare_read_source(DmMc02Bmi088Spi *state)
@@ -66,9 +67,10 @@ static void prepare_read_source(DmMc02Bmi088Spi *state)
     memset(state, 0, sizeof(*state));
     state->command_seen = true;
     state->read_transfer = true;
-    state->dummy_pending = true;
-    state->reg = 0x19;
+    state->dummy_pending = false;
+    state->reg = 0x15;
     state->read_start_reg = 0x12;
+    state->raw_read_sequence = 42;
 }
 
 static void seed_runtime_sentinels(DmMc02Bmi088Spi *state,
@@ -93,11 +95,12 @@ static void test_round_trip_preserves_framing_and_runtime(void)
 
     memset(&restored, 0, sizeof(restored));
     seed_runtime_sentinels(&restored, &restored_bmi, &opaque);
-    g_assert_cmpint(load_state(&restored, 1), ==, 0);
+    g_assert_cmpint(load_state(&restored, 2), ==, 0);
 
     g_assert_true(restored.command_seen);
     g_assert_true(restored.read_transfer);
-    g_assert_true(restored.dummy_pending);
+    g_assert_false(restored.dummy_pending);
+    g_assert_cmpuint(restored.raw_read_sequence, ==, 42);
     g_assert_cmpuint(restored.reg, ==, source.reg);
     g_assert_cmpuint(restored.read_start_reg, ==, source.read_start_reg);
     g_assert_true(restored.bmi == &restored_bmi);
@@ -110,10 +113,11 @@ static void test_round_trip_preserves_framing_and_runtime(void)
     source.dummy_pending = false;
     source.reg = 0x40;
     source.read_start_reg = 0x40;
+    source.raw_read_sequence = 0;
     save_state(&source);
     memset(&restored, 0, sizeof(restored));
     seed_runtime_sentinels(&restored, &restored_bmi, &opaque);
-    g_assert_cmpint(load_state(&restored, 1), ==, 0);
+    g_assert_cmpint(load_state(&restored, 2), ==, 0);
     g_assert_true(restored.command_seen);
     g_assert_false(restored.read_transfer);
     g_assert_false(restored.dummy_pending);
@@ -136,7 +140,7 @@ static void test_rejects_unsupported_version_without_runtime_changes(void)
     memset(&restored, 0, sizeof(restored));
     seed_runtime_sentinels(&restored, &bmi, &opaque);
 
-    g_assert_cmpint(load_state(&restored, 2), !=, 0);
+    g_assert_cmpint(load_state(&restored, 3), !=, 0);
     g_assert_true(restored.bmi == &bmi);
     g_assert_true(restored.consume == consume_sentinel);
     g_assert_true(restored.consume_opaque == opaque);
@@ -156,7 +160,7 @@ static void test_rejects_cursor_without_command(void)
     memset(&restored, 0, sizeof(restored));
     seed_runtime_sentinels(&restored, &bmi, &opaque);
 
-    g_assert_cmpint(load_state(&restored, 1), !=, 0);
+    g_assert_cmpint(load_state(&restored, 2), !=, 0);
     g_assert_true(restored.bmi == &bmi);
     g_assert_true(restored.consume == consume_sentinel);
     g_assert_true(restored.consume_opaque == opaque);
@@ -179,7 +183,7 @@ static void test_rejects_dummy_on_write_transaction(void)
     memset(&restored, 0, sizeof(restored));
     seed_runtime_sentinels(&restored, &bmi, &opaque);
 
-    g_assert_cmpint(load_state(&restored, 1), !=, 0);
+    g_assert_cmpint(load_state(&restored, 2), !=, 0);
     g_assert_true(restored.bmi == &bmi);
     g_assert_true(restored.consume == consume_sentinel);
     g_assert_true(restored.consume_opaque == opaque);
@@ -197,9 +201,42 @@ static void test_rejects_truncated_stream(void)
     qemu_fclose(file);
     memset(&state, 0, sizeof(state));
     seed_runtime_sentinels(&state, &bmi, &opaque);
-    g_assert_cmpint(load_state(&state, 1), !=, 0);
+    g_assert_cmpint(load_state(&state, 2), !=, 0);
     g_assert_true(state.bmi == &bmi);
     g_assert_true(state.consume == consume_sentinel);
+}
+
+static void test_legacy_partial_read_has_no_identity(void)
+{
+    /* Actual v1 layout: command/read/dummy/next-reg/start-reg. */
+    static const uint8_t legacy[] = { 1, 1, 0, 0x15, 0x12 };
+    DmMc02Bmi088Spi state = { .raw_read_sequence = 999 };
+    QEMUFile *file = open_test_file(true);
+
+    qemu_put_buffer(file, legacy, sizeof(legacy));
+    qemu_put_byte(file, QEMU_VM_EOF);
+    qemu_fclose(file);
+    g_assert_cmpint(load_state(&state, 1), ==, 0);
+    g_assert_cmpuint(state.reg, ==, 0x15);
+    g_assert_cmpuint(state.raw_read_sequence, ==, 0);
+}
+
+static void test_rejects_identity_without_raw_cursor(void)
+{
+    DmMc02Bmi088Spi source;
+    DmMc02Bmi088Spi restored = { 0 };
+    static const uint8_t bad_regs[] = { 0x12, 0x18 };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(bad_regs); ++i) {
+        prepare_read_source(&source);
+        source.reg = bad_regs[i];
+        save_state(&source);
+        g_assert_cmpint(load_state(&restored, 2), !=, 0);
+    }
+    prepare_read_source(&source);
+    source.dummy_pending = true;
+    save_state(&source);
+    g_assert_cmpint(load_state(&restored, 2), !=, 0);
 }
 
 int main(int argc, char **argv)
@@ -222,6 +259,10 @@ int main(int argc, char **argv)
                     test_rejects_dummy_on_write_transaction);
     g_test_add_func("/dm-bmi088-spi-vmstate/reject-truncated",
                     test_rejects_truncated_stream);
+    g_test_add_func("/dm-bmi088-spi-vmstate/legacy-partial-untagged",
+                    test_legacy_partial_read_has_no_identity);
+    g_test_add_func("/dm-bmi088-spi-vmstate/reject-identity-cursor",
+                    test_rejects_identity_without_raw_cursor);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

@@ -10,12 +10,23 @@ static int dm_mc02_bmi088_spi_post_load(void *opaque, int version_id)
     /* A framer with no command has no meaningful transaction cursor.  Keep
      * this check independent of the pointed-to die so the component remains
      * usable with a destination-owned runtime device pointer. */
-    if (version_id != 1 ||
+    if (version_id < 2) {
+        /* An old partial burst has bytes but no trustworthy source identity. */
+        state->raw_read_sequence = 0;
+    }
+    if ((version_id != 1 && version_id != 2) ||
         state->read_start_reg > 0x7f ||
         (!state->command_seen &&
          (state->read_transfer || state->dummy_pending || state->reg ||
           state->read_start_reg)) ||
-        (!state->read_transfer && state->dummy_pending)) {
+        (!state->read_transfer && state->dummy_pending) ||
+        (state->raw_read_sequence &&
+         (!state->command_seen || !state->read_transfer ||
+          state->dummy_pending ||
+          (state->read_start_reg != 0x02 &&
+           state->read_start_reg != 0x12) ||
+          state->reg <= state->read_start_reg ||
+          state->reg > state->read_start_reg + 5))) {
         return -EINVAL;
     }
     return 0;
@@ -23,7 +34,7 @@ static int dm_mc02_bmi088_spi_post_load(void *opaque, int version_id)
 
 const VMStateDescription vmstate_dm_mc02_bmi088_spi = {
     .name = "dm-mc02-bmi088-spi",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = dm_mc02_bmi088_spi_post_load,
     .fields = (VMStateField[]) {
@@ -32,6 +43,7 @@ const VMStateDescription vmstate_dm_mc02_bmi088_spi = {
         VMSTATE_BOOL(dummy_pending, DmMc02Bmi088Spi),
         VMSTATE_UINT8(reg, DmMc02Bmi088Spi),
         VMSTATE_UINT8(read_start_reg, DmMc02Bmi088Spi),
+        VMSTATE_UINT64_V(raw_read_sequence, DmMc02Bmi088Spi, 2),
         VMSTATE_END_OF_LIST()
     },
 };

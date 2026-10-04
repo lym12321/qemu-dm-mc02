@@ -19,7 +19,7 @@ static int dm_mc02_bmi088_spi_link_post_load(void *opaque, int version_id)
 {
     DmMc02Bmi088SpiLink *state = opaque;
 
-    if (!state || version_id != 1 ||
+    if (!state || version_id != 2 ||
         state->selected_mask_snapshot &
         ~((UINT32_C(1) << DM_MC02_SPI_MAX_TARGETS) - 1) ||
         /* The composite has fixed accelerometer/gyro slots.  The die
@@ -46,8 +46,10 @@ static int dm_mc02_bmi088_spi_link_post_load(void *opaque, int version_id)
 
 static const VMStateDescription vmstate_dm_mc02_bmi088_spi_link = {
     .name = "dm-mc02-bmi088-spi-link",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    /* VMS_STRUCT loads the current child layout, so the old composite with
+     * v1 framers must not be interpreted as this v2 layout. */
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = dm_mc02_bmi088_spi_link_pre_save,
     .post_load = dm_mc02_bmi088_spi_link_post_load,
     .fields = (VMStateField[]) {

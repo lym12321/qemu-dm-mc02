@@ -53,7 +53,7 @@ static int load_link(DmMc02Bmi088SpiLink *state)
 {
     QEMUFile *file = open_test_file(false);
     int ret = vmstate_load_state(file, dm_mc02_bmi088_spi_link_vmstate(),
-                                 state, 1);
+                                 state, 2);
 
     if (!ret) {
         g_assert_cmpint(qemu_file_get_error(file), ==, 0);
@@ -109,9 +109,10 @@ static void prepare_source(DmMc02Bmi088SpiLink *state)
     state->gyro.fifo_length = 8;
     state->accel_spi.command_seen = true;
     state->accel_spi.read_transfer = true;
-    state->accel_spi.dummy_pending = true;
-    state->accel_spi.reg = 0x19;
+    state->accel_spi.dummy_pending = false;
+    state->accel_spi.reg = 0x15;
     state->accel_spi.read_start_reg = 0x12;
+    state->accel_spi.raw_read_sequence = 101;
     state->gyro_spi.command_seen = true;
     state->gyro_spi.read_transfer = false;
     state->gyro_spi.reg = 0x40;
@@ -161,6 +162,7 @@ static void test_round_trip_restores_link_without_cs_callback(void)
     g_assert_cmpuint(restored.gyro.regs[0x02], ==, 0x22);
     g_assert_cmpuint(restored.accel.sample_sequence, ==, 101);
     g_assert_cmpuint(restored.gyro.sample_sequence, ==, 202);
+    g_assert_cmpuint(restored.accel_spi.raw_read_sequence, ==, 101);
     g_assert_true(restored.accel_spi.bmi == &restored.accel);
     g_assert_true(restored.gyro_spi.bmi == &restored.gyro);
     g_assert_true(restored.spi.targets[0].select == target_select_sentinel);
@@ -228,6 +230,25 @@ static void test_rejects_truncated_link_without_runtime_sync(void)
     g_assert_cmpuint(target_select_calls, ==, 0);
 }
 
+static void test_rejects_legacy_layout_before_runtime_sync(void)
+{
+    DmMc02Bmi088SpiLink source;
+    DmMc02Bmi088SpiLink restored;
+    QEMUFile *file;
+
+    prepare_source(&source);
+    g_assert_cmpint(save_link(&source), ==, 0);
+    seed_destination_runtime(&restored);
+    dm_mc02_spi_sync_calls = 0;
+    dm_mc02_spi_restore_selected_mask_calls = 0;
+    file = open_test_file(false);
+    g_assert_cmpint(vmstate_load_state(file,
+                    dm_mc02_bmi088_spi_link_vmstate(), &restored, 1), !=, 0);
+    qemu_fclose(file);
+    g_assert_cmpuint(dm_mc02_spi_sync_calls, ==, 0);
+    g_assert_cmpuint(dm_mc02_spi_restore_selected_mask_calls, ==, 0);
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf(
@@ -246,6 +267,8 @@ int main(int argc, char **argv)
                     test_rejects_invalid_selection_on_save);
     g_test_add_func("/dm-bmi088-spi-link-vmstate/reject-truncated",
                     test_rejects_truncated_link_without_runtime_sync);
+    g_test_add_func("/dm-bmi088-spi-link-vmstate/reject-legacy-layout",
+                    test_rejects_legacy_layout_before_runtime_sync);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

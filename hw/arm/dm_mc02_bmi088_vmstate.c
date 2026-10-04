@@ -89,8 +89,9 @@ static bool bmi088_fifo_frame_length_valid(const DmMc02Bmi088 *state)
         return state->fifo_read_frame_length <= state->fifo_length &&
                state->fifo_read_frame_length ==
                    bmi088_fifo_frame_length(state) &&
-               state->fifo_read_sequence ==
-                   state->fifo_sequence[state->fifo_head];
+               (!state->fifo_read_sequence ||
+                state->fifo_read_sequence ==
+                    state->fifo_sequence[state->fifo_head]);
     }
     if (!state->accel || state->fifo_read_sequence != 0) {
         return false;

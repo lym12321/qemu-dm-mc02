@@ -62,17 +62,19 @@ static uint16_t dm_mc02_bmi088_fifo_capacity(const DmMc02Bmi088 *bmi)
                         DM_MC02_BMI_GYRO_FIFO_CAPACITY;
 }
 
-static uint8_t dm_mc02_bmi088_fifo_frame_length(const DmMc02Bmi088 *bmi)
+static uint8_t dm_mc02_bmi088_fifo_frame_length(const DmMc02Bmi088 *bmi,
+                                               uint16_t offset)
 {
     uint8_t header;
 
+    if (offset >= bmi->fifo_length) {
+        return 0;
+    }
     if (!bmi->accel) {
         return 8;
     }
-    if (!bmi->fifo_length) {
-        return 0;
-    }
-    header = bmi->fifo[bmi->fifo_head];
+    header = bmi->fifo[(bmi->fifo_head + offset) %
+                       dm_mc02_bmi088_fifo_capacity(bmi)];
     if (header == 0x84) {
         return 7;
     }
@@ -106,7 +108,7 @@ static bool dm_mc02_bmi088_powered(const DmMc02Bmi088 *bmi)
 
 static void dm_mc02_bmi088_fifo_drop_frame(DmMc02Bmi088 *bmi)
 {
-    uint8_t frame_length = dm_mc02_bmi088_fifo_frame_length(bmi);
+    uint8_t frame_length = dm_mc02_bmi088_fifo_frame_length(bmi, 0);
     uint16_t capacity = dm_mc02_bmi088_fifo_capacity(bmi);
 
     if (!frame_length || frame_length > bmi->fifo_length) {
@@ -197,7 +199,7 @@ static uint8_t dm_mc02_bmi088_fifo_read(DmMc02Bmi088 *bmi,
         } else if (bmi->fifo_length) {
             bmi->fifo_read_kind = 1;
             bmi->fifo_read_frame_length =
-                dm_mc02_bmi088_fifo_frame_length(bmi);
+                dm_mc02_bmi088_fifo_frame_length(bmi, 0);
             bmi->fifo_read_sequence = bmi->fifo_sequence[bmi->fifo_head];
         } else if (bmi->accel && bmi->fifo_sensortime_pending) {
             bmi->fifo_read_kind = 3;
@@ -209,8 +211,14 @@ static uint8_t dm_mc02_bmi088_fifo_read(DmMc02Bmi088 *bmi,
         return 0x80;
     }
     if (bmi->fifo_read_kind == 1) {
-        result = bmi->fifo[(bmi->fifo_head + bmi->fifo_read_progress) %
-                           capacity];
+        unsigned byte = (bmi->fifo_head + bmi->fifo_read_progress) % capacity;
+
+        /* Stream overflow may replace the head during a partial read.  The
+         * resulting byte mixture is not consumption of the original sample. */
+        if (bmi->fifo_read_sequence != bmi->fifo_sequence[byte]) {
+            bmi->fifo_read_sequence = 0;
+        }
+        result = bmi->fifo[byte];
     } else if (bmi->fifo_read_kind == 2) {
         result = bmi->fifo_read_progress ?
                  MIN(bmi->fifo_skipped_frames, 0xff) : 0x40;
@@ -320,11 +328,64 @@ void dm_mc02_bmi088_reset(DmMc02Bmi088 *bmi)
         dm_mc02_bmi088_set_temperature_reg(bmi,
                                             bmi->signal.temperature_c);
     }
+    dm_mc02_bmi088_notify_source_change(bmi);
 }
 
 bool dm_mc02_bmi088_is_accel(const DmMc02Bmi088 *bmi)
 {
     return bmi->accel;
+}
+
+bool dm_mc02_bmi088_sample_retained(const DmMc02Bmi088 *bmi,
+                                    uint64_t sample_sequence)
+{
+    uint16_t capacity = dm_mc02_bmi088_fifo_capacity(bmi);
+    uint16_t offset = 0;
+
+    if (!sample_sequence) {
+        return false;
+    }
+    if (bmi->sample_sequence == sample_sequence) {
+        return true;
+    }
+    while (offset < bmi->fifo_length) {
+        uint8_t length = dm_mc02_bmi088_fifo_frame_length(bmi, offset);
+        unsigned head = (bmi->fifo_head + offset) % capacity;
+        bool tagged = !bmi->accel || bmi->fifo[head] == 0x84;
+
+        if (!length || length > bmi->fifo_length - offset) {
+            break;
+        }
+        /* Gyro cannot restart a partial head: ending the read drops it. */
+        if (!offset && !bmi->accel && bmi->fifo_read_progress &&
+            bmi->fifo_read_sequence != sample_sequence) {
+            tagged = false;
+        }
+        for (unsigned i = 0; tagged && i < length; ++i) {
+            tagged = bmi->fifo_sequence[(head + i) % capacity] ==
+                     sample_sequence;
+        }
+        if (tagged) {
+            return true;
+        }
+        offset += length;
+    }
+    return false;
+}
+
+void dm_mc02_bmi088_set_source_callback(DmMc02Bmi088 *bmi,
+                                        DmMc02Bmi088SourceFn callback,
+                                        void *opaque)
+{
+    bmi->source_changed = callback;
+    bmi->source_opaque = opaque;
+}
+
+void dm_mc02_bmi088_notify_source_change(DmMc02Bmi088 *bmi)
+{
+    if (bmi->source_changed) {
+        bmi->source_changed(bmi->source_opaque);
+    }
 }
 
 bool dm_mc02_bmi088_is_powered(const DmMc02Bmi088 *bmi)
@@ -452,6 +513,7 @@ bool dm_mc02_bmi088_sample(DmMc02Bmi088 *bmi,
         bmi->regs[0x0a] |= 1u << 7;
         bmi->gyro_drdy_clear_time_ns = now_ns + 300 * 1000;
     }
+    dm_mc02_bmi088_notify_source_change(bmi);
     return true;
 }
 
@@ -508,6 +570,10 @@ uint8_t dm_mc02_bmi088_read_reg(DmMc02Bmi088 *bmi, unsigned reg,
     memset(event, 0, sizeof(*event));
     if (reg >= ARRAY_SIZE(bmi->regs)) {
         return 0;
+    }
+    if ((bmi->accel && reg >= 0x12 && reg <= 0x17) ||
+        (!bmi->accel && reg >= 0x02 && reg <= 0x07)) {
+        event->raw_sample_sequence = bmi->sample_sequence;
     }
     return dm_mc02_bmi088_read_reg_internal(bmi, reg, now_ns, event);
 }
@@ -570,7 +636,9 @@ void dm_mc02_bmi088_write_reg(DmMc02Bmi088 *bmi, unsigned reg, uint8_t value)
     if (((bmi->accel && reg == 0x7e) || (!bmi->accel && reg == 0x14)) &&
         value == 0xb6) {
         dm_mc02_bmi088_reset(bmi);
+        return;
     }
+    dm_mc02_bmi088_notify_source_change(bmi);
 }
 
 void dm_mc02_bmi088_end_read(DmMc02Bmi088 *bmi)
@@ -588,4 +656,5 @@ void dm_mc02_bmi088_end_read(DmMc02Bmi088 *bmi)
     bmi->fifo_read_frame_length = 0;
     bmi->fifo_read_kind = 0;
     bmi->fifo_read_sequence = 0;
+    dm_mc02_bmi088_notify_source_change(bmi);
 }

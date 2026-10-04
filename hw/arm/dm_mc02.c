@@ -155,8 +155,6 @@ struct DmMc02MachineState {
     qemu_irq sysresetreq_irq;
     DmMc02Bmi088SpiLink bmi_spi_link;
     DmMc02Spi spi1_state;
-    uint64_t imu_consume_step_id;
-    bool imu_consume_step_valid;
     QEMUTimer *ws2812_timer;
     uint32_t ws2812_led_rgb[DM_MC02_WS2812_CHANNELS];
     bool ws2812_dirty;
@@ -181,8 +179,6 @@ struct DmMc02MachineState {
     char *flash_file;
     char *ospi2_flash_file;
     Notifier flash_shutdown_notifier;
-    uint64_t last_imu_sequence;
-    uint64_t last_imu_time_ns;
     bool gpio_ready;
     bool board_profile_locked;
     bool user_key_pressed;
@@ -195,24 +191,43 @@ struct DmMc02MachineState {
     char *gpio_input_spec;
 };
 
-static void dm_mc02_bmi088_accel_consumed(void *opaque)
+static void dm_mc02_bmi088_accel_consumed(void *opaque,
+                                         uint64_t sample_sequence)
 {
     DmMc02MachineState *s = opaque;
 
-    if (s && s->imu_consume_step_valid) {
+    if (s && sample_sequence) {
         dm_mc02_cosim_link_notify_imu_consumed(
-            &s->cosim, s->imu_consume_step_id, UINT32_C(1) << 0);
+            &s->cosim, sample_sequence, UINT32_C(1) << 0);
     }
 }
 
-static void dm_mc02_bmi088_gyro_consumed(void *opaque)
+static void dm_mc02_bmi088_gyro_consumed(void *opaque,
+                                        uint64_t sample_sequence)
 {
     DmMc02MachineState *s = opaque;
 
-    if (s && s->imu_consume_step_valid) {
+    if (s && sample_sequence) {
         dm_mc02_cosim_link_notify_imu_consumed(
-            &s->cosim, s->imu_consume_step_id, UINT32_C(1) << 1);
+            &s->cosim, sample_sequence, UINT32_C(1) << 1);
     }
+}
+
+static uint32_t dm_mc02_bmi088_retained(void *opaque, uint64_t source_id)
+{
+    DmMc02MachineState *s = opaque;
+
+    return (dm_mc02_bmi088_sample_retained(&s->bmi_spi_link.accel,
+                                          source_id) ? 1u : 0u) |
+           (dm_mc02_bmi088_sample_retained(&s->bmi_spi_link.gyro,
+                                          source_id) ? 2u : 0u);
+}
+
+static void dm_mc02_bmi088_source_changed(void *opaque)
+{
+    DmMc02MachineState *s = opaque;
+
+    dm_mc02_cosim_link_notify_imu_source_changed(&s->cosim);
 }
 
 static DmMc02Dma *dm_mc02_board_dma(DmMc02MachineState *s,
@@ -2407,6 +2422,9 @@ static void dm_mc02_machine_reset(void *opaque)
         .opaque = s,
     };
 
+    /* GPIO/CS and sensor resets may notify observers. Invalidate the old
+     * session's inputs before any of those callbacks can resume delivery. */
+    dm_mc02_cosim_link_clear_inputs(&s->cosim);
     if (s->cold_reset) {
         /* A cold board reset clears volatile memories but deliberately keeps
          * internal and external non-volatile Flash contents intact. */
@@ -2444,8 +2462,6 @@ static void dm_mc02_machine_reset(void *opaque)
         &s->bmi_spi_link.gyro.signal, s->imu_seed ^ UINT32_C(0x9e3779b9));
     dm_mc02_bmi088_signal_set_rng(
         &s->bmi_spi_link.accel.signal, s->imu_seed ^ UINT32_C(0x243f6a88));
-    s->imu_consume_step_id = 0;
-    s->imu_consume_step_valid = false;
 
     dm_mc02_ospi_reset(&s->ospi2);
     dm_mc02_ospi_reset(&s->ospi1);
@@ -2625,10 +2641,7 @@ static void dm_mc02_cosim_imu(void *opaque, const float gyro[3],
 {
     DmMc02MachineState *s = opaque;
 
-    s->last_imu_sequence = sample_sequence;
-    s->last_imu_time_ns = sensor_time_ns;
-    s->imu_consume_step_id = step_id;
-    s->imu_consume_step_valid = step_id != 0;
+    (void)step_id; /* The link owns the source-to-STEP ledger. */
     dm_mc02_bmi088_sample(&s->bmi_spi_link.gyro, gyro, sample_sequence,
                           sensor_time_ns,
                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
@@ -3167,6 +3180,12 @@ static void dm_mc02_init(MachineState *machine)
      * dm-mc02 machine and its SPI2/BMI088 path are unchanged. */
     dm_mc02_cosim_link_init(&s->cosim, serial_hd(0), dm_mc02_cosim_imu,
                             dm_mc02_cosim_telemetry, s, &error_fatal);
+    dm_mc02_cosim_link_set_imu_retained_handler(&s->cosim,
+                                               dm_mc02_bmi088_retained);
+    dm_mc02_bmi088_set_source_callback(&s->bmi_spi_link.accel,
+                                       dm_mc02_bmi088_source_changed, s);
+    dm_mc02_bmi088_set_source_callback(&s->bmi_spi_link.gyro,
+                                       dm_mc02_bmi088_source_changed, s);
     dm_mc02_cosim_link_set_adc_handler(&s->cosim, dm_mc02_cosim_adc);
     dm_mc02_cosim_link_set_adc_pin_voltage_handler(
         &s->cosim, dm_mc02_cosim_adc_pin_voltage);

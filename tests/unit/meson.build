@@ -368,6 +368,11 @@ tests = {
     migration,
     io,
   ],
+  'test-dm-cosim-link': [
+    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_wire.c',
+    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_wire.c',
+    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_payload.c',
+  ],
   'test-dm-adc-runtime-sync': [
     meson.project_source_root() / 'hw/arm/dm_mc02_adc.c',
     meson.project_source_root() / 'hw/arm/dm_mc02_dma_endpoint.c',

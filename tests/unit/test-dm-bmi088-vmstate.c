@@ -15,6 +15,13 @@
 
 static int temp_fd;
 
+static void source_observer(void *opaque)
+{
+    unsigned *calls = opaque;
+
+    (*calls)++;
+}
+
 static QEMUFile *open_test_file(bool write)
 {
     int fd = dup(temp_fd);
@@ -138,6 +145,7 @@ static void prepare_state(DmMc02Bmi088 *state, bool accel,
 static void assert_round_trip(const DmMc02Bmi088 *source)
 {
     DmMc02Bmi088 restored;
+    unsigned observer_calls = 0;
     DmMc02Bmi088SignalKind kind = source->accel
         ? DM_MC02_BMI088_SIGNAL_ACCEL
         : DM_MC02_BMI088_SIGNAL_GYRO;
@@ -145,7 +153,12 @@ static void assert_round_trip(const DmMc02Bmi088 *source)
     save_state(source);
     /* Die identity and signal kind are destination-side static config. */
     init_destination_config(&restored, source->accel, kind);
+    restored.source_changed = source_observer;
+    restored.source_opaque = &observer_calls;
     g_assert_cmpint(load_state(&restored), ==, 0);
+    g_assert_true(restored.source_changed == source_observer);
+    g_assert_true(restored.source_opaque == &observer_calls);
+    g_assert_cmpuint(observer_calls, ==, 0);
 
     g_assert_cmpmem(restored.regs, sizeof(restored.regs), source->regs,
                     sizeof(source->regs));
@@ -239,6 +252,11 @@ static void test_round_trip_restores_accel_and_gyro_state(void)
     assert_round_trip(&source);
 
     prepare_state(&source, false, false);
+    assert_round_trip(&source);
+
+    /* Overflow can invalidate a partial frame's provenance without changing
+     * its byte cursor.  A zero tag must remain untagged after restore. */
+    source.fifo_read_sequence = 0;
     assert_round_trip(&source);
 }
 

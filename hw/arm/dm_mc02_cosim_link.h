@@ -30,9 +30,11 @@
 #define DM_MC02_COSIM_V2_RETRY_PAYLOAD_SIZE DM_MC02_V2_WIRE_MAX_PAYLOAD
 #define DM_MC02_COSIM_V2_MOTOR_STATE_PAYLOAD_SIZE DM_MC02_V2_WIRE_MAX_PAYLOAD
 
+/* source_id is assigned by the link at admission, unique for its lifetime;
+ * peer sample_sequence and STEP IDs may be reused in another wire session. */
 typedef void DmMc02CosimImuHandler(void *opaque, const float gyro[3],
                                    const float accel[3],
-                                   uint64_t sample_sequence,
+                                   uint64_t source_id,
                                    uint64_t step_id,
                                    uint64_t sensor_time_ns);
 
@@ -48,6 +50,10 @@ typedef void DmMc02CosimImuHandler(void *opaque, const float gyro[3],
 #define DM_MC02_COSIM_ADC_PIN_VOLTAGE_FLAG_PIN_OVERRIDE \
     DM_MC02_V2_ADC_VOLTAGE_FLAG_PIN_OVERRIDE
 #define DM_MC02_COSIM_ADC_PIN_VOLTAGE_MAX_UV DM_MC02_V2_ADC_VOLTAGE_MAX_UV
+
+/* Returns the die mask whose bytes still carry this source. Destination wiring,
+ * not protocol or migration state. bit 0=accel, bit 1=gyro. */
+typedef uint32_t DmMc02CosimImuRetainedHandler(void *opaque, uint64_t source_id);
 
 typedef void DmMc02CosimAdcInputHandler(void *opaque, uint16_t channel,
                                         uint16_t raw);
@@ -86,7 +92,7 @@ typedef void DmMc02CosimTelemetryProvider(void *opaque,
 typedef struct DmMc02CosimImuSample {
     float gyro[3];
     float accel[3];
-    uint64_t sequence;
+    uint64_t source_id;
     uint64_t step_id;
     uint64_t sensor_time_ns;
     uint64_t due_qemu_ns;
@@ -95,10 +101,13 @@ typedef struct DmMc02CosimImuSample {
 } DmMc02CosimImuSample;
 
 typedef struct DmMc02CosimConsumeToken {
+    uint64_t source_id;
     uint64_t step_id;
     uint64_t t_sim_ns;
     uint64_t dt_ns;
     uint32_t consumed_mask;
+    bool terminal;
+    uint8_t done_payload[DM_MC02_V2_STEP_DONE_PAYLOAD_SIZE];
 } DmMc02CosimConsumeToken;
 
 typedef struct DmMc02CosimAdcSample {
@@ -112,6 +121,7 @@ typedef struct DmMc02CosimAdcSample {
 typedef struct DmMc02CosimLink {
     CharBackend chr;
     DmMc02CosimImuHandler *imu_handler;
+    DmMc02CosimImuRetainedHandler *imu_retained_handler;
     DmMc02CosimAdcInputHandler *adc_input_handler;
     DmMc02CosimAdcPinVoltageHandler *adc_pin_voltage_handler;
     DmMc02CosimMotorStepHandler *motor_step_handler;
@@ -147,7 +157,7 @@ typedef struct DmMc02CosimLink {
     uint64_t v2_last_step_done_id;
     uint64_t v2_last_step_done_t_sim_ns;
     uint64_t v2_last_step_done_dt_ns;
-    uint32_t v2_last_step_done_consumed_mask;
+    uint8_t v2_last_step_done_payload[DM_MC02_V2_STEP_DONE_PAYLOAD_SIZE];
     bool v2_retry_pending;
     uint64_t v2_retry_step_id;
     uint64_t v2_retry_t_sim_ns;
@@ -188,6 +198,11 @@ typedef struct DmMc02CosimLink {
     DmMc02CosimConsumeToken consume_queue[DM_MC02_COSIM_IMU_QUEUE_SIZE];
     uint8_t consume_count;
     bool imu_delivery_blocked;
+    /* Unique across wire sessions and machine reset; zero is never delivered. */
+    uint64_t imu_source_id;
+    bool imu_applying;
+    bool step_dispatching;
+    bool consume_servicing;
     DmMc02CosimTelemetry last_telemetry;
     bool telemetry_valid;
     bool telemetry_pending;
@@ -218,10 +233,15 @@ void dm_mc02_cosim_link_set_adc_pin_voltage_handler(
  * external plant adapter or a future board-local motor model. */
 void dm_mc02_cosim_link_set_motor_step_handler(
     DmMc02CosimLink *link, DmMc02CosimMotorStepHandler *handler);
+void dm_mc02_cosim_link_set_imu_retained_handler(
+    DmMc02CosimLink *link, DmMc02CosimImuRetainedHandler *handler);
+void dm_mc02_cosim_link_notify_imu_source_changed(DmMc02CosimLink *link);
+/* Quiesce old inputs before machine producer/CS reset callbacks. */
+void dm_mc02_cosim_link_clear_inputs(DmMc02CosimLink *link);
 /* Notify the link that a complete raw accel/gyro data path was consumed by
  * the guest.  bit 0 is accel and bit 1 is gyro. */
 void dm_mc02_cosim_link_notify_imu_consumed(DmMc02CosimLink *link,
-                                            uint64_t step_id,
+                                            uint64_t source_id,
                                             uint32_t consumed_mask);
 void dm_mc02_cosim_link_cleanup(DmMc02CosimLink *link);
 void dm_mc02_cosim_link_reset(DmMc02CosimLink *link);

@@ -15,9 +15,13 @@
 #include <stdint.h>
 
 typedef struct DmMc02Bmi088ReadEvent {
+    /* Identity of the raw data byte returned by this read; zero is untagged. */
+    uint64_t raw_sample_sequence;
     bool fifo_frame_complete;
     uint64_t fifo_sample_sequence;
 } DmMc02Bmi088ReadEvent;
+
+typedef void (*DmMc02Bmi088SourceFn)(void *opaque);
 
 typedef struct DmMc02Bmi088 {
     uint8_t regs[256];
@@ -37,6 +41,8 @@ typedef struct DmMc02Bmi088 {
     bool fifo_overrun;
     uint64_t sample_sequence;
     uint64_t gyro_drdy_clear_time_ns;
+    DmMc02Bmi088SourceFn source_changed;
+    void *source_opaque;
 } DmMc02Bmi088;
 
 void dm_mc02_bmi088_init(DmMc02Bmi088 *bmi, bool accel);
@@ -44,6 +50,16 @@ void dm_mc02_bmi088_reset(DmMc02Bmi088 *bmi);
 
 bool dm_mc02_bmi088_is_accel(const DmMc02Bmi088 *bmi);
 bool dm_mc02_bmi088_is_powered(const DmMc02Bmi088 *bmi);
+
+/* A nonzero source remains available as current raw data or a tagged FIFO
+ * frame that can complete. Runtime observer wiring is not component state;
+ * reads notify only after the bus has acknowledged a completed sample. */
+bool dm_mc02_bmi088_sample_retained(const DmMc02Bmi088 *bmi,
+                                    uint64_t sample_sequence);
+void dm_mc02_bmi088_set_source_callback(DmMc02Bmi088 *bmi,
+                                        DmMc02Bmi088SourceFn callback,
+                                        void *opaque);
+void dm_mc02_bmi088_notify_source_change(DmMc02Bmi088 *bmi);
 
 void dm_mc02_bmi088_set_noise(DmMc02Bmi088 *bmi, double standard_deviation);
 double dm_mc02_bmi088_get_noise(const DmMc02Bmi088 *bmi);

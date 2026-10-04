@@ -7,7 +7,10 @@
 
 #include <stdint.h>
 
-typedef void (*DmMc02Bmi088SpiConsumeFn)(void *opaque);
+/* A complete, consistently tagged raw burst or FIFO data frame.  Zero tags
+ * and mixed-sample bursts do not report a physical sample consumption. */
+typedef void (*DmMc02Bmi088SpiConsumeFn)(void *opaque,
+                                       uint64_t sample_sequence);
 
 typedef struct DmMc02Bmi088Spi {
     DmMc02Bmi088 *bmi;
@@ -16,6 +19,7 @@ typedef struct DmMc02Bmi088Spi {
     bool dummy_pending;
     uint8_t reg;
     uint8_t read_start_reg;
+    uint64_t raw_read_sequence;
     DmMc02Bmi088SpiConsumeFn consume;
     void *consume_opaque;
 } DmMc02Bmi088Spi;

@@ -2,10 +2,11 @@
 #include "qemu/osdep.h"
 #include "hw/arm/dm_mc02_bmi088_spi.h"
 
-static void dm_mc02_bmi088_spi_notify_consumed(DmMc02Bmi088Spi *adapter)
+static void dm_mc02_bmi088_spi_notify_consumed(DmMc02Bmi088Spi *adapter,
+                                               uint64_t sample_sequence)
 {
-    if (adapter->consume) {
-        adapter->consume(adapter->consume_opaque);
+    if (adapter->consume && sample_sequence) {
+        adapter->consume(adapter->consume_opaque, sample_sequence);
     }
 }
 
@@ -32,6 +33,7 @@ static uint8_t dm_mc02_bmi088_spi_transfer(void *opaque, uint8_t tx,
     }
     if (adapter->read_transfer) {
         unsigned read_reg_addr = adapter->reg;
+        unsigned raw_start = accel ? 0x12 : 0x02;
         bool fifo_read = (accel && read_reg_addr == 0x26) ||
                          (!accel && read_reg_addr == 0x3f);
         DmMc02Bmi088ReadEvent event;
@@ -47,13 +49,27 @@ static uint8_t dm_mc02_bmi088_spi_transfer(void *opaque, uint8_t tx,
         if (!fifo_read) {
             adapter->reg++;
         }
-        if ((accel && adapter->read_start_reg == 0x12 &&
-             read_reg_addr == 0x17) ||
-            (!accel && adapter->read_start_reg == 0x02 &&
-             read_reg_addr == 0x07)) {
-            dm_mc02_bmi088_spi_notify_consumed(adapter);
+        if (adapter->read_start_reg == raw_start &&
+            read_reg_addr >= raw_start && read_reg_addr < raw_start + 6) {
+            if (read_reg_addr == raw_start) {
+                adapter->raw_read_sequence = event.raw_sample_sequence;
+            } else if (adapter->raw_read_sequence != event.raw_sample_sequence) {
+                adapter->raw_read_sequence = 0;
+            }
+            if (read_reg_addr == raw_start + 5) {
+                uint64_t sequence = adapter->raw_read_sequence;
+
+                adapter->raw_read_sequence = 0;
+                dm_mc02_bmi088_spi_notify_consumed(adapter, sequence);
+            }
         } else if (event.fifo_frame_complete) {
-            dm_mc02_bmi088_spi_notify_consumed(adapter);
+            dm_mc02_bmi088_spi_notify_consumed(adapter,
+                                               event.fifo_sample_sequence);
+        }
+        /* Raw reads retain their bytes; complete consume already notifies
+         * the observer. Only FIFO reads can retire a stored source here. */
+        if (fifo_read) {
+            dm_mc02_bmi088_notify_source_change(bmi);
         }
         return result;
     }
@@ -98,6 +114,7 @@ void dm_mc02_bmi088_spi_reset(DmMc02Bmi088Spi *adapter)
     adapter->dummy_pending = false;
     adapter->reg = 0;
     adapter->read_start_reg = 0;
+    adapter->raw_read_sequence = 0;
 }
 
 void dm_mc02_bmi088_spi_set_consume_callback(

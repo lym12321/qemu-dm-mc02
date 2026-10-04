@@ -115,7 +115,8 @@ static void rx_reset(DmMc02CosimLink *link)
     link->v2_last_step_done_id = 0;
     link->v2_last_step_done_t_sim_ns = 0;
     link->v2_last_step_done_dt_ns = 0;
-    link->v2_last_step_done_consumed_mask = 0;
+    memset(link->v2_last_step_done_payload, 0,
+           sizeof(link->v2_last_step_done_payload));
     link->v2_retry_pending = false;
     link->v2_retry_step_id = 0;
     link->v2_retry_t_sim_ns = 0;
@@ -146,7 +147,8 @@ static void v2_validator_reset(DmMc02CosimLink *link)
     link->v2_last_step_done_id = 0;
     link->v2_last_step_done_t_sim_ns = 0;
     link->v2_last_step_done_dt_ns = 0;
-    link->v2_last_step_done_consumed_mask = 0;
+    memset(link->v2_last_step_done_payload, 0,
+           sizeof(link->v2_last_step_done_payload));
     link->v2_retry_pending = false;
     link->v2_retry_step_id = 0;
     link->v2_retry_t_sim_ns = 0;
@@ -252,7 +254,7 @@ static void imu_schedule_session(DmMc02CosimLink *link,
 }
 
 static bool cosim_arm_imu_consumption(DmMc02CosimLink *link,
-                                      uint64_t step_id,
+                                      uint64_t source_id, uint64_t step_id,
                                       uint64_t t_sim_ns, uint64_t dt_ns)
 {
     DmMc02CosimConsumeToken *token;
@@ -266,6 +268,8 @@ static bool cosim_arm_imu_consumption(DmMc02CosimLink *link,
         return false;
     }
     token = &link->consume_queue[link->consume_count++];
+    memset(token, 0, sizeof(*token));
+    token->source_id = source_id;
     token->step_id = step_id;
     token->t_sim_ns = t_sim_ns;
     token->dt_ns = dt_ns;
@@ -314,24 +318,28 @@ static void cosim_deliver_due(DmMc02CosimLink *link)
                                    DM_MC02_COSIM_ADC_QUEUE_SIZE;
             link->adc_queue_count--;
         } else {
+            DmMc02CosimImuSample sample = *imu;
+
             if (link->v2_initialized && link->imu_handler &&
-                !cosim_arm_imu_consumption(link, imu->step_id,
-                                            imu->step_t_sim_ns,
-                                            imu->step_dt_ns)) {
-                /* Keep the sample at the queue head until the guest releases
-                 * a consumption token.  Do not re-arm the timer at the same
-                 * deadline while the queue is blocked. */
+                !cosim_arm_imu_consumption(link, sample.source_id,
+                                            sample.step_id,
+                                            sample.step_t_sim_ns,
+                                            sample.step_dt_ns)) {
+                /* Retain the head until a terminal token releases capacity. */
                 link->imu_delivery_blocked = true;
                 break;
-            }
-            if (link->imu_handler) {
-                link->imu_handler(link->opaque, imu->gyro, imu->accel,
-                                  imu->sequence, imu->step_id,
-                                  imu->sensor_time_ns);
             }
             link->imu_queue_head = (link->imu_queue_head + 1) %
                                    DM_MC02_COSIM_IMU_QUEUE_SIZE;
             link->imu_queue_count--;
+            if (link->imu_handler) {
+                link->imu_applying = true;
+                link->imu_handler(link->opaque, sample.gyro, sample.accel,
+                                  sample.source_id, sample.step_id,
+                                  sample.sensor_time_ns);
+                link->imu_applying = false;
+                dm_mc02_cosim_link_notify_imu_source_changed(link);
+            }
         }
     }
     if (link->imu_timer && link->imu_delivery_blocked) {
@@ -518,73 +526,107 @@ static void send_v2_diagnostics(DmMc02CosimLink *link, uint64_t step_id,
                   payload, sizeof(payload));
 }
 
-static bool send_v2_step_done(DmMc02CosimLink *link,
-                              const DmMc02CosimConsumeToken *token)
+static void cosim_finish_consume_token(DmMc02CosimLink *link,
+                                       DmMc02CosimConsumeToken *token)
 {
-    uint8_t payload[DM_MC02_V2_STEP_DONE_PAYLOAD_SIZE];
     uint32_t missing = (DM_MC02_V2_CONSUMED_ACCEL |
-                        DM_MC02_V2_CONSUMED_GYRO) &
-                       ~token->consumed_mask;
+                        DM_MC02_V2_CONSUMED_GYRO) & ~token->consumed_mask;
     DmMc02V2StepDonePayload value = {
-        .status = DM_MC02_V2_STATUS_OK,
+        /* PROTOCOL also covers an accepted STEP that cannot fulfill the
+         * required consumption contract. Never manufacture consumed bits. */
+        .status = missing ? DM_MC02_V2_STATUS_PROTOCOL : DM_MC02_V2_STATUS_OK,
         .consumed_mask = token->consumed_mask,
         .missing_mask = missing,
         .queue_depth = link->imu_queue_count,
         .dropped_count = (uint32_t)MIN(link->imu_dropped, UINT32_MAX),
     };
 
-    if (!dm_mc02_v2_payload_encode_step_done(payload, sizeof(payload),
-                                              &value)) {
-        link->tx_dropped++;
-        return false;
-    }
+    token->terminal = true;
+    dm_mc02_v2_payload_encode_step_done(token->done_payload,
+                                        sizeof(token->done_payload), &value);
+}
+
+static bool send_v2_step_done(DmMc02CosimLink *link,
+                              const DmMc02CosimConsumeToken *token)
+{
     return send_v2_frame(link, DM_MC02_V2_WIRE_STEP_DONE, token->step_id,
                          token->t_sim_ns, token->dt_ns, 0,
-                         payload, sizeof(payload));
+                         token->done_payload, sizeof(token->done_payload));
 }
 
 static void v2_step_done_record(DmMc02CosimLink *link,
                                 const DmMc02CosimConsumeToken *token)
 {
+    /* An older delayed terminal must not replace the latest STEP's cache. */
+    if (!link->v2_last_step_valid ||
+        token->step_id != link->v2_last_step_id) {
+        return;
+    }
     link->v2_last_step_done_valid = true;
     link->v2_last_step_done_id = token->step_id;
     link->v2_last_step_done_t_sim_ns = token->t_sim_ns;
     link->v2_last_step_done_dt_ns = token->dt_ns;
-    link->v2_last_step_done_consumed_mask = token->consumed_mask;
+    memcpy(link->v2_last_step_done_payload, token->done_payload,
+           sizeof(token->done_payload));
 }
 
 static bool send_v2_step_done_cached(DmMc02CosimLink *link)
 {
-    DmMc02CosimConsumeToken token;
-
-    if (!link->v2_last_step_done_valid) {
-        return false;
-    }
-    token.step_id = link->v2_last_step_done_id;
-    token.t_sim_ns = link->v2_last_step_done_t_sim_ns;
-    token.dt_ns = link->v2_last_step_done_dt_ns;
-    token.consumed_mask = link->v2_last_step_done_consumed_mask;
-    return send_v2_step_done(link, &token);
+    return link->v2_last_step_done_valid &&
+           send_v2_frame(link, DM_MC02_V2_WIRE_STEP_DONE,
+                         link->v2_last_step_done_id,
+                         link->v2_last_step_done_t_sim_ns,
+                         link->v2_last_step_done_dt_ns, 0,
+                         link->v2_last_step_done_payload,
+                         sizeof(link->v2_last_step_done_payload));
 }
 
 static void cosim_retry_step_done(DmMc02CosimLink *link)
 {
-    const uint32_t all_consumed = DM_MC02_V2_CONSUMED_ACCEL |
-                                  DM_MC02_V2_CONSUMED_GYRO;
+    const uint32_t all = DM_MC02_V2_CONSUMED_ACCEL | DM_MC02_V2_CONSUMED_GYRO;
 
-    for (unsigned i = 0; i < link->consume_count;) {
-        DmMc02CosimConsumeToken *token = &link->consume_queue[i];
-
-        if ((token->consumed_mask & all_consumed) != all_consumed) {
-            i++;
-            continue;
-        }
-        if (!send_v2_step_done(link, token)) {
-            return;
-        }
-        v2_step_done_record(link, token);
-        cosim_remove_consume_token(link, i);
+    if (link->imu_applying || link->consume_servicing) {
+        return;
     }
+    link->consume_servicing = true;
+    for (;;) {
+        bool released = false;
+
+        for (unsigned i = 0; i < link->consume_count; ++i) {
+            DmMc02CosimConsumeToken *token = &link->consume_queue[i];
+            uint32_t retained;
+
+            if (token->terminal || !link->imu_retained_handler) {
+                continue;
+            }
+            retained = link->imu_retained_handler(link->opaque,
+                                                   token->source_id);
+            if (all & ~(token->consumed_mask | retained)) {
+                cosim_finish_consume_token(link, token);
+            }
+        }
+        /* The RX parser reserved ACK/motor reply slots before dispatch. */
+        if (link->step_dispatching) {
+            break;
+        }
+        while (link->consume_count && link->consume_queue[0].terminal) {
+            DmMc02CosimConsumeToken *token = &link->consume_queue[0];
+
+            if (!send_v2_step_done(link, token)) {
+                break;
+            }
+            v2_step_done_record(link, token);
+            cosim_remove_consume_token(link, 0);
+            released = true;
+        }
+        if (!released || !link->imu_delivery_blocked) {
+            break;
+        }
+        link->imu_delivery_blocked = false;
+        cosim_deliver_due(link);
+        /* Delivery may have replaced sources or created more terminals. */
+    }
+    link->consume_servicing = false;
 }
 
 static bool v2_imu_payload_valid(const uint8_t *payload, size_t payload_len)
@@ -843,6 +885,10 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
     *motor_protocol_error = false;
 
     if (dm_mc02_v2_wire_is_compact_imu(payload, payload_len)) {
+        if (link->imu_handler && link->imu_source_id == UINT64_MAX) {
+            *motor_protocol_error = true;
+            return false;
+        }
         cosim_deliver_due(link);
         if (link->imu_handler &&
             link->consume_count == DM_MC02_COSIM_IMU_QUEUE_SIZE) {
@@ -893,6 +939,11 @@ static bool v2_dispatch_step_payload(DmMc02CosimLink *link,
     }
     if (imu_section && link->imu_handler &&
         link->consume_count == DM_MC02_COSIM_IMU_QUEUE_SIZE) {
+        return false;
+    }
+    if (imu_section && link->imu_handler &&
+        link->imu_source_id == UINT64_MAX) {
+        *motor_protocol_error = true;
         return false;
     }
     if (adc_sections &&
@@ -1149,17 +1200,17 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
         }
         send_v2_step_ack(link, step_id, t_sim_ns, dt_ns,
                          link->v2_last_step_status);
-        if (link->v2_last_step_done_valid &&
-            link->v2_last_step_done_id == step_id &&
-            link->v2_last_step_done_t_sim_ns == t_sim_ns &&
-            link->v2_last_step_done_dt_ns == dt_ns) {
-            send_v2_step_done_cached(link);
-        }
         if (link->v2_last_motor_state_len) {
             send_v2_frame(link, DM_MC02_V2_WIRE_MOTOR_STATE, step_id,
                           t_sim_ns, dt_ns, 0,
                           link->v2_last_motor_state_payload,
                           link->v2_last_motor_state_len);
+        }
+        if (link->v2_last_step_done_valid &&
+            link->v2_last_step_done_id == step_id &&
+            link->v2_last_step_done_t_sim_ns == t_sim_ns &&
+            link->v2_last_step_done_dt_ns == dt_ns) {
+            send_v2_step_done_cached(link);
         }
         return true;
     }
@@ -1208,6 +1259,7 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
         /* The first six floats of ImuSampleV2 are the physical sample. Bias
          * fields remain plant metadata; the board model applies its own
          * configured sensor effects before exposing BMI088 raw data. */
+        link->step_dispatching = true;
         accepted = v2_dispatch_step_payload(link, payload, payload_len,
                                              step_id, t_sim_ns, dt_ns,
                                              motor_state_payload,
@@ -1221,6 +1273,8 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
                            NULL, 0);
             send_v2_step_ack(link, step_id, t_sim_ns, dt_ns,
                              DM_MC02_V2_STATUS_PROTOCOL);
+            link->step_dispatching = false;
+            cosim_retry_step_done(link);
             return true;
         }
         if (accepted) {
@@ -1244,6 +1298,8 @@ static bool process_v2_frame(DmMc02CosimLink *link, const uint8_t *frame,
             send_v2_frame(link, DM_MC02_V2_WIRE_MOTOR_STATE, step_id, t_sim_ns,
                           dt_ns, 0, motor_state_payload, motor_state_len);
         }
+        link->step_dispatching = false;
+        cosim_retry_step_done(link);
     } else {
         send_v2_diagnostics(link, step_id, t_sim_ns);
     }
@@ -1262,7 +1318,11 @@ static bool imu_dispatch(DmMc02CosimLink *link, const uint8_t *payload,
     if (!link->imu_time_base_valid) {
         imu_schedule_session(link, due_time_ns);
     }
-    sample.sequence = sequence;
+    (void)sequence; /* Wire sample identity is not a process-unique source. */
+    if (link->imu_source_id == UINT64_MAX) {
+        link->imu_dropped++;
+        return false;
+    }
     sample.step_id = step_id;
     sample.sensor_time_ns = sensor_time_ns;
     sample.due_qemu_ns = cosim_due_qemu_ns(link, due_time_ns);
@@ -1276,7 +1336,8 @@ static bool imu_dispatch(DmMc02CosimLink *link, const uint8_t *payload,
     cosim_deliver_due(link);
     if (!link->imu_queue_count && sample.due_qemu_ns <= now) {
         if (link->v2_initialized &&
-            !cosim_arm_imu_consumption(link, sample.step_id,
+            !cosim_arm_imu_consumption(link, link->imu_source_id + 1,
+                                        sample.step_id,
                                         sample.step_t_sim_ns,
                                         sample.step_dt_ns)) {
             link->imu_delivery_blocked = true;
@@ -1285,9 +1346,14 @@ static bool imu_dispatch(DmMc02CosimLink *link, const uint8_t *payload,
             }
             return false;
         }
+        sample.source_id = ++link->imu_source_id;
+        link->imu_delivery_blocked = false;
+        link->imu_applying = true;
         link->imu_handler(link->opaque, sample.gyro, sample.accel,
-                          sample.sequence, sample.step_id,
+                          sample.source_id, sample.step_id,
                           sample.sensor_time_ns);
+        link->imu_applying = false;
+        dm_mc02_cosim_link_notify_imu_source_changed(link);
         return true;
     }
     if (link->imu_queue_count == DM_MC02_COSIM_IMU_QUEUE_SIZE) {
@@ -1299,6 +1365,7 @@ static bool imu_dispatch(DmMc02CosimLink *link, const uint8_t *payload,
     }
     slot = (link->imu_queue_head + link->imu_queue_count) %
            DM_MC02_COSIM_IMU_QUEUE_SIZE;
+    sample.source_id = ++link->imu_source_id;
     link->imu_queue[slot] = sample;
     link->imu_queue_count++;
     if (link->imu_queue_count == 1 && link->imu_timer) {
@@ -1402,12 +1469,18 @@ static void parse_rx(DmMc02CosimLink *link)
                 get32le(frame_start + 12) == frame_len &&
             !cosim_control_can_queue(
                 link,
-                (get16le(frame_start + DM_MC02_OUTER_SIZE + 6) ==
+                1u +
+                ((get16le(frame_start + DM_MC02_OUTER_SIZE + 6) ==
                      DM_MC02_V2_WIRE_STEP && link->motor_step_handler &&
-                 v2_step_payload_has_motor(
-                     frame_start + DM_MC02_OUTER_SIZE + 4u +
-                         DM_MC02_V2_WIRE_HEADER_SIZE,
-                     get32le(frame_start + 12))) ? 2u : 1u)) {
+                  v2_step_payload_has_motor(
+                      frame_start + DM_MC02_OUTER_SIZE + 4u +
+                          DM_MC02_V2_WIRE_HEADER_SIZE,
+                      get32le(frame_start + 12))) ? 1u : 0u) +
+                ((get16le(frame_start + DM_MC02_OUTER_SIZE + 6) ==
+                      DM_MC02_V2_WIRE_STEP &&
+                  link->v2_last_step_done_valid &&
+                  get64le(frame_start + DM_MC02_OUTER_SIZE + 12) ==
+                      link->v2_last_step_done_id) ? 1u : 0u))) {
             return;
         }
         if (!process_frame(link, frame_start + DM_MC02_OUTER_SIZE,
@@ -1809,34 +1882,49 @@ void dm_mc02_cosim_link_set_motor_step_handler(
     }
 }
 
+void dm_mc02_cosim_link_set_imu_retained_handler(
+    DmMc02CosimLink *link, DmMc02CosimImuRetainedHandler *handler)
+{
+    if (link) {
+        link->imu_retained_handler = handler;
+    }
+}
+
+void dm_mc02_cosim_link_clear_inputs(DmMc02CosimLink *link)
+{
+    if (link) {
+        imu_schedule_clear(link);
+    }
+}
+
+void dm_mc02_cosim_link_notify_imu_source_changed(DmMc02CosimLink *link)
+{
+    if (link && link->v2_initialized) {
+        cosim_retry_step_done(link);
+    }
+}
+
 void dm_mc02_cosim_link_notify_imu_consumed(DmMc02CosimLink *link,
-                                            uint64_t step_id,
+                                            uint64_t source_id,
                                             uint32_t consumed_mask)
 {
-    const uint32_t all_consumed = DM_MC02_V2_CONSUMED_ACCEL |
-                                  DM_MC02_V2_CONSUMED_GYRO;
+    const uint32_t all = DM_MC02_V2_CONSUMED_ACCEL | DM_MC02_V2_CONSUMED_GYRO;
 
-    if (!link || !link->v2_initialized || !(consumed_mask & all_consumed)) {
+    if (!link || !link->v2_initialized || !source_id ||
+        !(consumed_mask & all)) {
         return;
     }
-    consumed_mask &= all_consumed;
     for (unsigned i = 0; i < link->consume_count; ++i) {
         DmMc02CosimConsumeToken *token = &link->consume_queue[i];
 
-        if (token->step_id != step_id) {
+        if (token->source_id != source_id || token->terminal) {
             continue;
         }
-        token->consumed_mask |= consumed_mask;
-        if ((token->consumed_mask & all_consumed) == all_consumed) {
-            if (send_v2_step_done(link, token)) {
-                v2_step_done_record(link, token);
-                cosim_remove_consume_token(link, i);
-                if (link->imu_delivery_blocked) {
-                    link->imu_delivery_blocked = false;
-                    cosim_deliver_due(link);
-                }
-            }
+        token->consumed_mask |= consumed_mask & all;
+        if (token->consumed_mask == all) {
+            cosim_finish_consume_token(link, token);
         }
+        cosim_retry_step_done(link);
         return;
     }
 }
