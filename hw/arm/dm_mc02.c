@@ -488,6 +488,18 @@ static void dm_mc02_pin_reset(void *opaque)
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
 }
 
+static void dm_mc02_software_reset(void *opaque, int line, int level)
+{
+    DmMc02MachineState *s = opaque;
+
+    if (!level) {
+        return;
+    }
+    dm_mc02_pwr_rcc_note_software_reset(&s->pwr_rcc, line, level);
+    /* Wiring SYSRESETREQ replaces the native NVIC's default reset request. */
+    qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
 static void dm_mc02_reset_spi_cs_hook(void *opaque)
 {
     dm_mc02_reset_spi_cs(opaque);
@@ -3145,7 +3157,7 @@ static void dm_mc02_init(MachineState *machine)
      * reset request.  The ARMv7-M container emits this named output for
      * guest AIRCR.SYSRESETREQ; PWR/RCC owns the latched RCC_RSR state. */
     s->sysresetreq_irq = qemu_allocate_irq(
-        dm_mc02_pwr_rcc_note_software_reset, &s->pwr_rcc, 0);
+        dm_mc02_software_reset, s, 0);
     qdev_connect_gpio_out_named(armv7m, "SYSRESETREQ", 0,
                                 s->sysresetreq_irq);
     dm_mc02_apply_mcu_power_state(s);

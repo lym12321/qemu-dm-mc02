@@ -267,12 +267,16 @@ static void test_sysresetreq_latches_software_reset_reason(void)
     QTestState *qts = qtest_init("-machine dm-mc02");
 
     g_assert_cmphex(qtest_readl(qts, RCC_RSR) & RCC_RSR_SFTRSTF, ==, 0);
+    /* CMSIS NVIC_SystemReset requests reset through AIRCR; native SysTick
+     * must reset as well as recording the H723 RCC_RSR source. */
+    qtest_writel(qts, SYST_RVR, 0x1234);
     qtest_writel(qts, SCB_AIRCR,
                  SCB_AIRCR_VECTKEY | SCB_AIRCR_SYSRESETREQ);
     /* The qtest MMIO command queues the reset request; a zero virtual-clock
      * step lets the normal runstate path consume it without depending on a
      * QMP event ordering detail. */
     qtest_clock_step(qts, 0);
+    g_assert_cmphex(qtest_readl(qts, SYST_RVR), ==, 0);
     g_assert_cmphex(qtest_readl(qts, RCC_RSR) & RCC_RSR_SFTRSTF, ==,
                     RCC_RSR_SFTRSTF);
 
