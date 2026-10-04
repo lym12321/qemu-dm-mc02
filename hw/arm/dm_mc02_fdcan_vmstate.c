@@ -7,13 +7,10 @@ static int dm_mc02_fdcan_prepare_post_load(void *opaque, int version_id)
 {
     DmMc02Fdcan *state = opaque;
 
-    if (version_id < 1 || version_id > 2) {
+    /* v1/v2 decoded Message RAM byte fields as word counts and NDTB as
+     * TFQS. Their registers and RAM bytes cannot be safely reinterpreted. */
+    if (version_id != 3) {
         return -EINVAL;
-    }
-    if (version_id < 2) {
-        /* v1 exposed PSR.BO but did not serialize the controller's internal
-         * participation gate.  Reconstruct it before validating the state. */
-        state->bus_off = !!(state->regs[0x044] & (1u << 7));
     }
     return dm_mc02_fdcan_state_valid(state) ? 0 : -EINVAL;
 }
@@ -67,16 +64,16 @@ static const VMStateField vmstate_dm_mc02_fdcan_fields[] = {
 
 const VMStateDescription vmstate_dm_mc02_fdcan_raw = {
     .name = "dm-mc02-fdcan-raw",
-    .version_id = 2,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = dm_mc02_fdcan_prepare_post_load,
     .fields = vmstate_dm_mc02_fdcan_fields,
 };
 
 static const VMStateDescription vmstate_dm_mc02_fdcan = {
     .name = "dm-mc02-fdcan",
-    .version_id = 2,
-    .minimum_version_id = 1,
+    .version_id = 3,
+    .minimum_version_id = 3,
     .post_load = dm_mc02_fdcan_post_load,
     .fields = vmstate_dm_mc02_fdcan_fields,
 };

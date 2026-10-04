@@ -61,7 +61,7 @@ static int dm_mc02_fdcan_msg_ram_link_post_load(void *opaque,
 {
     DmMc02FdcanMsgRamLink *link = opaque;
 
-    if (!link || version_id != 1 ||
+    if (!link || version_id != 2 ||
         !dm_mc02_fdcan_msg_ram_link_state_valid(link)) {
         return -EINVAL;
     }
@@ -74,8 +74,8 @@ static int dm_mc02_fdcan_msg_ram_link_post_load(void *opaque,
 
 static const VMStateDescription vmstate_dm_mc02_fdcan_msg_ram_link = {
     .name = "dm-mc02-fdcan-msg-ram-link",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = dm_mc02_fdcan_msg_ram_link_pre_save,
     .post_load = dm_mc02_fdcan_msg_ram_link_post_load,
     .fields = (VMStateField[]) {

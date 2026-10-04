@@ -14,6 +14,7 @@
 #include "qemu/host-utils.h"
 #include "qemu/timer.h"
 #include "qemu/error-report.h"
+#include "qemu/log.h"
 #include "hw/arm/dm_mc02_fdcan.h"
 
 #define FDCAN_CCCR  0x018
@@ -46,6 +47,10 @@
 #define FDCAN_TXFQS 0x0c4
 #define FDCAN_TXBAR 0x0d0
 #define FDCAN_TXBTO 0x0d8
+
+#define FDCAN_TXBC_NDTB_MASK 0x003f0000u
+#define FDCAN_TXBC_TFQS_SHIFT 24
+#define FDCAN_TXBC_TFQM (1u << 30)
 
 #define FDCAN_CCCR_INIT (1u << 0)
 #define FDCAN_CCCR_CCE  (1u << 1)
@@ -421,7 +426,7 @@ static enum DmMc02FdcanRxDestination fdcan_accept_rx(const DmMc02Fdcan *s,
         uint32_t xidfc = fdcan_load(s, FDCAN_XIDFC, 4);
         unsigned count = (xidfc & FDCAN_XIDFC_LSE_MASK) >>
                          FDCAN_XIDFC_LSE_SHIFT;
-        size_t offset = (xidfc & FDCAN_XIDFC_FLSSA_MASK) * 4u;
+        size_t offset = xidfc & FDCAN_XIDFC_FLSSA_MASK;
 
         count = MIN(count, s->msg_ram_size / (2 * sizeof(uint32_t)));
         for (unsigned index = 0; index < count; ++index, offset += 8) {
@@ -510,7 +515,7 @@ static enum DmMc02FdcanRxDestination fdcan_accept_rx(const DmMc02Fdcan *s,
     uint32_t sidfc = fdcan_load(s, FDCAN_SIDFC, 4);
     unsigned count = (sidfc & FDCAN_SIDFC_LSS_MASK) >>
                      FDCAN_SIDFC_LSS_SHIFT;
-    size_t offset = (sidfc & FDCAN_SIDFC_FLSSA_MASK) * 4u;
+    size_t offset = sidfc & FDCAN_SIDFC_FLSSA_MASK;
 
     count = MIN(count, s->msg_ram_size / sizeof(uint32_t));
     for (unsigned index = 0; index < count; ++index, offset += 4) {
@@ -598,13 +603,13 @@ static bool msg_ram_write32(DmMc02Fdcan *s, size_t offset, uint32_t value)
 
 static unsigned tx_base_bytes(const DmMc02Fdcan *s)
 {
-    return (fdcan_load(s, FDCAN_TXBC, 4) & 0xfffcu) * 4u;
+    return fdcan_load(s, FDCAN_TXBC, 4) & 0xfffcu;
 }
 
 static unsigned rx_base_bytes(const DmMc02Fdcan *s, unsigned fifo)
 {
     return (fdcan_load(s, fifo ? FDCAN_RXF1C : FDCAN_RXF0C, 4) &
-            FDCAN_SIDFC_FLSSA_MASK) * 4u;
+            FDCAN_SIDFC_FLSSA_MASK);
 }
 
 static unsigned rx_fifo_element_bytes(const DmMc02Fdcan *s, unsigned fifo)
@@ -617,12 +622,20 @@ static unsigned rx_fifo_element_bytes(const DmMc02Fdcan *s, unsigned fifo)
 
 static unsigned rx_buffer_base_bytes(const DmMc02Fdcan *s)
 {
-    return (fdcan_load(s, FDCAN_RXBC, 4) & 0xfffcu) * 4u;
+    return fdcan_load(s, FDCAN_RXBC, 4) & 0xfffcu;
 }
 
 static unsigned rx_buffer_element_bytes(const DmMc02Fdcan *s)
 {
     return element_bytes((fdcan_load(s, FDCAN_RXESC, 4) >> 8) & 7u);
+}
+
+static bool fdcan_tx_config_valid(uint32_t txbc)
+{
+    /* This data path supports FIFO only. Dedicated buffers, mixed layouts
+     * and queue ordering need separate support, not an NDTB/TFQS alias. */
+    return !(txbc & (FDCAN_TXBC_NDTB_MASK | FDCAN_TXBC_TFQM)) &&
+           ((txbc >> FDCAN_TXBC_TFQS_SHIFT) & 0x3fu) <= 32;
 }
 
 static void refresh_sizes(DmMc02Fdcan *s)
@@ -631,20 +644,15 @@ static void refresh_sizes(DmMc02Fdcan *s)
     uint32_t rxf0c = fdcan_load(s, FDCAN_RXF0C, 4);
     uint32_t rxf1c = fdcan_load(s, FDCAN_RXF1C, 4);
 
-    s->tx_fifo_size = (txbc >> 16) & 0x3f;
-    s->rx_fifo_size = (rxf0c >> 16) & 0x3f;
-    s->rx_fifo1_size = (rxf1c >> 16) & 0x3f;
-    if (!s->tx_fifo_size) {
-        s->tx_fifo_size = 3;
-    }
-    if (!s->rx_fifo_size) {
-        s->rx_fifo_size = 3;
-    }
-    if (!s->rx_fifo1_size) {
-        s->rx_fifo1_size = 3;
-    }
+    /* CMSIS/HAL: TFQS[29:24], F0S/F1S[22:16]; zero disables storage. */
+    s->tx_fifo_size = (txbc >> FDCAN_TXBC_TFQS_SHIFT) & 0x3f;
+    s->rx_fifo_size = (rxf0c >> 16) & 0x7f;
+    s->rx_fifo1_size = (rxf1c >> 16) & 0x7f;
     if (s->tx_fifo_put >= s->tx_fifo_size) {
         s->tx_fifo_put = 0;
+    }
+    if (s->tx_fifo_get >= s->tx_fifo_size) {
+        s->tx_fifo_get = 0;
     }
     if (s->rx_fifo_get >= s->rx_fifo_size) {
         s->rx_fifo_get = 0;
@@ -664,11 +672,11 @@ static uint32_t fdcan_rx_fifo_status(const DmMc02Fdcan *s)
 {
     uint32_t value = fdcan_load(s, FDCAN_RXF0S, 4);
 
-    value &= ~UINT32_C(0x3f3f7f);
+    value &= ~UINT32_C(0x013f3f7f);
     value |= s->rx_fifo_fill & 0x7f;
     value |= (uint32_t)(s->rx_fifo_get & 0x3f) << 8;
     value |= (uint32_t)(s->rx_fifo_put & 0x3f) << 16;
-    if (s->rx_fifo_fill >= s->rx_fifo_size) {
+    if (s->rx_fifo_size && s->rx_fifo_fill >= s->rx_fifo_size) {
         value |= UINT32_C(1) << 24;
     }
     return value;
@@ -678,11 +686,11 @@ static uint32_t fdcan_rx_fifo1_status(const DmMc02Fdcan *s)
 {
     uint32_t value = fdcan_load(s, FDCAN_RXF1S, 4);
 
-    value &= ~UINT32_C(0x3f3f7f);
+    value &= ~UINT32_C(0x013f3f7f);
     value |= s->rx_fifo1_fill & 0x7f;
     value |= (uint32_t)(s->rx_fifo1_get & 0x3f) << 8;
     value |= (uint32_t)(s->rx_fifo1_put & 0x3f) << 16;
-    if (s->rx_fifo1_fill >= s->rx_fifo1_size) {
+    if (s->rx_fifo1_size && s->rx_fifo1_fill >= s->rx_fifo1_size) {
         value |= UINT32_C(1) << 24;
     }
     return value;
@@ -703,7 +711,7 @@ static uint32_t fdcan_tx_fifo_status(const DmMc02Fdcan *s)
     value |= free_level;
     value |= (uint32_t)(s->tx_fifo_get & 0x1f) << 8;
     value |= (uint32_t)(s->tx_fifo_put & 0x1f) << 16;
-    if (free_level == 0) {
+    if (s->tx_fifo_size && free_level == 0) {
         value |= UINT32_C(1) << 21;
     }
     return value;
@@ -933,6 +941,10 @@ static void receive_frame(DmMc02Fdcan *s, const DmMc02CanFrame *frame)
         return;
     }
 
+    if (!fifo_size) {
+        s->rx_dropped++;
+        return;
+    }
     if (*fill >= fifo_size) {
         s->rx_dropped++;
         fdcan_store(s, FDCAN_IR, fdcan_load(s, FDCAN_IR, 4) |
@@ -1137,6 +1149,28 @@ static void dm_mc02_fdcan_write(void *opaque, hwaddr offset, uint64_t value,
         size > DM_MC02_FDCAN_REGION_SIZE - offset) {
         return;
     }
+    if (((offset & ~3u) == FDCAN_TXBC ||
+         (offset & ~3u) == FDCAN_RXF0C ||
+         (offset & ~3u) == FDCAN_RXF1C) &&
+        (offset & 3u) + size <= 4) {
+        unsigned shift = (offset & 3u) * 8;
+        uint32_t mask = ((UINT64_C(1) << (size * 8)) - 1) << shift;
+        uint32_t config_offset = offset & ~3u;
+        uint32_t config = (fdcan_load(s, config_offset, 4) & ~mask) |
+                          (((uint32_t)value << shift) & mask);
+
+        if (config_offset == FDCAN_TXBC ? !fdcan_tx_config_valid(config) :
+            ((config >> 16) & 0x7fu) > 64) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "FDCAN: unsupported configuration at 0x%x: 0x%08x\n",
+                          config_offset, config);
+            return;
+        }
+        /* Use the same admission and cursor update for subword writes. */
+        offset = config_offset;
+        value = config;
+        size = 4;
+    }
     if (size == 4 && offset == FDCAN_IR) {
         fdcan_store(s, offset, fdcan_load(s, offset, 4) & ~(uint32_t)value,
                     4);
@@ -1152,7 +1186,7 @@ static void dm_mc02_fdcan_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == FDCAN_RXF0A) {
         refresh_sizes(s);
-        if (s->rx_fifo_fill != 0 &&
+        if (s->rx_fifo_size && s->rx_fifo_fill != 0 &&
             ((uint32_t)value & 0x3f) == s->rx_fifo_get) {
             s->rx_fifo_get = (s->rx_fifo_get + 1) % s->rx_fifo_size;
             s->rx_fifo_fill--;
@@ -1162,7 +1196,7 @@ static void dm_mc02_fdcan_write(void *opaque, hwaddr offset, uint64_t value,
     }
     if (size == 4 && offset == FDCAN_RXF1A) {
         refresh_sizes(s);
-        if (s->rx_fifo1_fill != 0 &&
+        if (s->rx_fifo1_size && s->rx_fifo1_fill != 0 &&
             ((uint32_t)value & 0x3f) == s->rx_fifo1_get) {
             s->rx_fifo1_get = (s->rx_fifo1_get + 1) % s->rx_fifo1_size;
             s->rx_fifo1_fill--;
@@ -1175,7 +1209,7 @@ static void dm_mc02_fdcan_write(void *opaque, hwaddr offset, uint64_t value,
 
         fdcan_store(s, offset, value, size);
         s->rx_fifo_configured = true;
-        if ((old ^ (uint32_t)value) & UINT32_C(0x003f3fff)) {
+        if ((old ^ (uint32_t)value) & UINT32_C(0x007ffffc)) {
             s->rx_fifo_fill = 0;
             s->rx_fifo_get = 0;
             s->rx_fifo_put = 0;
@@ -1193,7 +1227,7 @@ static void dm_mc02_fdcan_write(void *opaque, hwaddr offset, uint64_t value,
 
         fdcan_store(s, offset, value, size);
         s->rx_fifo_configured = true;
-        if ((old ^ (uint32_t)value) & UINT32_C(0x003f3fff)) {
+        if ((old ^ (uint32_t)value) & UINT32_C(0x007ffffc)) {
             s->rx_fifo1_fill = 0;
             s->rx_fifo1_get = 0;
             s->rx_fifo1_put = 0;
@@ -1396,17 +1430,11 @@ void dm_mc02_fdcan_reset(DmMc02Fdcan *s)
     fdcan_update_irq(s);
 }
 
-static uint8_t fdcan_effective_fifo_size(uint32_t config)
-{
-    uint8_t size = (config >> 16) & 0x3f;
-
-    return size ? size : 3;
-}
-
 static bool fdcan_fifo_state_valid(uint8_t fill, uint8_t get, uint8_t put,
                                    uint8_t size)
 {
-    return fill <= size && get < size && put < size;
+    return size ? fill <= size && get < size && put < size :
+                  !fill && !get && !put;
 }
 
 bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *s)
@@ -1427,10 +1455,13 @@ bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *s)
         return false;
     }
 
-    rx_fifo_size = fdcan_effective_fifo_size(fdcan_load(s, FDCAN_RXF0C, 4));
-    rx_fifo1_size = fdcan_effective_fifo_size(fdcan_load(s, FDCAN_RXF1C, 4));
-    tx_fifo_size = fdcan_effective_fifo_size(fdcan_load(s, FDCAN_TXBC, 4));
-    if (!fdcan_fifo_state_valid(s->rx_fifo_fill, s->rx_fifo_get,
+    rx_fifo_size = (fdcan_load(s, FDCAN_RXF0C, 4) >> 16) & 0x7f;
+    rx_fifo1_size = (fdcan_load(s, FDCAN_RXF1C, 4) >> 16) & 0x7f;
+    tx_fifo_size = (fdcan_load(s, FDCAN_TXBC, 4) >>
+                    FDCAN_TXBC_TFQS_SHIFT) & 0x3f;
+    if (rx_fifo_size > 64 || rx_fifo1_size > 64 ||
+        !fdcan_tx_config_valid(fdcan_load(s, FDCAN_TXBC, 4)) ||
+        !fdcan_fifo_state_valid(s->rx_fifo_fill, s->rx_fifo_get,
                                 s->rx_fifo_put, rx_fifo_size) ||
         !fdcan_fifo_state_valid(s->rx_fifo1_fill, s->rx_fifo1_get,
                                 s->rx_fifo1_put, rx_fifo1_size) ||
@@ -1522,15 +1553,15 @@ bool dm_mc02_fdcan_message_ram_state_valid(const DmMc02Fdcan *s)
     }
 
     if (!fdcan_message_ram_span_valid(
-            s, (sidfc & FDCAN_SIDFC_FLSSA_MASK) * 4u, sid_count, 4) ||
+            s, sidfc & FDCAN_SIDFC_FLSSA_MASK, sid_count, 4) ||
         !fdcan_message_ram_span_valid(
-            s, (xidfc & FDCAN_XIDFC_FLSSA_MASK) * 4u, xid_count, 8)) {
+            s, xidfc & FDCAN_XIDFC_FLSSA_MASK, xid_count, 8)) {
         return false;
     }
 
-    rx_fifo0_size = fdcan_effective_fifo_size(rxf0c);
-    rx_fifo1_size = fdcan_effective_fifo_size(rxf1c);
-    tx_fifo_size = fdcan_effective_fifo_size(txbc);
+    rx_fifo0_size = (rxf0c >> 16) & 0x7f;
+    rx_fifo1_size = (rxf1c >> 16) & 0x7f;
+    tx_fifo_size = (txbc >> FDCAN_TXBC_TFQS_SHIFT) & 0x3f;
     rx_fifo0_element_size = element_bytes(rxesc & 7u);
     rx_fifo1_element_size = element_bytes((rxesc >> 4) & 7u);
     rx_buffer_element_size = element_bytes((rxesc >> 8) & 7u);
@@ -1538,18 +1569,18 @@ bool dm_mc02_fdcan_message_ram_state_valid(const DmMc02Fdcan *s)
 
     if ((s->rx_fifo_configured &&
          !fdcan_message_ram_span_valid(
-             s, (rxf0c & FDCAN_SIDFC_FLSSA_MASK) * 4u,
+             s, rxf0c & FDCAN_SIDFC_FLSSA_MASK,
              rx_fifo0_size, rx_fifo0_element_size)) ||
         (s->rx_fifo_configured &&
          !fdcan_message_ram_span_valid(
-             s, (rxf1c & FDCAN_SIDFC_FLSSA_MASK) * 4u,
+             s, rxf1c & FDCAN_SIDFC_FLSSA_MASK,
              rx_fifo1_size, rx_fifo1_element_size)) ||
         (s->rx_buffer_configured &&
          !fdcan_message_ram_span_valid(
-             s, (rxbc & 0xfffcu) * 4u, 64, rx_buffer_element_size)) ||
+             s, rxbc & 0xfffcu, 64, rx_buffer_element_size)) ||
         (s->tx_fifo_configured &&
          !fdcan_message_ram_span_valid(
-             s, (txbc & 0xfffcu) * 4u, tx_fifo_size, tx_element_size))) {
+             s, txbc & 0xfffcu, tx_fifo_size, tx_element_size))) {
         return false;
     }
     return true;

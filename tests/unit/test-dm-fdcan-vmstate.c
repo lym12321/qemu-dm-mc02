@@ -104,7 +104,7 @@ static void prepare_source(DmMc02Fdcan *state)
     memset(state, 0, sizeof(*state));
     put_le32(state->regs + FDCAN_RXF0C, 4u << 16);
     put_le32(state->regs + FDCAN_RXF1C, 4u << 16);
-    put_le32(state->regs + FDCAN_TXBC, 4u << 16);
+    put_le32(state->regs + FDCAN_TXBC, 4u << 24);
     put_le32(state->regs + FDCAN_IR, 1);
     put_le32(state->regs + FDCAN_IE, 1);
     put_le32(state->regs + FDCAN_ILE, 1);
@@ -203,6 +203,25 @@ static void test_rejects_invalid_fifo_state_before_irq_sync(void)
     g_assert_cmpint(load_state(&restored, dm_mc02_fdcan_vmstate()), !=, 0);
     g_assert_true(restored.irq_level_valid[0]);
     g_assert_cmpuint(capture.calls, ==, 0);
+
+    const struct { unsigned reg; uint32_t value; } invalid_configs[] = {
+        { FDCAN_RXF0C, 65u << 16 }, /* seven-bit count, exceeds 64 */
+        { FDCAN_TXBC, 33u << 24 }, /* exceeds 32 TX slots */
+        { FDCAN_TXBC, 1u << 16 },  /* dedicated TX unsupported */
+        { FDCAN_TXBC, 1u << 16 | 4u << 24 }, /* mixed layout unsupported */
+        { FDCAN_TXBC, 1u << 30 | 4u << 24 }, /* queue unsupported */
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(invalid_configs); ++i) {
+        prepare_source(&source);
+        put_le32(source.regs + invalid_configs[i].reg,
+                  invalid_configs[i].value);
+        save_state(&source, dm_mc02_fdcan_vmstate_raw());
+        g_assert_cmpint(load_state(&restored, dm_mc02_fdcan_vmstate_raw()),
+                        !=, 0);
+        g_assert_true(restored.irq_level_valid[0]);
+        g_assert_cmpuint(capture.calls, ==, 0);
+    }
     qemu_free_irq(irq);
 }
 
@@ -227,7 +246,7 @@ static void test_rejects_truncated_state_before_irq_sync(void)
     qemu_free_irq(irq);
 }
 
-static void test_bus_off_round_trip_and_v1_compatibility(void)
+static void test_bus_off_round_trip_and_old_layout_rejection(void)
 {
     DmMc02Fdcan source;
     DmMc02Fdcan restored;
@@ -242,12 +261,22 @@ static void test_bus_off_round_trip_and_v1_compatibility(void)
     g_assert_true(restored.bus_off);
     g_assert_cmpuint(restored.regs[FDCAN_PSR] & (1u << 7), !=, 0);
 
-    /* Serialize with the pre-bus_off v1 field set.  The v1 loader derives the
-     * internal participation gate from the already serialized PSR.BO bit. */
-    save_state_v(&source, dm_mc02_fdcan_vmstate(), 1);
-    memset(&restored, 0, sizeof(restored));
-    g_assert_cmpint(load_state_v(&restored, dm_mc02_fdcan_vmstate(), 1), ==, 0);
-    g_assert_true(restored.bus_off);
+    /* Both old normal/raw layouts must fail before reading producer state
+     * or projecting IRQs; retaining their RAM bytes would misdecode them. */
+    for (int version = 1; version <= 2; ++version) {
+        const VMStateDescription *descriptions[] = {
+            dm_mc02_fdcan_vmstate(), dm_mc02_fdcan_vmstate_raw(),
+        };
+
+        for (unsigned i = 0; i < G_N_ELEMENTS(descriptions); ++i) {
+            memset(&restored, 0, sizeof(restored));
+            restored.irq_level_valid[0] = true;
+            g_assert_cmpint(load_state_v(&restored, descriptions[i], version),
+                            !=, 0);
+            g_assert_cmpuint(restored.regs[FDCAN_PSR], ==, 0);
+            g_assert_true(restored.irq_level_valid[0]);
+        }
+    }
 }
 
 static void test_raw_description_has_no_runtime_projection(void)
@@ -285,8 +314,8 @@ int main(int argc, char **argv)
                     test_rejects_invalid_fifo_state_before_irq_sync);
     g_test_add_func("/dm-fdcan-vmstate/reject-truncated",
                     test_rejects_truncated_state_before_irq_sync);
-    g_test_add_func("/dm-fdcan-vmstate/bus-off-v1-compat",
-                    test_bus_off_round_trip_and_v1_compatibility);
+    g_test_add_func("/dm-fdcan-vmstate/bus-off-old-layout-reject",
+                    test_bus_off_round_trip_and_old_layout_rejection);
     g_test_add_func("/dm-fdcan-vmstate/raw-no-projection",
                     test_raw_description_has_no_runtime_projection);
     ret = g_test_run();
