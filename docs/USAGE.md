@@ -38,6 +38,17 @@ ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(ti
 可运行 `tools/run-lab-channels-smoke.sh` 验证真实固件 UART/CAN/ADC 与按键驱动 LED；
 该裸机测试夹具是数字模型消费者，不代表实板校准或完整 HAL 初始化。
 
+Lab 配置使用锁定的 PyYAML 6.0.3；运行 Python 工具前执行 `uv sync --frozen`。
+`sim.lab.load_manifest(path)` 读取 schema 1 YAML，固件路径相对 manifest 目录；时间使用
+整数 `ns`/`us`/`ms`/`s` 字符串。省略 `duration` 时取最大的 stimulus `at` 或 assertion
+`before`。未知字段、重复 key、错误类型和不支持的端点直接拒绝；不支持 YAML anchor/alias。
+配置文件最多 1 MiB，stimulus/assertions 各最多 1024 条，文本最多 4096 UTF-8 字节，
+虚拟时间最多 3600 秒。`at=duration` 可做最终发送，响应没有额外等待窗口。
+
+`LabExperiment` 只消费实际数字快照、UART 字节与 CAN 帧；`before` 为严格截止时间。
+UART 判断用读取后 QMP 上界，CAN 用原始 wire 时间，数字用快照时间；观测较晚可能保守失败，
+失败后不会被迟到数据改成通过。串口匹配只保留最小尾部，不缓存完整运行记录。
+
 ## Contents
 
 - [项目范围](#project-scope)

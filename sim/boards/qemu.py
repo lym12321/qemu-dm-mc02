@@ -76,6 +76,27 @@ def _snapshot(value) -> dict:
     return state
 
 
+def _digital_pin(endpoint: str) -> str | None:
+    if not isinstance(endpoint, str):
+        raise TypeError("digital endpoint must be a string")
+    if endpoint.startswith("gpio."):
+        return validate_gpio_pin(endpoint[5:])
+    if endpoint not in ("key", "led"):
+        raise ValueError("digital endpoint must be gpio.PIN, key or led")
+    return None
+
+
+def digital_level(endpoint: str, snapshot: dict) -> int:
+    """Project an admitted native snapshot without QMP or hardware state."""
+    pin = _digital_pin(endpoint)
+    state = _snapshot(snapshot)
+    if pin is not None:
+        return (state["gpio"][pin[0]]["sampled"] >> int(pin[1:])) & 1
+    if endpoint == "key":
+        return state["key"]["level"]
+    return int(state["led"]["rgb"] != 0)
+
+
 class QemuBoard:
     """Borrow an already connected synchronous QMP ``command`` interface.
 
@@ -103,19 +124,8 @@ class QemuBoard:
         The key's sampled level is distinct from its host ``pressed`` input.
         See ``led.source`` to distinguish waveform and latch observations.
         """
-        if not isinstance(endpoint, str):
-            raise TypeError("digital endpoint must be a string")
-        pin = None
-        if endpoint.startswith("gpio."):
-            pin = validate_gpio_pin(endpoint[5:])
-        elif endpoint not in ("key", "led"):
-            raise ValueError("digital endpoint must be gpio.PIN, key or led")
-        state = self.snapshot() if snapshot is None else _snapshot(snapshot)
-        if pin is not None:
-            return (state["gpio"][pin[0]]["sampled"] >> int(pin[1:])) & 1
-        if endpoint == "key":
-            return state["key"]["level"]
-        return int(state["led"]["rgb"] != 0)
+        _digital_pin(endpoint)  # Reject before acquiring a snapshot over QMP.
+        return digital_level(endpoint, self.snapshot() if snapshot is None else snapshot)
 
     def set_gpio(self, pin: str, level: int) -> None:
         validate_gpio_pin(pin)

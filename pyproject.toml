@@ -3,7 +3,7 @@ name = "dm-mc02-qemu-tools"
 version = "0.1.0"
 description = "Deterministic tooling for the independent DM-MC02 QEMU backend"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML==6.0.3"]
 
 [project.optional-dependencies]
 mujoco = [

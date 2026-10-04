@@ -1,0 +1,295 @@
+"""Schema 1 literal YAML admission, independent of processes and transports."""
+
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+import socket
+import subprocess
+import sys
+
+import pytest
+import yaml
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sim.lab import CanMatch, ManifestError, load_manifest
+
+
+HEADER = "schema: 1\nname: admission\nboard: dm-mc02\nfirmware: firmware.elf\n"
+
+
+def write_manifest(tmp_path, body="duration: 10ms\n", *, header=HEADER):
+    (tmp_path / "firmware.elf").write_bytes(b"fixture; no ELF contents required by admission")
+    path = tmp_path / "lab.yaml"
+    path.write_text(header + body, encoding="utf-8")
+    return path
+
+
+def test_architecture_example_infers_duration_and_resolves_relative_firmware(tmp_path):
+    directory = tmp_path / "lab"
+    directory.mkdir()
+    (directory / "build").mkdir()
+    elf = directory / "build" / "student.elf"
+    elf.write_bytes(b"fixture")
+    path = directory / "example.yaml"
+    path.write_text("""schema: 1
+name: uart-dma-idle
+board: dm-mc02
+firmware: build/student.elf
+stimulus:
+  - at: 100ms
+    endpoint: uart1
+    bytes: hello
+assertions:
+  - before: 200ms
+    uart_contains:
+      endpoint: uart2
+      text: received 5 bytes
+  - before: 250ms
+    digital_equals:
+      endpoint: led
+      value: 1
+""")
+    manifest = load_manifest(path)
+    assert manifest.path == path.resolve()
+    assert manifest.firmware == elf.resolve()
+    assert manifest.duration_ns == 250_000_000
+    assert manifest.ready is None
+    assert [(entry.at_ns, entry.endpoint, entry.kind, entry.value)
+            for entry in manifest.stimulus] == [(100_000_000, "uart1", "uart", b"hello")]
+    assert [(entry.before_ns, entry.endpoint, entry.kind, entry.value)
+            for entry in manifest.assertions] == [
+        (200_000_000, "uart2", "uart_contains", b"received 5 bytes"),
+        (250_000_000, "led", "digital_equals", 1)]
+    with pytest.raises(FrozenInstanceError):
+        manifest.duration_ns = 1
+
+
+def test_all_stimulus_kinds_and_optional_can_match_fields(tmp_path):
+    path = write_manifest(tmp_path, """duration: 10ms
+ready: {endpoint: uart1, text: LAB_READY}
+stimulus:
+  - {at: 5us, endpoint: uart10, bytes: "é\\u0000"}
+  - {at: 2ms, endpoint: key, pressed: false}
+  - {at: 0ns, endpoint: gpio.H15, value: 1}
+  - {at: 3ms, endpoint: adc1.ch0, raw: 65535}
+  - {at: 4ms, endpoint: adc1.ch31, voltage_uv: 3300000}
+  - {at: 10ms, endpoint: can3, frame: {id: 0x123, dlc: 2, data_hex: '0080'}}
+assertions:
+  - {before: 7ms, can_seen: {endpoint: can1, id: 0x123}}
+  - {before: 8ms, can_seen: {endpoint: can2, id: 0x1abcdef, flags: 1, dlc: 1, data_hex: 'ff'}}
+  - {before: 9ms, digital_equals: {endpoint: key, value: 0}}
+  - {before: 10ms, digital_equals: {endpoint: gpio.A0, value: 1}}
+""")
+    manifest = load_manifest(path)
+    assert manifest.ready.endpoint == "uart1" and manifest.ready.text == b"LAB_READY"
+    assert [entry.kind for entry in manifest.stimulus] == [
+        "uart", "key", "gpio", "adc_raw", "adc_voltage", "can"]
+    assert [entry.at_ns for entry in manifest.stimulus] == [5000, 2_000_000, 0,
+                                                           3_000_000, 4_000_000, 10_000_000]
+    assert [entry.value for entry in manifest.stimulus[:5]] == [b"\xc3\xa9\0", False, 1, 65535, 3300000]
+    frame = manifest.stimulus[5].value
+    assert (frame.can_id, frame.flags, frame.dlc, frame.data, frame.timestamp_ns) == (
+        0x123, 0, 2, b"\0\x80", 0)
+    assert manifest.assertions[0].value == CanMatch(0x123)
+    assert manifest.assertions[1].value == CanMatch(0x1abcdef, 1, 1, b"\xff")
+    with pytest.raises(FrozenInstanceError):
+        manifest.stimulus[0].value = b"changed"
+
+
+def test_can_fd_uses_existing_dlc_and_flag_admission(tmp_path):
+    path = write_manifest(tmp_path, """duration: 1ms
+stimulus:
+  - {at: 0ns, endpoint: can1, frame: {id: 0x123, flags: 12, dlc: 9, data_hex: '000102030405060708090a0b'}}
+assertions:
+  - {before: 1ms, can_seen: {endpoint: can1, id: 0x1abcdef}}
+  - {before: 1ms, can_seen: {endpoint: can1, id: 0x123, dlc: 15}}
+""")
+    manifest = load_manifest(path)
+    frame = manifest.stimulus[0].value
+    assert frame.flags == 12 and frame.length == 12 and frame.data == bytes(range(12))
+    assert manifest.assertions[0].value.flags is None
+    assert manifest.assertions[1].value.dlc == 15
+
+
+@pytest.mark.parametrize("body", [
+    "duration: true\n",                         # bool is not a time
+    "duration: 0s\n",                           # zero experiment duration
+    "duration: 3601s\n",                        # bounded virtual time
+    "duration: 1.5ms\n",                        # no floating-point time
+    "duration: 1e3ms\n",                        # no exponent grammar
+    "duration: -1ms\n",                         # no negative time
+    "duration: 1h\n",                           # unknown unit
+    "duration: 999999999999999999999999ns\n",    # integer token bound
+    "duration: 1ms\nstimulus: [{at: 2ms, endpoint: key, pressed: true}]\n",
+    "duration: 1ms\nassertions: [{before: 0ns, digital_equals: {endpoint: key, value: 0}}]\n",
+    "duration: 1ms\nassertions: [{before: 2ms, digital_equals: {endpoint: led, value: 1}}]\n",
+    "stimulus: [{at: 0ns, endpoint: uart1, bytes: ''}]\n",  # inferred zero
+])
+def test_time_rejections(tmp_path, body):
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, body))
+
+
+def test_integer_time_units_and_maximum_boundary(tmp_path):
+    manifest = load_manifest(write_manifest(tmp_path, """duration: 3600s
+stimulus:
+  - {at: 1ns, endpoint: key, pressed: true}
+  - {at: 1us, endpoint: key, pressed: false}
+  - {at: 1ms, endpoint: key, pressed: true}
+  - {at: 1s, endpoint: key, pressed: false}
+  - {at: 3600000000000ns, endpoint: key, pressed: true}
+"""))
+    assert manifest.duration_ns == 3_600_000_000_000
+    assert [entry.at_ns for entry in manifest.stimulus] == [1, 1000, 1_000_000,
+                                                           1_000_000_000, 3_600_000_000_000]
+
+
+@pytest.mark.parametrize("body", [
+    "duration: 1ms\nunknown: 1\n",
+    "duration: 1ms\nready: {endpoint: uart4, text: LAB_READY}\n",
+    "duration: 1ms\nready: {endpoint: uart1, text: ''}\n",
+    "duration: 1ms\nready: {endpoint: uart1, text: LAB_READY, timeout: 1s}\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: uart1, bytes: true}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: uart4, bytes: text}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: key, pressed: 1}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: gpio.A0, value: true}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: gpio.A16, value: 0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: gpio.I0, value: 0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc1.ch32, raw: 0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc2.ch0, raw: 0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc1.ch0, raw: 65536}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc1.ch0, voltage_uv: 3300001}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc1.ch0, raw: 0, voltage_uv: 0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: adc1.ch0}]\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: uart1, bytes: text, pressed: true}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms, uart_contains: {endpoint: can1, text: text}}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms, digital_equals: {endpoint: gpio.A0, value: true}}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms, digital_equals: {endpoint: uart1, value: 0}}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms, digital_equals: {endpoint: led, value: 0}, uart_contains: {endpoint: uart1, text: hi}}]\n",
+    "duration: 1ms\nassertions: [{before: 1ms, can_seen: {endpoint: can4, id: 1}}]\n",
+])
+def test_unknown_fields_types_endpoints_and_ranges_rejected(tmp_path, body):
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, body))
+
+
+@pytest.mark.parametrize("frame", [
+    "{id: true, dlc: 0, data_hex: ''}",
+    "{id: 1, flags: true, dlc: 0, data_hex: ''}",
+    "{id: 1, dlc: true, data_hex: ''}",
+    "{id: 0x800, dlc: 0, data_hex: ''}",
+    "{id: 0x20000000, flags: 1, dlc: 0, data_hex: ''}",
+    "{id: 1, flags: 16, dlc: 0, data_hex: ''}",
+    "{id: 1, flags: 8, dlc: 0, data_hex: ''}",
+    "{id: 1, flags: 6, dlc: 0, data_hex: ''}",
+    "{id: 1, dlc: 9, data_hex: ''}",
+    "{id: 1, dlc: 0, data_hex: '00'}",
+    "{id: 1, dlc: 1, data_hex: 'f'}",
+    "{id: 1, dlc: 1, data_hex: 'zz'}",
+    "{id: 1, dlc: 1, data_hex: '00', timestamp_ns: 7}",
+    "{id: 1, data_hex: ''}",
+])
+def test_can_configuration_rejections(tmp_path, frame):
+    body = f"duration: 1ms\nstimulus: [{{at: 0ns, endpoint: can1, frame: {frame}}}]\n"
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, body))
+
+
+@pytest.mark.parametrize("condition", [
+    "{endpoint: can1, id: 0x800, flags: 0}",
+    "{endpoint: can1, id: 1, flags: 0, dlc: 15}",
+    "{endpoint: can1, id: 1, dlc: 0, data_hex: '00'}",
+    "{endpoint: can1, id: 1, flags: true}",
+])
+def test_optional_can_fields_are_validated_when_present(tmp_path, condition):
+    body = f"duration: 1ms\nassertions: [{{before: 1ms, can_seen: {condition}}}]\n"
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, body))
+
+
+@pytest.mark.parametrize("header", [
+    HEADER.replace("schema: 1", "schema: true"),
+    HEADER.replace("schema: 1", "schema: 2"),
+    HEADER.replace("name: admission", "name: ''"),
+    HEADER.replace("board: dm-mc02", "board: other-board"),
+    HEADER.replace("firmware: firmware.elf", "firmware: missing.elf"),
+    HEADER.replace("firmware: firmware.elf", "firmware: ."),
+    HEADER.replace("firmware: firmware.elf", "firmware: 1"),
+])
+def test_schema_identity_and_firmware_path_rejections(tmp_path, header):
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, header=header))
+
+
+@pytest.mark.parametrize("body", [
+    "duration: 1ms\nduration: 2ms\n",
+    "duration: 1ms\nready: {endpoint: uart1, endpoint: uart2, text: ready}\n",
+    "duration: 1ms\nstimulus: [{at: 0ns, endpoint: can1, frame: {id: 1, dlc: 0, dlc: 1, data_hex: ''}}]\n",
+    "duration: 1ms\nready: &ready {endpoint: uart1, text: ready}\n",
+    "duration: 1ms\nunknown: &recursive [*recursive]\n",
+    "duration: 1ms\nunknown: !!python/object/apply:os.system [echo unsafe]\n",
+    "duration: 1ms\nunknown: !!bool invalid\n",
+    "duration: 1ms\nunknown: " + "[" * 17 + "0" + "]" * 17 + "\n",
+    "duration: 1ms\n---\nschema: 1\n",
+    "duration: 1ms\ntrue: value\n",
+])
+def test_yaml_structural_rejections(tmp_path, body):
+    with pytest.raises(ManifestError):
+        load_manifest(write_manifest(tmp_path, body))
+
+
+def test_utf8_limit_counts_bytes_not_codepoints(tmp_path):
+    text = "é" * 2048
+    body = f"duration: 1ms\nstimulus: [{{at: 0ns, endpoint: uart1, bytes: '{text}'}}]\n"
+    manifest = load_manifest(write_manifest(tmp_path, body))
+    assert len(manifest.stimulus[0].value) == 4096
+    with pytest.raises(ManifestError, match="UTF-8 bytes"):
+        load_manifest(write_manifest(tmp_path, body.replace(text, text + "é")))
+
+
+def test_lists_have_independent_capacity_limits(tmp_path):
+    stimuli = "  - {at: 0ns, endpoint: key, pressed: true}\n" * 1024
+    assertions = "  - {before: 1ms, digital_equals: {endpoint: key, value: 0}}\n" * 1024
+    body = "duration: 1ms\nstimulus:\n" + stimuli + "assertions:\n" + assertions
+    manifest = load_manifest(write_manifest(tmp_path, body))
+    assert len(manifest.stimulus) == len(manifest.assertions) == 1024
+    with pytest.raises(ManifestError, match="at most 1024"):
+        load_manifest(write_manifest(tmp_path, body + assertions.splitlines(keepends=True)[0]))
+    with pytest.raises(ManifestError, match="at most 1024"):
+        load_manifest(write_manifest(tmp_path, "duration: 1ms\nstimulus:\n" + stimuli + stimuli.splitlines(keepends=True)[0]))
+
+
+def test_file_bound_and_no_process_or_transport_side_effects(tmp_path, monkeypatch):
+    path = write_manifest(tmp_path)
+    original = path.read_bytes()
+    path.write_bytes(original + b"#" + b"x" * ((1 << 20) - len(original) - 1))
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("admission must not acquire runtime resources")
+
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    assert load_manifest(path).duration_ns == 10_000_000
+    path.write_bytes(path.read_bytes() + b"x")
+    monkeypatch.setattr(yaml, "load", forbidden)
+    with pytest.raises(ManifestError, match="1 MiB"):
+        load_manifest(path)
+
+
+def test_manifest_must_be_a_readable_regular_utf8_file(tmp_path):
+    with pytest.raises(ManifestError):
+        load_manifest(tmp_path)
+    with pytest.raises(ManifestError):
+        load_manifest(tmp_path / "missing.yaml")
+    with pytest.raises(ManifestError):
+        load_manifest(True)
+    path = write_manifest(tmp_path)
+    path.write_bytes(b"\xff")
+    with pytest.raises(ManifestError):
+        load_manifest(path)
+
+
+def test_node_budget_rejects_large_unused_structures(tmp_path):
+    body = "duration: 1ms\nunknown: [" + ",".join("0" for _ in range(40001)) + "]\n"
+    with pytest.raises(ManifestError, match="node limit"):
+        load_manifest(write_manifest(tmp_path, body))
