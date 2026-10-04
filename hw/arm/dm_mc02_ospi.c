@@ -770,8 +770,6 @@ void dm_mc02_ospim_init(DmMc02Ospim *state, Object *owner)
 #define W25Q_CMD_QUAD_READ          0x6b
 #define W25Q_CMD_QUAD_IO_READ      0xeb
 
-#define W25Q_STATUS_WIP             (1u << 0)
-
 static uint32_t dm_mc02_ospi_load(const uint32_t *regs, hwaddr offset,
                                   unsigned size)
 {
@@ -1185,8 +1183,8 @@ static uint32_t dm_mc02_ospi_status(const DmMc02Ospi *s)
                                         sizeof(uint32_t));
 
     status &= ~(OCTOSPI_SR_BUSY | (0x3f << 8));
-    if (s->has_flash && ((DmMc02Ospi *)s)->ssi_nor.selected &&
-        (dm_mc02_ospi_flash_status((DmMc02Ospi *)s) & W25Q_STATUS_WIP)) {
+    /* Reading controller status must not alter the active SSI transaction. */
+    if (s->ssi_nor.selected) {
         status |= OCTOSPI_SR_BUSY;
     }
     if (s->rx_pos < s->rx_size ||
