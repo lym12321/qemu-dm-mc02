@@ -1,0 +1,55 @@
+<!--
+  Adapted from Google DeepMind MuJoCo model/car/car.xml (Apache-2.0).
+  Upstream: 13827e9ee56f097f57acf69ae52b078f9839682d (3.12.0)
+  Source blob: 0ab791f05ad6b022e573a7bb13af6aa0efdddc1d
+  License: mujoco-LICENSE.txt
+  Changes: four independent wheels instead of two wheels/caster/tendons;
+  symmetric box chassis, explicit toy masses, same native cylinder/plane
+  contact, no actuator clamps, and a paired chassis IMU. Uncalibrated fixture.
+  Coordinates: +X forward, +Y left, +Z up. Every wheel axis is +Y.
+-->
+<mujoco model="four-wheel-fixture">
+  <compiler angle="radian"/>
+  <option timestep="0.001" gravity="0 0 -9.80665" integrator="Euler"/>
+  <default>
+    <joint damping=".03"/>
+    <default class="wheel">
+      <geom type="cylinder" size=".03 .01" mass=".05" rgba=".5 .5 1 1"/>
+    </default>
+  </default>
+  <worldbody>
+    <geom name="floor" type="plane" size="3 3 .01"/>
+    <body name="chassis" pos="0 0 .03">
+      <freejoint name="chassis_free"/>
+      <geom name="chassis_box" type="box" pos="0 0 .015"
+            size=".05 .04 .015" mass=".4" rgba=".5 1 .5 1"/>
+      <site name="imu_site" pos="0 0 .015"/>
+      <body name="wheel_fl" pos=".07 .06 0" zaxis="0 1 0">
+        <joint name="wheel_fl" type="hinge" axis="0 0 1"/>
+        <geom name="wheel_fl" class="wheel"/>
+      </body>
+      <body name="wheel_fr" pos=".07 -.06 0" zaxis="0 1 0">
+        <joint name="wheel_fr" type="hinge" axis="0 0 1"/>
+        <geom name="wheel_fr" class="wheel"/>
+      </body>
+      <body name="wheel_rl" pos="-.07 .06 0" zaxis="0 1 0">
+        <joint name="wheel_rl" type="hinge" axis="0 0 1"/>
+        <geom name="wheel_rl" class="wheel"/>
+      </body>
+      <body name="wheel_rr" pos="-.07 -.06 0" zaxis="0 1 0">
+        <joint name="wheel_rr" type="hinge" axis="0 0 1"/>
+        <geom name="wheel_rr" class="wheel"/>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="drive_fl" joint="wheel_fl" gear="1"/>
+    <motor name="drive_fr" joint="wheel_fr" gear="1"/>
+    <motor name="drive_rl" joint="wheel_rl" gear="1"/>
+    <motor name="drive_rr" joint="wheel_rr" gear="1"/>
+  </actuator>
+  <sensor>
+    <gyro name="imu_gyro" site="imu_site"/>
+    <accelerometer name="imu_accel" site="imu_site"/>
+  </sensor>
+</mujoco>

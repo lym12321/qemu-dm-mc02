@@ -608,6 +608,18 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 `time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
 不建立 QEMU 时间屏障。四轮底盘、固件 IMU 闭环和物理标定仍需分别验证。
 
+`models/four_wheel.xml` 是独立的四轮物理夹具，沿用官方 car 示例的圆柱轮与原生地面接触，
+绑定为 `wheel_fl → drive_fl`、`wheel_fr → drive_fr`、`wheel_rl → drive_rl`、
+`wheel_rr → drive_rr`；`chassis` 提供 body pose，IMU 配对仍为 `imu_gyro/imu_accel`。
+坐标为 +X 前、+Y 左、+Z 上；四轮等正力矩向前，右侧更快产生正 yaw。
+模型总质量 0.6 kg、轮半径 0.03 m、轴距 0.14 m、轮距 0.12 m、轮轴阻尼 0.03 Nm·s/rad，
+摩擦与接触参数使用锁定版本的原生默认值。这些参数未经实物标定；它是普通四轮夹具，
+尚未接入 M3508、BMI088 或固件闭环。可单独运行物理门：
+
+```bash
+uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
+```
+
 BMI088 的完整 raw burst/FIFO data 消费通知携带实际样本身份；默认字节、部分读取或跨样本混合不产生完整消费确认。raw 目前逐字节读取寄存器，没有已验证的硬件 shadow snapshot。`--wait-step-done` 用于 BMI088 消费门：输入已接受后，器件未接收该样本或未读来源被覆盖/器件复位，会返回失败 DONE（status=2），并报告真实已消费和缺失掩码。严格等待会立即报错，适用于传感器已经配置、每个样本都应被完整读取的场景；默认模式继续按 ACK 推进。来源按实际读取身份匹配，跨会话重用外部序号不会误确认；完成响应按 ACK 顺序发送，并保留最近结果供重放。此门不提供 CPU/电机全局锁步。SPI 独立组件的 v1 状态恢复会清除缺失的来源身份，SPI/BMI088 组合的旧 v1 快照拒绝；这些组件状态不代表整机迁移。
 
 v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，每次等待 0.25 秒，初次发送后最多重试三次；收到 `QUEUE_FULL` 后按 1 毫秒间隔重试，仍受同一个 2 秒期限约束。重试沿用原始输入，不重复推进 plant；准入发送尚未完成时先完成原发送。等待 ACK、DONE 或队列恢复时，CAN/SocketCAN 仍可双向转发。`--wait-step-done` 另有每次 2 秒、最多四次的完成等待；超时重试仍计入次数。重放尚未发送完时，先继续原发送；发送队列空才重放同一 STEP，不重复推进 plant。完成等待的时间另计。准入超时报 `STEP_ACK admission timed out`，附带 STEP 编号、时间、最后状态、队列深度和静默重试次数，便于定位未回应或队列持续占满。
