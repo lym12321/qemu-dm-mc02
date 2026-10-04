@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "profile": "ordinary Release, fixed single rotor, 14000 x 1 ms",
+  "source": "Predeclared trajectory gates, 2026-10-04; preserved without changing windows, targets or thresholds.",
+  "source_sha256": "56377b479869c3bdf7ad90f045a87b336dcb685d723bef31bddf903d9c96a142",
+  "gates": [
+    {
+      "id": "stable_idle",
+      "window_relative_enable_ms": [
+        500,
+        1000
+      ],
+      "metric": "max_abs_velocity",
+      "limit": 0.05,
+      "unit": "rad/s"
+    },
+    {
+      "id": "rise_peak",
+      "window_relative_enable_ms": [
+        1000,
+        4000
+      ],
+      "metric": "max_velocity",
+      "limit": 6.5,
+      "unit": "rad/s"
+    },
+    {
+      "id": "rise_settled",
+      "window_relative_enable_ms": [
+        1500,
+        4000
+      ],
+      "metric": "max_abs_target_error",
+      "limit": 0.15,
+      "target": 6.0,
+      "unit": "rad/s"
+    },
+    {
+      "id": "plateau_mean_velocity",
+      "window_relative_enable_ms": [
+        2000,
+        3800
+      ],
+      "metric": "abs_mean_target_error",
+      "limit": 0.05,
+      "target": 6.0,
+      "unit": "rad/s"
+    },
+    {
+      "id": "plateau_mean_effort",
+      "window_relative_enable_ms": [
+        2000,
+        3800
+      ],
+      "metric": "abs_mean_effort_error",
+      "limit": 0.02,
+      "target": 0.3,
+      "unit": "Nm"
+    },
+    {
+      "id": "stop_undershoot",
+      "window_relative_enable_ms": [
+        4000,
+        6000
+      ],
+      "metric": "min_velocity",
+      "minimum": -0.5,
+      "unit": "rad/s"
+    },
+    {
+      "id": "stop_settled",
+      "window_relative_enable_ms": [
+        4500,
+        6000
+      ],
+      "metric": "max_abs_velocity",
+      "limit": 0.15,
+      "unit": "rad/s"
+    },
+    {
+      "id": "late_stop_mean",
+      "window_relative_enable_ms": [
+        5000,
+        6000
+      ],
+      "metric": "abs_mean_velocity",
+      "limit": 0.05,
+      "unit": "rad/s"
+    }
+  ]
+}

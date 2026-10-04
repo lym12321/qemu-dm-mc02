@@ -1,0 +1,22 @@
+<mujoco model="trobot-business-bench">
+  <option timestep="0.001" gravity="0 0 -9.80665" integrator="Euler"/>
+  <worldbody>
+    <body name="imu_base" pos="0 0 0.1">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.02 0.02 0.02"/>
+      <joint name="base_yaw" type="hinge" axis="0 0 1"/>
+      <site name="imu_site"/>
+    </body>
+    <body name="rotor" pos="0 0 0.2">
+      <inertial pos="0 0 0" mass="1" diaginertia="0.02 0.02 0.02"/>
+      <joint name="rotor_joint" type="hinge" axis="0 0 1" damping="0.05"/>
+      <geom type="sphere" size="0.1"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="motor0" joint="rotor_joint" gear="1"/>
+  </actuator>
+  <sensor>
+    <gyro name="imu_gyro" site="imu_site"/>
+    <accelerometer name="imu_accel" site="imu_site"/>
+  </sensor>
+</mujoco>
