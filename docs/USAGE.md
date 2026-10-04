@@ -204,6 +204,31 @@ worker 独占 co-sim 与 FDCAN1，运行既有 v2、1 kHz、realtime 四轮 prof
 ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控制见下文 ChassisTest；
 持续四轮实时性能、实板标定、多板、DR16、裁判系统和赛场组合仍未由该入口支持。
 
+## Referee protocol
+
+裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：
+
+```python
+from sim.devices.referee import encode_frame, decode_frame
+
+wire = encode_frame(command_id=0x0201, payload=robot_status_bytes, sequence=0)
+frame = decode_frame(wire)
+assert frame.command_id == 0x0201
+```
+
+帧封装依据官方 RoboMaster 2026 通信协议 V1.1.0（20251217）的第 4 页及
+第 77–82 页；官方版本入口见 [RoboMaster 文档](https://bbs.robomaster.com/wiki/20204847/811363)。
+接口使用帧头 `0xa5`、小端 payload 长度、8-bit 序号、CRC8、
+小端 command ID、payload 与 CRC16。CRC 算法来自锁定的 MIT `crccheck 1.3.1`，
+CRC8 初值为 `0xff`，CRC16 初值为 `0xffff`，无最终 XOR。
+当前支持完整帧最多 128 字节（payload 最多 119 字节）；这是公开的模型准入范围。
+参数必须为整数或不可变 `bytes`，bool、越界、截断、多余尾部及 CRC 错误直接拒绝。
+
+`payload` 保持不透明，调用者须按所选协议版本填入准确的数据。接口不判断 command
+是否受固件支持，不自动递增序号，不解析连续 UART 流，也不拥有 UART/socket。
+具体命令 schema、规则状态、定时发送、UART endpoint 与赛场仍待独立接入；
+不能把帧校验通过作为规则正确或真实裁判系统的验证。
+
 ## Contents
 
 - [项目范围](#project-scope)
@@ -213,6 +238,7 @@ ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控
 - [首次验证](#first-validation)
 - [运行固件](#run-firmware)
 - [Robot 配置](#robot-manifest)
+- [裁判帧封装](#referee-protocol)
 - [Flash 镜像](#flash-images)
 - [串口、QMP 与 GDB](#serial-qmp-and-gdb)
 - [外部仿真 worker](#external-simulation-worker)
