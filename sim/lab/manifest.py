@@ -11,23 +11,19 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-import yaml
-from yaml.events import AliasEvent
+from sim.manifest import (MAX_FILE_BYTES, ManifestError, fields as _fields,
+                          load_document, readable_file as _readable_file,
+                          text_bytes as _text)
 
 from sim.boards import validate_gpio_pin
 from sim.fabric import CanFrame
 from sim.fabric.frame import CAN_EFF_MASK, CAN_SFF_MASK, WIRE_EXTENDED, WIRE_FD
 
-MAX_FILE_BYTES = 1 << 20
 MAX_ITEMS = 1024
 MAX_TEXT_BYTES = 4096
 MAX_TIME_NS = 3600 * 1_000_000_000
 _UARTS = frozenset(("uart1", "uart2", "uart3", "uart5", "uart7", "uart10"))
 _CANS = frozenset(("can1", "can2", "can3"))
-
-
-class ManifestError(ValueError):
-    """The complete Lab configuration was rejected before runtime admission."""
 
 
 @dataclass(frozen=True)
@@ -82,73 +78,10 @@ class LabManifest:
     ready: Ready | None = None
 
 
-class _LabLoader(yaml.SafeLoader):
-    """Use PyYAML safe constructors with bounded composition and unique keys."""
-
-    def __init__(self, stream):
-        super().__init__(stream)
-        self._depth = 0
-        self._nodes = 0
-
-    def compose_node(self, parent, index):
-        if self.check_event(AliasEvent) or self.peek_event().anchor is not None:
-            raise ManifestError("YAML anchors and aliases are not supported")
-        self._nodes += 1
-        if self._nodes > 40000:
-            raise ManifestError("YAML node limit exceeded")
-        self._depth += 1
-        try:
-            if self._depth > 16:
-                raise ManifestError("YAML nesting limit exceeded")
-            return super().compose_node(parent, index)
-        finally:
-            self._depth -= 1
-
-
-def _unique_mapping(loader, node):
-    result = {}
-    for key_node, value_node in node.value:
-        key = loader.construct_object(key_node)
-        if type(key) is not str:
-            raise ManifestError("YAML mapping keys must be strings")
-        if key in result:
-            raise ManifestError(f"duplicate YAML key: {key}")
-        result[key] = loader.construct_object(value_node)
-    return result
-
-
-_LabLoader.add_constructor("tag:yaml.org,2002:map", _unique_mapping)
-
-
-def _fields(value, allowed, required, label: str) -> dict:
-    if type(value) is not dict:
-        raise ManifestError(f"{label} must be a mapping")
-    unknown = set(value) - set(allowed)
-    missing = set(required) - set(value)
-    if unknown:
-        raise ManifestError(f"{label} has unknown fields: {', '.join(sorted(unknown))}")
-    if missing:
-        raise ManifestError(f"{label} is missing fields: {', '.join(sorted(missing))}")
-    return value
-
-
 def _integer(value, maximum: int, label: str) -> int:
     if type(value) is not int or not 0 <= value <= maximum:
         raise ManifestError(f"{label} must be an integer in 0..{maximum}")
     return value
-
-
-def _text(value, label: str, *, empty: bool = False,
-          maximum: int = MAX_TEXT_BYTES) -> bytes:
-    if type(value) is not str:
-        raise ManifestError(f"{label} must be a string")
-    try:
-        encoded = value.encode("utf-8")
-    except UnicodeError as error:
-        raise ManifestError(f"{label} must be valid UTF-8") from error
-    if len(encoded) > maximum or (not empty and not encoded):
-        raise ManifestError(f"{label} must contain {'0' if empty else '1'}..{maximum} UTF-8 bytes")
-    return encoded
 
 
 def _time(value, label: str, *, zero: bool = True) -> int:
@@ -274,36 +207,9 @@ def _items(value, label: str) -> list:
     return value
 
 
-def _readable_file(path: Path, label: str) -> Path:
-    try:
-        resolved = path.resolve(strict=True)
-        if not resolved.is_file():
-            raise ManifestError(f"{label} must be a regular file")
-        with resolved.open("rb"):
-            pass
-    except (OSError, ValueError, RuntimeError) as error:
-        if isinstance(error, ManifestError):
-            raise
-        raise ManifestError(f"{label} cannot be opened: {error}") from error
-    return resolved
-
-
 def load_manifest(path: str | Path) -> LabManifest:
     """Read one UTF-8 YAML file and admit schema 1 without runtime side effects."""
-    if not isinstance(path, (str, Path)):
-        raise ManifestError("manifest path must be a string or Path")
-    manifest_path = _readable_file(Path(path), "manifest")
-    try:
-        with manifest_path.open("rb") as source:
-            raw = source.read(MAX_FILE_BYTES + 1)
-        if len(raw) > MAX_FILE_BYTES:
-            raise ManifestError("manifest exceeds 1 MiB")
-        # _LabLoader inherits only safe_load's SafeLoader constructors.
-        document = yaml.load(raw.decode("utf-8"), Loader=_LabLoader)
-    except (OSError, UnicodeError, yaml.YAMLError, ValueError, TypeError, KeyError) as error:
-        if isinstance(error, ManifestError):
-            raise
-        raise ManifestError(f"cannot parse manifest: {error}") from error
+    manifest_path, document = load_document(path)
     item = _fields(document, ("schema", "name", "board", "firmware", "duration",
                               "stimulus", "assertions", "ready"),
                    ("schema", "name", "board", "firmware"), "manifest")

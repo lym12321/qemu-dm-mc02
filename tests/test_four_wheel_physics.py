@@ -24,6 +24,39 @@ JOINTS = {f"wheel_{corner}": f"drive_{corner}" for corner in CORNERS}
 IMUS = {"imu": ("imu_gyro", "imu_accel")}
 
 
+def test_robot_manifest_model_is_consumed_by_existing_native_profile(tmp_path):
+    from sim.robots.four_wheel import create_four_wheel_plant
+    from sim.robots.manifest import load_manifest
+
+    (tmp_path / "firmware.elf").write_bytes(b"path admission fixture")
+    path = tmp_path / "robot.yaml"
+    path.write_text(f"""schema: 1
+robot: {{name: native-profile}}
+boards: {{main: {{type: qemu, board: dm-mc02, firmware: firmware.elf}}}}
+buses: {{drive: {{type: can}}}}
+links: [{{from: main.fdcan1, to: drive}}]
+devices:
+  fl: {{type: dji-m3508, bus: drive, id: 1, joint: wheel_fl}}
+  fr: {{type: dji-m3508, bus: drive, id: 2, joint: wheel_fr}}
+  rl: {{type: dji-m3508, bus: drive, id: 3, joint: wheel_rl}}
+  rr: {{type: dji-m3508, bus: drive, id: 4, joint: wheel_rr}}
+physics: {{backend: mujoco, model: {MODEL}}}
+""")
+    manifest = load_manifest(path)
+    plant = create_four_wheel_plant(manifest.physics.model)
+    try:
+        assert tuple(device.motor_id for device in plant.devices) == (1, 2, 3, 4)
+        for device in manifest.devices:
+            state = plant.physics.get_joint_state(device.joint)
+            assert math.isfinite(state.position_rad) and math.isfinite(state.velocity_rad_s)
+        sample = plant.physics.get_imu("imu")
+        assert all(math.isfinite(value) for value in (*sample.gyro_rad_s, *sample.accel_m_s2))
+        assert plant.physics.time_s == 0
+    finally:
+        plant.close()
+    assert plant.closed and all(device.closed for device in plant.devices)
+
+
 def test_native_named_geometry_actuation_and_world_axes():
     model = mujoco.MjModel.from_xml_path(str(MODEL))
     data = mujoco.MjData(model)
