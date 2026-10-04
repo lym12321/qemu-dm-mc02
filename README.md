@@ -78,6 +78,7 @@ bash tools/run-trobot-business.sh
 | --- | --- |
 | `qemu/upstream/` | 固定版本的 QEMU fork、STM32H723/DM-MC02 模型与 QEMU 原生测试 |
 | `cosim/` | 板卡无关的协议、数据模型与 transport adapter |
+| `sim/` | 通用 coordinator、transport、CAN Fabric、虚拟器件与简单 plant |
 | `tools/` | 构建、QMP、worker、性能采样、源码包和统一测试门禁 |
 | `tests/` | Host、Python 与协议测试 |
 | `flake.nix`、`flake.lock` | 固定的 Nix 构建与测试环境 |

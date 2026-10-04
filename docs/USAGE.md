@@ -692,6 +692,7 @@ EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被
 | --- | --- |
 | `qemu/upstream/` | 固定的 QEMU fork、芯片/板级模型和 QEMU 原生测试 |
 | `cosim/` | 板卡无关的 C 模型、wire protocol 与 transport adapter |
+| `sim/` | 通用 host coordinator、transport、CAN Fabric、器件和简单 plant |
 | `tools/` | 构建、worker、QMP、RTF、源码包和测试 gate |
 | `tests/` | Host C、Python 与协议测试 |
 | `flake.nix`、`flake.lock` | Nix 环境与依赖锁定 |
@@ -726,3 +727,31 @@ M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输�
 RESET 保留 transport 的 partial bytes，并更新 QEMU/worker 时间原点。CAN wire 没有
 session 标识，因此不提供跨 reset 的 CAN 历史输入隔离。这个调度不提供位级仲裁、
 真实电气总线、CPU 全局锁步或实物电机标定。
+
+### trobot DJI driver test
+
+使用默认关闭的专用固件验证实际 `motor::dji` 驱动。普通业务 preset 不启用它，
+`DjiTest` 与 `MotorTest` 不能同时选择：
+
+```bash
+cd ../trobot
+cmake --preset DjiTestDebug
+cmake --build --preset DjiTestDebug --clean-first
+cmake --preset DjiTestRelease
+cmake --build --preset DjiTestRelease
+cd ../dm-mc02-qemu
+bash tools/run-trobot-dji-test.sh ../trobot/build/DjiTestRelease/trobot.elf \
+  build/test-results/trobot-dji.json ../trobot
+```
+
+第三个参数是产生 ELF 的固件源码目录，报告保存实际文件哈希；使用独立构建副本时，
+应传该副本。可用 Debug ELF 和 `QEMU_SYSTEM_ARM` 指定的 QEMU 重复验证。
+runner 通过 ID1/ID5 覆盖两个电流命令组，独立 literal 反馈检查实际角度、转子 RPM、
+减速后速度、电流和转矩解码，再检查正反向输出、禁用、重新启用、定向掉线与恢复。
+掉线阶段只丢弃 `0x201`，保留 `0x205`；固件持续刷新命令，证明 50 ms 反馈超时
+导致实际驱动任务清零。报告同时保留真实零电流 wire、冻结的反馈时间戳与新鲜命令时间。
+
+夹具用 QEMU CAN 时间戳决定可推进的 1 ms host ticks，同一 tick 的两个命令组只推进
+一次；tick 内到达的命令在下一边界交付，最多量化 1 ms。它不建立 CPU/plant 全局锁步。
+观测与追赶有界，FAIL、缺失项、清理失败或输入哈希变化均返回非零并保留报告；实物
+plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续性能门分别执行。
