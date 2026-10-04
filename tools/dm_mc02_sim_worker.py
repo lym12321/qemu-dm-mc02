@@ -28,6 +28,7 @@ from sim.transports import (
     DatagramTransport, FixedRecordStream, LengthPrefixedStream,
     connect_unix as transport_connect_unix, send_datagram,
 )
+from sim.core import StepResult
 
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
@@ -1287,6 +1288,7 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
     socketcan_sock = None
     engine = None
     can_runtime = None
+    can_runtime_close = None
     primary_error = None
     try:
         cosim_sock = connect_unix(args.cosim, args.connect_timeout)
@@ -1302,8 +1304,10 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
         coordinator = StepCoordinator(engine, motor_adapter)
         if can_factory is not None:
             can_runtime = can_factory(can, socketcan_tx)
+            # Resolve cleanup before any other plugin-owned descriptor.
+            can_runtime_close = getattr(can_runtime, "close", None)
             if any(not callable(getattr(can_runtime, name, None)) for name in
-                   ("reset", "step", "ingest_qemu", "ingest_socketcan", "close")):
+                   ("reset", "step", "ingest_qemu", "ingest_socketcan")) or not callable(can_runtime_close):
                 raise TypeError("CAN runtime requires reset/step/ingress/close methods")
         cosim_sock.setblocking(False)
         # The initial telemetry timestamp is the best available common clock
@@ -1541,7 +1545,11 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
                                adc_count + 1)
             virtual_time_ns += step_span_ns
             if can_runtime is not None:
-                can_runtime.step(step_span_ns)
+                result = can_runtime.step(step_span_ns)
+                if (not isinstance(result, StepResult) or result.status != "ok"
+                        or type(result.reached_time_ns) is not int
+                        or result.reached_time_ns != virtual_time_ns):
+                    raise RuntimeError(f"CAN runtime did not reach target: {result!r}")
             if args.protocol == "v1":
                 for input_index, (channel, raw) in enumerate(
                         args.adc_input_values):
@@ -1629,6 +1637,8 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
             socketcan_tx.drain()
     except BaseException as exc:
         primary_error = exc
+        if can_runtime is not None and not callable(can_runtime_close):
+            exc.add_note("CAN runtime cleanup unavailable: no callable close obtained")
         raise
     finally:
         cleanup_errors = []
@@ -1640,7 +1650,8 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
             if resource is None:
                 continue
             try:
-                close = getattr(resource, "close", None)
+                close = (can_runtime_close if name == "CAN runtime"
+                         else getattr(resource, "close", None))
                 if callable(close):
                     close()
             except BaseException as exc:

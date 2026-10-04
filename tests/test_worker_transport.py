@@ -325,6 +325,38 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(self.engine.close_calls, 0)
         self.assertTrue(all(sock.fileno() >= 0 for sock in self.sockets))
 
+    def test_can_runtime_descriptor_failure_uses_captured_cleanup(self):
+        calls = []
+        class InvalidRuntime:
+            @property
+            def close(self):
+                calls.append('resolve')
+                if len(calls) != 1:
+                    raise AssertionError('close descriptor looked up again')
+                return lambda: calls.append('close')
+            @property
+            def reset(self):
+                raise OSError('runtime descriptor failed')
+        with self.assertRaisesRegex(OSError, 'runtime descriptor failed'):
+            worker.run(self.args, can_factory=lambda can, tx: InvalidRuntime())
+        self.assertEqual(calls, ['resolve', 'close'])
+        self._assert_closed()
+
+    def test_can_runtime_failed_step_cannot_publish_cosim_step(self):
+        from sim.core import StepResult
+        calls = []
+        runtime = SimpleNamespace(
+            reset=lambda *args: None, step=lambda dt: StepResult('failed', dt),
+            ingest_qemu=lambda *args: None, ingest_socketcan=lambda *args: None,
+            close=lambda: calls.append('close'))
+        self.peers[0].sendall(self._reset_ack())
+        with self.assertRaisesRegex(RuntimeError, 'CAN runtime did not reach target'):
+            worker.run(self.args, can_factory=lambda can, tx: runtime)
+        self.assertEqual(self.peers[0].recv(4096), self._reset_wire())
+        self.assertEqual(calls, ['close'])
+        self.assertEqual(self.engine.step_calls, 1)
+        self._assert_closed()
+
     def test_initial_reset_invalid_ack_closes_all_resources(self):
         self.peers[0].sendall(self._reset_ack(reserved=1))
         with self.assertRaisesRegex(worker.step_protocol.StepProtocolError,
