@@ -858,8 +858,93 @@ static void test_common_multimode_dma_request_cache_key(void)
     qtest_quit(qts);
 }
 
+static void test_common_unsupported_resolution_admission(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02,adc-accurate-timing=on,adc-dma-endpoint=on");
+    const unsigned duals[] = { 0x6, 0x7 };
+    const uint32_t buffer = 0x20000100;
+    const uint8_t sentinel[] = { 0x12, 0x34, 0x56, 0x78 };
+
+    for (unsigned mode = 0; mode < ARRAY_SIZE(duals); ++mode) {
+        for (unsigned external = 0; external < 2; ++external) {
+            for (unsigned invalid_adc = 0; invalid_adc < 2; ++invalid_adc) {
+                for (unsigned code = 4; code < 8; ++code) {
+                    uint32_t cfgr = external ? (7u << 5) | (1u << 10) : 0;
+                    uint8_t bytes[sizeof(sentinel)];
+
+                    qtest_qmp_assert_success(qts,
+                        "{ 'execute': 'system_reset' }");
+                    configure_adc_pll2p(qts);
+                    configure_timer_fixture_clock(qts);
+                    qtest_writel(qts, ADC12_CCR, duals[mode] | (2u << 14));
+                    qtest_writel(qts, ADC1_SQR1, 0);
+                    qtest_writel(qts, ADC2_SQR1, 0);
+                    qtest_writel(qts, ADC1_CFGR,
+                                 cfgr | 1u | (invalid_adc == 0 ? code << 2 : 0));
+                    qtest_writel(qts, ADC2_CFGR,
+                                 cfgr | (invalid_adc == 1 ? code << 2 : 0));
+                    qtest_writel(qts, DMAMUX1_BASE + 8, 9u);
+                    qtest_writel(qts, DMA1_S2PAR,
+                                 mode ? ADC12_CDR2 : ADC12_CDR);
+                    qtest_writel(qts, DMA1_S2M0AR, buffer);
+                    qtest_writel(qts, DMA1_S2NDTR, 1);
+                    qtest_memwrite(qts, buffer, sentinel, sizeof(sentinel));
+                    qtest_writel(qts, DMA1_S2CR,
+                                 DMA_CR_EN | DMA_CR_PSIZE_32 | DMA_CR_MSIZE_32);
+
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
+                                 (external ? ADC_CR_ADSTART : 0));
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+                    if (external) {
+                        qtest_writel(qts, TIM8_CR2, 2u << 4);
+                        qtest_writel(qts, TIM8_EGR, 1u);
+                    } else {
+                        g_assert_false(qtest_readl(qts, ADC1_CR) &
+                                       ADC_CR_ADSTART);
+                    }
+                    qtest_clock_step(qts, 100000);
+                    g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
+                    g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
+                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==, 0);
+                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, 0);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 1);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_LISR), ==, 0);
+                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
+                    g_assert_cmpmem(bytes, sizeof(bytes), sentinel,
+                                    sizeof(sentinel));
+
+                    /* Stop any valid armed peer before fixing RES; the
+                     * repaired pair must produce data through the same DMA. */
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
+                    qtest_writel(qts, ADC1_CFGR, cfgr | 1u);
+                    qtest_writel(qts, ADC2_CFGR, cfgr);
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
+                                 (external ? ADC_CR_ADSTART : 0));
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+                    if (external) {
+                        qtest_writel(qts, TIM8_EGR, 1u);
+                    }
+                    qtest_clock_step(qts, 6000);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 0);
+                    g_assert_true(qtest_readl(qts, DMA1_LISR) & (1u << 21));
+                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
+                    g_assert_cmphex(bytes[0], ==, 0x00);
+                    g_assert_cmphex(bytes[1], ==, 0x01);
+                    g_assert_cmphex(bytes[2], ==, 0x00);
+                    g_assert_cmphex(bytes[3], ==, mode ? 0x00 : 0x01);
+                }
+            }
+        }
+    }
+    qtest_quit(qts);
+}
+
 void dm_mc02_adc_register_common_tests(void)
 {
+    g_test_add_func("/dm-mc02/adc/common-unsupported-resolution-admission",
+                    test_common_unsupported_resolution_admission);
     g_test_add_func("/dm-mc02/adc/adc2-regular-conversion-independent",
                     test_adc2_regular_conversion_is_independent);
     g_test_add_func("/dm-mc02/adc/common-csr-status-projection",

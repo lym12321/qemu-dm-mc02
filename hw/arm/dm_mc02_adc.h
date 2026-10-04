@@ -16,6 +16,9 @@
 #define DM_MC02_ADC_CHANNEL_COUNT 32
 #define DM_MC02_ADC_IRQ 18
 #define DM_MC02_ADC_LINEAR_CALIBRATION_WORDS 6
+#define DM_MC02_ADC_CFGR_OFFSET 0x0c
+#define DM_MC02_ADC_CFGR_RES_SHIFT 2
+#define DM_MC02_ADC_CFGR_RES_MASK (7u << DM_MC02_ADC_CFGR_RES_SHIFT)
 
 typedef struct DmMc02AdcRegularSample {
     /* Non-zero only for a common-owned regular ADC pair. */
@@ -150,6 +153,19 @@ typedef struct DmMc02Adc {
     unsigned regular_trigger_source;
 } DmMc02Adc;
 
+/* ST H723 CMSIS ADC_CFGR_RES_Msk=0x1c.  RES fits in the low byte of
+ * the little-endian register mirror; codes 4..7 are not modeled. */
+static inline unsigned dm_mc02_adc_resolution_code(const DmMc02Adc *state)
+{
+    return (state->regs[DM_MC02_ADC_CFGR_OFFSET] &
+            DM_MC02_ADC_CFGR_RES_MASK) >> DM_MC02_ADC_CFGR_RES_SHIFT;
+}
+
+static inline bool dm_mc02_adc_resolution_supported(const DmMc02Adc *state)
+{
+    return state && dm_mc02_adc_resolution_code(state) < 4;
+}
+
 void dm_mc02_adc_init(DmMc02Adc *state, Object *owner, const char *name);
 void dm_mc02_adc_reset(DmMc02Adc *state);
 void dm_mc02_adc_set_clock_hz(DmMc02Adc *state, uint64_t clock_hz);
@@ -223,7 +239,8 @@ void dm_mc02_adc_start(DmMc02Adc *state);
 /* Start a software regular conversion at an absolute virtual timestamp.
  * This is used by the ADC common interleaved boundary to model the delayed
  * slave sampling phase.  The ADC is armed immediately, but no conversion
- * cycles are consumed before start_ns. */
+ * cycles are consumed before start_ns.  An unsupported RES is rejected
+ * before changing conversion identity or runtime state. */
 bool dm_mc02_adc_start_regular_at(DmMc02Adc *state, uint64_t conversion_id,
                                   uint64_t start_ns);
 void dm_mc02_adc_stop(DmMc02Adc *state);
@@ -280,7 +297,9 @@ bool dm_mc02_adc_external_trigger_with_id_at(
     uint64_t conversion_id);
 
 /* Resolve the slave sampling start from a master trigger/start timestamp.
- * The result is UINT64_MAX when the ADC kernel clock is stopped. */
+ * The result is UINT64_MAX for an absent ADC, unsupported RES or stopped
+ * kernel clock.  Callers must check RES support before using a clock-stop
+ * fallback. */
 uint64_t dm_mc02_adc_interleaved_slave_start_ns(
     const DmMc02Adc *state, uint64_t master_start_ns,
     unsigned delay_code);

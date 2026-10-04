@@ -10,11 +10,12 @@
  */
 #include "qemu/osdep.h"
 #include "hw/arm/dm_mc02_adc.h"
+#include "qemu/log.h"
 
 #define ADC_ISR  0x00
 #define ADC_IER  0x04
 #define ADC_CR   0x08
-#define ADC_CFGR 0x0c
+#define ADC_CFGR DM_MC02_ADC_CFGR_OFFSET
 #define ADC_SMPR1 0x14
 #define ADC_SMPR2 0x18
 #define ADC_SQR1 0x30
@@ -81,8 +82,6 @@
 
 /* STM32H7 ADC_CFGR uses DMA[1:0] at bits 1:0 for data management. */
 #define ADC_CFGR_DMA_MASK    (3u << 0)
-#define ADC_CFGR_RES_SHIFT   2
-#define ADC_CFGR_RES_MASK    (3u << ADC_CFGR_RES_SHIFT)
 #define ADC_CFGR_CONT        (1u << 13)
 #define ADC_CFGR_AUTDLY      (1u << 14)
 #define ADC_CFGR_OVRMOD      (1u << 12)
@@ -228,6 +227,16 @@ static bool adc_regular_conversion_ongoing(const DmMc02Adc *s)
 static bool adc_injected_conversion_ongoing(const DmMc02Adc *s)
 {
     return adc_load(s, ADC_CR, sizeof(uint32_t)) & ADC_CR_JADSTART;
+}
+
+static bool adc_resolution_start_allowed(const DmMc02Adc *s)
+{
+    if (dm_mc02_adc_resolution_supported(s)) {
+        return true;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "H723 ADC: unsupported CFGR.RES=%u\n",
+                  dm_mc02_adc_resolution_code(s));
+    return false;
 }
 
 static bool adc_calibration_factor_write_allowed(const DmMc02Adc *s)
@@ -424,13 +433,12 @@ static unsigned adc_injected_sequence_channel(const DmMc02Adc *s,
 
 static unsigned adc_conversion_half_cycles(const DmMc02Adc *s)
 {
-    /* H723 ADC1/2 RES encodes 16, 14, 12 and 10 bits respectively.  The
-     * processing time is resolution + 0.5 ADC clocks (ST HAL/LL ADC). */
+    /* Processing timing is the existing N + 0.5 clock approximation;
+     * the separate timing slice corrects this from the H723 manual. */
     static const uint8_t cycles[] = { 33, 29, 25, 21 };
-    unsigned resolution = (adc_load(s, ADC_CFGR, 4) & ADC_CFGR_RES_MASK) >>
-                          ADC_CFGR_RES_SHIFT;
+    unsigned resolution = dm_mc02_adc_resolution_code(s);
 
-    return cycles[resolution];
+    return resolution < ARRAY_SIZE(cycles) ? cycles[resolution] : 0;
 }
 
 static uint64_t adc_rank_half_cycles(const DmMc02Adc *s, unsigned rank)
@@ -856,13 +864,6 @@ static uint64_t adc_rank_period_ns(const DmMc02Adc *s, unsigned rank)
     return adc_half_cycles_to_ns(s, adc_rank_half_cycles(s, rank));
 }
 
-static unsigned adc_resolution_index(const DmMc02Adc *s)
-{
-    /* H7 encoding is 00=16-bit, 01=14-bit, 10=12-bit, 11=10-bit. */
-    return (adc_load(s, ADC_CFGR, 4) & ADC_CFGR_RES_MASK) >>
-           ADC_CFGR_RES_SHIFT;
-}
-
 static uint64_t adc_interleaved_delay_half_cycles(const DmMc02Adc *s,
                                                   unsigned delay_code)
 {
@@ -876,9 +877,11 @@ static uint64_t adc_interleaved_delay_half_cycles(const DmMc02Adc *s,
         { 3, 5, 7, 9, 11, 13, 13, 13, 13 }, /* 12-bit */
         { 3, 5, 7, 9, 11, 11, 11, 11, 11 }, /* 10-bit */
     };
-    unsigned resolution = adc_resolution_index(s);
+    unsigned resolution = dm_mc02_adc_resolution_code(s);
 
-    resolution = MIN(resolution, ARRAY_SIZE(delay_half_cycles) - 1);
+    if (resolution >= ARRAY_SIZE(delay_half_cycles)) {
+        return 0;
+    }
     delay_code = MIN(delay_code, ARRAY_SIZE(delay_half_cycles[0]) - 1);
     return delay_half_cycles[resolution][delay_code];
 }
@@ -890,7 +893,7 @@ uint64_t dm_mc02_adc_interleaved_slave_start_ns(
     unsigned sampling_code;
     uint64_t phase_half_cycles;
 
-    if (!state || !state->clock_hz) {
+    if (!dm_mc02_adc_resolution_supported(state) || !state->clock_hz) {
         return UINT64_MAX;
     }
     channel = state->legacy_samples ? 0 :
@@ -1175,7 +1178,7 @@ static bool adc_start_automatic_injected_conversion(DmMc02Adc *s)
     }
     cr = adc_load(s, ADC_CR, 4);
     if (!(cr & ADC_CR_ADEN) || (cr & ADC_CR_ADCAL) ||
-        s->calibration_active) {
+        s->calibration_active || !adc_resolution_start_allowed(s)) {
         return false;
     }
     s->current_injected_rank = 0;
@@ -1658,7 +1661,7 @@ static void adc_start_conversion(DmMc02Adc *s)
     uint32_t cr = adc_load(s, ADC_CR, 4);
 
     if (!(cr & ADC_CR_ADEN) || (cr & ADC_CR_ADCAL) ||
-        s->calibration_active) {
+        s->calibration_active || !adc_resolution_start_allowed(s)) {
         return;
     }
     /* EXTEN=0 is the software-start path.  For an external trigger, ADSTART
@@ -1690,7 +1693,7 @@ static void adc_start_injected_conversion(DmMc02Adc *s)
 
     if (!(cr & ADC_CR_ADEN) || (cr & ADC_CR_ADCAL) ||
         s->calibration_active || (cfgr & ADC_CFGR_JAUTO) ||
-        !adc_injected_start_allowed(s)) {
+        !adc_injected_start_allowed(s) || !adc_resolution_start_allowed(s)) {
         return;
     }
     if ((adc_injected_context_register(s) & ADC_JSQR_JEXTEN_MASK) != 0) {
@@ -1713,7 +1716,7 @@ static bool adc_external_trigger_event(DmMc02Adc *s,
     unsigned exten;
     unsigned sequence_length;
 
-    if (!s || !event) {
+    if (!s || !event || !adc_resolution_start_allowed(s)) {
         return false;
     }
     cfgr = adc_load(s, ADC_CFGR, 4);
@@ -1784,7 +1787,7 @@ static bool adc_injected_external_trigger_event(
     unsigned injected_source;
     bool discontinuous;
 
-    if (!s || !event) {
+    if (!s || !event || !adc_resolution_start_allowed(s)) {
         return false;
     }
     jsqr = adc_injected_context_register(s);
@@ -2014,12 +2017,25 @@ static void dm_mc02_adc_write(void *opaque, hwaddr offset, uint64_t value,
         }
         if (adc_range_overlaps(offset, size, ADC_CFGR)) {
             uint32_t old_cfgr = adc_load(s, ADC_CFGR, 4);
+            uint32_t cfgr;
 
             adc_store(s, offset, value, size);
+            cfgr = adc_load(s, ADC_CFGR, 4);
+            /* ST LL_ADC_SetResolution(): neither conversion group may
+             * be ongoing when RES changes, including an armed group. */
+            if (((old_cfgr ^ cfgr) & DM_MC02_ADC_CFGR_RES_MASK) &&
+                (adc_regular_conversion_ongoing(s) ||
+                 adc_injected_conversion_ongoing(s))) {
+                cfgr = (cfgr & ~DM_MC02_ADC_CFGR_RES_MASK) |
+                       (old_cfgr & DM_MC02_ADC_CFGR_RES_MASK);
+                adc_store(s, ADC_CFGR, cfgr, 4);
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "H723 ADC: RES change while conversion armed\n");
+            }
             if ((old_cfgr ^ adc_load(s, ADC_CFGR, 4)) & ADC_CFGR_JQDIS) {
                 if (adc_regular_conversion_ongoing(s) ||
                     adc_injected_conversion_ongoing(s)) {
-                    uint32_t cfgr = adc_load(s, ADC_CFGR, 4);
+                    cfgr = adc_load(s, ADC_CFGR, 4);
 
                     if (old_cfgr & ADC_CFGR_JQDIS) {
                         cfgr |= ADC_CFGR_JQDIS;
@@ -2151,6 +2167,9 @@ static void dm_mc02_adc_write(void *opaque, hwaddr offset, uint64_t value,
             stop_regular = true;
             stop_injected = true;
         }
+    } else if ((commands & (ADC_CR_ADSTART | ADC_CR_JADSTART)) &&
+               !adc_resolution_start_allowed(s)) {
+        cr &= ~(ADC_CR_ADSTART | ADC_CR_JADSTART);
     } else {
         /* Regular and injected starts are separate group commands.  The
          * groups have independent timers, status flags, and stop commands. */
@@ -2588,7 +2607,12 @@ void dm_mc02_adc_clear_board_source(DmMc02Adc *state, uint16_t channel)
 
 void dm_mc02_adc_start(DmMc02Adc *state)
 {
-    uint32_t cr = adc_load(state, ADC_CR, 4);
+    uint32_t cr;
+
+    if (!state || !adc_resolution_start_allowed(state)) {
+        return;
+    }
+    cr = adc_load(state, ADC_CR, 4);
 
     cr |= ADC_CR_ADEN | ADC_CR_ADSTART;
     adc_store(state, ADC_CR, cr, 4);
@@ -2609,7 +2633,8 @@ bool dm_mc02_adc_start_regular_at(DmMc02Adc *state, uint64_t conversion_id,
     cr = adc_load(state, ADC_CR, 4);
     if (!(cr & ADC_CR_ADEN) || (cr & ADC_CR_ADCAL) ||
         state->calibration_active || state->conversion_active ||
-        (adc_load(state, ADC_CFGR, 4) & ADC_CFGR_EXTEN_MASK)) {
+        (adc_load(state, ADC_CFGR, 4) & ADC_CFGR_EXTEN_MASK) ||
+        !adc_resolution_start_allowed(state)) {
         return false;
     }
 

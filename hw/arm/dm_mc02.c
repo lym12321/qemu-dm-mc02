@@ -2178,6 +2178,19 @@ static void dm_mc02_adc_common_cdr2_read(void *opaque, unsigned source)
     dm_mc02_adc_acknowledge_regular_data(&s->adc[source]);
 }
 
+static bool dm_mc02_adc_common_resolutions_supported(DmMc02MachineState *s)
+{
+    if (dm_mc02_adc_resolution_supported(&s->adc[0]) &&
+        dm_mc02_adc_resolution_supported(&s->adc[1])) {
+        return true;
+    }
+    qemu_log_mask(LOG_GUEST_ERROR,
+                  "DM-MC02 ADC common: unsupported RES pair (%u, %u)\n",
+                  dm_mc02_adc_resolution_code(&s->adc[0]),
+                  dm_mc02_adc_resolution_code(&s->adc[1]));
+    return false;
+}
+
 static bool dm_mc02_adc_common_start_peer(void *opaque, unsigned source,
                                            uint64_t conversion_id)
 {
@@ -2189,7 +2202,8 @@ static bool dm_mc02_adc_common_start_peer(void *opaque, unsigned source,
     if (!s || source != 1) {
         return false;
     }
-    if (!dm_mc02_adc_enabled(&s->adc[1])) {
+    if (!dm_mc02_adc_enabled(&s->adc[1]) ||
+        !dm_mc02_adc_common_resolutions_supported(s)) {
         return false;
     }
     /* Seed both independent ADC kernels before starting the slave.  The
@@ -2223,7 +2237,8 @@ static bool dm_mc02_adc_common_external_trigger_peer(
     uint64_t conversion_start_ns = timestamp_ns;
     unsigned delay_code;
 
-    if (!s || source != 1 || !dm_mc02_adc_enabled(&s->adc[1])) {
+    if (!s || source != 1 || !dm_mc02_adc_enabled(&s->adc[1]) ||
+        !dm_mc02_adc_common_resolutions_supported(s)) {
         return false;
     }
     /* ADC1 owns the common trigger admission.  Start ADC2 through the

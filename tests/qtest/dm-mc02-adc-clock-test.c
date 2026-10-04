@@ -342,8 +342,154 @@ static void test_common_clock_hpre_live_change_preserves_remaining_work(void)
     qtest_quit(qts);
 }
 
+static void test_resolution_readback_and_start_admission(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02,adc-accurate-timing=on");
+    const uint32_t bases[] = { ADC1_BASE, ADC2_BASE };
+
+    /* ST H723 CMSIS defines RES[4:2], not a two-bit field.  Codes 4..7
+     * are outside this model's subset, not all declared silicon-reserved. */
+    for (unsigned adc = 0; adc < ARRAY_SIZE(bases); ++adc) {
+        uint32_t base = bases[adc];
+
+        for (unsigned code = 0; code < 8; ++code) {
+            uint32_t cfgr = ADC_CFGR_JQDIS | (code << 2);
+            uint32_t starts = ADC_CR_ADSTART | ADC_CR_JADSTART;
+
+            qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+            qtest_writel(qts, base + 0x0c, ADC_CFGR_JQDIS);
+            qtest_writeb(qts, base + 0x0c, code << 2);
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==, cfgr);
+            qtest_writew(qts, base + 0x0c, (code << 2) | ADC_CFGR_OVRMOD);
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==,
+                            cfgr | ADC_CFGR_OVRMOD);
+            qtest_writel(qts, base + 0x0c, cfgr);
+            qtest_writel(qts, base + 0x30, 0); /* One regular rank. */
+            qtest_writel(qts, base + 0x4c, 0); /* One injected rank. */
+            qtest_writel(qts, base + 0x08, ADC_CR_ADEN | starts);
+            g_assert_true(qtest_readl(qts, base + 0x08) & ADC_CR_ADEN);
+            g_assert_cmphex(qtest_readl(qts, base + 0x08) & starts, ==,
+                            code < 4 ? starts : 0);
+            qtest_clock_step(qts, 12000);
+            g_assert_cmphex(qtest_readl(qts, base) &
+                            (ADC_ISR_EOC | ADC_ISR_JEOC), ==,
+                            code < 4 ? ADC_ISR_EOC | ADC_ISR_JEOC : 0);
+            g_assert_cmphex(qtest_readl(qts, base + 0x08) & starts, ==, 0);
+        }
+    }
+    qtest_quit(qts);
+}
+
+static void test_unsupported_resolution_preserves_dma_and_prior_result(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02,adc-accurate-timing=on,adc-dma-endpoint=on");
+    const uint32_t buffer = 0x20000100;
+    const uint8_t sentinel[] = { 0x5a, 0xa5 };
+
+    for (unsigned code = 4; code < 8; ++code) {
+        uint8_t bytes[sizeof(sentinel)];
+        uint32_t prior_status;
+
+        qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+        qtest_writel(qts, ADC1_SQR1, 0);
+        qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+        qtest_clock_step(qts, 12000);
+        prior_status = qtest_readl(qts, ADC1_ISR);
+        g_assert_true(prior_status & ADC_ISR_EOC);
+
+        /* Enable DMA while ADC DMA is disabled, so the prior EOC is not a
+         * stream-enable retry.  A rejected conversion must not publish it. */
+        qtest_writel(qts, DMAMUX1_BASE + 8, 9u);
+        qtest_writel(qts, DMA1_S2PAR, ADC1_DR);
+        qtest_writel(qts, DMA1_S2M0AR, buffer);
+        qtest_writel(qts, DMA1_S2NDTR, 1);
+        qtest_memwrite(qts, buffer, sentinel, sizeof(sentinel));
+        qtest_writel(qts, DMA1_S2CR,
+                     DMA_CR_EN | DMA_CR_PSIZE_16 | DMA_CR_MSIZE_16);
+        qtest_writel(qts, ADC1_CFGR, (code << 2) | 1u);
+        qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+        qtest_clock_step(qts, 100000);
+        g_assert_false(qtest_readl(qts, ADC1_CR) & ADC_CR_ADSTART);
+        g_assert_cmphex(qtest_readl(qts, ADC1_ISR), ==, prior_status);
+        qtest_memread(qts, buffer, bytes, sizeof(bytes));
+        g_assert_cmpmem(bytes, sizeof(bytes), sentinel, sizeof(sentinel));
+        g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 1);
+        g_assert_true(qtest_readl(qts, DMA1_S2CR) & DMA_CR_EN);
+        g_assert_cmphex(qtest_readl(qts, DMA1_LISR), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100);
+
+        qtest_writel(qts, ADC1_CFGR, 1u);
+        qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+        qtest_clock_step(qts, 12000);
+        qtest_memread(qts, buffer, bytes, sizeof(bytes));
+        g_assert_cmphex(bytes[0], ==, 0x00);
+        g_assert_cmphex(bytes[1], ==, 0x01);
+        g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 0);
+        g_assert_true(qtest_readl(qts, DMA1_LISR) & (1u << 21)); /* TCIF2. */
+    }
+    qtest_quit(qts);
+}
+
+static void test_resolution_busy_partial_write_protection(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02,adc-accurate-timing=on");
+    const uint32_t bases[] = { ADC1_BASE, ADC2_BASE };
+
+    for (unsigned adc = 0; adc < ARRAY_SIZE(bases); ++adc) {
+        uint32_t base = bases[adc];
+
+        for (unsigned group = 0; group < 4; ++group) {
+            bool injected = group % 2;
+            bool armed = group >= 2;
+            uint32_t start = injected ? ADC_CR_JADSTART : ADC_CR_ADSTART;
+            uint32_t stop = injected ? ADC_CR_JADSTP : ADC_CR_ADSTP;
+            uint32_t cfgr = ADC_CFGR_JQDIS | (1u << 2);
+
+            qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+            if (armed && !injected) {
+                cfgr |= (7u << 5) | (1u << 10);
+            }
+            qtest_writel(qts, base + 0x0c, cfgr);
+            qtest_writel(qts, base + 0x30, 0);
+            qtest_writel(qts, base + 0x4c,
+                         armed && injected ? ADC_JSQR_JEXTEN_RISING : 0);
+            qtest_writel(qts, base + 0x08, ADC_CR_ADEN | start);
+            g_assert_true(qtest_readl(qts, base + 0x08) & start);
+            qtest_writeb(qts, base + 0x0c,
+                         (cfgr & 0xffu) | (7u << 2) | 2u);
+            cfgr |= 2u;
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==, cfgr);
+            qtest_writew(qts, base + 0x0c,
+                         (cfgr & 0xffffu) | (7u << 2) | ADC_CFGR_OVRMOD);
+            cfgr |= ADC_CFGR_OVRMOD;
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==, cfgr);
+            qtest_writel(qts, base + 0x0c,
+                         (cfgr & ~ADC_CFGR_JQDIS) | (7u << 2));
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==, cfgr);
+            qtest_clock_step(qts, 10666); /* Existing (1.5 + 14.5) timing at 1.5 MHz. */
+            g_assert_false(qtest_readl(qts, base) &
+                           (injected ? ADC_ISR_JEOC : ADC_ISR_EOC));
+            qtest_clock_step(qts, 1);
+            g_assert_cmphex(qtest_readl(qts, base) &
+                            (injected ? ADC_ISR_JEOC : ADC_ISR_EOC), ==,
+                            armed ? 0 : injected ? ADC_ISR_JEOC : ADC_ISR_EOC);
+            qtest_writel(qts, base + 0x08, ADC_CR_ADEN | stop);
+            qtest_writel(qts, base + 0x0c, 7u << 2);
+            g_assert_cmphex(qtest_readl(qts, base + 0x0c), ==, 7u << 2);
+        }
+    }
+    qtest_quit(qts);
+}
+
 void dm_mc02_adc_register_clock_tests(void)
 {
+    g_test_add_func("/dm-mc02/adc/resolution-busy-partial-write-protection",
+                    test_resolution_busy_partial_write_protection);
+    g_test_add_func("/dm-mc02/adc/unsupported-resolution-dma-prior-result",
+                    test_unsupported_resolution_preserves_dma_and_prior_result);
+    g_test_add_func("/dm-mc02/adc/resolution-readback-start-admission",
+                    test_resolution_readback_and_start_admission);
     g_test_add_func("/dm-mc02/adc/cpu-pll1-independent",
                     test_cpu_pll1_does_not_disable_adc_clock);
     g_test_add_func("/dm-mc02/adc/kernel-clock-source-timing",

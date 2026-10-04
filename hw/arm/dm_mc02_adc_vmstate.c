@@ -111,6 +111,22 @@ static bool adc_vmstate_timing_valid(const DmMc02Adc *state,
     bool regular_active = state->conversion_active;
     bool injected_active = state->injected_conversion_active;
 
+    /* CFGR.RES[4:2] is three bits (ST H723 CMSIS ADC_CFGR_RES_Msk).
+     * Idle unsupported configurations may be read back or recalibrated, but
+     * cannot restore any armed, active, paused or waiting conversion.  The
+     * regular deadline is also used by calibration, so is not itself a
+     * conversion-state marker. */
+    if (!dm_mc02_adc_resolution_supported(state) &&
+        ((cr & (ADC_VMSTATE_CR_ADSTART | ADC_VMSTATE_CR_JADSTART)) ||
+         regular_active || injected_active ||
+         state->regular_waiting_for_data ||
+         state->regular_sequence_complete ||
+         state->regular_discontinuous_paused ||
+         state->regular_discontinuous_pause_after_data ||
+         state->regular_waiting_for_auto_injected ||
+         state->injected_discontinuous_paused)) {
+        return false;
+    }
     if (state->current_rank >= regular_length ||
         state->current_injected_rank >= injected_length ||
         state->regular_discontinuous_remaining > regular_length) {

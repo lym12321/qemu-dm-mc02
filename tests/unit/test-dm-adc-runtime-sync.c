@@ -15,7 +15,12 @@
 #include <unistd.h>
 
 #define ADC_ISR 0x00
+#define ADC_IER 0x04
 #define ADC_CR  0x08
+#define ADC_CFGR 0x0c
+#define ADC_SMPR1 0x14
+#define ADC_SQR1 0x30
+#define ADC_DR 0x40
 #define ADC_JSQR 0x4c
 #define ADC_JDR1 0x80
 #define ADC_ISR_EOC (1u << 2)
@@ -23,7 +28,32 @@
 #define ADC_CR_ADEN (1u << 0)
 #define ADC_CR_ADSTART (1u << 2)
 #define ADC_CR_JADSTART (1u << 3)
+#define ADC_CR_ADSTP (1u << 4)
+#define ADC_CR_JADSTP (1u << 5)
 #define ADC_CR_ADCAL (1u << 31)
+#define ADC_CFGR_RES_SHIFT 2
+#define ADC_CFGR_RES_MASK (7u << ADC_CFGR_RES_SHIFT)
+#define ADC_CFGR_EXTEN (1u << 10)
+#define ADC_CFGR_CONT (1u << 13)
+#define ADC_CFGR_JAUTO (1u << 25)
+#define ADC_CFGR_JQDIS (1u << 31)
+#define ADC_JSQR_JEXTEN (1u << 7)
+
+/* Independent register/source evidence: ST stm32h723xx.h defines RES_Pos=2
+ * and RES_Msk=0x1c.  ST stm32h7xx_ll_adc.h LL_ADC_RESOLUTION_{16,14,12,10}B
+ * defines codes 000..011, and LL_ADC_SetResolution requires both conversion
+ * groups idle.  Codes 100..111 are unsupported by this model, not a claim
+ * that they are all reserved on H723 silicon. */
+
+extern unsigned dm_adc_test_dma_requests;
+
+typedef struct AdcObserver {
+    unsigned starts;
+    unsigned triggers;
+    unsigned samples;
+    unsigned irq_calls;
+    int irq_level;
+} AdcObserver;
 
 static int temp_fd;
 static int64_t adc_clock_ns;
@@ -40,6 +70,110 @@ static void put_reg(uint8_t *regs, unsigned offset, uint32_t value)
     for (unsigned byte = 0; byte < sizeof(value); ++byte) {
         regs[offset + byte] = value >> (byte * 8);
     }
+}
+
+static uint32_t get_reg(const uint8_t *regs, unsigned offset)
+{
+    uint32_t value = 0;
+
+    for (unsigned byte = 0; byte < sizeof(value); ++byte) {
+        value |= (uint32_t)regs[offset + byte] << (byte * 8);
+    }
+    return value;
+}
+
+static void mmio_write(DmMc02Adc *state, unsigned offset, uint32_t value,
+                       unsigned size)
+{
+    g_assert_nonnull(state->iomem.ops);
+    state->iomem.ops->write(state->iomem.opaque, offset, value, size);
+}
+
+static uint32_t mmio_read(DmMc02Adc *state, unsigned offset, unsigned size)
+{
+    g_assert_nonnull(state->iomem.ops);
+    return state->iomem.ops->read(state->iomem.opaque, offset, size);
+}
+
+static bool observe_start(void *opaque, unsigned adc_index)
+{
+    AdcObserver *observer = opaque;
+
+    g_assert_cmpuint(adc_index, ==, 0);
+    observer->starts++;
+    return true;
+}
+
+static bool observe_trigger(void *opaque, unsigned adc_index,
+                            uint32_t source, bool rising,
+                            unsigned event_count, uint64_t timestamp_ns,
+                            uint64_t *conversion_id)
+{
+    AdcObserver *observer = opaque;
+
+    (void)source;
+    (void)rising;
+    (void)event_count;
+    (void)timestamp_ns;
+    g_assert_cmpuint(adc_index, ==, 0);
+    observer->triggers++;
+    *conversion_id = 1;
+    return true;
+}
+
+static void observe_sample(void *opaque, unsigned adc_index,
+                           const DmMc02AdcRegularSample *sample)
+{
+    AdcObserver *observer = opaque;
+
+    (void)sample;
+    g_assert_cmpuint(adc_index, ==, 0);
+    observer->samples++;
+}
+
+static void observe_irq(void *opaque, int line, int level)
+{
+    AdcObserver *observer = opaque;
+
+    (void)line;
+    observer->irq_calls++;
+    observer->irq_level = level;
+}
+
+static void init_mmio_adc(DmMc02Adc *state)
+{
+    adc_clock_ns = 0;
+    dm_mc02_adc_init(state, NULL, "adc-resolution");
+    dm_mc02_adc_set_clock_hz(state, 100000000);
+    dm_mc02_adc_set_accurate_timing(state, true);
+    mmio_write(state, ADC_SQR1, 0, 4); /* One regular rank, channel zero. */
+    mmio_write(state, ADC_CFGR, ADC_CFGR_JQDIS, 4);
+    mmio_write(state, ADC_JSQR, 0, 4); /* One injected rank, channel zero. */
+    mmio_write(state, ADC_CR, ADC_CR_ADEN, 4);
+}
+
+static void attach_observer(DmMc02Adc *state, AdcObserver *observer,
+                            qemu_irq irq, DmMc02Dma *dma,
+                            DmMc02Dmamux *dmamux)
+{
+    dm_mc02_adc_set_regular_start_callback(state, 0, observe_start, observer);
+    dm_mc02_adc_set_regular_trigger_callback(state, 0, observe_trigger,
+                                             observer);
+    dm_mc02_adc_set_regular_sample_callback(state, 0, observe_sample,
+                                            observer);
+    dm_mc02_adc_set_irq(state, irq);
+    dm_mc02_adc_set_dma(state, dma, dmamux, 9, ADC_DR);
+    dm_adc_test_dma_requests = 0;
+}
+
+static void assert_no_conversion(DmMc02Adc *state)
+{
+    g_assert_false(state->conversion_active);
+    g_assert_false(state->injected_conversion_active);
+    g_assert_false(timer_pending(state->sample_timer));
+    g_assert_false(timer_pending(state->injected_timer));
+    g_assert_cmpuint(state->next_sample_ns, ==, 0);
+    g_assert_cmpuint(state->next_injected_sample_ns, ==, 0);
 }
 
 static QEMUFile *open_test_file(bool write)
@@ -87,6 +221,267 @@ static void free_adc(DmMc02Adc *state)
     timer_free(state->sample_timer);
     timer_free(state->injected_timer);
     timer_free(state->regulator_timer);
+}
+
+static void test_resolution_mmio_readback(void)
+{
+    static const unsigned sizes[] = { 1, 2, 4 };
+
+    g_assert_false(dm_mc02_adc_resolution_supported(NULL));
+    for (unsigned code = 0; code < 8; code++) {
+        for (unsigned index = 0; index < ARRAY_SIZE(sizes); index++) {
+            DmMc02Adc state;
+            unsigned size = sizes[index];
+            uint32_t value = (code << ADC_CFGR_RES_SHIFT) | 1u;
+            uint32_t mask = size == 4 ? UINT32_MAX :
+                            (UINT32_C(1) << (size * 8)) - 1;
+            uint32_t old_cfgr;
+
+            init_mmio_adc(&state);
+            old_cfgr = mmio_read(&state, ADC_CFGR, 4);
+            if (size >= 2) {
+                value |= ADC_CFGR_CONT;
+            }
+            if (size == 4) {
+                value |= ADC_CFGR_JQDIS;
+            }
+            mmio_write(&state, ADC_CFGR, value, size);
+            g_assert_cmphex(mmio_read(&state, ADC_CFGR, 4), ==,
+                            (old_cfgr & ~mask) | (value & mask));
+            g_assert_cmphex(mmio_read(&state, ADC_CFGR, 1) &
+                            ADC_CFGR_RES_MASK, ==,
+                            code << ADC_CFGR_RES_SHIFT);
+            g_assert_cmpint(dm_mc02_adc_resolution_supported(&state), ==,
+                            code < 4);
+            assert_no_conversion(&state);
+            if (code >= 4) {
+                uint32_t disabled_cr;
+
+                dm_mc02_adc_stop(&state);
+                disabled_cr = mmio_read(&state, ADC_CR, 4);
+                g_assert_false(disabled_cr & ADC_CR_ADEN);
+                dm_mc02_adc_start(&state);
+                g_assert_cmphex(mmio_read(&state, ADC_CR, 4), ==, disabled_cr);
+                mmio_write(&state, ADC_CR, ADC_CR_ADEN, size);
+                g_assert_true(mmio_read(&state, ADC_CR, 4) & ADC_CR_ADEN);
+                assert_no_conversion(&state);
+            }
+            free_adc(&state);
+        }
+    }
+}
+
+static void test_unsupported_resolution_starts_preserve_results(void)
+{
+    static const unsigned sizes[] = { 1, 2, 4 };
+
+    for (unsigned code = 4; code < 8; code++) {
+        for (unsigned index = 0; index < ARRAY_SIZE(sizes); index++) {
+            for (unsigned group = 0; group < 3; group++) {
+                DmMc02Adc state;
+                DmMc02Dma dma = { 0 };
+                DmMc02Dmamux dmamux = { 0 };
+                AdcObserver observer = { 0 };
+                qemu_irq irq = qemu_allocate_irq(observe_irq, &observer, 0);
+                uint8_t before[DM_MC02_ADC_REGION_SIZE];
+                uint32_t start = group == 1 ? ADC_CR_JADSTART :
+                                             ADC_CR_ADSTART;
+                uint32_t cfgr = ADC_CFGR_JQDIS | 1u |
+                                (code << ADC_CFGR_RES_SHIFT);
+                unsigned irq_calls;
+
+                init_mmio_adc(&state);
+                if (group == 2) {
+                    cfgr |= ADC_CFGR_JAUTO;
+                }
+                mmio_write(&state, ADC_CFGR, cfgr, 4);
+                put_reg(state.regs, ADC_DR, 0x579b);
+                put_reg(state.regs, ADC_JDR1, 0x2468);
+                put_reg(state.regs, ADC_ISR, mmio_read(&state, ADC_ISR, 4) |
+                         ADC_ISR_EOC | ADC_ISR_JEOC);
+                mmio_write(&state, ADC_IER, ADC_ISR_EOC | ADC_ISR_JEOC, 4);
+                attach_observer(&state, &observer, irq, &dma, &dmamux);
+                irq_calls = observer.irq_calls;
+                g_assert_cmpint(observer.irq_level, ==, 1);
+                memcpy(before, state.regs, sizeof(before));
+
+                mmio_write(&state, ADC_CR, ADC_CR_ADEN | start, sizes[index]);
+                g_assert_cmpmem(state.regs, sizeof(state.regs),
+                                before, sizeof(before));
+                g_assert_false(dm_mc02_adc_start_regular_at(&state, 5, 50));
+                dm_mc02_adc_start(&state);
+                g_assert_cmpmem(state.regs, sizeof(state.regs),
+                                before, sizeof(before));
+                assert_no_conversion(&state);
+                g_assert_cmpuint(state.regular_sequence_id, ==, 0);
+                g_assert_cmpuint(state.regular_active_sequence_id, ==, 0);
+                g_assert_cmpuint(observer.starts, ==, 0);
+                g_assert_cmpuint(observer.triggers, ==, 0);
+                g_assert_cmpuint(observer.samples, ==, 0);
+                g_assert_cmpuint(observer.irq_calls, ==, irq_calls);
+                g_assert_cmpuint(dm_adc_test_dma_requests, ==, 0);
+
+                /* A later supported configuration can use the existing
+                 * wiring; rejected starts do not leave a phantom busy bit. */
+                mmio_write(&state, ADC_CFGR, ADC_CFGR_JQDIS, 4);
+                mmio_write(&state, ADC_CR, ADC_CR_ADEN | start, 1);
+                g_assert_true(timer_pending(group == 1 ? state.injected_timer :
+                                                         state.sample_timer));
+                g_assert_cmpuint(observer.starts, ==, group == 1 ? 0 : 1);
+                g_assert_cmphex(get_reg(state.regs, ADC_DR), ==, 0x579b);
+                g_assert_cmphex(get_reg(state.regs, ADC_JDR1), ==, 0x2468);
+                free_adc(&state);
+                qemu_free_irq(irq);
+            }
+        }
+    }
+}
+
+static void test_unsupported_resolution_external_boundaries(void)
+{
+    for (unsigned code = 4; code < 8; code++) {
+        DmMc02Adc state;
+        DmMc02Dma dma = { 0 };
+        DmMc02Dmamux dmamux = { 0 };
+        AdcObserver observer = { 0 };
+        qemu_irq irq = qemu_allocate_irq(observe_irq, &observer, 0);
+        DmMc02TriggerEvent event = {
+            .source_id = DM_MC02_TRIGGER_TIM2_TRGO,
+            .rising = true,
+            .event_count = 1,
+            .timestamp_ns = 500,
+        };
+        uint8_t before[DM_MC02_ADC_REGION_SIZE];
+        unsigned irq_calls;
+
+        init_mmio_adc(&state);
+        mmio_write(&state, ADC_CFGR, ADC_CFGR_JQDIS | 1u |
+                   (code << ADC_CFGR_RES_SHIFT) | ADC_CFGR_EXTEN |
+                   (DM_MC02_TRIGGER_TIM2_TRGO << 5), 4);
+        mmio_write(&state, ADC_JSQR, ADC_JSQR_JEXTEN | (2u << 2), 4);
+        mmio_write(&state, ADC_CR, ADC_CR_ADEN | ADC_CR_ADSTART |
+                   ADC_CR_JADSTART, 4);
+        g_assert_false(mmio_read(&state, ADC_CR, 4) &
+                       (ADC_CR_ADSTART | ADC_CR_JADSTART));
+
+        /* Exercise the public trigger guards themselves with an armed raw
+         * fixture.  Normal VMState rejects this invalid combination; a
+         * trigger must still not notify common or schedule a conversion. */
+        put_reg(state.regs, ADC_CR, ADC_CR_ADEN | ADC_CR_ADSTART |
+                 ADC_CR_JADSTART);
+        put_reg(state.regs, ADC_DR, 0x579b);
+        put_reg(state.regs, ADC_JDR1, 0x2468);
+        put_reg(state.regs, ADC_ISR, mmio_read(&state, ADC_ISR, 4) |
+                 ADC_ISR_EOC | ADC_ISR_JEOC);
+        mmio_write(&state, ADC_IER, ADC_ISR_EOC | ADC_ISR_JEOC, 4);
+        attach_observer(&state, &observer, irq, &dma, &dmamux);
+        irq_calls = observer.irq_calls;
+        memcpy(before, state.regs, sizeof(before));
+        g_assert_false(dm_mc02_adc_external_trigger(
+            &state, event.source_id, true));
+        g_assert_false(dm_mc02_adc_external_trigger_with_id(
+            &state, event.source_id, true, 1, 500, 5));
+        g_assert_false(dm_mc02_adc_external_trigger_with_id_at(
+            &state, event.source_id, true, 1, 500, 750, 5));
+        dm_mc02_adc_trigger_sink(&state, &event);
+        assert_no_conversion(&state);
+        g_assert_cmpmem(state.regs, sizeof(state.regs), before, sizeof(before));
+        g_assert_cmpuint(state.regular_sequence_id, ==, 0);
+        g_assert_cmpuint(state.regular_active_sequence_id, ==, 0);
+        g_assert_cmpuint(observer.starts, ==, 0);
+        g_assert_cmpuint(observer.triggers, ==, 0);
+        g_assert_cmpuint(observer.samples, ==, 0);
+        g_assert_cmpuint(observer.irq_calls, ==, irq_calls);
+        g_assert_cmpuint(dm_adc_test_dma_requests, ==, 0);
+        free_adc(&state);
+        qemu_free_irq(irq);
+    }
+}
+
+static void test_resolution_change_protected_while_busy(void)
+{
+    static const unsigned sizes[] = { 1, 2, 4 };
+
+    for (unsigned group = 0; group < 4; group++) {
+        for (unsigned index = 0; index < ARRAY_SIZE(sizes); index++) {
+            DmMc02Adc state;
+            bool injected = group % 2;
+            bool armed = group >= 2;
+            unsigned size = sizes[index];
+            uint32_t cfgr = ADC_CFGR_JQDIS | (1u << ADC_CFGR_RES_SHIFT);
+            uint32_t start = injected ? ADC_CR_JADSTART : ADC_CR_ADSTART;
+            uint32_t stop = injected ? ADC_CR_JADSTP : ADC_CR_ADSTP;
+            uint32_t mask = size == 4 ? UINT32_MAX :
+                            (UINT32_C(1) << (size * 8)) - 1;
+            uint32_t candidate;
+            uint32_t expected;
+            bool context_valid;
+            uint32_t context;
+            uint64_t deadline;
+            QEMUTimer *timer;
+
+            init_mmio_adc(&state);
+            if (armed && !injected) {
+                cfgr |= ADC_CFGR_EXTEN | (DM_MC02_TRIGGER_TIM2_TRGO << 5);
+            }
+            mmio_write(&state, ADC_CFGR, cfgr, 4);
+            if (armed && injected) {
+                mmio_write(&state, ADC_JSQR, ADC_JSQR_JEXTEN | (2u << 2), 4);
+            }
+            mmio_write(&state, ADC_CR, ADC_CR_ADEN | start, 4);
+            g_assert_true(mmio_read(&state, ADC_CR, 4) & start);
+            timer = injected ? state.injected_timer : state.sample_timer;
+            g_assert_cmpint(timer_pending(timer), ==, !armed);
+            deadline = injected ? state.next_injected_sample_ns :
+                                  state.next_sample_ns;
+            context_valid = state.injected_active_context_valid;
+            context = state.injected_active_jsqr;
+
+            candidate = (cfgr & ~(ADC_CFGR_RES_MASK | ADC_CFGR_JQDIS)) |
+                        (7u << ADC_CFGR_RES_SHIFT) | ADC_CFGR_CONT | 2u;
+            expected = (cfgr & ~mask) | (candidate & mask);
+            expected = (expected & ~ADC_CFGR_RES_MASK) |
+                       (cfgr & ADC_CFGR_RES_MASK) | ADC_CFGR_JQDIS;
+            mmio_write(&state, ADC_CFGR, candidate, size);
+            g_assert_cmphex(mmio_read(&state, ADC_CFGR, 4), ==, expected);
+            g_assert_true(dm_mc02_adc_resolution_supported(&state));
+            g_assert_cmpint(timer_pending(timer), ==, !armed);
+            g_assert_cmpuint(injected ? state.next_injected_sample_ns :
+                             state.next_sample_ns, ==, deadline);
+            g_assert_cmpint(state.injected_active_context_valid, ==,
+                            context_valid);
+            g_assert_cmphex(state.injected_active_jsqr, ==, context);
+
+            /* Stop releases both RES and the existing independent JQDIS
+             * protection; changing JQDIS while idle flushes the context. */
+            mmio_write(&state, ADC_CR, ADC_CR_ADEN | stop, 4);
+            assert_no_conversion(&state);
+            mmio_write(&state, ADC_CFGR, candidate, 4);
+            g_assert_cmphex(mmio_read(&state, ADC_CFGR, 4), ==, candidate);
+            g_assert_false(dm_mc02_adc_resolution_supported(&state));
+            g_assert_false(state.injected_active_context_valid);
+            free_adc(&state);
+        }
+    }
+}
+
+static void test_interleaved_resolution_sentinel(void)
+{
+    /* ST LL_ADC_MULTI_TWOSMP_DELAY_1CYCLE_5 and SAMPLINGTIME_1CYCLE_5
+     * encode zero; together at 100 MHz they advance the start by 30 ns. */
+    for (unsigned code = 0; code < 8; code++) {
+        DmMc02Adc state;
+
+        init_mmio_adc(&state);
+        mmio_write(&state, ADC_CFGR, ADC_CFGR_JQDIS |
+                   (code << ADC_CFGR_RES_SHIFT), 4);
+        g_assert_cmpuint(dm_mc02_adc_interleaved_slave_start_ns(&state, 500, 0),
+                         ==, code < 4 ? 530 : UINT64_MAX);
+        dm_mc02_adc_set_clock_hz(&state, 0);
+        g_assert_cmpuint(dm_mc02_adc_interleaved_slave_start_ns(&state, 500, 0),
+                         ==, UINT64_MAX);
+        free_adc(&state);
+    }
 }
 
 static void test_rearms_paused_regular_rank_after_load(void)
@@ -216,6 +611,16 @@ int main(int argc, char **argv)
                     test_rearms_paused_injected_rank_after_load);
     g_test_add_func("/dm-adc/runtime-sync/rearm-paused-calibration",
                     test_rearms_paused_calibration_after_load);
+    g_test_add_func("/dm-adc/resolution/mmio-readback",
+                    test_resolution_mmio_readback);
+    g_test_add_func("/dm-adc/resolution/unsupported-starts-preserve-results",
+                    test_unsupported_resolution_starts_preserve_results);
+    g_test_add_func("/dm-adc/resolution/unsupported-external-boundaries",
+                    test_unsupported_resolution_external_boundaries);
+    g_test_add_func("/dm-adc/resolution/change-protected-while-busy",
+                    test_resolution_change_protected_while_busy);
+    g_test_add_func("/dm-adc/resolution/interleaved-sentinel",
+                    test_interleaved_resolution_sentinel);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

@@ -153,6 +153,29 @@ static void test_rejects_truncated_state_without_projection(void)
     g_assert_cmpuint(dm_mc02_adc_pair_adc_sync_calls, ==, 0);
 }
 
+static void test_rejects_unsupported_child_before_projection(void)
+{
+    for (unsigned child = 0; child < DM_MC02_ADC_PAIR_COUNT; ++child) {
+        for (unsigned code = 4; code < 8; ++code) {
+            DmMc02AdcPair source;
+            DmMc02AdcPair restored = { 0 };
+
+            prepare_source(&source);
+            g_assert_true(dm_mc02_adc_pair_state_valid(&source));
+            /* ST H723 CMSIS defines RES[4:2]; high-bit encodings are
+             * unsupported by this model and cannot resume conversions. */
+            source.adc[child].regs[0x0c] = code << 2;
+            save_state(&source);
+
+            dm_mc02_adc_pair_common_sync_calls = 0;
+            dm_mc02_adc_pair_adc_sync_calls = 0;
+            g_assert_cmpint(load_state(&restored), ==, -EINVAL);
+            g_assert_cmpuint(dm_mc02_adc_pair_common_sync_calls, ==, 0);
+            g_assert_cmpuint(dm_mc02_adc_pair_adc_sync_calls, ==, 0);
+        }
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf(
@@ -169,6 +192,8 @@ int main(int argc, char **argv)
                     test_rejects_common_adc_identity_mismatch);
     g_test_add_func("/dm-adc-pair-vmstate/reject-truncated",
                     test_rejects_truncated_state_without_projection);
+    g_test_add_func("/dm-adc-pair-vmstate/reject-unsupported-child",
+                    test_rejects_unsupported_child_before_projection);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);
