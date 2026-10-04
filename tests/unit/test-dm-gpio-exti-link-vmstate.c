@@ -276,6 +276,34 @@ static void test_exti_pending_address_and_mask_projection(void)
     qemu_free_irqs(inputs, 4);
 }
 
+static void test_gpio_observation_is_read_only(void)
+{
+    DmMc02GpioBank bank;
+    DmMc02GpioBank before;
+    unsigned callbacks = 0;
+
+    dm_mc02_gpio_init(&bank, NULL, "observed-gpio", 1, odr_changed,
+                      &callbacks);
+    /* RM0468 Rev 3 GPIO MODER/IDR: mode 01 is a general-purpose output;
+     * mode 00 is input, 10 alternate function and 11 analog.  The existing
+     * digital model samples explicitly injected AF/analog levels as well;
+     * this does not claim analog-pad or alternate-function electrical drive.
+     * Pins 1, 4 and 15 are outputs; pin 2 is AF and pin 3 is analog. */
+    bank.moder = UINT32_C(0x400001e4);
+    dm_mc02_gpio_set_input(&bank, UINT16_MAX, UINT16_C(0x801d));
+    dm_mc02_gpio_set_odr(&bank, UINT16_C(0x8002));
+    callbacks = 0;
+    memcpy(&before, &bank, sizeof(before));
+
+    g_assert_cmphex(dm_mc02_gpio_output_mask(&bank), ==, 0x8012);
+    g_assert_cmphex(dm_mc02_gpio_sample(&bank), ==, 0x800f);
+    g_assert_cmphex(bank.iomem.ops->read(&bank, 0x10, 4), ==, 0x800f);
+    g_assert_cmphex(bank.iomem.ops->read(&bank, 0x12, 2), ==, 0);
+    g_assert_cmphex(dm_mc02_gpio_sample(&bank), ==, 0x800f);
+    g_assert_cmpuint(callbacks, ==, 0);
+    g_assert_cmpmem(&bank, sizeof(bank), &before, sizeof(before));
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf(
@@ -298,6 +326,8 @@ int main(int argc, char **argv)
                     test_nvic_route_validation_is_atomic);
     g_test_add_func("/dm-gpio-exti-link-vmstate/exti-pending-mmio",
                     test_exti_pending_address_and_mask_projection);
+    g_test_add_func("/dm-gpio-exti-link-vmstate/gpio-read-only-observation",
+                    test_gpio_observation_is_read_only);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

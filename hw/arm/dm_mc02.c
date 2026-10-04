@@ -11,6 +11,8 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
+#include "qapi/qmp/qdict.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
 #include "hw/arm/armv7m.h"
@@ -89,7 +91,6 @@
 #define DM_MC02_DMA_CR_MSIZE_SHIFT 13
 #define DM_MC02_DMA_SIZE_16       1u
 
-#define DM_MC02_WS2812_CHANNELS   2
 #define DM_MC02_WS2812_BITS       24
 #define DM_MC02_WS2812_FIRST_BITS 24
 #define DM_MC02_WS2812_TOTAL_BITS 72
@@ -156,7 +157,7 @@ struct DmMc02MachineState {
     DmMc02Bmi088SpiLink bmi_spi_link;
     DmMc02Spi spi1_state;
     QEMUTimer *ws2812_timer;
-    uint32_t ws2812_led_rgb[DM_MC02_WS2812_CHANNELS];
+    uint32_t ws2812_led_rgb;
     bool ws2812_dirty;
     Clock *sysclk;
     Clock *apb1_timerclk;
@@ -329,6 +330,9 @@ static bool dm_mc02_board_pin_high(const DmMc02MachineState *s,
 }
 
 static bool dm_mc02_get_buzzer_enabled(Object *obj, Error **errp);
+static void dm_mc02_get_board_state(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp);
 static bool dm_mc02_get_buzzer_level(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_frequency(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_duty(Object *obj, Error **errp);
@@ -1524,6 +1528,8 @@ static void dm_mc02_machine_instance_init(Object *obj)
                              dm_mc02_set_user_key);
     object_property_add_str(obj, "gpio-input", dm_mc02_get_gpio_input,
                             dm_mc02_set_gpio_input);
+    object_property_add(obj, "board-state", "any", dm_mc02_get_board_state,
+                        NULL, NULL, NULL);
     object_property_add_str(obj, "vin-mv", dm_mc02_get_vin_mv,
                             dm_mc02_set_vin_mv);
     object_property_add_str(obj, "imu-noise-gyro-dps",
@@ -2475,7 +2481,7 @@ static void dm_mc02_machine_reset(void *opaque)
     dm_mc02_reset_input_reset(&s->reset_input);
     dm_mc02_usb_reset(&s->usb_hs);
 
-    memset(s->ws2812_led_rgb, 0, sizeof(s->ws2812_led_rgb));
+    s->ws2812_led_rgb = 0;
     s->ws2812_dirty = true;
     if (s->ws2812_timer) {
         timer_del(s->ws2812_timer);
@@ -2514,13 +2520,14 @@ static uint8_t dm_mc02_ws2812_byte(const uint8_t *waveform,
  * low-rate virtual timer and lets the co-sim link's existing value de-duper
  * suppress unchanged telemetry.
  */
-static bool dm_mc02_ws2812_decode(DmMc02MachineState *s,
+static bool dm_mc02_ws2812_decode(const DmMc02MachineState *s,
                                   uint32_t *first_rgb,
                                   uint32_t *first_brightness)
 {
     const DmMc02BoardDeviceWiring *devices = &s->board->devices;
-    DmMc02Dma *ws_dma = dm_mc02_board_dma(s,
-                                          devices->ws2812_dma_controller);
+    const DmMc02Dma *ws_dma =
+        devices->ws2812_dma_controller < ARRAY_SIZE(s->dma_subsystem.dma) ?
+        &s->dma_subsystem.dma[devices->ws2812_dma_controller] : NULL;
     const hwaddr stream = DM_MC02_DMA_STREAM_BASE +
                           devices->ws2812_dma_stream *
                           DM_MC02_DMA_STREAM_STRIDE;
@@ -2565,25 +2572,77 @@ static bool dm_mc02_ws2812_decode(DmMc02MachineState *s,
     green = dm_mc02_ws2812_byte(waveform, 0);
     red = dm_mc02_ws2812_byte(waveform, 8);
     blue = dm_mc02_ws2812_byte(waveform, 16);
-    s->ws2812_led_rgb[0] = ((uint32_t)red << 16) |
-                           ((uint32_t)green << 8) | blue;
-
-    /* Keep the second pixel decoded for a future multi-pixel telemetry
-     * payload, while the v1 protocol continues to expose the first pixel. */
-    if (ndtr >= 48) {
-        green = dm_mc02_ws2812_byte(waveform, 24);
-        red = dm_mc02_ws2812_byte(waveform, 32);
-        blue = dm_mc02_ws2812_byte(waveform, 40);
-        s->ws2812_led_rgb[1] = ((uint32_t)red << 16) |
-                               ((uint32_t)green << 8) | blue;
-    } else {
-        s->ws2812_led_rgb[1] = 0;
-    }
-
-    *first_rgb = s->ws2812_led_rgb[0];
+    *first_rgb = ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
     *first_brightness = MAX(((*first_rgb >> 16) & 0xff),
                             MAX((*first_rgb >> 8) & 0xff, *first_rgb & 0xff));
     return true;
+}
+
+static void dm_mc02_get_board_state(Object *obj, Visitor *v,
+                                     const char *name, void *opaque,
+                                     Error **errp)
+{
+    const DmMc02MachineState *s = DM_MC02_MACHINE(obj);
+    QDict *state, *gpio, *led, *key;
+    const DmMc02BoardDeviceWiring *devices;
+    uint32_t rgb, brightness;
+    char pin[5];
+    QObject *result;
+    bool decoded;
+
+    if (!s->board || !s->gpio_ready) {
+        error_setg(errp, "board-state is available after machine initialization");
+        return;
+    }
+    devices = &s->board->devices;
+    state = qdict_new();
+    gpio = qdict_new();
+    qdict_put_int(state, "schema", 1);
+    qdict_put_int(state, "timestamp_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    qdict_put_str(state, "board", s->board->name);
+    qdict_put_int(state, "vin_mv", s->vin_mv);
+    for (unsigned i = 0; i < s->board->soc->gpio_bank_count; ++i) {
+        const DmMc02GpioBank *bank = &s->gpio_exti.gpio[i];
+        QDict *values = qdict_new();
+        char port[] = { 'A' + i, 0 };
+
+        qdict_put_int(values, "moder", bank->moder);
+        qdict_put_int(values, "sampled", dm_mc02_gpio_sample(bank));
+        qdict_put_int(values, "odr", bank->odr);
+        qdict_put_int(values, "output_mask", dm_mc02_gpio_output_mask(bank));
+        qdict_put(gpio, port, values);
+    }
+    qdict_put(state, "gpio", gpio);
+
+    /* Reuse the existing board waveform observation without touching its
+     * telemetry cache, timers, DMA cursor, IRQs or guest memory. */
+    decoded = dm_mc02_ws2812_decode(s, &rgb, &brightness);
+    if (!decoded) {
+        rgb = dm_mc02_board_pin_high(s, devices->led) ? 0xffffff : 0;
+        brightness = rgb ? 255 : 0;
+    }
+    led = qdict_new();
+    snprintf(pin, sizeof(pin), "%c%u", 'A' + devices->led.bank,
+             devices->led.pin);
+    qdict_put_str(led, "pin", pin);
+    qdict_put_int(led, "rgb", rgb);
+    qdict_put_int(led, "brightness", brightness);
+    qdict_put_str(led, "source", decoded ? "ws2812-dma" : "gpio-latch");
+    qdict_put(state, "led", led);
+
+    key = qdict_new();
+    snprintf(pin, sizeof(pin), "%c%u", 'A' + devices->user_key.bank,
+             devices->user_key.pin);
+    qdict_put_str(key, "pin", pin);
+    qdict_put_bool(key, "pressed", s->user_key_pressed);
+    qdict_put_int(key, "level",
+                  (dm_mc02_gpio_sample(&s->gpio_exti.gpio[devices->user_key.bank])
+                   >> devices->user_key.pin) & 1);
+    qdict_put(state, "key", key);
+
+    result = QOBJECT(state);
+    visit_type_any(v, name, &result, errp);
+    qobject_unref(result);
 }
 
 static void dm_mc02_ws2812_refresh(void *opaque)
@@ -2610,14 +2669,14 @@ static void dm_mc02_cosim_telemetry(void *opaque,
 
     if (s->ws2812_dirty) {
         if (dm_mc02_ws2812_decode(s, &led_rgb, &led_brightness)) {
-            s->ws2812_led_rgb[0] = led_rgb;
+            s->ws2812_led_rgb = led_rgb;
         } else {
             /* PA7 remains useful during early GPIO-only bring-up. */
-            s->ws2812_led_rgb[0] = led_active ? UINT32_C(0xffffff) : 0;
+            s->ws2812_led_rgb = led_active ? UINT32_C(0xffffff) : 0;
         }
         s->ws2812_dirty = false;
     }
-    telemetry->led_rgb = s->ws2812_led_rgb[0];
+    telemetry->led_rgb = s->ws2812_led_rgb;
     telemetry->led_brightness = MAX((telemetry->led_rgb >> 16) & 0xff,
                                     MAX((telemetry->led_rgb >> 8) & 0xff,
                                         telemetry->led_rgb & 0xff));

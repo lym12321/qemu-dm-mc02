@@ -39,6 +39,10 @@ void dm_mc02_gpio_set_odr(DmMc02GpioBank *bank, uint32_t value);
 /* Set externally-driven input bits without changing the output latch. */
 void dm_mc02_gpio_set_input(DmMc02GpioBank *bank, uint32_t mask,
                             uint32_t value);
+/* Read-only digital observation.  Sampled levels use the same output-latch
+ * projection as IDR; AF/analog and electrical drive remain unmodelled. */
+uint16_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank);
+uint16_t dm_mc02_gpio_sample(const DmMc02GpioBank *bank);
 void dm_mc02_gpio_reset(DmMc02GpioBank *bank);
 
 /* Component-only state contract; runtime wiring and profile metadata are not

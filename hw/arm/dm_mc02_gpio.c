@@ -18,7 +18,7 @@
 #define GPIO_AFR0    0x20
 #define GPIO_AFR1    0x24
 
-static uint32_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank)
+uint16_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank)
 {
     uint32_t mask = 0;
 
@@ -28,6 +28,13 @@ static uint32_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank)
         }
     }
     return mask;
+}
+
+uint16_t dm_mc02_gpio_sample(const DmMc02GpioBank *bank)
+{
+    uint16_t outputs = dm_mc02_gpio_output_mask(bank);
+
+    return (bank->idr & ~outputs) | (bank->odr & outputs);
 }
 
 static bool gpio_lane(hwaddr offset, unsigned size, hwaddr reg)
@@ -54,11 +61,8 @@ static uint32_t gpio_register_value(const DmMc02GpioBank *bank, hwaddr reg)
         return bank->ospeedr;
     case GPIO_PUPDR:
         return bank->pupdr;
-    case GPIO_IDR: {
-        uint32_t outputs = dm_mc02_gpio_output_mask(bank);
-
-        return (bank->idr & ~outputs) | (bank->odr & outputs);
-    }
+    case GPIO_IDR:
+        return dm_mc02_gpio_sample(bank);
     case GPIO_ODR:
         return bank->odr;
     case GPIO_AFR0:
