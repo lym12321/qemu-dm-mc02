@@ -8,14 +8,22 @@ module keeps those details isolated and has no QEMU dependency.
 
 from __future__ import annotations
 
-import errno
 import platform
+from pathlib import Path
 import select
 import socket
 import struct
+import sys
 import weakref
 from dataclasses import dataclass
 from typing import Any
+
+# Direct tools execution and importlib consumers resolve the same package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sim.transports.socketcan import (
+    SocketCANError, open_socketcan as transport_open_socketcan,
+    require_socketcan,
+)
 
 WIRE_SIZE = 84
 WIRE_HEADER_SIZE = 20
@@ -40,10 +48,6 @@ _CAN_STRUCT = struct.Struct("=IB3x8s")
 _CANFD_STRUCT = struct.Struct("=IBBBB64s")
 _WIRE_STRUCT = struct.Struct("<IIB3xQ64s")
 _FD_DLC_LENGTHS = (0, 1, 2, 3, 4, 5, 6, 7, 8, 12, 16, 20, 24, 32, 48, 64)
-
-
-class SocketCANError(RuntimeError):
-    """Raised when the host cannot provide the requested SocketCAN feature."""
 
 
 @dataclass(frozen=True)
@@ -193,43 +197,14 @@ def unpack_can_frame(raw: bytes, timestamp_ns: int = 0) -> CanFrame:
 
 
 def _require_socketcan() -> None:
-    if platform.system() != "Linux":
-        raise SocketCANError("SocketCAN is supported only on Linux")
-    if not hasattr(socket, "AF_CAN"):
-        raise SocketCANError("this Python build has no AF_CAN support")
-    if not hasattr(socket, "CAN_RAW"):
-        raise SocketCANError("this Python build has no CAN_RAW support")
+    require_socketcan(socket_module=socket, platform_module=platform)
 
 
 def open_socketcan(interface: str, *, enable_fd: bool = True) -> socket.socket:
     """Open and bind a raw SocketCAN interface, with clear host errors."""
-    _require_socketcan()
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_CAN, socket.SOCK_RAW, socket.CAN_RAW)
-        if enable_fd:
-            option = getattr(socket, "CAN_RAW_FD_FRAMES", 5)
-            sock.setsockopt(socket.SOL_CAN_RAW, option, 1)
-        sock.bind((interface,))
-        return sock
-    except BaseException as exc:
-        primary = exc
-        if isinstance(exc, OSError):
-            if exc.errno in (errno.ENODEV, errno.ENXIO):
-                primary = SocketCANError(
-                    f"SocketCAN interface is unavailable: {interface}")
-            else:
-                primary = SocketCANError(
-                    f"cannot open SocketCAN interface {interface}: {exc}")
-        if sock is not None:
-            try:
-                sock.close()
-            except BaseException as error:
-                primary.add_note(f"cleanup SocketCAN.close() failed: "
-                                 f"{type(error).__name__}: {error}")
-        if primary is exc:
-            raise
-        raise primary from exc
+    return transport_open_socketcan(
+        interface, enable_fd=enable_fd, socket_module=socket,
+        platform_module=platform)
 
 
 def _send_all(sock: Any, payload: bytes) -> None:

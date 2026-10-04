@@ -23,6 +23,11 @@ worker = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = worker
 SPEC.loader.exec_module(worker)
 
+from sim.transports import (
+    DatagramTransport, FixedRecordStream, LengthPrefixedStream, StreamTransport,
+    connect_unix as transport_connect_unix, send_datagram,
+)
+
 
 class AlwaysBlocked:
     def send(self, data):
@@ -75,6 +80,85 @@ class StepFrameBatch:
 
     def push_front(self, frames):
         self.frames[0:0] = list(frames)
+
+
+class GenericTransportTests(unittest.TestCase):
+    """Transport tests use opaque bytes, independent of worker codecs."""
+
+    def test_stream_tx_retains_exact_suffix_and_frame_order(self):
+        sock = PartialWriter(2)
+        stream = StreamTransport(sock)
+        stream.send(b"abcdef")
+        self.assertEqual([bytes(view) for view in stream.tx_queue], [b"cdef"])
+        stream.send(b"ghij")
+        self.assertEqual([bytes(view) for view in stream.tx_queue],
+                         [b"ef", b"ghij"])
+        while not stream.flush():
+            pass
+        self.assertEqual(sock.output, b"abcdefghij")
+        self.assertIs(stream.sock, sock)
+
+    def test_stream_tx_rejects_capacity_without_losing_old_records(self):
+        stream = StreamTransport(AlwaysBlocked(), max_pending=2)
+        stream.send(b"first")
+        stream.send(b"second")
+        with self.assertRaisesRegex(BufferError, "TX queue is full"):
+            stream.send(b"third")
+        self.assertEqual([bytes(view) for view in stream.tx_queue],
+                         [b"first", b"second"])
+
+    def test_length_prefix_framing_retains_next_record_until_consumed(self):
+        first, second = struct.pack("<I", 3) + b"one", struct.pack("<I", 3) + b"two"
+        sock = ReceiveChunks([first + second])
+        stream = LengthPrefixedStream(sock, min_length=1, max_length=8)
+        records = stream.receive_records()
+        self.assertEqual(next(records), first)
+        self.assertEqual(bytes(stream.buffer), second)
+        self.assertEqual(list(records), [second])
+        self.assertEqual(sock.reads, 1)
+
+    def test_fixed_records_keep_partial_bytes_between_single_reads(self):
+        sock = ReceiveChunks([b"abcde", b"f"])
+        stream = FixedRecordStream(sock, record_size=3)
+        self.assertEqual(list(stream.receive_records()), [b"abc"])
+        self.assertEqual(bytes(stream.buffer), b"de")
+        sock.allow_read()
+        self.assertEqual(list(stream.receive_records()), [b"def"])
+        self.assertEqual(sock.reads, 2)
+
+    def test_datagram_short_write_keeps_whole_record_and_fails(self):
+        sock = PartialWriter(2)
+        queue = DatagramTransport(sock)
+        with self.assertRaisesRegex(ConnectionError, "short.*datagram write"):
+            queue.send(b"whole")
+        self.assertEqual(list(queue.tx_queue), [b"whole"])
+        with self.assertRaisesRegex(ConnectionError, "short.*datagram write"):
+            send_datagram(sock, b"whole")
+
+    def test_nonfinite_timeout_is_rejected_before_socket_io(self):
+        for timeout in (float("nan"), float("inf")):
+            with self.subTest(timeout=timeout), \
+                    patch.object(socket, "socket") as create:
+                for queue_class in (StreamTransport, DatagramTransport):
+                    queue = queue_class(AlwaysBlocked())
+                    queue.tx_queue.append(b"pending")
+                    with patch.object(queue, "flush") as flush:
+                        with self.assertRaisesRegex(ValueError, "timeout"):
+                            queue.drain(timeout)
+                        flush.assert_not_called()
+                with self.assertRaisesRegex(ValueError, "timeout"):
+                    transport_connect_unix("unused", timeout)
+                create.assert_not_called()
+
+    def test_geometry_and_capacity_reject_boolean_values(self):
+        for construct in (
+                lambda: StreamTransport(AlwaysBlocked(), max_pending=True),
+                lambda: DatagramTransport(AlwaysBlocked(), max_pending=True),
+                lambda: FixedRecordStream(AlwaysBlocked(), record_size=True),
+                lambda: LengthPrefixedStream(
+                    AlwaysBlocked(), min_length=False, max_length=8)):
+            with self.assertRaises(ValueError):
+                construct()
 
 
 class ImmediateRclpy:

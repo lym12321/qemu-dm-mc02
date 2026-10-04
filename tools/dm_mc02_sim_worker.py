@@ -22,6 +22,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterable
 
+# Direct tools execution and importlib consumers resolve the same package.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sim.transports import (
+    DatagramTransport, FixedRecordStream, LengthPrefixedStream,
+    connect_unix as transport_connect_unix, send_datagram,
+)
+
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
                                    pack_can_frame, pack_wire_frame,
@@ -474,80 +481,22 @@ def send_v2_step(stream: StepFramedSocket, validator, step_wire: bytes,
                            time.monotonic() + V2_QUEUE_FULL_RETRY_SEC)
 
 
-class FramedSocket:
-    """Non-blocking parser and bounded TX queue for the framed stream.
-
-    The worker is the producer of the simulation stream.  A slow QEMU
-    chardev must therefore apply backpressure to the worker without making a
-    blocking ``send`` call in the simulation loop.  Frames remain intact and
-    ordered; a persistently stalled peer fails with a bounded-queue error
-    instead of silently losing samples.
-    """
+class FramedSocket(LengthPrefixedStream):
+    """Legacy codec over the shared bounded, length-prefixed transport."""
 
     def __init__(self, sock: socket.socket):
-        self.sock = sock
-        self.buffer = bytearray()
-        self.tx_queue: deque[memoryview] = deque()
-
-    def send(self, data: bytes) -> None:
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            self.flush()
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            raise BufferError("co-sim TX queue is full")
-        self.tx_queue.append(memoryview(data))
-        self.flush()
-
-    @property
-    def tx_pending(self) -> bool:
-        return bool(self.tx_queue)
-
-    def flush(self) -> bool:
-        """Write as much as possible without waiting for socket writability."""
-        while self.tx_queue:
-            view = self.tx_queue[0]
-            try:
-                written = self.sock.send(view)
-            except BlockingIOError:
-                return False
-            if written == 0:
-                raise ConnectionError("QEMU co-sim socket closed")
-            if written < len(view):
-                self.tx_queue[0] = view[written:]
-                return False
-            self.tx_queue.popleft()
-        return True
-
-    def drain(self, timeout: float = 1.0) -> None:
-        """Drain queued frames during orderly worker shutdown."""
-        deadline = time.monotonic() + timeout
-        while not self.flush():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("co-sim TX queue did not drain")
-            _, writable, _ = select.select([], [self.sock], [], remaining)
-            if not writable:
-                raise TimeoutError("co-sim socket is not writable")
+        super().__init__(
+            sock, min_length=HEADER, max_length=HEADER + MAX_PAYLOAD,
+            length_error="invalid co-sim frame length",
+            max_pending=MAX_PENDING_FRAMES, queue_name="co-sim",
+            endpoint_name="QEMU co-sim", writable_name="co-sim",
+            clock=time, poller=select)
 
     def receive(self) -> list[tuple[int, int, int, bytes]]:
         frames = []
-        # Return after one read so a continuously readable peer cannot
-        # prevent the caller from servicing other sockets or its deadline.
-        try:
-            data = self.sock.recv(4096)
-        except BlockingIOError:
-            pass
-        else:
-            if not data:
-                raise ConnectionError("QEMU co-sim socket closed")
-            self.buffer.extend(data)
-        while len(self.buffer) >= 4:
-            length = struct.unpack_from("<I", self.buffer)[0]
-            if length < HEADER or length > HEADER + MAX_PAYLOAD:
-                raise ValueError("invalid co-sim frame length")
-            if len(self.buffer) < 4 + length:
-                break
-            body = bytes(self.buffer[4:4 + length])
-            del self.buffer[:4 + length]
+        for raw in self.receive_records():
+            body = raw[4:]
+            length = len(body)
             magic, version, kind, payload_len, seq, virtual_time_ns = \
                 struct.unpack_from("<IHHIQQ", body)
             if (magic, version, payload_len) != (MAGIC, VERSION, length - HEADER):
@@ -567,6 +516,9 @@ class StepFramedSocket(FramedSocket):
 
     def __init__(self, sock: socket.socket):
         super().__init__(sock)
+        self.max_length = (4 + step_protocol.STEP_HEADER_SIZE +
+                           step_protocol.STEP_MAX_PAYLOAD)
+        self.length_error = "invalid co-sim v2 frame length"
         self.pending_frames: deque[step_protocol.StepFrame] = deque()
 
     def receive(self) -> list[step_protocol.StepFrame]:
@@ -577,23 +529,8 @@ class StepFramedSocket(FramedSocket):
             self.pending_frames.clear()
             return frames
         frames: list[step_protocol.StepFrame] = []
-        try:
-            data = self.sock.recv(4096)
-        except BlockingIOError:
-            pass
-        else:
-            if not data:
-                raise ConnectionError("QEMU co-sim socket closed")
-            self.buffer.extend(data)
-        while len(self.buffer) >= 4:
-            body_len = struct.unpack_from("<I", self.buffer)[0]
-            if body_len < HEADER or body_len > 4 + step_protocol.STEP_HEADER_SIZE + \
-                    step_protocol.STEP_MAX_PAYLOAD:
-                raise ValueError("invalid co-sim v2 frame length")
-            if len(self.buffer) < 4 + body_len:
-                break
-            raw = bytes(self.buffer[:4 + body_len])
-            del self.buffer[:4 + body_len]
+        for raw in self.receive_records():
+            body_len = len(raw) - 4
             if len(raw) < 8 or struct.unpack_from("<I", raw, 4)[0] != MAGIC:
                 raise ValueError("invalid co-sim v2 frame magic")
             version = struct.unpack_from("<H", raw, 8)[0]
@@ -616,27 +553,18 @@ class StepFramedSocket(FramedSocket):
         for frame in reversed(tuple(frames)):
             self.pending_frames.appendleft(frame)
 
-class CanStream:
-    """Fixed-width FDCAN host stream with a bounded non-blocking TX queue."""
+class CanStream(FixedRecordStream):
+    """FDCAN codec over the shared bounded fixed-record transport."""
 
     def __init__(self, sock: socket.socket):
-        self.sock = sock
-        self.buffer = bytearray()
-        self.tx_queue: deque[memoryview] = deque()
+        super().__init__(
+            sock, record_size=CAN_WIRE_SIZE,
+            max_pending=MAX_PENDING_FRAMES, queue_name="FDCAN",
+            endpoint_name="QEMU FDCAN", clock=time, poller=select)
 
     def receive(self) -> list[tuple[int, int, int, int, bytes]]:
         frames = []
-        try:
-            data = self.sock.recv(4096)
-        except BlockingIOError:
-            pass
-        else:
-            if not data:
-                raise ConnectionError("QEMU FDCAN socket closed")
-            self.buffer.extend(data)
-        while len(self.buffer) >= CAN_WIRE_SIZE:
-            body = bytes(self.buffer[:CAN_WIRE_SIZE])
-            del self.buffer[:CAN_WIRE_SIZE]
+        for body in self.receive_records():
             frame = unpack_wire_frame(body)
             frames.append((frame.can_id, frame.flags, frame.dlc,
                            frame.timestamp_ns, frame.data))
@@ -645,43 +573,10 @@ class CanStream:
     def send(self, can_id: int, flags: int, dlc: int, timestamp_ns: int,
              data: bytes) -> None:
         """Send one fixed-width frame to the QEMU FDCAN chardev."""
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            self.flush()
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            raise BufferError("FDCAN TX queue is full")
+        self._check_tx_capacity()
         payload = pack_wire_frame(CanFrame(
             can_id, flags, dlc, data, timestamp_ns))
-        self.tx_queue.append(memoryview(payload))
-        self.flush()
-
-    @property
-    def tx_pending(self) -> bool:
-        return bool(self.tx_queue)
-
-    def flush(self) -> bool:
-        while self.tx_queue:
-            view = self.tx_queue[0]
-            try:
-                written = self.sock.send(view)
-            except BlockingIOError:
-                return False
-            if written == 0:
-                raise ConnectionError("QEMU FDCAN socket closed")
-            if written < len(view):
-                self.tx_queue[0] = view[written:]
-                return False
-            self.tx_queue.popleft()
-        return True
-
-    def drain(self, timeout: float = 1.0) -> None:
-        deadline = time.monotonic() + timeout
-        while not self.flush():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("FDCAN TX queue did not drain")
-            _, writable, _ = select.select([], [self.sock], [], remaining)
-            if not writable:
-                raise TimeoutError("QEMU FDCAN socket is not writable")
+        self._enqueue(payload)
 
 
 def send_socketcan(sock: socket.socket, frame: CanFrame) -> None:
@@ -691,54 +586,20 @@ def send_socketcan(sock: socket.socket, frame: CanFrame) -> None:
     helper remains useful to callers that want one-shot forwarding and makes
     backpressure explicit instead of sleeping inside the simulation loop.
     """
-    payload = pack_can_frame(frame)
-    try:
-        written = sock.send(payload)
-    except BlockingIOError as exc:
-        raise BufferError("SocketCAN TX is backpressured") from exc
-    if written != len(payload):
-        raise ConnectionError("short SocketCAN datagram write")
+    send_datagram(sock, pack_can_frame(frame), name="SocketCAN")
 
 
-class DatagramQueue:
-    """Bounded non-blocking queue for datagram-style host endpoints."""
+class DatagramQueue(DatagramTransport):
+    """SocketCAN codec over the bounded opaque datagram transport."""
 
     def __init__(self, sock: socket.socket):
-        self.sock = sock
-        self.tx_queue: deque[bytes] = deque()
+        super().__init__(sock, max_pending=MAX_PENDING_FRAMES,
+                         name="SocketCAN", writable_name="SocketCAN interface",
+                         clock=time, poller=select)
 
     def send(self, frame: CanFrame) -> None:
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            self.flush()
-        if len(self.tx_queue) >= MAX_PENDING_FRAMES:
-            raise BufferError("SocketCAN TX queue is full")
-        self.tx_queue.append(pack_can_frame(frame))
-        self.flush()
-
-    @property
-    def tx_pending(self) -> bool:
-        return bool(self.tx_queue)
-
-    def flush(self) -> bool:
-        while self.tx_queue:
-            try:
-                written = self.sock.send(self.tx_queue[0])
-            except BlockingIOError:
-                return False
-            if written != len(self.tx_queue[0]):
-                raise ConnectionError("short SocketCAN datagram write")
-            self.tx_queue.popleft()
-        return True
-
-    def drain(self, timeout: float = 1.0) -> None:
-        deadline = time.monotonic() + timeout
-        while not self.flush():
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise TimeoutError("SocketCAN TX queue did not drain")
-            _, writable, _ = select.select([], [self.sock], [], remaining)
-            if not writable:
-                raise TimeoutError("SocketCAN interface is not writable")
+        self._check_tx_capacity()
+        self._enqueue(pack_can_frame(frame))
 
 
 def _report_cleanup_error(primary: BaseException, name: str,
@@ -754,25 +615,9 @@ def _report_cleanup_error(primary: BaseException, name: str,
 
 
 def connect_unix(path: str, timeout: float) -> socket.socket:
-    deadline = time.monotonic() + timeout
-    last_error: OSError | None = None
-    while time.monotonic() < deadline:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        try:
-            sock.connect(path)
-            sock.setblocking(False)
-            return sock
-        except BaseException as exc:
-            try:
-                sock.close()
-            except BaseException as error:
-                _report_cleanup_error(exc, "Unix connection", error)
-                raise exc
-            if not isinstance(exc, OSError):
-                raise
-            last_error = exc
-            time.sleep(0.01)
-    raise TimeoutError(f"cannot connect to {path}: {last_error}")
+    return transport_connect_unix(
+        path, timeout, socket_module=socket, clock=time,
+        report_cleanup_error=_report_cleanup_error)
 
 
 @dataclass
