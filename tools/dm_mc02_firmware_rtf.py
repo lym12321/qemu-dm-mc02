@@ -141,8 +141,8 @@ def read_iwdg_timeouts(qmp: QmpSession) -> tuple[int, str]:
 def process_cpu_seconds(pid: int) -> float | None:
     try:
         with open(f"/proc/{pid}/stat", encoding="ascii") as stream:
-            fields = stream.read().split()
-        ticks = int(fields[13]) + int(fields[14])
+            fields = stream.read().rsplit(")", 1)[1].split()
+        ticks = int(fields[11]) + int(fields[12])
         return ticks / os.sysconf(os.sysconf_names["SC_CLK_TCK"])
     except (FileNotFoundError, IndexError, ValueError):
         return None
@@ -204,7 +204,7 @@ def _set_startup_qmp_timeout(qmp: QmpSession, deadline: float, phase: str) -> No
     )
 
 
-def _startup_qmp_call(
+def deadline_qmp_call(
     qmp: QmpSession,
     deadline: float,
     phase: str,
@@ -252,13 +252,13 @@ def observe_runtime(
         tick = read_tick(qmp, tick_address)
         watchdog_timeouts, diagnostics = read_iwdg_timeouts(qmp)
     else:
-        tick = _startup_qmp_call(
+        tick = deadline_qmp_call(
             qmp,
             host_deadline,
             phase,
             lambda: read_tick(qmp, tick_address),
         )
-        watchdog_timeouts, diagnostics = _startup_qmp_call(
+        watchdog_timeouts, diagnostics = deadline_qmp_call(
             qmp,
             host_deadline,
             phase,
@@ -469,7 +469,7 @@ def run_one(config: RunConfig, run_number: int) -> dict[str, Any]:
             raise StartupTimeoutError(
                 "QMP connection exceeded startup timeout"
             ) from exc
-        _startup_qmp_call(
+        deadline_qmp_call(
             qmp,
             startup_deadline,
             "sampling epoch setup",
@@ -477,13 +477,13 @@ def run_one(config: RunConfig, run_number: int) -> dict[str, Any]:
                 qmp, "sampling epoch setup", expected_status="prelaunch"
             ),
         )
-        initial_timeouts, _ = _startup_qmp_call(
+        initial_timeouts, _ = deadline_qmp_call(
             qmp,
             startup_deadline,
             "IWDG startup query",
             lambda: read_iwdg_timeouts(qmp),
         )
-        initial_tick = _startup_qmp_call(
+        initial_tick = deadline_qmp_call(
             qmp,
             startup_deadline,
             "tick startup query",
@@ -491,7 +491,7 @@ def run_one(config: RunConfig, run_number: int) -> dict[str, Any]:
         )
         qmp.clear_events()
         tracker = TickEpochTracker(initial_tick, initial_timeouts)
-        _startup_qmp_call(
+        deadline_qmp_call(
             qmp,
             startup_deadline,
             "QEMU cont",

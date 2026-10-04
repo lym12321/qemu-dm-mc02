@@ -28,20 +28,26 @@ def positive_seconds(value: str) -> float:
     return result
 
 
-def stop(process: subprocess.Popen[bytes] | None) -> None:
+def stop(process: subprocess.Popen[bytes] | None, *,
+         process_group: bool = True) -> None:
     if process is None:
         return
     # Each process owns its group, including workers launched by the test.
     for sig in (signal.SIGTERM, signal.SIGKILL):
         try:
-            os.killpg(process.pid, sig)
+            if process_group:
+                os.killpg(process.pid, sig)
+            else:
+                process.send_signal(sig)
         except ProcessLookupError:
             pass
         try:
             process.wait(timeout=1.0)
         except subprocess.TimeoutExpired:
+            if sig == signal.SIGKILL:
+                raise RuntimeError("process remained alive after TERM/KILL deadlines")
             continue
-        if sig == signal.SIGKILL:
+        if sig == signal.SIGKILL or not process_group:
             break
         # Reap the direct child, then also remove any remaining descendants.
 
@@ -81,6 +87,7 @@ def main() -> int:
         stderr_path = Path(tmp) / "qemu.stderr"
         try:
             with stderr_path.open("wb") as stderr:
+                qemu_start_ns = time.monotonic_ns()
                 qemu = subprocess.Popen(
                     [expand(value) for value in command],
                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -99,7 +106,8 @@ def main() -> int:
                     time.sleep(0.01)
                 test = subprocess.Popen(
                     [sys.executable, "-", *[
-                        expand(value).replace("{qemu_pid}", str(qemu.pid))
+                        expand(value).replace("{qemu_pid}", str(qemu.pid)).replace(
+                            "{qemu_start_ns}", str(qemu_start_ns))
                         for value in args.python_arg
                     ]],
                     stdin=subprocess.PIPE, start_new_session=True,
@@ -121,8 +129,15 @@ def main() -> int:
                     print(stderr.read().decode(errors="replace"), file=sys.stderr)
             return 1
         finally:
-            stop(test)
-            stop(qemu)
+            cleanup_errors = []
+            for process in (test, qemu):
+                try:
+                    stop(process)
+                except Exception as exc:
+                    cleanup_errors.append(str(exc))
+            if cleanup_errors:
+                raise RuntimeError("integration cleanup failed: " +
+                                   "; ".join(cleanup_errors))
 
 
 if __name__ == "__main__":

@@ -28,6 +28,16 @@ def test_forward_tick_delta_accepts_normal_progress() -> None:
     assert collector.forward_tick_delta(100, 150) == 50
 
 
+def test_process_cpu_seconds_handles_spaces_and_parenthesis_in_comm(monkeypatch) -> None:
+    # Linux proc_pid_stat(5): utime/stime are fields 14/15; comm is enclosed
+    # in parentheses and can contain spaces and a closing parenthesis.
+    record = "123 (QEMU worker) name) S " + " ".join(
+        ["0"] * 10 + ["120", "30"] + ["0"] * 7)
+    monkeypatch.setattr("builtins.open", lambda *a, **kw: io.StringIO(record))
+    monkeypatch.setattr(collector.os, "sysconf", lambda key: 100)
+    assert collector.process_cpu_seconds(123) == 1.5
+
+
 def test_forward_tick_delta_accepts_one_uint32_wrap() -> None:
     assert collector.forward_tick_delta(0xFFFF_FFF0, 0x10) == 32
 
