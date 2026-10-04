@@ -39,6 +39,19 @@ def _port(value) -> int:
     return number
 
 
+def _runtime_options(parser, *, timeout: float) -> None:
+    parser.add_argument("--qemu", metavar="PATH", help="QEMU executable (default: project build)")
+    parser.add_argument("--timeout", type=_seconds, default=timeout, metavar="SECONDS",
+                        help=f"total host deadline, including startup (default: {timeout:g})")
+    parser.add_argument("--startup-timeout", type=_seconds, default=10.0, metavar="SECONDS",
+                        help="startup deadline from QEMU launch (default: 10)")
+    parser.add_argument("--qmp", metavar="PATH", help="additional native QMP Unix socket")
+    parser.add_argument("--gdb-port", type=_port, metavar="PORT",
+                        help="native GDB port on 127.0.0.1, in 1..65535")
+    parser.add_argument("--paused", action="store_true",
+                        help="start paused for native GDB or interactive cont (requires --gdb-port)")
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sim", description="Run DM-MC02 firmware and reproducible Lab experiments.")
@@ -47,23 +60,23 @@ def _parser() -> argparse.ArgumentParser:
     boards = board.add_subparsers(dest="action", required=True)
     boards.add_parser("run", help="forward all options to tools/run-qemu.sh",
                       add_help=False)
-    lab = groups.add_parser("lab", help="run a YAML experiment against real firmware")
+    lab = groups.add_parser("lab", help="manifest experiments and interactive public board IO")
     labs = lab.add_subparsers(dest="action", required=True)
     run = labs.add_parser("run", help="apply a Lab manifest and report its assertions",
                          description="Run one YAML Lab manifest with native QEMU observations.")
     run.add_argument("manifest", metavar="PATH", type=Path,
                      help="YAML manifest; firmware paths are relative to its directory")
-    run.add_argument("--qemu", metavar="PATH", help="QEMU executable (default: project build)")
-    run.add_argument("--timeout", type=_seconds, default=30.0, metavar="SECONDS",
-                     help="total host deadline, including startup (default: 30)")
-    run.add_argument("--startup-timeout", type=_seconds, default=10.0, metavar="SECONDS",
-                     help="startup deadline from QEMU launch (default: 10)")
-    run.add_argument("--qmp", metavar="PATH", help="additional native QMP Unix socket")
-    run.add_argument("--gdb-port", type=_port, metavar="PORT",
-                     help="native GDB port on 127.0.0.1, in 1..65535")
-    run.add_argument("--paused", action="store_true",
-                     help="wait for native GDB to resume the CPU (requires --gdb-port)")
+    _runtime_options(run, timeout=30.0)
     run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
+    interactive = labs.add_parser("interactive", help="observe UART/CAN and enter GPIO/key/ADC commands",
+                                  description="Use a pipe or TTY for commands; enter help to list commands.")
+    interactive.add_argument("--elf", required=True, type=Path, metavar="PATH", help="firmware ELF")
+    interactive.add_argument("--uart", action="append", choices=("uart1", "uart2", "uart3", "uart5", "uart7", "uart10"),
+                             help="attach a UART; repeat for several (default: uart1)")
+    interactive.add_argument("--can", action="append", choices=("can1", "can2", "can3"),
+                             help="attach a CAN channel; repeat for several")
+    interactive.add_argument("--adc", action="store_true", help="enable ADC1 raw16/voltage input")
+    _runtime_options(interactive, timeout=300.0)
     return parser
 
 
@@ -136,6 +149,22 @@ def _interrupted(signum, _frame) -> None:
     raise KeyboardInterrupt(f"interrupted by signal {signum}")
 
 
+def _run_interactive(args) -> int:
+    try:
+        from sim.lab.interactive import run_interactive
+        result = run_interactive(
+            args.elf, uarts=tuple(args.uart or ("uart1",)), cans=tuple(args.can or ()),
+            adc=args.adc, emit=_emit, paused=args.paused, qemu=args.qemu,
+            startup_timeout=args.startup_timeout, timeout=args.timeout,
+            qmp_path=args.qmp, gdb_port=args.gdb_port)
+        print(f"Lab interactive closed: {result['commands']} commands, "
+              f"{result['observation_batches']} observations", flush=True)
+        return 0
+    except (Exception, KeyboardInterrupt) as error:
+        _diagnose(error)
+        return 130 if isinstance(error, KeyboardInterrupt) else 1
+
+
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # The existing native launcher owns all board option admission. Preserve
@@ -151,6 +180,6 @@ def main(argv=None) -> int:
     args = _parser().parse_args(arguments)
     previous = signal.signal(signal.SIGTERM, _interrupted)
     try:
-        return _run_lab(args)
+        return _run_lab(args) if args.action == "run" else _run_interactive(args)
     finally:
         signal.signal(signal.SIGTERM, previous)

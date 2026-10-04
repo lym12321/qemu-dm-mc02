@@ -168,3 +168,36 @@ def test_sigterm_unwinds_runtime_and_restores_callers_handler(monkeypatch, tmp_p
     assert signal.getsignal(signal.SIGTERM) is previous
     result = json.loads(report.read_text())
     assert result["status"] == "failed" and result["error_type"] == "KeyboardInterrupt"
+
+
+def test_interactive_cli_forwards_configured_channels_and_deadlines(monkeypatch, tmp_path, capsys):
+    from sim.lab import interactive
+    calls = []
+    monkeypatch.setattr(interactive, "run_interactive", lambda firmware, **options:
+                        calls.append((firmware, options)) or
+                        {"commands": 3, "observation_batches": 9, "end_ns": 10})
+    assert cli.main(["lab", "interactive", "--elf", "fixture.elf", "--uart", "uart2",
+                     "--uart", "uart10", "--can", "can3", "--adc", "--timeout", "20",
+                     "--startup-timeout", "2", "--gdb-port", "1235", "--paused"]) == 0
+    firmware, options = calls[0]
+    assert firmware == Path("fixture.elf")
+    assert {name: value for name, value in options.items() if name != "emit"} == {
+        "uarts": ("uart2", "uart10"), "cans": ("can3",), "adc": True, "paused": True,
+        "qemu": None, "startup_timeout": 2., "timeout": 20., "qmp_path": None, "gdb_port": 1235,
+    }
+    assert "closed: 3 commands, 9 observations" in capsys.readouterr().out
+    result = isolated(tmp_path, "lab", "interactive", "--help")
+    assert result.returncode == 0 and "--can" in result.stdout and "--adc" in result.stdout
+
+
+def test_interactive_cli_preserves_cleanup_failure(monkeypatch, capsys):
+    from sim.lab import interactive
+    def failed(*args, **kwargs):
+        error = RuntimeError("interactive consumer failed")
+        error.add_note("Lab cleanup QMP failed: connection release")
+        raise error
+    monkeypatch.setattr(interactive, "run_interactive", failed)
+    assert cli.main(["lab", "interactive", "--elf", "fixture.elf"]) == 1
+    output = capsys.readouterr()
+    assert "closed" not in output.out
+    assert "Lab cleanup QMP failed" in output.err

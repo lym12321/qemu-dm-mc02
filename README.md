@@ -9,6 +9,7 @@
 | [快速构建](#快速开始) | [详细使用手册](docs/USAGE.md) |
 | [运行固件](#运行固件) | [串口与调试](docs/USAGE.md#serial-qmp-and-gdb) |
 | [验证](#验证) | [故障排查](docs/USAGE.md#troubleshooting) |
+| [Virtual Lab：YAML 与交互命令](docs/USAGE.md#virtual-lab) | [GPIO/UART/CAN/ADC 示例](examples/labs/board-io.yaml) |
 
 > [!IMPORTANT]
 > 项目面向固件功能验证，采用数字外设模型和虚拟时间。它不提供完整 STM32H723 硅级时序、模拟电气行为或整机 snapshot/live migration。真实机构闭环和完整业务就绪需要针对具体固件与外部后端验证。

@@ -104,6 +104,37 @@ uv run tools/sim board run --elf build/student.elf --debug --qmp /tmp/student-qm
 从仓库根目录可用 `uv run python -m sim`；`tools/sim` 也可从任意目录启动，或将 `tools`
 加入 PATH 后直接使用 `sim`。`board run` 原样调用现有 launcher，不重建调试协议。
 
+交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
+
+```bash
+uv run tools/sim lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
+```
+
+连接提示只说明 transport 已连接。输入 `help` 查看命令；`state` 显示原生只读 JSON：
+
+```text
+key press
+key release
+gpio B0 1
+vin 24000
+uart uart1 "hello world"
+can can1 0x321 0 8 4142434445464748
+adc ch4 voltage_uv 1650000
+adc ch4 raw 12345
+pause
+cont
+quit
+```
+
+文本支持引号，按 UTF-8 原样发送，不展开 shell。只允许已配置的 UART/CAN/ADC 端点；
+暂停时 ADC 输入明确拒绝，先 `cont` 再输入。命令错误会显示并继续，真实连接、运行或清理
+错误返回非零。输入使用 pipe 或 TTY，行最多 4096 字节，超长行丢弃到换行；不支持重定向
+普通文件作为 stdin。EOF 和 quit 会清理退出。默认总期限 300 秒，调试可用 `--gdb-port`、
+`--paused` 和 `--qmp`，期限可显式调整。当前不提供交互 reset 或自动 IMU 环境。
+
+Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
+或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
+
 ## Contents
 
 - [项目范围](#project-scope)
@@ -195,10 +226,11 @@ sudo apt-get install -y \
   cmake \
   ripgrep \
   gcc-arm-none-eabi \
-  binutils-arm-none-eabi
+  binutils-arm-none-eabi \
+  gdb-multiarch
 ```
 
-CMake/CTest 构建 Host 测试，ARM GCC/binutils 构建测试 guest，ripgrep 是完整门禁检查项使用的命令。然后按 [uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 `uv`，在仓库根目录创建锁定的 Python 测试环境：
+CMake/CTest 构建 Host 测试，ARM GCC/binutils 构建测试 guest，GDB 验证原生调试连接，ripgrep 是完整门禁检查项使用的命令。然后按 [uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 `uv`，在仓库根目录创建锁定的 Python 测试环境：
 
 ```bash
 uv sync --locked --group dev --python /usr/bin/python3
