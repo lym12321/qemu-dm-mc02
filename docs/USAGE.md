@@ -614,7 +614,8 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 坐标为 +X 前、+Y 左、+Z 上；四轮等正力矩向前，右侧更快产生正 yaw。
 模型总质量 0.6 kg、轮半径 0.03 m、轴距 0.14 m、轮距 0.12 m、轮轴阻尼 0.03 Nm·s/rad，
 摩擦与接触参数使用锁定版本的原生默认值。这些参数未经实物标定；它是普通四轮夹具，
-尚未接入 M3508、BMI088 或固件闭环。可单独运行物理门：
+可通过下文的共享 M3508 joint adapter 驱动。BMI088 输入与固件闭环仍待接入。
+可单独运行物理门：
 
 ```bash
 uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
@@ -905,6 +906,41 @@ M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输�
 或发送反馈；完成阶段只接受该器件返回的原 plan。一次只允许一个 pending plan，
 reset/close 会取消它。发送失败保留已提交状态，调用方必须冻结并 reset，不能重复完成
 或重复推进 plant。`M3508` 保留原简单转子用法，并复用这一协议边界。
+
+`M3508JointPlant` 把多个协议器件绑定到同一个 `MujocoPhysics`，取得这些器件与
+物理模型的独占执行所有权。绑定必须使用 `M3508Device`，每个 joint 和电机 ID 唯一，
+所有器件位于同一 CAN bus。四轮模型的完整组合如下：
+
+```python
+from sim.core import Coordinator, Session
+from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.fabric import CanBus
+from sim.fabric.runtime import CanParticipant
+from sim.physics import MujocoPhysics
+
+corners = ("fl", "fr", "rl", "rr")
+physics = MujocoPhysics.from_xml_path(
+    "models/four_wheel.xml",
+    joints={f"wheel_{c}": f"drive_{c}" for c in corners},
+    imus={"imu": ("imu_gyro", "imu_accel")},
+)
+bus = CanBus()
+devices = {M3508Device(bus, i): f"wheel_{corner}"
+           for i, corner in enumerate(corners, 1)}
+# 在 reset/step 前把主机或 QEMU CAN endpoint 接到 bus。
+shared = M3508JointPlant(physics, devices)
+coordinator = Coordinator({"can": CanParticipant(bus, [shared])})
+coordinator.reset(Session(1))
+coordinator.step(1_000_000)
+coordinator.close()
+```
+
+默认减速比 `g=3591/187` 来自 [DJI M3508 P19 V1.0 手册](https://rm-static.djicdn.com/tem/17348/RoboMaster%20M3508%20P19%20Brushless%20DC%20Gear%20Motor%20V1.0.pdf)
+的规格表。adapter 使用理想无损换算：转子角度和速度为 joint 的 `g` 倍，joint
+力矩为转子力矩的 `g` 倍；XML motor 保持 gear=1。效率、背隙及转子惯量未经标定。
+每个命令截止区间只推进一次共享物理模型，收齐全部终点采样后才生成反馈。
+reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍以所给 Session 为原点。
+任一运行失败会冻结这个 owner，直到成功 reset；已推进的物理状态和已排队反馈不回滚。
 
 每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
 命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。
