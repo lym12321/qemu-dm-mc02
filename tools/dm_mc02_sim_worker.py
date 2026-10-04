@@ -20,7 +20,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterable
+from typing import Callable, Iterable
 
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
@@ -133,6 +133,7 @@ V2_STEP_RESPONSE_TIMEOUT_SEC = 2.0
 V2_STEP_ACK_TIMEOUT_SEC = 0.25
 V2_STEP_MAX_RETRIES = 3
 V2_STEP_DONE_MAX_RETRIES = 3
+V2_QUEUE_FULL_RETRY_SEC = 0.001
 BACKEND_REQUIRED_METHODS = (
     "step", "set_motor", "reset_motor", "set_motor_enabled",
     "set_motor_dm", "motor_feedback",
@@ -289,29 +290,36 @@ class V2SessionReset(RuntimeError):
 def wait_v2_response(stream: StepFramedSocket, validator,
                      expected_kind: int, expected_step_id: int,
                      expected_time_ns: int, timeout: float = 2.0,
-                     allow_queue_full: bool = False):
+                     allow_queue_full: bool = False,
+                     service_io: Callable[[float], None] | None = None,
+                     interrupt_on_reset: bool = False):
     """Wait for one response while validating the v2 response session."""
     deadline = time.monotonic() + timeout
-    async_reset = False
     while True:
+        if time.monotonic() >= deadline:
+            raise TimeoutError("timed out waiting for v2 response")
+        if service_io is not None:
+            service_io(0)
+        elif stream.tx_pending:
+            stream.flush()
         received = stream.receive()
         for frame_index, frame in enumerate(received):
             validator.accept(frame)
             if frame.header.kind == step_protocol.RESET:
-                async_reset = True
+                if (expected_kind != step_protocol.RESET_ACK or
+                        interrupt_on_reset):
+                    # Stop replaying the old STEP as soon as RESET starts,
+                    # even if RESET_ACK arrives in a later socket read.
+                    stream.push_front(received[frame_index + 1:])
+                    raise V2SessionReset(frame.header.step_id,
+                                         frame.header.t_sim_ns,
+                                         frame.header.session_id)
                 continue
             if frame.header.kind == step_protocol.RESET_ACK:
                 try:
                     ack = step_protocol.decode_reset_ack_payload(frame.payload)
                 except step_protocol.StepProtocolError as exc:
                     raise RuntimeError("invalid RESET_ACK payload") from exc
-                if async_reset and expected_kind != step_protocol.RESET_ACK:
-                    # RESET_ACK closes the unsolicited reset handshake. The
-                    # in-flight STEP was invalidated by that reset and must be
-                    # rebuilt against the new plant/session epoch.
-                    raise V2SessionReset(frame.header.step_id,
-                                         frame.header.t_sim_ns,
-                                         frame.header.session_id)
             elif frame.header.kind == step_protocol.STEP_ACK:
                 try:
                     ack = step_protocol.decode_step_ack_payload(frame.payload)
@@ -391,9 +399,79 @@ def wait_v2_response(stream: StepFramedSocket, validator,
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("timed out waiting for v2 response")
-        readable, _, _ = select.select([stream.sock], [], [], remaining)
-        if not readable:
-            raise TimeoutError("timed out waiting for v2 response")
+        if service_io is not None:
+            service_io(remaining)
+        else:
+            writable = [stream.sock] if stream.tx_pending else []
+            readable, writable_ready, _ = select.select(
+                [stream.sock], writable, [], remaining)
+            if writable_ready:
+                stream.flush()
+            if not readable and not writable_ready:
+                raise TimeoutError("timed out waiting for v2 response")
+
+
+def send_v2_step(stream: StepFramedSocket, validator, step_wire: bytes,
+                 step_id: int, timestamp_ns: int,
+                 service_io: Callable[[float], None] | None = None):
+    """Send one STEP and replay its bytes within one admission deadline.
+
+    QUEUE_FULL waits briefly for recovery while servicing transport, without
+    renewing the budget or stepping the backend again. Silent ACK timeouts
+    retain the existing retry limit. Strict consumption is a separate phase.
+    """
+    deadline = time.monotonic() + V2_STEP_RESPONSE_TIMEOUT_SEC
+    ack_retries = 0
+    retry_at = None
+    last_status = None
+    queue_depth = None
+    stream.send(step_wire)
+
+    def timed_out():
+        return TimeoutError(
+            f"STEP_ACK admission timed out: step={step_id} "
+            f"time={timestamp_ns} last_status={last_status} "
+            f"queue_depth={queue_depth} retries={ack_retries}")
+
+    while True:
+        now = time.monotonic()
+        remaining = deadline - now
+        if remaining <= 0:
+            raise timed_out()
+        if retry_at is not None and now >= retry_at:
+            if not stream.tx_pending:
+                stream.send(step_wire)
+            retry_at = None
+        wait_time = min(V2_STEP_ACK_TIMEOUT_SEC, remaining)
+        if retry_at is not None:
+            wait_time = min(wait_time, retry_at - now)
+        try:
+            response = wait_v2_response(
+                stream, validator, step_protocol.STEP_ACK,
+                step_id, timestamp_ns, timeout=wait_time,
+                allow_queue_full=True, service_io=service_io)
+        except TimeoutError:
+            if time.monotonic() >= deadline:
+                raise timed_out() from None
+            if retry_at is None:
+                if ack_retries >= V2_STEP_MAX_RETRIES:
+                    raise timed_out() from None
+                ack_retries += 1
+            retry_at = None
+            # A blocked or partly written STEP is still in the bounded TX
+            # queue. Flush it during the next wait; do not append a copy.
+            if not stream.tx_pending:
+                stream.send(step_wire)
+            continue
+        ack = step_protocol.decode_step_ack_payload(response.payload)
+        last_status, queue_depth = ack.status, ack.queue_depth
+        if time.monotonic() >= deadline:
+            raise timed_out()
+        if last_status != step_protocol.STATUS_QUEUE_FULL:
+            return response
+        if retry_at is None:
+            retry_at = min(deadline,
+                           time.monotonic() + V2_QUEUE_FULL_RETRY_SEC)
 
 
 class FramedSocket:
@@ -1441,6 +1519,28 @@ def run(args: argparse.Namespace) -> int:
         qemu_timestamp_mapper = QemuTimestampMapper(
             reset.t_sim_ns, reset.t_sim_ns)
 
+    def complete_v2_reset(reset: V2SessionReset) -> None:
+        # RESET already changed the RX validator. Wait for its ACK before
+        # rebuilding the plant/session. Repeated RESET replaces the session
+        # but never renews this handshake's budget.
+        deadline = time.monotonic() + V2_STEP_RESPONSE_TIMEOUT_SEC
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError("timed out waiting for v2 RESET_ACK")
+            try:
+                wait_v2_response(
+                    cosim, v2_rx_validator, step_protocol.RESET_ACK,
+                    reset.step_id, reset.t_sim_ns, timeout=remaining,
+                    service_io=service_worker_io, interrupt_on_reset=True)
+            except V2SessionReset as latest_reset:
+                reset = latest_reset
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError("timed out waiting for v2 RESET_ACK")
+            break
+        reset_v2_worker_session(reset)
+
     def wait_v2_step_response(expected_kind: int, step_id: int,
                               timestamp_ns: int,
                               allow_queue_full: bool = False,
@@ -1448,82 +1548,85 @@ def run(args: argparse.Namespace) -> int:
         try:
             return wait_v2_response(
                 cosim, v2_rx_validator, expected_kind, step_id, timestamp_ns,
-                timeout=timeout, allow_queue_full=allow_queue_full)
+                timeout=timeout, allow_queue_full=allow_queue_full,
+                service_io=service_worker_io)
         except V2SessionReset as reset:
-            reset_v2_worker_session(reset)
+            complete_v2_reset(reset)
             return False
-        return True
 
     if can_sock:
         can_sock.setblocking(False)
     if socketcan_sock:
         socketcan_sock.setblocking(False)
 
+    def service_worker_io(timeout: float) -> None:
+        """Service transport without consuming v2 replies or advancing plant."""
+        readable = [cosim_sock]
+        writable = []
+        if can_sock:
+            readable.append(can_sock)
+        if socketcan_sock:
+            readable.append(socketcan_sock)
+        if cosim.tx_pending:
+            writable.append(cosim_sock)
+        if can and can.tx_pending:
+            writable.append(can_sock)
+        if socketcan_tx and socketcan_tx.tx_pending:
+            writable.append(socketcan_sock)
+        ready, writable_ready, _ = select.select(readable, writable, [], timeout)
+        if cosim_sock in writable_ready:
+            cosim.flush()
+        if can_sock and can_sock in writable_ready:
+            can.flush()
+        if socketcan_sock and socketcan_sock in writable_ready:
+            socketcan_tx.flush()
+        if can_sock in ready:
+            can_frames = can.receive()
+            if args.verbose and can_frames:
+                print("received CAN frames", len(can_frames), flush=True)
+            for can_id, flags, dlc, timestamp_ns, data in can_frames:
+                mapped_timestamp_ns = qemu_timestamp_mapper.map(
+                    timestamp_ns, virtual_time_ns)
+                if socketcan_sock:
+                    socketcan_tx.send(
+                        CanFrame(can_id, flags, dlc, data,
+                                 mapped_timestamp_ns))
+                command = coordinator.submit_can(
+                    can_id, flags, data[:min(dlc, 8)],
+                    mapped_timestamp_ns, virtual_time_ns)
+                if command is not None:
+                    if args.verbose:
+                        print("motor command", command.mode,
+                              "index", command.index, flush=True)
+        if socketcan_sock in ready:
+            try:
+                frame = unpack_can_frame(
+                    socketcan_sock.recv(72), timestamp_ns=virtual_time_ns)
+            except ValueError as exc:
+                if args.verbose:
+                    print(f"socketcan: ignored frame: {exc}",
+                          file=sys.stderr, flush=True)
+            else:
+                if can:
+                    can.send(
+                        frame.can_id, frame.flags, frame.dlc,
+                        qemu_timestamp_mapper.unmap(
+                            frame.timestamp_ns,
+                            qemu_timestamp_mapper.qemu_origin_ns),
+                        frame.data)
+        if cosim_sock in ready:
+            if args.protocol == "v1":
+                for kind, _, _, payload in cosim.receive():
+                    if kind == TELEMETRY and args.verbose:
+                        if len(payload) == 12:
+                            rgb, brightness, buzzer, flags, _ = \
+                                struct.unpack("<IIBBH", payload)
+                            print("telemetry rgb=%06x brightness=%d buzzer=%d flags=%02x" %
+                                  (rgb, brightness, buzzer, flags), flush=True)
+
     try:
         while args.frames == 0 or imu_frames < args.frames:
-            readable = [cosim_sock]
-            writable = []
-            if can_sock:
-                readable.append(can_sock)
-            if socketcan_sock:
-                readable.append(socketcan_sock)
-            if cosim.tx_pending:
-                writable.append(cosim_sock)
-            if can and can.tx_pending:
-                writable.append(can_sock)
-            if socketcan_tx and socketcan_tx.tx_pending:
-                writable.append(socketcan_sock)
-            ready, writable_ready, _ = select.select(readable, writable, [], 0)
-            if cosim_sock in writable_ready:
-                cosim.flush()
-            if can_sock and can_sock in writable_ready:
-                can.flush()
-            if socketcan_sock and socketcan_sock in writable_ready:
-                socketcan_tx.flush()
-            if can_sock in ready:
-                can_frames = can.receive()
-                if args.verbose and can_frames:
-                    print("received CAN frames", len(can_frames), flush=True)
-                for can_id, flags, dlc, timestamp_ns, data in can_frames:
-                    mapped_timestamp_ns = qemu_timestamp_mapper.map(
-                        timestamp_ns, virtual_time_ns)
-                    if socketcan_sock:
-                        socketcan_tx.send(
-                            CanFrame(can_id, flags, dlc, data,
-                                     mapped_timestamp_ns))
-                    command = coordinator.submit_can(
-                        can_id, flags, data[:min(dlc, 8)],
-                        mapped_timestamp_ns, virtual_time_ns)
-                    if command is not None:
-                        if args.verbose:
-                            print("motor command", command.mode,
-                                  "index", command.index, flush=True)
-            if socketcan_sock in ready:
-                try:
-                    frame = unpack_can_frame(
-                        socketcan_sock.recv(72), timestamp_ns=virtual_time_ns)
-                except ValueError as exc:
-                    if args.verbose:
-                        print(f"socketcan: ignored frame: {exc}",
-                              file=sys.stderr, flush=True)
-                else:
-                    if can:
-                        can.send(
-                            frame.can_id, frame.flags, frame.dlc,
-                            qemu_timestamp_mapper.unmap(
-                                frame.timestamp_ns,
-                                qemu_timestamp_mapper.qemu_origin_ns),
-                            frame.data)
-            if cosim_sock in ready:
-                if args.protocol == "v1":
-                    for kind, _, _, payload in cosim.receive():
-                        if kind == TELEMETRY and args.verbose:
-                            if len(payload) == 12:
-                                rgb, brightness, buzzer, flags, _ = \
-                                    struct.unpack("<IIBBH", payload)
-                                print("telemetry rgb=%06x brightness=%d buzzer=%d flags=%02x" %
-                                      (rgb, brightness, buzzer, flags), flush=True)
-
+            service_worker_io(0)
             gyro, accel = coordinator.advance(virtual_time_ns, dt)
             adc_count = (len(args.adc_input_values) +
                          len(args.adc_voltage_values)
@@ -1593,34 +1696,12 @@ def run(args: argparse.Namespace) -> int:
                     imu_payload)
                 v2_tx_validator.accept(step_frame)
                 step_wire = step_protocol.encode_step_frame(step_frame)
-                cosim.send(step_wire)
-                reset_during_step = False
-                ack_retries = 0
-                while True:
-                    try:
-                        response = wait_v2_step_response(
-                            step_protocol.STEP_ACK, step_id, virtual_time_ns,
-                            allow_queue_full=True,
-                            timeout=V2_STEP_ACK_TIMEOUT_SEC)
-                    except TimeoutError:
-                        if ack_retries >= V2_STEP_MAX_RETRIES:
-                            raise
-                        ack_retries += 1
-                        # QEMU treats an identical STEP in the same session as
-                        # an idempotent acknowledgement request.
-                        cosim.send(step_wire)
-                        continue
-                    if response is False:
-                        reset_during_step = True
-                        break
-                    response_ack = step_protocol.decode_step_ack_payload(
-                        response.payload)
-                    if response_ack.status != step_protocol.STATUS_QUEUE_FULL:
-                        break
-                    # QEMU has retained this exact STEP for a safe retry. Do
-                    # not re-run the host validator: it is one logical input.
-                    cosim.send(step_wire)
-                if reset_during_step:
+                try:
+                    send_v2_step(
+                        cosim, v2_rx_validator, step_wire, step_id,
+                        virtual_time_ns, service_io=service_worker_io)
+                except V2SessionReset as reset:
+                    complete_v2_reset(reset)
                     continue
                 if args.wait_step_done:
                     done_retries = 0

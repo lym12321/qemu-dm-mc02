@@ -160,14 +160,205 @@ def _step_reply(step, kind, status=0):
         dt_ns=step.header.dt_ns, flags=step.header.session_id, payload=payload)
 
 
+@pytest.fixture
+def retry_worker_peer(monkeypatch):
+    """Run the real worker; socketpairs isolate only host transport setup."""
+    cosim_worker, cosim_peer = socket.socketpair()
+    can_worker, can_peer = socket.socketpair()
+    host_worker, host_peer = socket.socketpair(socket.AF_UNIX, socket.SOCK_DGRAM)
+    peers = (cosim_peer, can_peer, host_peer)
+    worker_sockets = (cosim_worker, can_worker, host_worker)
+    for sock in peers:
+        sock.settimeout(2.0)
+    state = SimpleNamespace(
+        cosim=cosim_peer, can=can_peer, host=host_peer,
+        steps=[], resets=[], closes=[], outcome=[], qemu_origin=10_000_000_000)
+    engine = worker.NullEngine(1)
+    original_step, original_reset = engine.step, engine.reset
+
+    def step(dt):
+        state.steps.append(dt)
+        return original_step(dt)
+
+    def reset():
+        state.resets.append(True)
+        original_reset()
+
+    monkeypatch.setattr(engine, "step", step)
+    monkeypatch.setattr(engine, "reset", reset)
+    monkeypatch.setattr(engine, "close", lambda: state.closes.append(True),
+                        raising=False)
+    monkeypatch.setattr(worker, "create_engine", lambda args: engine)
+    connections = {"cosim": cosim_worker, "can": can_worker}
+    monkeypatch.setattr(worker, "connect_unix",
+                        lambda path, timeout: connections[path])
+    monkeypatch.setattr(worker, "open_socketcan", lambda interface: host_worker)
+    monkeypatch.setattr(sys, "argv", [
+        "dm_mc02_sim_worker.py", "--cosim", "cosim", "--fdcan", "can",
+        "--socketcan", "test", "--protocol", "v2", "--engine", "null",
+        "--motor-count", "1", "--rate", "1000", "--frames", "1",
+        "--wait-step-done",
+    ])
+    args = worker.parse_args()
+
+    def run_worker():
+        try:
+            state.outcome.append(worker.run(args))
+        except Exception as exc:
+            state.outcome.append(exc)
+
+    state.thread = threading.Thread(target=run_worker, daemon=True)
+    state.thread.start()
+    protocol = worker.step_protocol
+    try:
+        reset_frame = protocol.decode_step_frame(_recv_v2_wire(cosim_peer))
+        assert reset_frame.header.kind == protocol.RESET
+        cosim_peer.sendall(protocol.build_step_frame(
+            protocol.RESET_ACK, 0, 0, flags=reset_frame.header.session_id,
+            payload=struct.pack("<IIQII", 0, protocol.CAPABILITY_MASK,
+                                state.qemu_origin, 0, 0)))
+        state.step_wire = _recv_v2_wire(cosim_peer)
+        state.step = protocol.decode_step_frame(state.step_wire)
+        assert (state.step.header.kind, state.step.header.step_id,
+                state.step.header.t_sim_ns, state.step.header.dt_ns) == \
+            (protocol.STEP, 1, 1_000_000, 1_000_000)
+        yield state
+    finally:
+        for sock in peers:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+        state.thread.join(timeout=3.0)
+        closed_by_worker = [sock.fileno() == -1 for sock in worker_sockets]
+        for sock in worker_sockets:
+            sock.close()
+        assert not state.thread.is_alive(), "worker did not stop on disconnect"
+        assert closed_by_worker == [True, True, True]
+        assert state.closes == [True]
 
 
+def _assert_can_forwarded_before_response(peer, marker):
+    """Literal Linux/QEMU records are the oracle, not production codecs."""
+    fd_payload = bytes([marker]) * 12
+    peer.can.sendall(struct.pack(
+        "<IIB3xQ64s", 0x1234567, 13, 9, peer.qemu_origin + 500_000,
+        fd_payload))
+    classic_payload = bytes([marker, 0x20, 0x30, 0x40])
+    peer.host.send(struct.pack("=IB3x8s", 0x321, 4, classic_payload))
+    # ACK/DONE remains withheld throughout these reads. A next-iteration-only
+    # forwarding implementation cannot satisfy this gate.
+    peer.host.settimeout(0.15)
+    peer.can.settimeout(0.15)
+    assert peer.host.recv(72) == struct.pack(
+        "=IBBBB64s", 0x81234567, 12, 5, 0, 0, fd_payload)
+    assert _recv_exact(peer.can, 84) == struct.pack(
+        "<IIB3xQ64s", 0x321, 0, 4, peer.qemu_origin + 1_000_000,
+        classic_payload)
+    assert peer.steps == [0.001]
 
 
+def test_worker_queue_full_replays_once_per_retry_and_services_can(
+        retry_worker_peer):
+    peer = retry_worker_peer
+    protocol = worker.step_protocol
+    for _ in range(2):
+        peer.cosim.sendall(_step_reply(
+            peer.step, protocol.STEP_ACK, protocol.STATUS_QUEUE_FULL))
+        assert _recv_v2_wire(peer.cosim) == peer.step_wire
+        assert peer.steps == [0.001]
+    _assert_can_forwarded_before_response(peer, 1)
+    peer.cosim.sendall(_step_reply(peer.step, protocol.STEP_ACK))
+    _assert_can_forwarded_before_response(peer, 2)
+    peer.cosim.sendall(_step_reply(peer.step, protocol.STEP_DONE))
+    peer.thread.join(timeout=3.0)
+    assert not peer.thread.is_alive()
+    assert peer.outcome == [0]
+    assert peer.steps == [0.001]
 
 
+@pytest.mark.parametrize("termination", ["disconnect", "reset", "repeated_reset"])
+def test_worker_queue_full_interrupted_without_restepping_old_input(
+        retry_worker_peer, termination):
+    peer = retry_worker_peer
+    protocol = worker.step_protocol
+    peer.cosim.sendall(_step_reply(
+        peer.step, protocol.STEP_ACK, protocol.STATUS_QUEUE_FULL))
+    assert _recv_v2_wire(peer.cosim) == peer.step_wire
+    assert peer.steps == [0.001]
+    if termination == "disconnect":
+        peer.cosim.shutdown(socket.SHUT_RDWR)
+        peer.thread.join(timeout=3.0)
+        assert not peer.thread.is_alive()
+        assert len(peer.outcome) == 1
+        assert isinstance(peer.outcome[0], ConnectionError)
+        assert "co-sim socket closed" in str(peer.outcome[0])
+        assert peer.steps == [0.001]
+    else:
+        session = 1 if peer.step.header.session_id != 1 else 2
+        new_origin = 20_000_000_000
+        peer.cosim.sendall(protocol.build_step_frame(
+            protocol.RESET, 0, new_origin, flags=session))
+        # Keep RESET_ACK withheld beyond the old 250 ms ACK wait. RESET
+        # itself must cancel old STEP replay, even across socket reads.
+        peer.cosim.settimeout(0.35)
+        with pytest.raises(socket.timeout):
+            peer.cosim.recv(1)
+        assert peer.steps == [0.001] and peer.resets == []
+        peer.cosim.settimeout(2.0)
+        if termination == "repeated_reset":
+            # A second reset can share the same virtual timestamp while
+            # replacing the session. Only the latest ACK may restart plant.
+            session += 1
+            peer.cosim.sendall(protocol.build_step_frame(
+                protocol.RESET, 0, new_origin, flags=session))
+        peer.cosim.sendall(protocol.build_step_frame(
+            protocol.RESET_ACK, 0, new_origin, flags=session,
+            payload=struct.pack("<IIQII", 0, protocol.CAPABILITY_MASK,
+                                new_origin, 0, 0)))
+        new_step = protocol.decode_step_frame(_recv_v2_wire(peer.cosim))
+        assert (new_step.header.step_id, new_step.header.t_sim_ns,
+                new_step.header.dt_ns, new_step.header.session_id) == \
+            (1, new_origin + 1_000_000, 1_000_000, session)
+        peer.cosim.sendall(_step_reply(new_step, protocol.STEP_ACK) +
+                           _step_reply(new_step, protocol.STEP_DONE))
+        peer.thread.join(timeout=3.0)
+        assert not peer.thread.is_alive()
+        assert peer.outcome == [0]
+        assert peer.resets == [True]
+        assert peer.steps == [0.001, 0.001]
 
 
+def test_worker_persistent_queue_full_has_one_real_admission_deadline(
+        retry_worker_peer):
+    peer = retry_worker_peer
+    protocol = worker.step_protocol
+    queue_full = _step_reply(
+        peer.step, protocol.STEP_ACK, protocol.STATUS_QUEUE_FULL)
+    started = time.monotonic()
+    replays = 0
+    peer.cosim.settimeout(0.3)
+    while time.monotonic() - started < 3.25:
+        try:
+            peer.cosim.sendall(queue_full)
+            replay = _recv_v2_wire(peer.cosim)
+        except ConnectionError:
+            break
+        assert replay == peer.step_wire
+        replays += 1
+    elapsed = time.monotonic() - started
+    peer.thread.join(timeout=0.5)
+    assert not peer.thread.is_alive(), "QUEUE_FULL kept extending ACK admission"
+    assert 1.7 <= elapsed < 3.0
+    assert replays > 3
+    assert peer.steps == [0.001]
+    assert len(peer.outcome) == 1
+    assert isinstance(peer.outcome[0], TimeoutError)
+    diagnostic = str(peer.outcome[0])
+    assert "STEP_ACK admission timed out" in diagnostic
+    assert "step=1" in diagnostic and "last_status=1" in diagnostic
+    assert "queue_depth=0" in diagnostic
 
 
 @pytest.mark.parametrize(
