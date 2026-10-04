@@ -13,7 +13,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define EXTI_PR1 0x14
+#define EXTI_FTSR1 0x04
+#define EXTI_D3PCR1H 0x14
+#define EXTI_PR1 0x88
 #define EXTI_C1IMR1 0x80
 
 static int temp_fd;
@@ -80,7 +82,7 @@ static void save_state(const DmMc02GpioExti *state)
 static int load_state(DmMc02GpioExti *state)
 {
     QEMUFile *file = open_test_file(false);
-    int ret = vmstate_load_state(file, dm_mc02_gpio_exti_vmstate(), state, 1);
+    int ret = vmstate_load_state(file, dm_mc02_gpio_exti_vmstate(), state, 2);
 
     if (!ret) {
         g_assert_cmpint(qemu_file_get_error(file), ==, 0);
@@ -178,6 +180,27 @@ static void test_rejects_truncated_state_without_projection(void)
     g_assert_cmpuint(input_sync_count, ==, 0);
 }
 
+static void test_rejects_legacy_pending_layout_without_projection(void)
+{
+    DmMc02GpioExti source;
+    DmMc02GpioExti restored;
+    QEMUFile *file;
+
+    prepare_source(&source);
+    save_state(&source);
+    prepare_destination(&restored);
+    restored.exti.irq_level[0] = true;
+    odr_sync_count = 0;
+    input_sync_count = 0;
+    file = open_test_file(false);
+    g_assert_cmpint(vmstate_load_state(file, dm_mc02_gpio_exti_vmstate(),
+                                      &restored, 1), !=, 0);
+    g_assert_true(restored.exti.irq_level[0]);
+    g_assert_cmpuint(odr_sync_count, ==, 0);
+    g_assert_cmpuint(input_sync_count, ==, 0);
+    qemu_fclose(file);
+}
+
 static void test_nvic_route_validation_is_atomic(void)
 {
     DmMc02Exti exti;
@@ -221,6 +244,38 @@ static void test_nvic_route_validation_is_atomic(void)
     qemu_free_irqs(inputs, 4);
 }
 
+static void test_exti_pending_address_and_mask_projection(void)
+{
+    DmMc02Exti exti;
+    bool levels[4] = { false };
+    qemu_irq *inputs = qemu_allocate_irqs(nvic_input_changed, levels, 4);
+    const uint32_t line = UINT32_C(1) << 15;
+
+    dm_mc02_exti_init(&exti, NULL);
+    dm_mc02_exti_set_irq(&exti, 6, inputs[1]);
+    exti.iomem.ops->write(&exti, EXTI_FTSR1, line, 4);
+    dm_mc02_exti_set_line(&exti, 15, true);
+    dm_mc02_exti_set_line(&exti, 15, false);
+    g_assert_cmphex(exti.iomem.ops->read(&exti, EXTI_PR1, 4), ==, line);
+    g_assert_false(levels[1]);
+
+    exti.iomem.ops->write(&exti, EXTI_C1IMR1, line, 4);
+    g_assert_true(levels[1]);
+    /* CMSIS places D3PCR1H at 0x14; it is not a PR1 alias. */
+    exti.iomem.ops->write(&exti, EXTI_D3PCR1H, line, 4);
+    g_assert_cmphex(exti.iomem.ops->read(&exti, EXTI_PR1, 4), ==, line);
+    g_assert_true(levels[1]);
+    exti.iomem.ops->write(&exti, EXTI_C1IMR1, 0, 4);
+    g_assert_false(levels[1]);
+    g_assert_cmphex(exti.iomem.ops->read(&exti, EXTI_PR1, 4), ==, line);
+    exti.iomem.ops->write(&exti, EXTI_C1IMR1, line, 4);
+    g_assert_true(levels[1]);
+    exti.iomem.ops->write(&exti, EXTI_PR1, line, 4);
+    g_assert_cmphex(exti.iomem.ops->read(&exti, EXTI_PR1, 4), ==, 0);
+    g_assert_false(levels[1]);
+    qemu_free_irqs(inputs, 4);
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf(
@@ -237,8 +292,12 @@ int main(int argc, char **argv)
                     test_rejects_invalid_destination_without_projection);
     g_test_add_func("/dm-gpio-exti-link-vmstate/reject-truncated",
                     test_rejects_truncated_state_without_projection);
+    g_test_add_func("/dm-gpio-exti-link-vmstate/reject-legacy-pending-layout",
+                    test_rejects_legacy_pending_layout_without_projection);
     g_test_add_func("/dm-gpio-exti-link-vmstate/nvic-route-atomic",
                     test_nvic_route_validation_is_atomic);
+    g_test_add_func("/dm-gpio-exti-link-vmstate/exti-pending-mmio",
+                    test_exti_pending_address_and_mask_projection);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

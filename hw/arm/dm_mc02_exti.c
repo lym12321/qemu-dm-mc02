@@ -5,7 +5,8 @@
 #define EXTI_RTSR1  0x00
 #define EXTI_FTSR1  0x04
 #define EXTI_SWIER1 0x08
-#define EXTI_PR1    0x14
+/* ST STM32H723 CMSIS EXTI_TypeDef: PR1 follows IMR1/EMR1 at 0x88. */
+#define EXTI_PR1    0x88
 #define EXTI_C1IMR1 0x80
 
 static uint32_t exti_load(const DmMc02Exti *s, hwaddr offset)
@@ -96,6 +97,12 @@ static void dm_mc02_exti_write(void *opaque, hwaddr offset, uint64_t value,
     }
     for (unsigned i = 0; i < size; ++i) {
         s->regs[offset + i] = value >> (i * 8);
+    }
+    if (offset < EXTI_C1IMR1 + sizeof(uint32_t) &&
+        offset + size > EXTI_C1IMR1) {
+        for (unsigned group = 0; group < ARRAY_SIZE(s->irq); ++group) {
+            exti_update_irq(s, group, false);
+        }
     }
 }
 

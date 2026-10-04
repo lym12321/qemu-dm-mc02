@@ -12,7 +12,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-#define EXTI_PR1     0x14
+#define EXTI_PR1     0x88
 #define EXTI_C1IMR1  0x80
 
 static int temp_fd;
@@ -61,7 +61,7 @@ static void save_state(const DmMc02Exti *state)
 static int load_state(DmMc02Exti *state)
 {
     QEMUFile *file = open_test_file(false);
-    int ret = vmstate_load_state(file, dm_mc02_exti_vmstate(), state, 1);
+    int ret = vmstate_load_state(file, dm_mc02_exti_vmstate(), state, 2);
 
     if (!ret) {
         g_assert_cmpint(qemu_file_get_error(file), ==, 0);
@@ -114,6 +114,29 @@ static void test_rejects_truncated_state_without_reprojection(void)
     g_assert_cmpuint(sync_count, ==, 0);
 }
 
+static void test_rejects_legacy_pending_layout(void)
+{
+    DmMc02Exti source = { 0 };
+    const VMStateDescription *descriptions[] = {
+        dm_mc02_exti_vmstate(), dm_mc02_exti_vmstate_raw(),
+    };
+
+    source.regs[0x14] = 4;
+    source.regs[EXTI_C1IMR1] = 4;
+    save_state(&source);
+    for (unsigned i = 0; i < ARRAY_SIZE(descriptions); ++i) {
+        DmMc02Exti restored = { 0 };
+        QEMUFile *file = open_test_file(false);
+
+        restored.irq_level[0] = true;
+        sync_count = 0;
+        g_assert_cmpint(vmstate_load_state(file, descriptions[i], &restored, 1), !=, 0);
+        g_assert_true(restored.irq_level[0]);
+        g_assert_cmpuint(sync_count, ==, 0);
+        qemu_fclose(file);
+    }
+}
+
 int main(int argc, char **argv)
 {
     g_autofree char *temp_file = g_strdup_printf("%s/dm-exti-vmstate.XXXXXX",
@@ -128,6 +151,8 @@ int main(int argc, char **argv)
                     test_round_trip_restores_line_and_reprojects_irq);
     g_test_add_func("/dm-exti-vmstate/reject-truncated",
                     test_rejects_truncated_state_without_reprojection);
+    g_test_add_func("/dm-exti-vmstate/reject-legacy-pending-layout",
+                    test_rejects_legacy_pending_layout);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

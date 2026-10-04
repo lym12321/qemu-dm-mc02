@@ -56,7 +56,7 @@ static int dm_mc02_gpio_exti_post_load(void *opaque, int version_id)
 {
     DmMc02GpioExti *state = opaque;
 
-    if (!state || version_id != 1 ||
+    if (!state || version_id != 2 ||
         !dm_mc02_gpio_exti_state_valid(state)) {
         return -EINVAL;
     }
@@ -71,8 +71,8 @@ static int dm_mc02_gpio_exti_pre_save(void *opaque)
 
 static const VMStateDescription vmstate_dm_mc02_gpio_exti = {
     .name = "dm-mc02-gpio-exti",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .pre_save = dm_mc02_gpio_exti_pre_save,
     .post_load = dm_mc02_gpio_exti_post_load,
     .fields = (VMStateField[]) {

@@ -7,7 +7,7 @@ static int dm_mc02_exti_post_load(void *opaque, int version_id)
 {
     DmMc02Exti *state = opaque;
 
-    if (version_id != 1) {
+    if (version_id != 2) {
         return -EINVAL;
     }
     dm_mc02_exti_sync_runtime(state);
@@ -22,15 +22,15 @@ static const VMStateField vmstate_dm_mc02_exti_fields[] = {
 
 const VMStateDescription vmstate_dm_mc02_exti_raw = {
     .name = "dm-mc02-exti-raw",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .fields = vmstate_dm_mc02_exti_fields,
 };
 
 static const VMStateDescription vmstate_dm_mc02_exti = {
     .name = "dm-mc02-exti",
-    .version_id = 1,
-    .minimum_version_id = 1,
+    .version_id = 2,
+    .minimum_version_id = 2,
     .post_load = dm_mc02_exti_post_load,
     .fields = vmstate_dm_mc02_exti_fields,
 };

@@ -22,7 +22,8 @@
 
 #define EXTI_BASE         0x58000000ull
 #define EXTI_FTSR1        (EXTI_BASE + 0x04)
-#define EXTI_PR1          (EXTI_BASE + 0x14)
+#define EXTI_D3PCR1H      (EXTI_BASE + 0x14)
+#define EXTI_PR1          (EXTI_BASE + 0x88)
 #define EXTI_C1IMR1       (EXTI_BASE + 0x80)
 
 #define SYST_CSR_ENABLE       (1u << 0)
@@ -232,16 +233,28 @@ static void test_gpio_exti_reaches_native_nvic(void)
      * PA15 starts high (released user key), so driving the board input low
      * must create a falling-edge pending interrupt. */
     qtest_writel(qts, EXTI_FTSR1, line_mask);
-    qtest_writel(qts, EXTI_C1IMR1, line_mask);
     qtest_qmp_assert_success(
         qts, "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine', "
         "'property': 'gpio-input', 'value': 'A15=0' } }");
 
+    /* ST CMSIS/HAL PR1 is at 0x88. An edge latches while IMR1 masks IRQ. */
+    g_assert_cmphex(qtest_readl(qts, EXTI_PR1), ==, line_mask);
+    g_assert_false(qtest_get_irq(qts, TEST_EXTI_IRQ));
+    qtest_writel(qts, EXTI_C1IMR1, line_mask);
     g_assert_true(qtest_get_irq(qts, TEST_EXTI_IRQ));
     g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, irq_mask);
 
+    qtest_writel(qts, EXTI_D3PCR1H, line_mask);
+    g_assert_cmphex(qtest_readl(qts, EXTI_PR1), ==, line_mask);
+    g_assert_true(qtest_get_irq(qts, TEST_EXTI_IRQ));
+    qtest_writel(qts, EXTI_C1IMR1, 0);
+    g_assert_false(qtest_get_irq(qts, TEST_EXTI_IRQ));
+    g_assert_cmphex(qtest_readl(qts, EXTI_PR1), ==, line_mask);
+    qtest_writel(qts, EXTI_C1IMR1, line_mask);
+    g_assert_true(qtest_get_irq(qts, TEST_EXTI_IRQ));
     qtest_writel(qts, EXTI_PR1, line_mask);
     g_assert_false(qtest_get_irq(qts, TEST_EXTI_IRQ));
+    g_assert_cmphex(qtest_readl(qts, EXTI_PR1), ==, 0);
     /* Clearing the EXTI source deasserts the level, while NVIC pending is
      * architecturally cleared by ICPR. */
     qtest_writel(qts, NVIC_ICPR1, irq_mask);
