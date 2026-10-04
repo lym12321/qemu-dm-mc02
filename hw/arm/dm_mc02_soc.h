@@ -95,9 +95,13 @@ bool dm_mc02_soc_validate_map(const DmMc02SocProfile *soc);
 bool dm_mc02_soc_dma_sram_range_valid(const DmMc02SocProfile *soc,
                                       hwaddr address, size_t bytes);
 
+/* Non-NULL Flash ops select QEMU ROMD with borrowed callbacks. NULL retains
+ * the RAM-only USB-host reference fixture, which has no Flash controller. */
 void dm_mc02_soc_memory_init(DmMc02SocMemory *memory, Object *owner,
                              MemoryRegion *system_memory,
-                             const DmMc02SocProfile *soc, Error **errp);
+                             const DmMc02SocProfile *soc,
+                             const MemoryRegionOps *flash_ops,
+                             void *flash_opaque, Error **errp);
 void dm_mc02_soc_memory_reset_volatile(DmMc02SocMemory *memory,
                                        const DmMc02SocProfile *soc);
 void dm_mc02_soc_memory_reset_fdcan_msg_ram(DmMc02SocMemory *memory);

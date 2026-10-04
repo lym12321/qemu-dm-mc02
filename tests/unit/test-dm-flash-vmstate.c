@@ -22,13 +22,12 @@ static unsigned sync_count;
 /* The component test intentionally does not link QEMU's full system memory
  * implementation.  This test-only implementation observes the public
  * runtime-sync boundary; the production implementation lives in
- * dm_mc02_flash.c and rebuilds the real overlay. */
+ * dm_mc02_flash.c and rebuilds write admission. */
 void dm_mc02_flash_sync_runtime(DmMc02Flash *state)
 {
     uint32_t cr = ldl_le_p(state->regs + FLASH_CR1_OFFSET);
 
     state->program_enabled = !(cr & FLASH_CR_LOCK) && (cr & FLASH_CR_PG);
-    state->program_window.enabled = state->program_enabled;
     sync_count++;
 }
 
@@ -86,7 +85,7 @@ static void init_target(DmMc02Flash *state, uint8_t *storage,
     state->storage_region = storage_region;
 }
 
-static void test_round_trip_restores_register_state_and_overlay(void)
+static void test_round_trip_restores_register_state_and_admission(void)
 {
     DmMc02Flash source;
     DmMc02Flash restored;
@@ -111,7 +110,6 @@ static void test_round_trip_restores_register_state_and_overlay(void)
     storage_size = restored.storage_size;
     storage_region_pointer = restored.storage_region;
     restored.program_enabled = false;
-    restored.program_window.enabled = false;
     sync_count = 0;
 
     g_assert_cmpint(load_state(&restored), ==, 0);
@@ -120,14 +118,13 @@ static void test_round_trip_restores_register_state_and_overlay(void)
     g_assert_true(restored.key1_seen);
     g_assert_true(restored.optkey_seen);
     g_assert_true(restored.program_enabled);
-    g_assert_true(restored.program_window.enabled);
     g_assert_cmpuint(sync_count, ==, 1);
     g_assert_true(restored.storage == storage_pointer);
     g_assert_cmpuint(restored.storage_size, ==, storage_size);
     g_assert_true(restored.storage_region == storage_region_pointer);
 }
 
-static void test_locked_state_disables_program_overlay(void)
+static void test_locked_state_disables_program_admission(void)
 {
     DmMc02Flash source;
     DmMc02Flash restored;
@@ -140,14 +137,12 @@ static void test_locked_state_disables_program_overlay(void)
 
     init_target(&restored, storage, &storage_region);
     restored.program_enabled = true;
-    restored.program_window.enabled = true;
     sync_count = 0;
     g_assert_cmpint(load_state(&restored), ==, 0);
     g_assert_false(restored.program_enabled);
-    g_assert_false(restored.program_window.enabled);
 }
 
-static void test_rejects_truncated_state_without_rebuilding_overlay(void)
+static void test_rejects_truncated_state_without_rebuilding_admission(void)
 {
     DmMc02Flash state;
     MemoryRegion storage_region;
@@ -159,11 +154,9 @@ static void test_rejects_truncated_state_without_rebuilding_overlay(void)
     qemu_fclose(file);
     init_target(&state, storage, &storage_region);
     state.program_enabled = true;
-    state.program_window.enabled = true;
     sync_count = 0;
     g_assert_cmpint(load_state(&state), !=, 0);
     g_assert_true(state.program_enabled);
-    g_assert_true(state.program_window.enabled);
     g_assert_cmpuint(sync_count, ==, 0);
 }
 
@@ -191,7 +184,7 @@ static void test_pending_word_round_trip_and_admission(void)
                     source.program_data, sizeof(source.program_data));
     g_assert_cmpuint(sync_count, ==, 1);
 
-    /* Destination geometry must be checked before rebuilding the overlay. */
+    /* Destination geometry must be checked before rebuilding admission. */
     init_target(&restored, storage, &storage_region);
     restored.storage_size = 0x110;
     sync_count = 0;
@@ -254,12 +247,12 @@ int main(int argc, char **argv)
     g_assert_cmpint(temp_fd, >=, 0);
     module_call_init(MODULE_INIT_QOM);
     g_test_init(&argc, &argv, NULL);
-    g_test_add_func("/dm-flash-vmstate/round-trip-overlay",
-                    test_round_trip_restores_register_state_and_overlay);
-    g_test_add_func("/dm-flash-vmstate/locked-overlay",
-                    test_locked_state_disables_program_overlay);
+    g_test_add_func("/dm-flash-vmstate/round-trip-admission",
+                    test_round_trip_restores_register_state_and_admission);
+    g_test_add_func("/dm-flash-vmstate/locked-admission",
+                    test_locked_state_disables_program_admission);
     g_test_add_func("/dm-flash-vmstate/reject-truncated",
-                    test_rejects_truncated_state_without_rebuilding_overlay);
+                    test_rejects_truncated_state_without_rebuilding_admission);
     g_test_add_func("/dm-flash-vmstate/pending-word",
                     test_pending_word_round_trip_and_admission);
     g_test_add_func("/dm-flash-vmstate/v1-empty-buffer",

@@ -2682,10 +2682,10 @@ static void dm_mc02_init(MachineState *machine)
     s->refclk = clock_new(OBJECT(machine), "REFCLK");
     clock_set_hz(s->refclk, soc->refclk_hz);
 
-    /* The SoC owns its internal memory map; the machine adds the flash
-     * programming window and optional persistent backing below. */
+    /* The SoC owns the Flash ROMD bytes; the controller borrows writes. */
     dm_mc02_soc_memory_init(&s->soc_memory, OBJECT(machine), system_memory,
-                            soc, &error_fatal);
+                            soc, dm_mc02_flash_storage_ops(), &s->flash_regs,
+                            &error_fatal);
     if (s->flash_file && s->flash_file[0]) {
         DmNorFlashPersistenceResult result = dm_nor_flash_persistence_load(
             s->flash_file,
@@ -2704,8 +2704,6 @@ static void dm_mc02_init(MachineState *machine)
     dm_mc02_flash_init(&s->flash_regs, OBJECT(machine),
                        memory_region_get_ram_ptr(&s->soc_memory.flash),
                        soc->flash_size, &s->soc_memory.flash);
-    memory_region_add_subregion_overlap(system_memory, soc->flash_base,
-                                         &s->flash_regs.program_window, 1);
     memory_region_add_subregion(system_memory, soc->flash_r_base,
                                 &s->flash_regs.iomem);
 

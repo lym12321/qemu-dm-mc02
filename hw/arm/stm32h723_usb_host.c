@@ -35,7 +35,7 @@ static void stm32h723_usb_host_init(MachineState *machine)
     MemoryRegion *system_memory = get_system_memory();
 
     dm_mc02_soc_memory_init(&s->soc_memory, OBJECT(machine), system_memory,
-                            soc, &error_fatal);
+                            soc, NULL, NULL, &error_fatal);
     s->sysclk = clock_new(OBJECT(machine), "SYSCLK");
     clock_set_hz(s->sysclk, soc->reset_cpu_hz);
     s->refclk = clock_new(OBJECT(machine), "REFCLK");

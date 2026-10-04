@@ -59,6 +59,7 @@ tests = {
   ],
   'test-dm-soc-memory': [
     meson.project_source_root() / 'hw/arm/dm_mc02_soc.c',
+    meson.project_source_root() / 'hw/arm/dm_mc02_flash.c',
     'test-dm-soc-memory-stubs.c',
     hwcore,
   ],

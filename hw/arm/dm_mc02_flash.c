@@ -96,17 +96,8 @@ static void dm_mc02_flash_reject_program(DmMc02Flash *s, const char *reason)
 static uint64_t dm_mc02_flash_program_read(void *opaque, hwaddr offset,
                                            unsigned size)
 {
-    DmMc02Flash *s = opaque;
-    uint64_t value = 0;
-
-    if (size > sizeof(value) || offset > s->storage_size ||
-        size > s->storage_size - offset) {
-        return 0;
-    }
-    for (unsigned i = 0; i < size; ++i) {
-        value |= (uint64_t)s->storage[offset + i] << (i * 8);
-    }
-    return value;
+    /* ROMD reads go directly to the SoC RAM block, as in nrf51_nvm.c. */
+    g_assert_not_reached();
 }
 
 static void dm_mc02_flash_program_write(void *opaque, hwaddr offset,
@@ -115,7 +106,7 @@ static void dm_mc02_flash_program_write(void *opaque, hwaddr offset,
     DmMc02Flash *s = opaque;
     uint32_t sr = dm_mc02_flash_load(s->regs, FLASH_SR1, sizeof(sr));
 
-    if (sr & FLASH_SR_PGSERR) {
+    if (!s->program_enabled || (sr & FLASH_SR_PGSERR)) {
         return;
     }
     /* ST stm32h7xx_hal_flash.c HAL_FLASH_Program(), H72x/3x branch:
@@ -156,6 +147,8 @@ static void dm_mc02_flash_program_write(void *opaque, hwaddr offset,
     }
     memcpy(s->storage + s->program_address, s->program_data,
            DM_MC02_FLASH_WORD_SIZE);
+    memory_region_flush_rom_device(s->storage_region, s->program_address,
+                                    DM_MC02_FLASH_WORD_SIZE);
     dm_mc02_flash_clear_program(s);
     dm_mc02_flash_store(s->regs, FLASH_SR1, sr | FLASH_SR_EOP, sizeof(sr));
 }
@@ -172,6 +165,11 @@ static const MemoryRegionOps dm_mc02_flash_program_ops = {
     .impl.unaligned = true,
 };
 
+const MemoryRegionOps *dm_mc02_flash_storage_ops(void)
+{
+    return &dm_mc02_flash_program_ops;
+}
+
 static void dm_mc02_flash_erase_sector(DmMc02Flash *s, uint32_t cr)
 {
     unsigned sector = (cr & FLASH_CR_SNB_MASK) >> FLASH_CR_SNB_SHIFT;
@@ -180,9 +178,11 @@ static void dm_mc02_flash_erase_sector(DmMc02Flash *s, uint32_t cr)
     if (!s->storage || offset >= s->storage_size || sector >= 8) {
         return;
     }
-    memset(s->storage + offset, 0xff,
-           MIN((size_t)DM_MC02_FLASH_SECTOR_SIZE,
-               s->storage_size - offset));
+    size_t size = MIN((size_t)DM_MC02_FLASH_SECTOR_SIZE,
+                      s->storage_size - offset);
+
+    memset(s->storage + offset, 0xff, size);
+    memory_region_flush_rom_device(s->storage_region, offset, size);
 }
 
 static uint64_t dm_mc02_flash_read(void *opaque, hwaddr offset,
@@ -209,7 +209,7 @@ static void dm_mc02_flash_write(void *opaque, hwaddr offset, uint64_t value,
     }
 
     /* The modeled control path uses the HAL's aligned 32-bit accesses.
-     * Smaller writes must not bypass LOCK or runtime overlay projection. */
+     * Smaller writes must not bypass LOCK or runtime write admission. */
     const hwaddr command_registers[] = {
         FLASH_KEYR1, FLASH_OPTKEYR, FLASH_CR1, FLASH_CCR1,
     };
@@ -338,11 +338,6 @@ void dm_mc02_flash_init(DmMc02Flash *state, Object *owner,
     memory_region_init_io(&state->iomem, owner, &dm_mc02_flash_ops, state,
                           "dm-mc02.flash-regs",
                           DM_MC02_FLASH_REG_REGION_SIZE);
-    memory_region_init_io(&state->program_window, owner,
-                          &dm_mc02_flash_program_ops, state,
-                          "dm-mc02.flash-program-window", storage_size);
-    memory_region_set_enabled(&state->program_window, false);
-    memory_region_set_readonly(storage_region, true);
 }
 
 void dm_mc02_flash_set_program_enabled(DmMc02Flash *state, bool enabled)
@@ -351,12 +346,6 @@ void dm_mc02_flash_set_program_enabled(DmMc02Flash *state, bool enabled)
         return;
     }
     state->program_enabled = enabled;
-    if (state->storage_region) {
-        /* Keep the RAM-backed execution region read-only at all times.  The
-         * higher-priority IO overlay is enabled only for PG writes. */
-        memory_region_set_readonly(state->storage_region, true);
-    }
-    memory_region_set_enabled(&state->program_window, enabled);
 }
 
 void dm_mc02_flash_sync_runtime(DmMc02Flash *state)
@@ -386,7 +375,7 @@ void dm_mc02_flash_reset(DmMc02Flash *state)
                         sizeof(uint32_t));
     dm_mc02_flash_store(state->regs, FLASH_OPTCR, FLASH_OPTCR_OPTLOCK,
                         sizeof(uint32_t));
-    /* A reset must never leave the NOR write overlay active, even though the
+    /* A reset must never leave programming admitted, even though the
      * backing Flash contents intentionally survive a warm system reset. */
     dm_mc02_flash_set_program_enabled(state, false);
 }

@@ -11,9 +11,15 @@ typedef struct TestRamAllocation {
 
 static GHashTable *test_ram_allocations;
 unsigned test_migratable_ram_calls;
+unsigned test_migratable_rom_device_calls;
 unsigned test_nonmigratable_ram_calls;
 unsigned test_nonmigratable_rom_calls;
 unsigned test_invalid_owner_calls;
+unsigned test_io_calls;
+unsigned test_flush_calls;
+MemoryRegion *test_flush_region;
+hwaddr test_flush_offset;
+hwaddr test_flush_size;
 
 void test_soc_memory_stubs_init(void);
 void test_soc_memory_stubs_cleanup(void);
@@ -56,6 +62,45 @@ void memory_region_init_ram_nomigrate(MemoryRegion *mr, Object *owner,
         test_invalid_owner_calls++;
     }
     test_record_region(mr, name, size, false, true);
+}
+
+void memory_region_init_rom_device(MemoryRegion *mr, Object *owner,
+                                   const MemoryRegionOps *ops, void *opaque,
+                                   const char *name, uint64_t size,
+                                   Error **errp)
+{
+    (void)errp;
+    if (owner) {
+        test_invalid_owner_calls++;
+    }
+    test_record_region(mr, name, size, true, false);
+    mr->ops = ops;
+    mr->opaque = opaque;
+    mr->rom_device = true;
+    mr->romd_mode = true;
+    test_migratable_rom_device_calls++;
+}
+
+void memory_region_init_io(MemoryRegion *mr, Object *owner,
+                           const MemoryRegionOps *ops, void *opaque,
+                           const char *name, uint64_t size)
+{
+    (void)owner;
+    (void)name;
+    (void)size;
+    mr->ops = ops;
+    mr->opaque = opaque;
+    test_io_calls++;
+}
+
+void memory_region_flush_rom_device(MemoryRegion *mr, hwaddr offset,
+                                    hwaddr size)
+{
+    g_assert_true(memory_region_is_romd(mr));
+    test_flush_calls++;
+    test_flush_region = mr;
+    test_flush_offset = offset;
+    test_flush_size = size;
 }
 
 void memory_region_init_rom_nomigrate(MemoryRegion *mr, Object *owner,
@@ -133,9 +178,13 @@ void test_soc_memory_stubs_init(void)
                                                  NULL,
                                                  (GDestroyNotify)g_free);
     test_migratable_ram_calls = 0;
+    test_migratable_rom_device_calls = 0;
     test_nonmigratable_ram_calls = 0;
     test_nonmigratable_rom_calls = 0;
     test_invalid_owner_calls = 0;
+    test_io_calls = 0;
+    test_flush_calls = 0;
+    test_flush_region = NULL;
 }
 
 void test_soc_memory_stubs_cleanup(void)

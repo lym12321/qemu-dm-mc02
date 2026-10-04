@@ -119,7 +119,9 @@ bool dm_mc02_soc_dma_sram_range_valid(const DmMc02SocProfile *soc,
 
 void dm_mc02_soc_memory_init(DmMc02SocMemory *memory, Object *owner,
                              MemoryRegion *system_memory,
-                             const DmMc02SocProfile *soc, Error **errp)
+                             const DmMc02SocProfile *soc,
+                             const MemoryRegionOps *flash_ops,
+                             void *flash_opaque, Error **errp)
 {
     uint8_t *calib;
 
@@ -129,8 +131,17 @@ void dm_mc02_soc_memory_init(DmMc02SocMemory *memory, Object *owner,
      * DeviceState.  A NULL owner gives QEMU a global RAMBlock id and keeps
      * the region migratable without making the SoC depend on machine QOM
      * details. */
-    memory_region_init_ram(&memory->flash, NULL, "dm-mc02.flash",
-                           soc->flash_size, errp);
+    if (flash_ops) {
+        /* QEMU ROMD: direct instruction/data reads and callback writes share
+         * one migratable RAM block, as in hw/nvram/nrf51_nvm.c. */
+        memory_region_init_rom_device(&memory->flash, NULL, flash_ops,
+                                       flash_opaque, "dm-mc02.flash",
+                                       soc->flash_size, errp);
+    } else {
+        /* The USB-host reference fixture has no Flash command consumer. */
+        memory_region_init_ram(&memory->flash, NULL, "dm-mc02.flash",
+                               soc->flash_size, errp);
+    }
     memset(memory_region_get_ram_ptr(&memory->flash), 0xff, soc->flash_size);
     memory_region_add_subregion(system_memory, soc->flash_base,
                                 &memory->flash);

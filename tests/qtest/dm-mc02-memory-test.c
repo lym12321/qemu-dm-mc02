@@ -2,6 +2,7 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qapi/qmp/qdict.h"
 
 #define FDCAN_MSG_RAM_BASE 0x4000ac00ull
 #define FDCAN_MSG_RAM_SIZE 0x2800ull
@@ -30,6 +31,17 @@
 #define FLASH_IMAGE_SIZE   (1024 * 1024)
 #define FLASH_IMAGE_MARKER 0x80000
 #define FLASH_PROGRAM_OFFSET 0x1000
+
+static void assert_flash_romd(QTestState *qts)
+{
+    QDict *response = qtest_qmp(qts, "{ 'execute': 'human-monitor-command', "
+                                     "'arguments': { 'command-line': 'info mtree -f' } }");
+    const char *tree = qdict_get_str(response, "return");
+
+    g_assert_nonnull(strstr(tree, "romd): dm-mc02.flash"));
+    g_assert_null(strstr(tree, "flash-program-window"));
+    qobject_unref(response);
+}
 
 static void flash_unlock(QTestState *qts)
 {
@@ -116,6 +128,7 @@ static void test_internal_flash_word_transaction(void)
     const uint64_t address = FLASH_BASE + 0x20000;
     const uint32_t value = 0x12345678;
 
+    assert_flash_romd(qts);
     /* Locked or PG-disabled writes do not alter the read-only NVM view. */
     qtest_writeb(qts, FLASH_CR1, 0);
     qtest_writew(qts, FLASH_CR1, FLASH_CR_PG);
@@ -129,6 +142,7 @@ static void test_internal_flash_word_transaction(void)
     g_assert_cmphex(qtest_readl(qts, address), ==, UINT32_MAX);
 
     qtest_writel(qts, FLASH_CR1, FLASH_CR_PG);
+    assert_flash_romd(qts);
     for (unsigned i = 0; i < 7; ++i) {
         qtest_writel(qts, address + 4 * i, value + i);
         g_assert_cmphex(qtest_readl(qts, address), ==, UINT32_MAX);
@@ -208,7 +222,7 @@ static void test_internal_flash_word_transaction(void)
     g_assert_cmphex(qtest_readl(qts, address), ==, value);
 
     /* HAL_FLASH_Unlock only clears LOCK through KEYR1, preserving PG.
-     * Unlock must reproject the program window without a later CR1 write. */
+     * Unlock must admit ROMD writes without a later CR1 write. */
     flash_unlock(qts);
     qtest_writel(qts, FLASH_CR1, FLASH_CR_LOCK | FLASH_CR_PG);
     flash_unlock(qts);

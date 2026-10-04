@@ -1,7 +1,7 @@
 /*
  * Minimal STM32H723 FLASH_R peripheral model for the DM-MC02 machine.
  *
- * NVM bytes belong to the SoC's RAM-backed, read-only execution region. This
+ * NVM bytes belong to the SoC's ROMD execution region. This
  * controller borrows it for unlock, sector erase and HAL-style 256-bit word
  * programming; timing, force-write and ECC remain out of scope.
  */
@@ -24,10 +24,7 @@ typedef struct DmMc02Flash {
     uint8_t *storage;
     size_t storage_size;
     MemoryRegion *storage_region;
-    /* Enabled only while FLASH_CR1.PG is active.  Normal instruction/data
-     * reads stay on the RAM-backed region; the overlay buffers program
-     * writes until one complete flash word can be committed. */
-    MemoryRegion program_window;
+    /* Derived write admission; ROMD instruction/data reads stay direct. */
     bool program_enabled;
     /* HAL_FLASH_Program() writes an aligned H723 flash word as eight
      * consecutive 32-bit stores.  These bytes are not committed NVM until
@@ -38,9 +35,12 @@ typedef struct DmMc02Flash {
     uint8_t program_data[DM_MC02_FLASH_WORD_SIZE];
 } DmMc02Flash;
 
+/* storage and storage_region borrow the same SoC-owned ROMD RAM block. */
 void dm_mc02_flash_init(DmMc02Flash *state, Object *owner,
                         uint8_t *storage, size_t storage_size,
                         MemoryRegion *storage_region);
+/* ROMD writes borrow this producer; SoC memory remains the byte owner. */
+const MemoryRegionOps *dm_mc02_flash_storage_ops(void);
 void dm_mc02_flash_reset(DmMc02Flash *state);
 void dm_mc02_flash_set_program_enabled(DmMc02Flash *state, bool enabled);
 void dm_mc02_flash_sync_runtime(DmMc02Flash *state);
