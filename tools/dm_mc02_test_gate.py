@@ -29,6 +29,7 @@ class Status(str, Enum):
 OPTIONAL_SMOKES = frozenset(
     {
         "run-mujoco-worker-smoke.sh",
+        "run-robot-smoke.sh",
         "run-ros2-worker-smoke.sh",
     }
 )

@@ -8,15 +8,15 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-import math
-import os
 from pathlib import Path
 import select
-import shutil
 import time
 
 from sim.boards import QemuBoard
 from sim.boards.channels import ChannelEvent, LabChannels
+from sim.boards.launch import (UARTS, CANS, PROJECT_ROOT, positive_seconds,
+                               regular_file as _regular_file, resolve_qemu as _qemu_path,
+                               qmp_socket_path as _external_qmp, qemu_command)
 from sim.transports import StreamTransport, connect_unix
 from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
@@ -25,43 +25,6 @@ from tools.dm_mc02_test_harness import running_qemu
 
 from .experiment import LabExperiment
 from .manifest import LabManifest, Stimulus
-
-
-UARTS = ("uart1", "uart2", "uart3", "uart5", "uart7", "uart10")
-CANS = ("can1", "can2", "can3")
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
-
-
-def positive_seconds(value) -> float:
-    if (isinstance(value, bool) or not isinstance(value, (int, float)) or
-            not math.isfinite(value) or value <= 0):
-        raise ValueError("timeout must be finite and positive")
-    return float(value)
-
-
-def _regular_file(path, label: str, *, executable=False) -> Path:
-    path = Path(path).resolve()
-    if not path.is_file() or not os.access(path, os.X_OK if executable else os.R_OK):
-        raise ValueError(f"{label} is not {'executable' if executable else 'readable'}: {path}")
-    return path
-
-
-def _qemu_path(value) -> Path:
-    value = value or os.environ.get("QEMU_SYSTEM_ARM") or PROJECT_ROOT / "build/qemu/qemu-system-arm"
-    if isinstance(value, str) and "/" not in value:
-        value = shutil.which(value) or value
-    return _regular_file(value, "QEMU", executable=True)
-
-
-def _external_qmp(path) -> Path | None:
-    if path is None:
-        return None
-    if not isinstance(path, (str, Path)) or "\0" in str(path):
-        raise ValueError("QMP socket must be a path without NUL")
-    path = Path(path).absolute()
-    if len(os.fsencode(path)) > 100 or not path.parent.is_dir() or path.exists():
-        raise ValueError("QMP socket needs an existing parent, a new path, and at most 100 bytes")
-    return path
 
 
 class ConnectedLab:
@@ -149,22 +112,11 @@ def open_lab(firmware, *, qemu=None, uarts=(), cans=(), adc=False,
     if gdb_port is not None and (type(gdb_port) is not int or not 1 <= gdb_port <= 65535):
         raise ValueError("GDB port must be an integer in 1..65535")
     external_qmp = _external_qmp(qmp_path)
-    command = [str(qemu), "-machine", "dm-mc02,fdcan-host-ack=on", "-kernel", str(firmware),
-               "-nodefaults", "-display", "none", "-monitor", "none", "-S",
-               "-qmp", "unix:{qmp},server=on,wait=off"]
     sockets = ["qmp", *uarts, *cans]
     if adc:
         sockets.append("cosim")
-    for port in ("cosim", *UARTS, *CANS):
-        if port in sockets:
-            command += ["-chardev", f"socket,id={port},path={{{port}}},server=on,wait=off",
-                        "-serial", f"chardev:{port}"]
-        else:
-            command += ["-serial", "none"]
-    if external_qmp is not None:
-        command += ["-qmp", f"unix:{str(external_qmp).replace(',', ',,')},server=on,wait=off"]
-    if gdb_port is not None:
-        command += ["-gdb", f"tcp:127.0.0.1:{gdb_port}"]
+    command = qemu_command(firmware, qemu, sockets,
+                           qmp_path=external_qmp, gdb_port=gdb_port)
     with running_qemu(command, sockets=sockets, startup_timeout=startup_timeout) as owner:
         startup_deadline = owner.start_ns / 1e9 + startup_timeout
         deadline = owner.start_ns / 1e9 + timeout

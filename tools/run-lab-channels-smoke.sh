@@ -24,6 +24,11 @@ arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O2 -Wall -Wextra -Werror \
     -Wl,-T,"$root_dir/smoke/dm_mc02_uart_smoke.ld" \
     -o "$guest_elf" "$root_dir/smoke/dm_mc02_lab_smoke.c"
 
+if [[ ${1:-} == --robot-only ]]; then
+    python3 "$root_dir/smoke/dm_mc02_robot_smoke.py" "$root_dir" "$guest_elf" "$run_dir"
+    exit
+fi
+
 # Slots: 0 co-sim, 1 USART1, 7 FDCAN1. The shared harness owns QEMU,
 # subprocess cleanup and short private /tmp sockets; this consumer owns peers.
 python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \

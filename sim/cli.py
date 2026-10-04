@@ -39,17 +39,18 @@ def _port(value) -> int:
     return number
 
 
-def _runtime_options(parser, *, timeout: float) -> None:
+def _runtime_options(parser, *, timeout: float, paused=True) -> None:
     parser.add_argument("--qemu", metavar="PATH", help="QEMU executable (default: project build)")
     parser.add_argument("--timeout", type=_seconds, default=timeout, metavar="SECONDS",
-                        help=f"total host deadline, including startup (default: {timeout:g})")
+                        help=f"active host deadline including startup; cleanup separate (default: {timeout:g})")
     parser.add_argument("--startup-timeout", type=_seconds, default=10.0, metavar="SECONDS",
                         help="startup deadline from QEMU launch (default: 10)")
     parser.add_argument("--qmp", metavar="PATH", help="additional native QMP Unix socket")
     parser.add_argument("--gdb-port", type=_port, metavar="PORT",
                         help="native GDB port on 127.0.0.1, in 1..65535")
-    parser.add_argument("--paused", action="store_true",
-                        help="start paused for native GDB or interactive cont (requires --gdb-port)")
+    if paused:
+        parser.add_argument("--paused", action="store_true",
+                            help="start paused for native GDB or interactive cont (requires --gdb-port)")
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -77,6 +78,15 @@ def _parser() -> argparse.ArgumentParser:
                              help="attach a CAN channel; repeat for several")
     interactive.add_argument("--adc", action="store_true", help="enable ADC1 raw16/voltage input")
     _runtime_options(interactive, timeout=300.0)
+    robot = groups.add_parser("robot", help="single-board four-wheel robot manifests")
+    robots = robot.add_subparsers(dest="action", required=True)
+    run = robots.add_parser("run", help="run firmware, chassis physics and optional upper processes")
+    run.add_argument("manifest", type=Path, metavar="PATH",
+                     help="YAML robot manifest; paths are relative to its directory")
+    run.add_argument("--duration", type=_seconds, default=5.0, metavar="SECONDS",
+                     help="QEMU virtual duration after optional UART ready (default: 5)")
+    _runtime_options(run, timeout=30.0, paused=False)
+    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
     return parser
 
 
@@ -165,6 +175,35 @@ def _run_interactive(args) -> int:
         return 130 if isinstance(error, KeyboardInterrupt) else 1
 
 
+def _run_robot(args) -> int:
+    try:
+        from sim.robots.manifest import load_manifest
+        from sim.robots.runtime import run_manifest
+
+        manifest = load_manifest(args.manifest)
+        result = run_manifest(
+            manifest, emit=_emit, duration=args.duration, qemu=args.qemu,
+            startup_timeout=args.startup_timeout, timeout=args.timeout,
+            qmp_path=args.qmp, gdb_port=args.gdb_port)
+        payload = {"status": "passed", "result": asdict(result)}
+        code = 0
+    except (Exception, KeyboardInterrupt) as error:
+        _diagnose(error)
+        payload = {"status": "failed", "error": str(error),
+                   "error_type": type(error).__name__,
+                   "notes": list(getattr(error, "__notes__", ()))}
+        code = 130 if isinstance(error, KeyboardInterrupt) else 1
+    if args.report is not None:
+        try:
+            _write_report(args.report, payload)
+        except (Exception, KeyboardInterrupt) as error:
+            _diagnose(error)
+            return 130 if isinstance(error, KeyboardInterrupt) else 1
+    if code == 0:
+        print(f"Robot {result.name!r}: passed (application ready: {result.ready})", flush=True)
+    return code
+
+
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # The existing native launcher owns all board option admission. Preserve
@@ -180,6 +219,8 @@ def main(argv=None) -> int:
     args = _parser().parse_args(arguments)
     previous = signal.signal(signal.SIGTERM, _interrupted)
     try:
+        if args.group == "robot":
+            return _run_robot(args)
         return _run_lab(args) if args.action == "run" else _run_interactive(args)
     finally:
         signal.signal(signal.SIGTERM, previous)

@@ -135,6 +135,75 @@ quit
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
 
+## Robot manifest
+
+`sim robot run` 将一块 DM-MC02、FDCAN1、一条 CAN 总线、四个 M3508 与既有 MuJoCo
+四轮模型组合运行，可同时启动上位机程序。先在构建 QEMU 的环境中安装 MuJoCo extra：
+
+```bash
+uv sync --frozen --extra mujoco
+uv run --extra mujoco tools/sim robot run robot.yaml --duration 5 --report build/robot-result.json
+# 自动编译既有裸机测试固件，验证实际进程组合与失败清理：
+nix develop -c uv run --frozen --extra mujoco bash tools/run-robot-smoke.sh
+```
+
+例如将下面的 `robot.yaml` 放在仓库根目录，将固件路径改成自己的 ELF：
+
+```yaml
+schema: 1
+robot: {name: four-wheel}
+boards:
+  main: {type: qemu, board: dm-mc02, firmware: build/firmware.elf}
+buses:
+  drive: {type: can}
+links:
+  - {from: main.fdcan1, to: drive}
+devices:
+  fl: {type: dji-m3508, bus: drive, id: 1, joint: wheel_fl}
+  fr: {type: dji-m3508, bus: drive, id: 2, joint: wheel_fr}
+  rl: {type: dji-m3508, bus: drive, id: 3, joint: wheel_rl}
+  rr: {type: dji-m3508, bus: drive, id: 4, joint: wheel_rr}
+physics: {backend: mujoco, model: models/four_wheel.xml}
+```
+
+固件和模型路径相对 YAML 所在目录。schema 1 固定支持上述单板、单总线、单物理后端及
+ID 1–4 的 joint 对应关系；标签可改，接线和身份必须一致。未知字段、重复 key、错误类型、
+YAML anchor/alias 及资源超限都拒绝。模型的 joint/actuator/IMU binding 由 worker 在
+连接 co-sim、发送 RESET 前校验。模型尺寸、质量、摩擦和电机参数是未标定的 toy profile。
+
+固件若输出实际应用就绪标记，可增加以下字段：
+
+```yaml
+ready: {endpoint: main.uart1, text: "READY\n"}
+upper_computers:
+  observer: {command: [./observer, literal-argument]}
+```
+
+`ready` 支持 `uart1/2/3/5/7/10`，必须与实际固件相符；匹配后用该批字节读取后的 QMP
+虚拟时间上界作为 duration 起点。省略时报告 `not_waited`，起点是恢复前的 QEMU 快照，
+不验证应用 ready 或 plant 已推进。`--duration` 默认 5 个 QEMU 虚拟秒，范围为 1 ns–3600 s。
+
+上位机 `command` 是原样 argv，不展开 shell；程序在配置准入时解析为绝对可执行路径，
+工作目录固定为 YAML 所在目录，其余参数原样保留。最多 8 个上位机，每个最多 128 个参数、
+单参数 4096 UTF-8 字节、总计 16 KiB（含终止符及解析后的程序路径）。相对 PATH 项也按该
+工作目录查找。上位机可使用自身已有的标准接口；配置不自动提供 CAN、UART 或视觉订阅。
+
+worker 独占 co-sim 与 FDCAN1，运行既有 v2、1 kHz、realtime 四轮 profile；父进程只观察
+原生 QMP 和 ready UART。`--qemu` 覆盖二进制；`--startup-timeout` 默认 10 秒、
+`--timeout` 默认 30 秒，两者从启动 QEMU 前开始计入。startup 包含连接、子进程启动及
+实际 ready 等待；active host 期限包含 startup，但不包含各资源独立的有界清理。进程退出
+（包括上位机提前返回 0）、超时、中断及清理失败均非零，成功报告仅在清理结束后发布。
+报告保留每个子进程 stdout/stderr 的采样尾部，各最多 12000 字节；持续输出可能遇到 pipe 背压。
+
+`--qmp /tmp/robot-qmp.sock` 提供独立的原生 QMP monitor，路径须不存在、父目录须存在、
+总长度最多 100 字节；正常退出由 QEMU 清理该 socket，强制 KILL 后可能留下路径，重试前
+应核对并删除旧 socket。`--gdb-port 1234` 使用原生 GDB；Robot 自动恢复运行，没有
+`--paused` 模式。GDB 暂停仍受 worker ACK 与 host 期限约束。
+
+本入口验证进程组合与声明的运行边界。CPU、worker 和 plant epoch 各自独立，UART ready、
+ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控制见下文 ChassisTest；
+持续四轮实时性能、实板标定、多板、DR16、裁判系统和赛场组合仍未由该入口支持。
+
 ## Contents
 
 - [项目范围](#project-scope)
@@ -143,6 +212,7 @@ Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `a
 - [构建](#build)
 - [首次验证](#first-validation)
 - [运行固件](#run-firmware)
+- [Robot 配置](#robot-manifest)
 - [Flash 镜像](#flash-images)
 - [串口、QMP 与 GDB](#serial-qmp-and-gdb)
 - [外部仿真 worker](#external-simulation-worker)
