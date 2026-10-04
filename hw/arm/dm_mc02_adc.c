@@ -433,9 +433,10 @@ static unsigned adc_injected_sequence_channel(const DmMc02Adc *s,
 
 static unsigned adc_conversion_half_cycles(const DmMc02Adc *s)
 {
-    /* Processing timing is the existing N + 0.5 clock approximation;
-     * the separate timing slice corrects this from the H723 manual. */
-    static const uint8_t cycles[] = { 33, 29, 25, 21 };
+    /* RM0468 Rev 3, 28.4.23, Table 228: TSAR is 8.5/7.5/6.5/5.5 ADC
+     * clocks for the supported 16/14/12/10-bit modes.  Keep half-cycles
+     * integral; the channel's sampling time is added by the rank helper. */
+    static const uint8_t cycles[] = { 17, 15, 13, 11 };
     unsigned resolution = dm_mc02_adc_resolution_code(s);
 
     return resolution < ARRAY_SIZE(cycles) ? cycles[resolution] : 0;

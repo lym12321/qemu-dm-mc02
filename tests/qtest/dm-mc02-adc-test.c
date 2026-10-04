@@ -239,18 +239,18 @@ static void test_repeated_adstart_keeps_rank_progress(void)
     QTestState *qts = qtest_init(
         "-machine dm-mc02,adc-accurate-timing=on");
 
-    /* Two ranks with the reset sampling code take 36 half-cycles each at the
-     * default 1.5 MHz ADC clock: 36 / 3 MHz = 12000 ns. */
+    /* RM0468 Rev 3 Table 228: reset SMP=1.5 plus TSAR=8.5 clocks.
+     * Each rank at 1.5 MHz takes ceil(20 half-cycles / 3 MHz)=6667 ns. */
     qtest_writel(qts, ADC1_SQR1, 1u);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==,
                     ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100);
 
     /* Reissuing the already-set rs command must not reset current_rank. */
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, 6666);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -290,7 +290,7 @@ static void test_regular_sequence_sqr2_sqr3(void)
 
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     for (size_t rank = 0; rank < ARRAY_SIZE(expected); ++rank) {
-        qtest_clock_step(qts, 12000);
+        qtest_clock_step(qts, 6667);
         g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, expected[rank]);
         if (rank + 1u < ARRAY_SIZE(expected)) {
@@ -332,7 +332,7 @@ static void test_regular_sequence_sqr4(void)
 
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     for (size_t rank = 0; rank < ARRAY_SIZE(expected); ++rank) {
-        qtest_clock_step(qts, 12000);
+        qtest_clock_step(qts, 6667);
         g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, expected[rank]);
         if (rank + 1u < ARRAY_SIZE(expected)) {
@@ -358,7 +358,7 @@ static void test_autowait_holds_until_dr_read(void)
     qtest_writel(qts, ADC1_CFGR, ADC_CFGR_CONT | ADC_CFGR_AUTDLY);
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_true(isr & (ADC_ISR_EOC | ADC_ISR_EOS));
     g_assert_false(isr & (1u << 4));
@@ -373,7 +373,7 @@ static void test_autowait_holds_until_dr_read(void)
      * from this virtual timestamp. */
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, 6666);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -412,13 +412,13 @@ static void test_regular_dma_overrun_request_gate_case(bool endpoint,
     qtest_writel(qts, ADC1_CFGR, cfgr | (overwrite ? ADC_CFGR_OVRMOD : 0));
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==, ADC_ISR_EOC);
 
     /* The stream is still disabled, so EOC remains pending when rank 2
      * completes.  The producer must set OVR and must not issue a DMA beat. */
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==,
                     ADC_ISR_EOC | ADC_ISR_OVR);
@@ -429,7 +429,7 @@ static void test_regular_dma_overrun_request_gate_case(bool endpoint,
      * EOC; the next conversion must remain blocked by the latched OVR. */
     qtest_writel(qts, DMA1_S0CR, dma_cr);
     qtest_readl(qts, ADC1_DR);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==,
                     ADC_ISR_EOC | ADC_ISR_OVR);
@@ -443,7 +443,7 @@ static void test_regular_dma_overrun_request_gate_case(bool endpoint,
     qtest_writel(qts, ADC1_ISR, ADC_ISR_OVR);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_OVR);
     qtest_readl(qts, ADC1_DR);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     qtest_memread(qts, 0x20000100, &sample, sizeof(sample));
     g_assert_cmphex(sample, ==, UINT16_C(0x0200));
     g_assert_cmphex(qtest_readl(qts, DMA1_S0NDTR), ==, 0);
@@ -476,18 +476,18 @@ static void test_regular_discontinuous_software_is_full_sequence(void)
     qtest_writel(qts, ADC1_SQR1, 3u);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100u);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0200u);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_CR) & ADC_CR_ADSTART, ==, 0);
     qtest_quit(qts);
@@ -574,7 +574,7 @@ static void test_calibration_factors_follow_difsel_regular_and_injected(void)
     /* Channel 0 is single-ended: regular ADC_DR uses CALFACT_S. */
     qtest_writel(qts, ADC1_DIFSEL, 0);
     start_one_conversion(qts, 0);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100u - calfact_s);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -583,7 +583,7 @@ static void test_calibration_factors_follow_difsel_regular_and_injected(void)
 
     /* The same channel in the differential set uses CALFACT_D for DR. */
     start_one_conversion(qts, 0);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100u - calfact_d);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -594,7 +594,7 @@ static void test_calibration_factors_follow_difsel_regular_and_injected(void)
     /* Injected conversion also follows the single-ended selection. */
     qtest_writel(qts, ADC1_DIFSEL, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100u - calfact_s);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -605,7 +605,7 @@ static void test_calibration_factors_follow_difsel_regular_and_injected(void)
 
     /* ...and follows the differential selection through JDR1 as well. */
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, 6667);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100u - calfact_d);
 
     qtest_quit(qts);

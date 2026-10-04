@@ -23,9 +23,9 @@ static void test_injected_software_sequence(void)
     g_assert_true(cr & ADC_CR_JADSTART);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0);
 
-    /* Reset sampling time is three sample half-cycles plus 33 processing
-     * half-cycles: 36 / (2 * 1.5 MHz) = 12000 ns. */
-    qtest_clock_step(qts, 11999);
+    /* RM0468 Rev 3, Table 228 gives 17 processing half-cycles at 16-bit.
+     * With reset sampling, 20 / (2 * 1.5 MHz) rounds up to 6667 ns. */
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_false(isr & (ADC_ISR_JEOC | ADC_ISR_JEOS));
     qtest_clock_step(qts, 1);
@@ -41,7 +41,7 @@ static void test_injected_software_sequence(void)
     g_assert_false(isr & ADC_ISR_JEOC);
     g_assert_false(isr & ADC_ISR_JEOS);
 
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC);
     qtest_clock_step(qts, 1);
     isr = qtest_readl(qts, ADC1_ISR);
@@ -64,11 +64,11 @@ static void test_injected_software_sequence(void)
     qtest_writel(qts, ADC1_CFGR, ADC_CFGR_JQDIS);
     qtest_writel(qts, ADC1_JSQR, jsqr);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTP);
     g_assert_false(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR2), ==, 0);
 
     qtest_quit(qts);
@@ -93,21 +93,21 @@ static void test_injected_software_jdiscen_full_sequence(void)
     g_assert_cmphex(qtest_readl(qts, ADC1_JSQR), ==, jsqr);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR2), ==, 0x0200);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC | ADC_ISR_JEOS);
@@ -137,7 +137,7 @@ static void test_jauto_regular_to_injected(void)
     qtest_writel(qts, ADC1_JSQR, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & (ADC_ISR_EOC | ADC_ISR_EOS), ==,
                     ADC_ISR_EOC | ADC_ISR_EOS);
@@ -146,7 +146,7 @@ static void test_jauto_regular_to_injected(void)
 
     /* Automatic injection is a separate conversion interval after regular
      * EOS, and the one-shot regular start is already complete. */
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==, 0);
     qtest_clock_step(qts, 1);
     isr = qtest_readl(qts, ADC1_ISR);
@@ -165,15 +165,15 @@ static void test_jauto_regular_to_injected(void)
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, ADC1_JSQR, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC | ADC_ISR_EOS);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
                     ADC_ISR_JEOS);
     g_assert_false(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_JEOC | ADC_ISR_JEOS);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
@@ -190,9 +190,9 @@ static void test_jauto_disabled_does_not_start_injected(void)
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, ADC1_JSQR, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==, 0);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0);
@@ -211,14 +211,14 @@ static void test_jauto_jadstp_resumes_regular(void)
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, ADC1_JSQR, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
 
     /* Abort the automatic injected conversion before it completes. */
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC | ADC_ISR_EOS);
     qtest_writel(qts, ADC1_CR, ADC_CR_JADSTP);
     g_assert_cmphex(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART, ==, 0);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_EOS), ==, 0);
     qtest_clock_step(qts, 1);
@@ -232,7 +232,7 @@ static void test_jauto_jadstp_resumes_regular(void)
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, ADC1_JSQR, 0);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
 
     /* JADSTP releases the automatic-injection wait, but AUTDLY still owns
@@ -242,7 +242,7 @@ static void test_jauto_jadstp_resumes_regular(void)
     qtest_clock_step(qts, 100000);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS, ==, 0);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_EOS), ==, 0);
     qtest_clock_step(qts, 1);
@@ -267,7 +267,7 @@ static void test_injected_tim8_trigger(void)
     qtest_writel(qts, TIM8_EGR, 1u);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==, 0);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
@@ -312,7 +312,7 @@ static void test_injected_discontinuous_tim8_trigger(void)
     qtest_writel(qts, TIM8_EGR, 1u);
     /* A second edge while the first rank is converting is not queued. */
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & ADC_ISR_JEOC, ==, ADC_ISR_JEOC);
     g_assert_cmphex(isr & ADC_ISR_JEOS, ==, 0);
@@ -325,13 +325,13 @@ static void test_injected_discontinuous_tim8_trigger(void)
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR2), ==, 0);
 
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & ADC_ISR_JEOS, ==, 0);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR2), ==, 0x0200);
 
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_cmphex(isr & (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC | ADC_ISR_JEOS);
@@ -367,7 +367,7 @@ static void test_tim8_oc1ref_trigger_edges(void)
     qtest_clock_step(qts, 999);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
@@ -389,7 +389,7 @@ static void test_tim8_oc1ref_trigger_edges(void)
     qtest_clock_step(qts, 249);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
@@ -420,7 +420,7 @@ static void test_tim8_ocref_stateful_compare_modes(void)
     QTestState *qts = qtest_init(
         "-machine dm-mc02,adc-accurate-timing=on");
     const unsigned ccr_time_ns = 250;
-    const unsigned conversion_ns = 12000;
+    const unsigned conversion_ns = ADC_16BIT_MIN_RANK_NS;
 
     configure_timer_fixture_clock(qts);
 
@@ -474,7 +474,7 @@ static void test_tim8_ocref_stateful_compare_modes(void)
     qtest_writel(qts, ADC1_JSQR, (9u << ADC_JSQR_JEXTSEL_SHIFT) |
                  ADC_JSQR_JEXTEN_FALLING);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
-    qtest_clock_step(qts, 7999);
+    qtest_clock_step(qts, 20000 - conversion_ns - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==, 0);
     qtest_clock_step(qts, 1);
     qtest_clock_step(qts, conversion_ns);
@@ -520,7 +520,7 @@ static void test_injected_context_queue(void)
     /* Context A is consumed first.  Completion promotes B and keeps the
      * external-trigger arm set while the queue still has a context. */
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100u);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS);
     g_assert_true(qtest_readl(qts, ADC1_CR) & ADC_CR_JADSTART);
@@ -529,13 +529,13 @@ static void test_injected_context_queue(void)
     /* Context B has two ranks; if C had overwritten the pending slot this
      * edge would report JEOS after one rank instead. */
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_true(isr & ADC_ISR_JEOC);
     g_assert_false(isr & ADC_ISR_JEOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR1), ==, 0x0100u);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_JEOC);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
                     ADC_ISR_JEOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JDR2), ==, 0x0200u);
@@ -550,7 +550,7 @@ static void test_injected_context_queue(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
     qtest_writel(qts, TIM8_CR2, 2u << 4);
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
                     ADC_ISR_JEOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_JSQR), ==, 0);
@@ -558,7 +558,7 @@ static void test_injected_context_queue(void)
     qtest_writel(qts, ADC1_ISR, ADC_ISR_JEOC | ADC_ISR_JEOS);
 
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==, 0);
 
@@ -566,7 +566,7 @@ static void test_injected_context_queue(void)
      * machine reset; the still-armed JADSTART accepts the next edge. */
     qtest_writel(qts, ADC1_JSQR, context_b);
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC, ==,
                     ADC_ISR_JEOC);
 
@@ -583,7 +583,7 @@ static void test_tim1_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM1_CR2, 2u << 4);
     qtest_writel(qts, TIM1_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -594,7 +594,7 @@ static void test_tim1_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
     qtest_writel(qts, TIM1_CR2, 2u << 20);
     qtest_writel(qts, TIM1_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC | ADC_ISR_JEOS);
@@ -611,7 +611,7 @@ static void test_tim3_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM3_CR2, 2u << 4);
     qtest_writel(qts, TIM3_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -621,7 +621,7 @@ static void test_tim3_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM3_CR2, 2u << 4);
     qtest_writel(qts, TIM3_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -632,7 +632,7 @@ static void test_tim3_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
     qtest_writel(qts, TIM3_CR2, 2u << 4);
     qtest_writel(qts, TIM3_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC | ADC_ISR_JEOS);
@@ -676,7 +676,7 @@ static void test_tim3_oc4ref_trigger_mux_mapping(void)
     qtest_clock_step(qts, 999);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==, 0);
     qtest_clock_step(qts, 1);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -692,7 +692,7 @@ static void test_tim3_oc4ref_trigger_mux_mapping(void)
     qtest_clock_step(qts, 999);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==, 0);
     qtest_clock_step(qts, 1);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS, ==,
@@ -711,7 +711,7 @@ static void test_tim2_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM2_CR2, 2u << 4);
     qtest_writel(qts, TIM2_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
@@ -722,7 +722,7 @@ static void test_tim2_trigger_mux_mapping(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_JADSTART);
     qtest_writel(qts, TIM2_CR2, 2u << 4);
     qtest_writel(qts, TIM2_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_JEOC | ADC_ISR_JEOS), ==,
                     ADC_ISR_JEOC | ADC_ISR_JEOS);
@@ -752,7 +752,7 @@ static void test_tim2_compare_pulse_only_cc1(void)
     configure_timer_fixture_clock(qts);
 
     /* With CCR1 configured, the same trigger path starts the conversion at
-     * 250 ns and the one-rank conversion completes 12000 ns later. */
+     * 250 ns and the one-rank conversion completes 6667 ns later. */
     qtest_writel(qts, ADC1_CFGR, adc_trigger);
     qtest_writel(qts, ADC1_SQR1, 0);
     qtest_writel(qts, TIM2_ARR, 31);
@@ -763,7 +763,7 @@ static void test_tim2_compare_pulse_only_cc1(void)
     qtest_clock_step(qts, 249);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==, 0);
     qtest_clock_step(qts, 1);
-    qtest_clock_step(qts, 11999);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==, 0);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -778,7 +778,7 @@ static void test_tim8_busy_trigger_is_not_queued(void)
     configure_timer_fixture_clock(qts);
 
     /* TIM8 update is the selected regular trigger.  The timer period is 1 us,
-     * while a reset-sampling rank takes 12000 ns, so several edges arrive
+     * while a reset-sampling rank takes 6667 ns, so several edges arrive
      * while the first conversion is active. */
     qtest_writel(qts, ADC1_CFGR, (7u << 5) | (1u << 10));
     qtest_writel(qts, ADC1_SQR1, 0);
@@ -787,7 +787,7 @@ static void test_tim8_busy_trigger_is_not_queued(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM8_CR1, 1u);
 
-    qtest_clock_step(qts, 12999);
+    qtest_clock_step(qts, 1000 + ADC_16BIT_MIN_RANK_NS - 1);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     qtest_clock_step(qts, 1);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -815,13 +815,13 @@ static void test_regular_discontinuous_external_subgroups(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
 
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100u);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0200u);
@@ -829,13 +829,13 @@ static void test_regular_discontinuous_external_subgroups(void)
 
     /* The next matching edge resumes at rank 3, not rank 1. */
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0);
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_CR) & ADC_CR_ADSTART, ==, 0);
@@ -859,13 +859,13 @@ static void test_regular_discontinuous_autowait_boundary(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM8_EGR, 1u);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_true(isr & ADC_ISR_EOC);
     g_assert_false(isr & ADC_ISR_EOS);
     g_assert_cmphex(qtest_readl(qts, ADC1_DR), ==, 0x0100u);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     isr = qtest_readl(qts, ADC1_ISR);
     g_assert_true(isr & ADC_ISR_EOC);
     g_assert_false(isr & ADC_ISR_EOS);
@@ -876,7 +876,7 @@ static void test_regular_discontinuous_autowait_boundary(void)
     qtest_clock_step(qts, 100000);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOS);
     qtest_quit(qts);

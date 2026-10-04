@@ -150,7 +150,12 @@
 #define ADC_CALIBRATION_OFFSET_DELAY_NS  853334
 #define ADC_CALIBRATION_LINEAR_DELAY_NS 10922667
 #define ADC_REGULATOR_STARTUP_DELAY_NS 10000
-#define ADC_16BIT_32CYCLE_RANK_NS 32667
+/* RM0468 Rev 3, Table 228: 16-bit TSAR is 8.5 ADC cycles.
+ * DS13313 Rev 5, Table 80: tCONV = ts + 0.5 + N/2 cycles.
+ * At the fixture's 1.5 MHz clock, ceil((1.5 + 8.5) / fADC)
+ * is 6667 ns; sampling code 4 (32.5 cycles) gives 27334 ns. */
+#define ADC_16BIT_MIN_RANK_NS 6667
+#define ADC_16BIT_32CYCLE_RANK_NS 27334
 
 #define RCC_CR_HSION    (1u << 0)
 #define RCC_CR_HSEON    (1u << 16)

@@ -271,6 +271,73 @@ static void test_resolution_mmio_readback(void)
     }
 }
 
+static void test_supported_resolution_deadlines(void)
+{
+    /* RM0468 Rev 3, 28.4.23 Table 228 gives TSAR=8.5/7.5/6.5/5.5
+     * clocks; 28.4.13 gives SMP=1.5/32.5/810.5 clocks for codes 0/4/7.
+     * These literal deadlines also exercise integer nanosecond rounding. */
+    static const struct {
+        uint64_t clock_hz;
+        unsigned sampling_code;
+        unsigned rank_ns[4];
+    } cases[] = {
+        { 24000000, 0, { 417, 375, 334, 292 } },
+        { 24000000, 4, { 1709, 1667, 1625, 1584 } },
+        { 1500000, 0, { 6667, 6000, 5334, 4667 } },
+        { 1500000, 4, { 27334, 26667, 26000, 25334 } },
+        { 1500000, 7, { 546000, 545334, 544667, 544000 } },
+    };
+
+    for (unsigned test = 0; test < ARRAY_SIZE(cases); test++) {
+        for (unsigned code = 0; code < 4; code++) {
+            for (unsigned injected = 0; injected < 2; injected++) {
+                DmMc02Adc state;
+                DmMc02Dma dma = { 0 };
+                DmMc02Dmamux dmamux = { 0 };
+                AdcObserver observer = { 0 };
+                qemu_irq irq = qemu_allocate_irq(observe_irq, &observer, 0);
+                uint32_t flag = injected ? ADC_ISR_JEOC : ADC_ISR_EOC;
+                uint32_t start = injected ? ADC_CR_JADSTART : ADC_CR_ADSTART;
+                unsigned data_reg = injected ? ADC_JDR1 : ADC_DR;
+                unsigned deadline = cases[test].rank_ns[code];
+                QEMUTimer *timer;
+
+                init_mmio_adc(&state);
+                dm_mc02_adc_set_clock_hz(&state, cases[test].clock_hz);
+                mmio_write(&state, ADC_SMPR1, cases[test].sampling_code, 4);
+                mmio_write(&state, ADC_CFGR, ADC_CFGR_JQDIS | 1u |
+                            (code << ADC_CFGR_RES_SHIFT), 4);
+                put_reg(state.regs, data_reg, 0x2468);
+                mmio_write(&state, ADC_IER, flag, 4);
+                attach_observer(&state, &observer, irq, &dma, &dmamux);
+                mmio_write(&state, ADC_CR, ADC_CR_ADEN | start, 1);
+                timer = injected ? state.injected_timer : state.sample_timer;
+                g_assert_true(timer_pending(timer));
+                g_assert_cmpuint(injected ? state.next_injected_sample_ns :
+                                 state.next_sample_ns, ==, deadline);
+                adc_clock_ns = deadline - 1;
+                qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+                g_assert_false(mmio_read(&state, ADC_ISR, 4) & flag);
+                g_assert_cmphex(get_reg(state.regs, data_reg), ==, 0x2468);
+                g_assert_cmpint(observer.irq_level, ==, 0);
+                g_assert_cmpuint(observer.samples, ==, 0);
+                g_assert_cmpuint(dm_adc_test_dma_requests, ==, 0);
+                adc_clock_ns++;
+                g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+                g_assert_true(mmio_read(&state, ADC_ISR, 4) & flag);
+                g_assert_cmphex(get_reg(state.regs, data_reg), ==, 0x0100);
+                g_assert_cmpint(observer.irq_level, ==, 1);
+                g_assert_cmpuint(observer.samples, ==, injected ? 0 : 1);
+                g_assert_cmpuint(dm_adc_test_dma_requests, ==, injected ? 0 : 1);
+                g_assert_false(mmio_read(&state, ADC_CR, 4) & start);
+                g_assert_false(timer_pending(timer));
+                free_adc(&state);
+                qemu_free_irq(irq);
+            }
+        }
+    }
+}
+
 static void test_unsupported_resolution_starts_preserve_results(void)
 {
     static const unsigned sizes[] = { 1, 2, 4 };
@@ -613,6 +680,8 @@ int main(int argc, char **argv)
                     test_rearms_paused_calibration_after_load);
     g_test_add_func("/dm-adc/resolution/mmio-readback",
                     test_resolution_mmio_readback);
+    g_test_add_func("/dm-adc/resolution/supported-deadlines",
+                    test_supported_resolution_deadlines);
     g_test_add_func("/dm-adc/resolution/unsupported-starts-preserve-results",
                     test_unsupported_resolution_starts_preserve_results);
     g_test_add_func("/dm-adc/resolution/unsupported-external-boundaries",

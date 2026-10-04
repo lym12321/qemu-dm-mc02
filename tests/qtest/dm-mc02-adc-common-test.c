@@ -13,7 +13,7 @@ static void test_adc2_regular_conversion_is_independent(void)
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_ADRDY);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_ADRDY);
 
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC2_ISR) &
                   (ADC_ISR_EOC | ADC_ISR_EOS));
     g_assert_cmphex(qtest_readl(qts, ADC2_DR), ==, 0x0100);
@@ -46,7 +46,7 @@ static void test_common_csr_projects_both_adc_status_blocks(void)
                  ADC_CR_JADSTART);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN | ADC_CR_ADSTART |
                  ADC_CR_JADSTART);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
 
     adc1_status = qtest_readl(qts, ADC1_ISR);
     adc2_status = qtest_readl(qts, ADC2_ISR);
@@ -93,7 +93,7 @@ static void test_common_cdr_packs_regular_simultaneous_results(void)
     qtest_writel(qts, ADC12_CCR, 0x6u | (2u << 14));
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
 
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
@@ -123,7 +123,7 @@ static void test_common_cdr_read_acknowledges_both_eoc(void)
     qtest_writel(qts, ADC2_CFGR, ADC_CFGR_CONT | ADC_CFGR_AUTDLY);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
 
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
@@ -135,7 +135,7 @@ static void test_common_cdr_read_acknowledges_both_eoc(void)
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
 
     /* The read, rather than a wall-clock delay, is the release event. */
-    qtest_clock_step(qts, 4499);
+    qtest_clock_step(qts, 2499);
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     qtest_clock_step(qts, 1);
@@ -161,7 +161,7 @@ static void test_common_cdr2_publishes_interleaved_regular_result(void)
     qtest_writel(qts, ADC2_CFGR, ADC_CFGR_CONT);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 4500);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 2500);
 
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
@@ -170,8 +170,8 @@ static void test_common_cdr2_publishes_interleaved_regular_result(void)
 
     /* The fixture's ADC kernel is 4 MHz.  Default sampling is 3/2 cycles and
      * DELAY=0 is another 3/2 cycles, so the slave EOC is 750 ns after the
-     * master start plus one 4500 ns rank conversion. */
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 5250);
+     * master start plus one 2500 ns rank conversion. */
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 3250);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, UINT32_C(0x00000100));
 
@@ -179,21 +179,21 @@ static void test_common_cdr2_publishes_interleaved_regular_result(void)
      * the ordering of the next events visible: M0,S0,M1,S1. */
     qtest_writel(qts, ADC1_ISR, ADC_ISR_EOC | ADC_ISR_EOS);
     qtest_writel(qts, ADC2_ISR, ADC_ISR_EOC | ADC_ISR_EOS);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 9000);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 5000);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
 
     qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
     configure_adc_pll2p(qts);
-    /* DELAY=2 is 3.5 ADC clocks.  It moves the slave EOC from 5250 ns to
-     * 5750 ns relative to this sequence start. */
+    /* DELAY=2 is 3.5 ADC clocks.  It moves the slave EOC from 3250 ns to
+     * 3750 ns relative to this sequence start. */
     qtest_writel(qts, ADC12_CCR, delay2_ccr);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 13500);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 7500);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 14750);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 8750);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, UINT32_C(0x00000100));
 
@@ -208,10 +208,10 @@ static void test_common_cdr2_publishes_interleaved_regular_result(void)
     qtest_writel(qts, ADC2_CFGR, ADC_CFGR_CONT);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 19250);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 11250);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 20000);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 12000);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, UINT32_C(0x00000100));
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==, 0);
@@ -232,7 +232,7 @@ static void test_common_master_start_drives_slave(void)
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     g_assert_true(qtest_readl(qts, ADC2_CR) & ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==,
@@ -244,7 +244,7 @@ static void test_common_master_start_drives_slave(void)
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     /* The slave cannot own a regular start while DUAL=regular simultaneous. */
     g_assert_false(qtest_readl(qts, ADC2_CR) & ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
 
     /* A board reset must preserve the runtime common-to-peer wiring. */
@@ -254,7 +254,7 @@ static void test_common_master_start_drives_slave(void)
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     g_assert_true(qtest_readl(qts, ADC2_CR) & ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
 
@@ -287,7 +287,7 @@ static void test_common_external_trigger_drives_slave(void)
      * both ranks then publish one CDR pair. */
     qtest_writel(qts, TIM8_CR2, 2u << 4);
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==,
@@ -304,10 +304,93 @@ static void test_common_external_trigger_drives_slave(void)
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
     qtest_writel(qts, TIM8_CR2, 2u << 4);
     qtest_writel(qts, TIM8_EGR, 1u);
-    qtest_clock_step(qts, 12000);
+    qtest_clock_step(qts, ADC_16BIT_MIN_RANK_NS);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC, ==, 0);
     g_assert_cmphex(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC, ==, 0);
 
+    qtest_quit(qts);
+}
+
+static void test_common_unsupported_resolution_admission(void)
+{
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02,adc-accurate-timing=on,adc-dma-endpoint=on");
+    const unsigned duals[] = { 0x6, 0x7 };
+    const uint32_t buffer = 0x20000100;
+    const uint8_t sentinel[] = { 0x12, 0x34, 0x56, 0x78 };
+
+    for (unsigned mode = 0; mode < ARRAY_SIZE(duals); ++mode) {
+        for (unsigned external = 0; external < 2; ++external) {
+            for (unsigned invalid_adc = 0; invalid_adc < 2; ++invalid_adc) {
+                for (unsigned code = 4; code < 8; ++code) {
+                    uint32_t cfgr = external ? (7u << 5) | (1u << 10) : 0;
+                    uint8_t bytes[sizeof(sentinel)];
+
+                    qtest_qmp_assert_success(qts,
+                        "{ 'execute': 'system_reset' }");
+                    configure_adc_pll2p(qts);
+                    configure_timer_fixture_clock(qts);
+                    qtest_writel(qts, ADC12_CCR, duals[mode] | (2u << 14));
+                    qtest_writel(qts, ADC1_SQR1, 0);
+                    qtest_writel(qts, ADC2_SQR1, 0);
+                    qtest_writel(qts, ADC1_CFGR,
+                                 cfgr | 1u | (invalid_adc == 0 ? code << 2 : 0));
+                    qtest_writel(qts, ADC2_CFGR,
+                                 cfgr | (invalid_adc == 1 ? code << 2 : 0));
+                    qtest_writel(qts, DMAMUX1_BASE + 8, 9u);
+                    qtest_writel(qts, DMA1_S2PAR,
+                                 mode ? ADC12_CDR2 : ADC12_CDR);
+                    qtest_writel(qts, DMA1_S2M0AR, buffer);
+                    qtest_writel(qts, DMA1_S2NDTR, 1);
+                    qtest_memwrite(qts, buffer, sentinel, sizeof(sentinel));
+                    qtest_writel(qts, DMA1_S2CR,
+                                 DMA_CR_EN | DMA_CR_PSIZE_32 | DMA_CR_MSIZE_32);
+
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
+                                 (external ? ADC_CR_ADSTART : 0));
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+                    if (external) {
+                        qtest_writel(qts, TIM8_CR2, 2u << 4);
+                        qtest_writel(qts, TIM8_EGR, 1u);
+                    } else {
+                        g_assert_false(qtest_readl(qts, ADC1_CR) &
+                                       ADC_CR_ADSTART);
+                    }
+                    qtest_clock_step(qts, 100000);
+                    g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
+                    g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
+                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==, 0);
+                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, 0);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 1);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_LISR), ==, 0);
+                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
+                    g_assert_cmpmem(bytes, sizeof(bytes), sentinel,
+                                    sizeof(sentinel));
+
+                    /* Stop any valid armed peer before fixing RES; the
+                     * repaired pair must produce data through the same DMA. */
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
+                    qtest_writel(qts, ADC1_CFGR, cfgr | 1u);
+                    qtest_writel(qts, ADC2_CFGR, cfgr);
+                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
+                                 (external ? ADC_CR_ADSTART : 0));
+                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
+                    if (external) {
+                        qtest_writel(qts, TIM8_EGR, 1u);
+                    }
+                    qtest_clock_step(qts, 4000);
+                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 0);
+                    g_assert_true(qtest_readl(qts, DMA1_LISR) & (1u << 21));
+                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
+                    g_assert_cmphex(bytes[0], ==, 0x00);
+                    g_assert_cmphex(bytes[1], ==, 0x01);
+                    g_assert_cmphex(bytes[2], ==, 0x00);
+                    g_assert_cmphex(bytes[3], ==, mode ? 0x00 : 0x01);
+                }
+            }
+        }
+    }
     qtest_quit(qts);
 }
 
@@ -342,7 +425,7 @@ static void test_common_multimode_dma(bool endpoint)
     qtest_writel(qts, ADC1_CFGR, ADC_CFGR_DMA_CIRCULAR);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 9000);
+    qtest_clock_step(qts, 5000);
 
     qtest_memread(qts, 0x20000100, samples, sizeof(samples));
     /* The two legacy ranks form two successive common CDR words. */
@@ -387,7 +470,7 @@ static void test_common_fifo_consuming(gconstpointer opaque)
     qtest_writel(qts, ADC1_CFGR, ADC_CFGR_DMA_CIRCULAR);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_false(qtest_readl(qts, DMA1_S0CR) & DMA_CR_EN);
     /* FIFO reads consume before the memory write, even if it fails. */
     g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
@@ -435,14 +518,14 @@ static void test_common_multimode_dma_overrun_request_gate(bool endpoint,
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
 
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==, ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, ADC2_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==, ADC_ISR_EOC);
     g_assert_cmphex(qtest_readl(qts, DMA1_S0NDTR), ==, 1);
 
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_cmphex(qtest_readl(qts, ADC1_ISR) &
                     (ADC_ISR_EOC | ADC_ISR_OVR), ==,
                     ADC_ISR_EOC | ADC_ISR_OVR);
@@ -495,7 +578,7 @@ static void test_common_multimode_dma_overrun_request_gate(bool endpoint,
     g_assert_cmphex(qtest_readl(qts, ADC2_ISR) & ADC_ISR_OVR, ==, 0);
 
     qtest_writel(qts, DMA1_S0CR, cr);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
     g_assert_cmphex(qtest_readl(qts, 0x20000100), ==,
                     UINT32_C(0x01000100));
     g_assert_cmphex(qtest_readl(qts, DMA1_S0NDTR), ==, 0);
@@ -545,12 +628,12 @@ static void test_common_interleaved_external_trigger_cadence(void)
     qtest_writel(qts, TIM8_CR2, 2u << 4);
     qtest_writel(qts, TIM8_EGR, 1u);
 
-    /* The 4 MHz fixture completes the master at 4500 ns and the default
-     * DELAY=0 places the slave at 5250 ns (3/2 sampling + 3/2 delay cycles). */
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 4500);
+    /* The 4 MHz fixture completes the master at 2500 ns and the default
+     * DELAY=0 places the slave at 3250 ns (3/2 sampling + 3/2 delay cycles). */
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 2500);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
     g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 5250);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 3250);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
 
     qtest_quit(qts);
@@ -578,7 +661,7 @@ static void test_common_interleaved_injected_simultaneous(void)
     /* DUAL=0x3 shares the regular-interleaved mode but keeps injected
      * simultaneous trigger delivery as a separate ADC group.  Both injected
      * kernels receive the same trigger timestamp and complete together. */
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 4500);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 2500);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOC);
     g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_JEOC);
     g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_JEOS);
@@ -631,7 +714,7 @@ static void test_common_interleaved_damdf_dma(bool endpoint, unsigned dual,
 
     /* DAMDF=2 consumes the master CDR2 value immediately. DAMDF=3 merely
      * accumulates the first byte and must not issue a partial DMA request. */
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 4500);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 2500);
     if (damdf == 2) {
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
@@ -645,7 +728,7 @@ static void test_common_interleaved_damdf_dma(bool endpoint, unsigned dual,
 
     /* The delayed slave provides the next alternating byte.  DAMDF=3 now
      * has two bytes only, so the DMA stream remains untouched. */
-    g_assert_cmpint(qtest_clock_step_next(qts), ==, 5250);
+    g_assert_cmpint(qtest_clock_step_next(qts), ==, 3250);
     if (damdf == 2) {
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
@@ -656,13 +739,13 @@ static void test_common_interleaved_damdf_dma(bool endpoint, unsigned dual,
         g_assert_true(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_true(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
         g_assert_cmphex(qtest_readl(qts, DMA1_S0NDTR), ==, 1);
-        /* M1 and S1 complete at 9000 and 9750 ns.  The fourth value makes
+        /* M1 and S1 complete at 5000 and 5750 ns.  The fourth value makes
          * the complete CDR word valid.  ADC1 rank 1 is the board VIN sense
          * channel (24 V through the 11:1 divider -> raw low byte 0x41),
          * while ADC2 rank 1 uses the deterministic 0x0100 fallback; DAMDF=3
          * therefore emits M0,S0,M1,S1 = 0x41,0x00,0x41,0x00. */
-        g_assert_cmpint(qtest_clock_step_next(qts), ==, 9000);
-        g_assert_cmpint(qtest_clock_step_next(qts), ==, 9750);
+        g_assert_cmpint(qtest_clock_step_next(qts), ==, 5000);
+        g_assert_cmpint(qtest_clock_step_next(qts), ==, 5750);
         g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
         g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
         g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==,
@@ -704,7 +787,7 @@ static void test_common_cdr2_dma_endpoint_reservation(unsigned dual)
     qtest_writel(qts, ADC2_CFGR, ADC_CFGR_AUTDLY);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
 
     /* The invalid destination must abort CDR2's source reservation.  The
      * first result and its producer EOC remain available for retry. */
@@ -785,7 +868,7 @@ static void test_common_multimode_dma_endpoint_reservation_retry(void)
     qtest_writel(qts, ADC2_CFGR, ADC_CFGR_AUTDLY);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 4500);
+    qtest_clock_step(qts, 2500);
 
     /* Invalid P2M memory aborts the common source reservation.  DMA reports
      * TEIF and stops, but CDR's two producer EOC flags remain for retry. */
@@ -842,7 +925,7 @@ static void test_common_multimode_dma_request_cache_key(void)
     qtest_writel(qts, ADC1_CFGR, ADC_CFGR_DMA_CIRCULAR);
     qtest_writel(qts, ADC2_CR, ADC_CR_ADEN);
     qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-    qtest_clock_step(qts, 9000);
+    qtest_clock_step(qts, 5000);
 
     qtest_memread(qts, 0x20000100, adc_samples, sizeof(adc_samples));
     qtest_memread(qts, 0x20000200, cdr_samples, sizeof(cdr_samples));
@@ -858,93 +941,8 @@ static void test_common_multimode_dma_request_cache_key(void)
     qtest_quit(qts);
 }
 
-static void test_common_unsupported_resolution_admission(void)
-{
-    QTestState *qts = qtest_init(
-        "-machine dm-mc02,adc-accurate-timing=on,adc-dma-endpoint=on");
-    const unsigned duals[] = { 0x6, 0x7 };
-    const uint32_t buffer = 0x20000100;
-    const uint8_t sentinel[] = { 0x12, 0x34, 0x56, 0x78 };
-
-    for (unsigned mode = 0; mode < ARRAY_SIZE(duals); ++mode) {
-        for (unsigned external = 0; external < 2; ++external) {
-            for (unsigned invalid_adc = 0; invalid_adc < 2; ++invalid_adc) {
-                for (unsigned code = 4; code < 8; ++code) {
-                    uint32_t cfgr = external ? (7u << 5) | (1u << 10) : 0;
-                    uint8_t bytes[sizeof(sentinel)];
-
-                    qtest_qmp_assert_success(qts,
-                        "{ 'execute': 'system_reset' }");
-                    configure_adc_pll2p(qts);
-                    configure_timer_fixture_clock(qts);
-                    qtest_writel(qts, ADC12_CCR, duals[mode] | (2u << 14));
-                    qtest_writel(qts, ADC1_SQR1, 0);
-                    qtest_writel(qts, ADC2_SQR1, 0);
-                    qtest_writel(qts, ADC1_CFGR,
-                                 cfgr | 1u | (invalid_adc == 0 ? code << 2 : 0));
-                    qtest_writel(qts, ADC2_CFGR,
-                                 cfgr | (invalid_adc == 1 ? code << 2 : 0));
-                    qtest_writel(qts, DMAMUX1_BASE + 8, 9u);
-                    qtest_writel(qts, DMA1_S2PAR,
-                                 mode ? ADC12_CDR2 : ADC12_CDR);
-                    qtest_writel(qts, DMA1_S2M0AR, buffer);
-                    qtest_writel(qts, DMA1_S2NDTR, 1);
-                    qtest_memwrite(qts, buffer, sentinel, sizeof(sentinel));
-                    qtest_writel(qts, DMA1_S2CR,
-                                 DMA_CR_EN | DMA_CR_PSIZE_32 | DMA_CR_MSIZE_32);
-
-                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
-                                 (external ? ADC_CR_ADSTART : 0));
-                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-                    if (external) {
-                        qtest_writel(qts, TIM8_CR2, 2u << 4);
-                        qtest_writel(qts, TIM8_EGR, 1u);
-                    } else {
-                        g_assert_false(qtest_readl(qts, ADC1_CR) &
-                                       ADC_CR_ADSTART);
-                    }
-                    qtest_clock_step(qts, 100000);
-                    g_assert_false(qtest_readl(qts, ADC1_ISR) & ADC_ISR_EOC);
-                    g_assert_false(qtest_readl(qts, ADC2_ISR) & ADC_ISR_EOC);
-                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR), ==, 0);
-                    g_assert_cmphex(qtest_readl(qts, ADC12_CDR2), ==, 0);
-                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 1);
-                    g_assert_cmphex(qtest_readl(qts, DMA1_LISR), ==, 0);
-                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
-                    g_assert_cmpmem(bytes, sizeof(bytes), sentinel,
-                                    sizeof(sentinel));
-
-                    /* Stop any valid armed peer before fixing RES; the
-                     * repaired pair must produce data through the same DMA. */
-                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
-                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN | ADC_CR_ADSTP);
-                    qtest_writel(qts, ADC1_CFGR, cfgr | 1u);
-                    qtest_writel(qts, ADC2_CFGR, cfgr);
-                    qtest_writel(qts, ADC2_CR, ADC_CR_ADEN |
-                                 (external ? ADC_CR_ADSTART : 0));
-                    qtest_writel(qts, ADC1_CR, ADC_CR_ADEN | ADC_CR_ADSTART);
-                    if (external) {
-                        qtest_writel(qts, TIM8_EGR, 1u);
-                    }
-                    qtest_clock_step(qts, 6000);
-                    g_assert_cmphex(qtest_readl(qts, DMA1_S2NDTR), ==, 0);
-                    g_assert_true(qtest_readl(qts, DMA1_LISR) & (1u << 21));
-                    qtest_memread(qts, buffer, bytes, sizeof(bytes));
-                    g_assert_cmphex(bytes[0], ==, 0x00);
-                    g_assert_cmphex(bytes[1], ==, 0x01);
-                    g_assert_cmphex(bytes[2], ==, 0x00);
-                    g_assert_cmphex(bytes[3], ==, mode ? 0x00 : 0x01);
-                }
-            }
-        }
-    }
-    qtest_quit(qts);
-}
-
 void dm_mc02_adc_register_common_tests(void)
 {
-    g_test_add_func("/dm-mc02/adc/common-unsupported-resolution-admission",
-                    test_common_unsupported_resolution_admission);
     g_test_add_func("/dm-mc02/adc/adc2-regular-conversion-independent",
                     test_adc2_regular_conversion_is_independent);
     g_test_add_func("/dm-mc02/adc/common-csr-status-projection",
@@ -959,6 +957,8 @@ void dm_mc02_adc_register_common_tests(void)
                     test_common_master_start_drives_slave);
     g_test_add_func("/dm-mc02/adc/common-external-trigger-drives-slave",
                     test_common_external_trigger_drives_slave);
+    g_test_add_func("/dm-mc02/adc/common-unsupported-resolution-admission",
+                    test_common_unsupported_resolution_admission);
     g_test_add_func("/dm-mc02/adc/common-interleaved-external-trigger-cadence",
                     test_common_interleaved_external_trigger_cadence);
     g_test_add_func("/dm-mc02/adc/common-interleaved-injected-simultaneous",
