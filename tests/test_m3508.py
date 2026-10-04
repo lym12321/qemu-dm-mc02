@@ -6,11 +6,12 @@ independent hand calculations for the declared approximation, not hardware.
 """
 
 import math
+from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
 from sim.core import Session, StepContext
-from sim.devices.dji import M3508, decode_current_command, encode_feedback
+from sim.devices.dji import M3508, M3508Device, decode_current_command, encode_feedback
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.frame import WIRE_EXTENDED, WIRE_FD, WIRE_RTR
 from sim.physics import Rotor
@@ -261,3 +262,192 @@ def test_invalid_device_configuration_does_not_attach(kwargs):
 def test_invalid_rotor_configuration(kwargs):
     with pytest.raises(ValueError):
         Rotor(**kwargs)
+
+
+def test_protocol_prepare_has_no_physics_or_feedback_and_complete_uses_literal_sample():
+    bus = CanBus()
+    host = Host(bus)
+    device = M3508Device(bus)
+    device.reset(Session(1), position_rad=2, velocity_rad_s=3)
+    device.receive(CanFrame(0x200, data=bytes.fromhex("f000 0000 0000 0000")))
+    ctx = StepContext(1, 1, 1_000_000, 1_000_000)
+    plan = device.prepare_step(ctx)
+    assert plan.context is ctx
+    assert plan.active_until_ns == 1_000_000
+    assert plan.effort_nm == pytest.approx(-.1)
+    assert device.get_rotor_state() == (2, 3)
+    assert device.t_sim_ns == 0 and bus.pending == 0 and host.frames == []
+    assert not hasattr(device, "rotor")
+    with pytest.raises(FrozenInstanceError):
+        plan.effort_nm = 0
+    result = device.complete_step(plan, -math.pi / 2, -40 * math.pi)
+    assert result.status == "ok" and result.reached_time_ns == 1_000_000
+    assert device.get_rotor_state() == (-math.pi / 2, -40 * math.pi)
+    bus.step(1_000_000)
+    assert len(host.frames) == 1
+    frame = host.frames[0]
+    # Independent vendor fields: encoder6144, rotorRPM-1200, commandRaw-4096.
+    assert (frame.can_id, frame.timestamp_ns, frame.data) == (
+        0x201, 1_000_000, bytes.fromhex("1800 fb50 f000 19 00"))
+
+
+@pytest.mark.parametrize("raw,target,active,effort", [
+    ("4000", 100_000_000, 100_000_000, .4),
+    ("4000", 150_000_000, 100_000_000, .4),
+    ("0000", 150_000_000, 0, 0),
+])
+def test_protocol_timeout_and_zero_current_plan_boundaries(raw, target, active, effort):
+    bus = CanBus()
+    device = M3508Device(bus)
+    device.reset(Session(1), position_rad=7, velocity_rad_s=5)
+    device.receive(CanFrame(0x200, data=bytes.fromhex(raw + " 0000 0000 0000")))
+    plan = device.prepare_step(StepContext(1, 1, target, target))
+    assert (plan.active_until_ns, plan.effort_nm) == (active, effort)
+    assert device.t_sim_ns == 0 and device.get_rotor_state() == (7, 5)
+    assert bus.pending == 0
+    device.complete_step(plan, 8, 6)
+    assert device.current_raw == 0
+    assert bus.pending == 1  # Coalesces all missed feedback deadlines.
+    next_plan = device.prepare_step(StepContext(1, 2, target + 1_000_000, 1_000_000))
+    assert next_plan.active_until_ns == target and next_plan.effort_nm == 0
+
+
+def test_protocol_pending_command_and_plan_identity_do_not_change_completed_state():
+    bus = CanBus()
+    first, fifth = M3508Device(bus, 1), M3508Device(bus, 5)
+    first.reset(Session(1))
+    fifth.reset(Session(1))
+    first.receive(CanFrame(0x200, data=bytes.fromhex("1000 0000 0000 0000")))
+    ctx = StepContext(1, 1, 1_000_000, 1_000_000)
+    plan = first.prepare_step(ctx)
+    other_plan = fifth.prepare_step(ctx)
+    with pytest.raises(RuntimeError):
+        first.prepare_step(ctx)
+    with pytest.raises(RuntimeError):
+        first.receive(CanFrame(0x200, data=bytes(8)))
+    assert first.current_raw == 4096
+    for rejected in (other_plan, replace(plan)):
+        with pytest.raises((ValueError, RuntimeError)):
+            first.complete_step(rejected, 9, 8)
+    assert first.t_sim_ns == 0 and first.get_rotor_state() == (0, 0)
+    assert bus.pending == 0
+    first.complete_step(plan, 1, 2)
+    assert first.get_rotor_state() == (1, 2)
+    with pytest.raises((ValueError, RuntimeError)):
+        first.complete_step(plan, 3, 4)
+
+
+def test_protocol_bad_sample_is_rejected_before_commit_and_original_plan_remains_live():
+    bus = CanBus()
+    device = M3508Device(bus)
+    device.reset(Session(1), position_rad=1, velocity_rad_s=2)
+    plan = device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    for position, velocity in ((math.nan, 0), (0, math.inf), (True, 0), (0, "1")):
+        with pytest.raises((ValueError, TypeError)):
+            device.complete_step(plan, position, velocity)
+        assert device.t_sim_ns == 0 and device.get_rotor_state() == (1, 2)
+        assert bus.pending == 0
+    device.complete_step(plan, .1, .2)
+    assert device.t_sim_ns == 1_000_000 and device.get_rotor_state() == (.1, .2)
+
+
+def test_protocol_reset_invalidates_old_plan_and_enforces_new_session_exact_context():
+    bus = CanBus()
+    device = M3508Device(bus)
+    with pytest.raises(RuntimeError):
+        device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    device.reset(Session(1))
+    stale = device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    device.reset(Session(2, 10), position_rad=3, velocity_rad_s=4)
+    with pytest.raises((ValueError, RuntimeError)):
+        device.complete_step(stale, 9, 9)
+    for ctx in (StepContext(1, 1, 1_000_010, 1_000_000),
+                StepContext(2, 2, 1_000_010, 1_000_000),
+                StepContext(2, 1, 1_000_011, 1_000_000)):
+        with pytest.raises(ValueError):
+            device.prepare_step(ctx)
+    assert device.get_rotor_state() == (3, 4) and device.t_sim_ns == 10
+    plan = device.prepare_step(StepContext(2, 1, 1_000_010, 1_000_000))
+    device.complete_step(plan, 5, 6)
+    assert device.get_rotor_state() == (5, 6)
+
+
+def test_protocol_completed_feedback_coalesces_but_keeps_original_phase():
+    bus = CanBus()
+    host = Host(bus)
+    device = M3508Device(bus)
+    device.reset(Session(1))
+    for step_id, target, dt, expected_pending in (
+            (1, 500_000, 500_000, 0),
+            (2, 3_500_000, 3_000_000, 1),
+            (3, 3_900_000, 400_000, 0),
+            (4, 4_000_000, 100_000, 1)):
+        plan = device.prepare_step(StepContext(1, step_id, target, dt))
+        device.complete_step(plan, 0, 0)
+        assert bus.pending == expected_pending
+        bus.step(target)
+    assert [frame.timestamp_ns for frame in host.frames] == [3_500_000, 4_000_000]
+
+
+def test_protocol_emit_rejection_preserves_committed_sample_without_plan_replay():
+    bus = CanBus(max_pending=1)
+    host = Host(bus)
+    device = M3508Device(bus)
+    device.reset(Session(1))
+    plan = device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    host.send(0x123, b"occupied", timestamp_ns=10_000_000)
+    with pytest.raises(BufferError):
+        device.complete_step(plan, 3, 4)
+    assert device.t_sim_ns == 1_000_000 and device.get_rotor_state() == (3, 4)
+    with pytest.raises((ValueError, RuntimeError)):
+        device.complete_step(plan, 5, 6)
+    device.reset(Session(2))
+    assert bus.pending == 1  # Reset never consumes another owner's queued wire.
+
+
+def test_protocol_close_cancels_pending_and_preserves_borrowed_bus():
+    bus = CanBus()
+    host = Host(bus)
+    device = M3508Device(bus)
+    device.reset(Session(1))
+    plan = device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    device.close()
+    device.close()
+    with pytest.raises(RuntimeError):
+        device.complete_step(plan, 1, 2)
+    with pytest.raises(RuntimeError):
+        device.prepare_step(StepContext(1, 1, 1_000_000, 1_000_000))
+    with pytest.raises(RuntimeError):
+        device.reset(Session(2))
+    host.send(0x123, b"live")
+    assert bus.pending == 1
+
+
+def test_legacy_get_rotor_state_and_feedback_follow_live_external_rotor_changes():
+    device = M3508(CanBus())
+    device.reset(Session(1))
+    device.rotor.position = -math.pi / 2
+    device.rotor.velocity = -40 * math.pi
+    assert device.get_rotor_state() == (-math.pi / 2, -40 * math.pi)
+    assert device.feedback().data == bytes.fromhex("1800 fb50 0000 19 00")
+
+
+def test_zero_torque_coefficient_keeps_timeout_damping_segments():
+    device = M3508(CanBus(), torque_per_amp=0,
+                   rotor=Rotor(initial_velocity=1))
+    device.reset(Session(1))
+    device.receive(CanFrame(0x200, data=bytes.fromhex("4000 0000 0000 0000")))
+    advance(device, 150_000_000)
+    # Original two half-implicit intervals: v=.6,q=.06 at100ms;
+    # then v=.48,q=.084 at150ms. One150ms coast gives different state.
+    assert device.get_rotor_state() == pytest.approx((.084, .48))
+
+
+def test_protocol_finite_extreme_velocity_saturates_wire_before_rpm_overflow():
+    device = M3508Device(CanBus())
+    for velocity, literal in ((1e308, "0000 7fff 0000 19 00"),
+                              (-1e308, "0000 8000 0000 19 00")):
+        device.reset(Session(1), velocity_rad_s=velocity)
+        assert device.feedback().data == bytes.fromhex(literal)
+    with pytest.raises(ValueError, match="finite.*torque"):
+        M3508Device(CanBus(), torque_per_amp=1e308)

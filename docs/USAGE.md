@@ -899,6 +899,13 @@ M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输�
 默认每虚拟毫秒反馈，较大 step 只发送最新样本；100 ms 命令超时后零驱动并继续反馈。
 这些是公开的模型近似；C620 手册没有提供这里使用的数值超时保证。
 
+需要由外部 plant 驱动时，使用 `sim.devices.dji.M3508Device`：先
+`prepare_step(ctx)` 取得转子力矩与命令截止时间，推进物理模型，再用
+`complete_step(plan, position_rad, velocity_rad_s)` 提交转子采样。准备阶段不推进时间
+或发送反馈；完成阶段只接受该器件返回的原 plan。一次只允许一个 pending plan，
+reset/close 会取消它。发送失败保留已提交状态，调用方必须冻结并 reset，不能重复完成
+或重复推进 plant。`M3508` 保留原简单转子用法，并复用这一协议边界。
+
 每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
 命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。
 RESET 保留 transport 的 partial bytes，并更新 QEMU/worker 时间原点。CAN wire 没有
