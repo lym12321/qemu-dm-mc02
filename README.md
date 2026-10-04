@@ -48,18 +48,29 @@ python3 tools/dm_mc02_test_gate.py --jobs 4
 
 门禁执行回归验证并在本地生成日志与报告。硬件语义以 ST 资料及实板观测为依据，测试通过不代表完整芯片准确性。完整说明见[测试与性能](docs/USAGE.md#testing-and-performance)。
 
+工作区的 `trobot` 可编译独立 HAL/BSP 测试固件，也可验证实际电机组件与 MuJoCo 单转子的数据边界。构建、报告和明确未支持项见[固件测试](docs/USAGE.md#trobot-halbsp-firmware-test)。
+
 ## 运行固件
 
-固件由用户单独提供；仓库不分发或修改 `trobot/` 中的固件。
+固件由外部工程提供；本仓库不分发 `trobot` 固件。
 
 ```bash
 export DM_MC02_ELF=/absolute/path/to/trobot.elf
-build/qemu/qemu-system-arm -machine dm-mc02 \
-  -kernel "$DM_MC02_ELF" -nodefaults -display none \
-  -serial none -monitor stdio
+bash tools/run-qemu.sh
 ```
 
-在前面进入的 Nix shell 中执行上述命令。串口映射、Flash 镜像、GDB/QMP 调试和外部 worker 的配置见[使用手册](docs/USAGE.md)。
+在前面进入的 Nix shell 中运行。也可直接传入 `--elf /absolute/path/to/firmware.elf`。默认将 USART1 与 QEMU monitor 接到终端；`Ctrl-a c` 切换两者，monitor 中输入 `quit` 正常关闭。
+
+用 `bash tools/run-qemu.sh --debug` 从复位暂停，再用 ARM GDB 连接 `127.0.0.1:1234`。当前 `trobot` 需要静止 IMU 输入才能完成 INS 初始化；未经修改的 Release 固件启动复现见[手册](docs/USAGE.md#trobot-stationary-startup)。串口、Flash 镜像、GDB/QMP 和外部 worker 的详细配置也见手册。
+
+已有普通 Release ELF 时，可用固定单转子 MuJoCo 场景自动验证 `0→6→0 rad/s` 速度控制并保存报告：
+
+```bash
+bash tools/run-trobot-business.sh
+```
+
+先同步 MuJoCo extra；默认 ELF、参数与报告说明见[业务仿真](docs/USAGE.md#trobot-release-business-fixture)。
+同一入口加 `--performance` 可运行三轮持续 paced 性能门，详见手册。
 
 ## 项目结构
 

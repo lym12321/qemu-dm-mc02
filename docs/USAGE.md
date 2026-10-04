@@ -173,17 +173,28 @@ smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后�
 
 ## Run firmware
 
-输入 ELF 必须面向 DM-MC02 地址空间。先记录用于复现的文件身份，再从项目 QEMU 启动：
+输入 ELF 必须面向 DM-MC02 地址空间。先记录用于复现的文件身份，再通过统一入口启动：
 
 ```bash
 export DM_MC02_ELF=/absolute/path/to/trobot.elf
 sha256sum "$DM_MC02_ELF"
-build/qemu/qemu-system-arm -machine dm-mc02 \
-  -kernel "$DM_MC02_ELF" -nodefaults -display none \
-  -serial none -monitor stdio
+bash tools/run-qemu.sh
 ```
 
-终端进入 QEMU monitor 后，可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`。`quit` 会走正常关闭路径。没有 UART 后端时不会自动显示串口内容；`-serial none` 将默认第一个串口槽位留给二进制 co-sim，避免协议数据污染终端。
+也可传入 `--elf PATH`，它优先于 `DM_MC02_ELF`。入口默认使用 `build/qemu/qemu-system-arm` 和 `dm-mc02` machine；`--qemu PATH` 或 `QEMU_SYSTEM_ARM` 可以覆盖 QEMU。运行环境与构建时保持一致。
+
+默认 USART1 与 QEMU monitor 共用终端（原生 `mon:stdio`）。`Ctrl-a c` 切换 UART/monitor，`Ctrl-a h` 查看帮助。monitor 中可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`；`quit` 会走正常关闭路径。用 `--uart USART2` 等名称选择其它 UART，或用 `--uart none` 仅显示 monitor。当前 `trobot` Release 关闭了 logger/terminal，串口没有文本并不代表固件未运行。
+
+常用参数以 `bash tools/run-qemu.sh --help` 为准：
+
+| 参数 | 用途 |
+| --- | --- |
+| `--elf PATH` | 固件 ELF；默认读取 `DM_MC02_ELF` |
+| `--debug`、`--gdb-port PORT` | 从复位暂停，启用原生 GDB；默认 `127.0.0.1:1234` |
+| `--uart NAME` | USART1（默认）、USART2、USART3、UART5、UART7、USART10 或 `none` |
+| `--qmp PATH` | 创建 QMP Unix socket，`server=on,wait=off` |
+| `--cosim PATH` | 创建 co-sim Unix socket，`server=on,wait=off`；worker 单独启动 |
+| `--qemu PATH`、`--machine NAME` | 覆盖 QEMU 或 `dm-mc02` machine 属性 |
 
 查看 machine 属性：
 
@@ -191,13 +202,7 @@ build/qemu/qemu-system-arm -machine dm-mc02 \
 build/qemu/qemu-system-arm -machine dm-mc02,help
 ```
 
-固件调试可增加 `-S -gdb tcp:127.0.0.1:1234`，再从 ARM GDB 连接：
-
-```gdb
-target remote localhost:1234
-```
-
-调试暂停、trace 和外部 worker 都会改变运行场景，不属于默认 Release 性能基准。
+具体固件可能等待传感器或外部输入。当前 `trobot` 的可复现启动流程见下文静止输入示例；launcher 不替固件判断应用就绪。
 
 ## Flash images
 
@@ -222,6 +227,28 @@ target remote localhost:1234
 
 ## Serial, QMP and GDB
 
+### GDB
+
+终端一启动 QEMU，CPU 在复位处暂停：
+
+```bash
+bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --debug
+```
+
+终端二加载同一 ELF 并连接。Nix 的固定 ARM 工具链已提供 `arm-none-eabi-gdb`；Ubuntu 用户可使用自己的 ARM 工具链 GDB，或执行 `sudo apt-get install -y gdb-multiarch` 并将下面命令的程序名替换为它：
+
+```bash
+arm-none-eabi-gdb /absolute/path/to/trobot.elf
+```
+
+```gdb
+target remote 127.0.0.1:1234
+break main
+continue
+```
+
+`--debug --gdb-port 2345` 可改变监听端口，GDB 的连接地址相应改变。QEMU 原生对应参数为 `-S -gdb tcp:127.0.0.1:1234`。调试暂停、trace 和外部 worker 都会改变运行场景，不属于默认 Release 性能基准。
+
 ### UART and FDCAN slots
 
 重复的 `-serial` 参数按顺序接入 machine 槽位：
@@ -231,6 +258,8 @@ target remote localhost:1234
 | 0 | 二进制 co-sim 控制/采样通道 |
 | 1–6 | USART1、USART2、USART3、UART5、UART7、USART10 |
 | 7–9 | FDCAN1、FDCAN2、FDCAN3 |
+
+默认 DM-MC02 profile 的 UART5 仅接收；选择 `--uart UART5` 可输入数据，但不会输出文本。
 
 例如将 USART1 输出到文件，monitor 留在终端：
 
@@ -248,9 +277,10 @@ FDCAN 使用固定 84 字节二进制帧，经项目 chardev/socket 连接；它
 自动化控制可为每个进程创建独立、较短的 Unix socket 路径：
 
 ```bash
-build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
-  -nodefaults -display none -serial none \
-  -qmp unix:/tmp/dm-mc02-qmp.sock,server=on,wait=off
+dm_run_dir=$(mktemp -d /tmp/dm-qemu.qmp.XXXXXX)
+bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --qmp "$dm_run_dir/qmp.sock"
+rm -f -- "$dm_run_dir/qmp.sock"
+rmdir -- "$dm_run_dir"
 ```
 
 项目 Python 工具通过 `tools/dm_mc02_qmp.py` 复用固定版本的 QEMU Python client。不要另开第二个 reader 读取同一 QMP 连接。深层临时目录可能超过 `sockaddr_un` 路径限制；Linux smoke 应使用脚本管理的 `/tmp/dm-qemu.*.XXXXXX` 私有临时目录。
@@ -265,34 +295,171 @@ bash tools/run-qemu-v2-motor-smoke.sh
 bash tools/run-worker.sh --help
 ```
 
-手动启动时，在 QEMU 的第一个 serial 槽位挂接 co-sim Unix socket：
+手动启动时，入口的 `--cosim PATH` 将 QEMU 第一个 serial 槽位连接到 co-sim Unix socket，UART 仍由 `--uart` 选择。当前 `trobot` 的具体启动步骤见下文。
+
+### trobot stationary startup
+
+当前未经修改的 `trobot` Release 会先完成 INS 初始化，再进入 `example_task`。它需要静止 IMU 样本；未接外部输入时，当前 BMI088 复位寄存器 fallback 不是静止 1 g，不能据此期待 INS 就绪。现有 NullEngine 提供零角速度和 `(0, 0, 1)` g 加速度，可用于启动 fixture；这不是经过校准的真实 plant。
+
+在三个终端中均进入仓库根目录和相同 Nix 环境。终端一启动 QEMU，输出的临时目录供终端二使用：
 
 ```bash
-build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
-  -nodefaults -display none -monitor stdio \
-  -chardev socket,id=cosim,path=/tmp/dm-mc02-cosim.sock,server=on,wait=off \
-  -serial chardev:cosim
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
+dm_run_dir=$(mktemp -d /tmp/dm-qemu.trobot.XXXXXX)
+printf '%s\n' "$dm_run_dir"
+bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --debug \
+  --cosim "$dm_run_dir/cosim.sock"
+rm -f -- "$dm_run_dir/cosim.sock"
+rmdir -- "$dm_run_dir"
 ```
 
-另一个终端启动 worker：
+终端二将目录替换为终端一打印的实际值，启动已有 worker：
 
 ```bash
-bash tools/run-worker.sh --cosim /tmp/dm-mc02-cosim.sock
+dm_run_dir=/tmp/dm-qemu.trobot.XXXXXX
+bash tools/run-worker.sh --cosim "$dm_run_dir/cosim.sock" \
+  --engine null --protocol v1 --rate 1000 --realtime
 ```
 
-这只建立 co-sim 控制/采样通道。要交换电机总线数据，还需将 QEMU FDCAN chardev socket 配好并给 worker 传入 `--fdcan`；完整 wiring 示例见 `tools/run-qemu-worker-smoke.sh`。通道联通不等于机构闭环已验证。
+终端三用同一 ELF 启动 GDB，设置应用任务和错误处理断点后继续：
+
+```bash
+arm-none-eabi-gdb /absolute/path/to/trobot.elf
+```
+
+```gdb
+target remote 127.0.0.1:1234
+break Error_Handler
+break example_task
+continue
+```
+
+命中 `example_task` 后，使用 `x/b &'ins::inited'` 读取初始化标志；本场景已观察到值为 `1`。Release ELF 可能只有符号而没有类型调试信息，直接 `print ins::inited` 会报类型未知。这些符号属于当前 `trobot`，其它固件应选择自己的应用就绪位置。此结果证明该固件在静止输入下进入应用任务，不证明电机、真实机构或所有业务行为完成验证。退出时先关闭 GDB，在 QEMU monitor 中输入 `quit`，再停止 worker。
+
+### trobot Release business fixture
+
+普通 `trobot` Release 的 `example_task` 使用 PI 速度控制，依次给定 `0→6→0 rad/s`。
+下面的入口自动启动 QEMU 与 MuJoCo worker，验证这一固定业务场景并保存报告。
+先准备普通 Release ELF 和项目 QEMU；入口不会编译固件，也不使用专用 MotorTest 固件。
+在构建 QEMU 时所选的 Nix 或系统环境中同步项目 `.venv`，并确保有 `arm-none-eabi-nm`：
+
+```bash
+uv sync --locked --group dev --extra mujoco --python "${PYTHON:-/usr/bin/python3}"
+bash tools/run-trobot-business.sh
+```
+
+该场景需要实际 MuJoCo Python 包。常用参数如下；完整帮助可运行
+`bash tools/run-trobot-business.sh --help`：
+
+| 参数 | 默认值与用途 |
+| --- | --- |
+| `--elf PATH` | 仓库相邻的 `../trobot/build/Release/trobot.elf`；必须保留 `xTickCount` 符号 |
+| `--qemu PATH` | `build/qemu/qemu-system-arm`；设置 `QEMU_SYSTEM_ARM` 可覆盖默认值 |
+| `--output DIR` | 新建 `build/test-results/trobot-business-<UTC时间>/`；已有目录会被拒绝，原文件保留 |
+| `--performance` | 三轮固定 72000 step；每轮在实际 enable 后测量至少 60 秒 |
+
+固定模型只有一个带阻尼转子：转动惯量 `Izz=0.02 kg·m²`、阻尼
+`0.05 N·m·s/rad`、传动比 `1`。IMU 独立保持零角速度和 `(0, 0, 1) g`，
+用于固件 INS 初始化。现有 v2 worker 使用 `--realtime` 节奏，执行 14000 个
+1 ms plant step。应用就绪来自固件实际发送的 ID 1、classic CAN、8 字节 enable 命令。
+
+八项轨迹门保持固定，窗口以转子 enable 时刻为零点，包含起点、不含终点：
+
+| 窗口（秒） | 检查 | 通过条件 |
+| --- | --- | --- |
+| 0.5–1.0 | 静止阶段最大绝对速度 | ≤ 0.05 rad/s |
+| 1.0–4.0 | 加速阶段峰值速度 | ≤ 6.5 rad/s |
+| 1.5–4.0 | 对 6 rad/s 的最大绝对误差 | ≤ 0.15 rad/s |
+| 2.0–3.8 | 平均速度对 6 rad/s 的绝对误差 | ≤ 0.05 rad/s |
+| 2.0–3.8 | 平均力矩对 0.3 N·m 的绝对误差 | ≤ 0.02 N·m |
+| 4.0–6.0 | 停止阶段最低速度 | ≥ −0.5 rad/s |
+| 4.5–6.0 | 停止后最大绝对速度 | ≤ 0.15 rad/s |
+| 5.0–6.0 | 停止后平均速度的绝对值 | ≤ 0.05 rad/s |
+
+入口打印 `report.json` 路径。报告保留每项测量、应用启动时间、tick/watchdog 与
+co-sim 诊断、QEMU/worker 的 CPU 和 RSS 采样、PID/starttime 身份及输入文件哈希。
+同目录的 `plant.jsonl` 保存完整 plant 轨迹，`can.bin` 保存固件发送的 CAN 帧，
+`worker.stdout`、`worker.stderr` 和 `harness.log` 用于定位失败。CPU、RSS 与诊断
+来自采样，不表示全程峰值；CAN 文件只记录 guest TX。哈希记录选定的 ELF、QEMU、profile
+与工具输入，未覆盖完整依赖闭包。QEMU stderr 由 harness 暂存，失败时将最多 12 KiB
+摘录写入 `harness.log`，成功时不永久保存。
+
+从 QEMU 启动到应用 enable 的总期限为 10 秒，包含 socket 与 QMP 连接；业务运行
+总期限为 22 秒，外层进程保护期限为 30 秒，之后执行有界清理。只有轨迹完整、八项门
+通过、没有异常 reset/watchdog，`consume_dropped`、`rx_bad_frames`、`tx_dropped` 为零，
+选定输入哈希未变化，且确认本轮进程
+已清理，报告才写 `passed` 并返回零。运行失败或中断会保留 `failed` 报告并返回非零；
+缺少项目 `.venv` 时，入口在启动前直接提示依赖错误。
+
+这是固定参数的 14 秒功能夹具；转子与 IMU 未经实物标定。worker pacing 和 v2 响应
+不建立 CPU/plant 全局锁步，CAN 时间戳也不安排延迟交付。该 14 秒结果不作为持续实时
+结论；持续测量使用下述入口。
+
+用同一入口执行持续 paced 性能门：
+
+```bash
+bash tools/run-trobot-business.sh --performance
+```
+
+每轮使用相同 ELF、worker、模型与原八项轨迹门，执行 72000 个 1 ms step；应用仍只执行
+一次 `0→6→0`，随后持续运行 1 kHz 零目标控制。实际 enable 后的下一次完整观测作为
+测量起点，host、firmware tick 与对应 plant 区间均须达到 60 秒。启动期限保持 10 秒，
+每轮总期限为 85 秒，harness 保护期限为 95 秒，之后执行有界清理。
+
+报告分别保留每轮精确的 firmware tick RTF 与 plant 轨迹推进 RTF。tick 查询前后记录
+monotonic 时间，RTF 同时给出点估计和区间；保守下界须达到 `0.999x`。
+plant 推进 RTF 须在 `0.999–1.001x`，相对测量起点的 plant/host 时间偏差，以及计入查询
+与配对误差的采样 tick/plant 漂移均须不超过 100 ms，最长连续 step 间隔也须不超过
+100 ms。停止后的持续轨迹沿用最大绝对速度 `0.15 rad/s`、平均速度绝对值 `0.05 rad/s`
+门。这里的容差属于固定工具场景，不代表 1 ms 控制延迟保证。
+
+输出根目录的 `report.json` 汇总三轮状态，`run-1/` 至 `run-3/` 保留各轮完整证据。
+每轮还记录实际启动时间、PID/starttime、CPU 用量和采样最大 RSS、宿主身份/负载、
+watchdog、最终暂停计数及输入哈希。CPU 以一个核心为 100%，可能超过 100%；RSS 为
+采样最大值。三轮全部通过才返回零；中断保留失败，未执行的轮次明确标为跳过。
+
+该门测量当前固定业务场景的 wall-clock pacing。plant 时间戳在 ACK 和 pacing sleep
+之前记录，表示轨迹推进；无节流容量、完整 loop 完成延迟、CPU/plant 全局锁步及任意机构
+性能仍需独立验证。
+
+### Backend choices
+
+手动运行 stationary startup 示例只建立 co-sim 控制/采样通道。要交换电机总线数据，还需将 QEMU FDCAN chardev socket 配好并给 worker 传入 `--fdcan`；完整 wiring 示例见 `tools/run-dm-motor-smoke.sh`，上面的业务入口已自动连接该通道。通道联通不等于机构闭环已验证。
+
+worker 按 RESET 时的时间原点转换 QEMU 与 plant 时间，CAN 反馈携带 QEMU 时间戳。
+当前 FDCAN 收到帧就立即交付；时间戳不会延迟未来帧，也未实现 guest RX timestamp。
+`--realtime` 只控制 worker 的 wall-clock 节奏，v2 ACK 表示输入接受、DONE 表示 BMI088
+消费完成；它们都不保证 CPU 与电机 plant 在同一时刻推进。
 
 worker 支持的常用选择：
 
 | 场景 | 入口 |
 | --- | --- |
-| NullEngine 协议/连接 fixture | 默认 `--engine null`；仅用于工具与传输验证 |
+| NullEngine fixture | 默认 `--engine null`；静止 IMU 输入和简化电机响应，用于功能/传输验证 |
 | MuJoCo adapter | `uv sync --locked --group dev --extra mujoco` 后运行 `bash tools/run-mujoco-worker-smoke.sh` |
 | ROS 2 adapter | 安装并 source 系统 ROS 环境（验收环境为 Jazzy），运行 `bash tools/run-ros2-worker-smoke.sh` |
 | 已有 Linux CAN 接口 | `--socketcan can0 --fdcan /path/to/fdcan.sock` |
 | 自定义 plant | `--backend package:create_backend` 或 `--backend-registry package:register --engine name` |
 
-MuJoCo 示例只验证 adapter 和测试模型，不代表已完成 Release 固件闭环。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
+MuJoCo worker smoke 验证 adapter 和测试模型；下文的 MotorTest 另验证实际固件电机组件的数据边界。普通 Release 的固定单转子业务使用上面的 [business fixture](#trobot-release-business-fixture) 入口。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
+
+BMI088 的完整 raw burst/FIFO data 消费通知携带实际样本身份；默认字节、部分读取或跨样本混合不产生完整消费确认。raw 目前逐字节读取寄存器，没有已验证的硬件 shadow snapshot。`--wait-step-done` 用于 BMI088 消费门：输入已接受后，器件未接收该样本或未读来源被覆盖/器件复位，会返回失败 DONE（status=2），并报告真实已消费和缺失掩码。严格等待会立即报错，适用于传感器已经配置、每个样本都应被完整读取的场景；默认模式继续按 ACK 推进。来源按实际读取身份匹配，跨会话重用外部序号不会误确认；完成响应按 ACK 顺序发送，并保留最近结果供重放。此门不提供 CPU/电机全局锁步。SPI 独立组件的 v1 状态恢复会清除缺失的来源身份，SPI/BMI088 组合的旧 v1 快照拒绝；这些组件状态不代表整机迁移。
+
+v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，每次等待 0.25 秒，初次发送后最多重试三次；收到 `QUEUE_FULL` 后按 1 毫秒间隔重试，仍受同一个 2 秒期限约束。重试沿用原始输入，不重复推进 plant；准入发送尚未完成时先完成原发送。等待 ACK、DONE 或队列恢复时，CAN/SocketCAN 仍可双向转发。`--wait-step-done` 另有每次 2 秒、最多四次的完成等待；超时重试仍计入次数。重放尚未发送完时，先继续原发送；发送队列空才重放同一 STEP，不重复推进 plant。完成等待的时间另计。准入超时报 `STEP_ACK admission timed out`，附带 STEP 编号、时间、最后状态、队列深度和静默重试次数，便于定位未回应或队列持续占满。
+
+worker 每次从 co-sim/FDCAN stream 最多读取 4096 字节，返回完整帧并保留未完成帧；v2 暂存的已解码回复先处理，再读取新输入。因此持续可读输入期间仍有机会检查等待期限并服务其它就绪方向。此策略不保证各方向吞吐相同或固定的主机延迟；自定义 backend 的阻塞调用仍需自行限时。
+
+QMP 或固件触发 machine reset 时，同一 co-sim 连接会先完成已开始发送的帧，再发送新会话 RESET、RESET_ACK 和状态快照；尚未开始发送的旧回复会取消。断开连接会清空旧输出，重连建立新会话，不重放丢失的回复。客户端主动发送 RESET 仍按原有队列顺序返回响应；使用严格会话校验的客户端需处理此前的旧会话回复。
+
+同一连接的复位也会保留尚未接收完整的帧前缀。后缀到达后，旧 v2 STEP 按旧会话 ID 整帧拒绝，新会话 STEP 可继续接收；`cosim-diagnostics` 的 `rx_buffered` 表示当前保留的接收字节数。拒绝旧 STEP 会增加 `rx_bad_frames` 和 `rx_dropped_bytes`，不代表帧边界损坏。真正断连会清空旧接收字节。此边界不隔离旧客户端 RESET 帧或无会话 ID 的 v1 输入；会话 ID 完整回绕和客户端主动复用 ID 也不提供历史隔离保证。
+
+v2 控制响应队列满时，已经接收完整但尚未处理的 STEP 也会留在接收缓冲区，不交付设备。读取回复释放队列后可以继续处理；期间发生复位时，该帧保持原字节，按旧会话 ID 拒绝，新会话 STEP 可继续接收。`tx_queue=8` 与非零 `rx_buffered` 可帮助确认此状态。遥测仍按既有拥塞策略丢弃或延后发送，`tx_dropped` 会记录相关事件；此恢复不提供丢失回复的重放。
+
+worker 收到新 RESET 后立即停止旧 STEP 重试，等待对应 RESET_ACK 后重建 plant 会话。此握手另有 2 秒期限；期间再次 RESET 会切换到最新会话，期限保持不变。worker 保留队列中旧 STEP 的完整帧或未发送后缀，按原顺序完成发送，新 STEP 排在其后；QEMU 会按旧会话 ID 拒绝完整旧 STEP。该策略也适用于完成等待中尚未发送完的重放。握手超时、断连或恢复后的 STEP 准入超时会报错并清理资源。连接关闭会终止当前 worker，重新运行 worker 可建立新会话。
+
+初始 RESET 超时、协议错误、运行失败或中断时，worker 会尝试关闭已成功获取的 backend 和所有连接。某项关闭失败时，继续关闭其它连接，并输出 `cleanup <资源>.close() failed`；原始运行错误保持不变。正常运行结束后的关闭失败也会返回非零。连接或配置尚未完成时失败，连接 helper 会尝试关闭它持有的 socket；Unix 连接关闭失败会停止重试，保留原始连接错误及清理诊断。SocketCAN 保留原有接口错误说明。
+
+自定义 backend 返回后，worker 先尝试取得 `close()`，再检查方法；属性 getter 抛错或对象被拒绝时，会尝试调用已取得的关闭方法一次。准入失败且无法取得可调用的关闭方法时，诊断为 `backend cleanup unavailable`，不能保证插件私有资源已释放。自定义 factory 负责其返回前创建的私有资源；自定义 backend 的 getter、调用及关闭操作应及时返回，worker 不强制中断阻塞的插件。
 
 ## Testing and performance
 
@@ -303,6 +470,66 @@ tools/meson test -C build/qemu --print-errorlogs qtest-arm/dm-mc02-memory-test
 ```
 
 该命令复用已有 qtest，不需要业务固件。修改模型后先构建 QEMU；完整回归用于发布和涉及多个入口的变更。
+
+### trobot HAL/BSP firmware test
+
+外部 `trobot` 工作区可选择专用测试构建，普通业务 preset 默认关闭测试：
+
+```bash
+cd ../trobot
+cmake --preset SelfTestDebug
+cmake --build --preset SelfTestDebug --clean-first
+cmake --preset SelfTestRelease
+cmake --build --preset SelfTestRelease
+cd ../dm-mc02-qemu
+tools/run-trobot-selftest.sh ../trobot/build/SelfTestRelease/trobot.elf build/test-results/trobot-selftest.json
+```
+
+需要现有 ARM GCC、CMake/Ninja、Python3 和项目 QEMU；可继续使用本项目固定 Nix shell。
+runner 复用既有测试生命周期，提供确定的按键、ADC 电压、BMI088 样本及六路 UART/三路
+CAN 输入，检查精确数据和公开 PWM/LED 输出。它在 `iwdg-boot-grace-ms=0` 下实际执行
+POR→软件复位→watchdog 复位并汇总所有启动的结果；FAIL、缺失项、错误输出或异常复位
+返回非零，JSON 保存用例、各轮 `PHASE` 计数及 ELF/QEMU 哈希。任何一轮的失败计数都使
+整套测试失败。USART1 的 `PHASE`/`DONE` 计数只属于当前
+启动，整体结论以 JSON 为准。可传入 Debug ELF 或用 `QEMU_SYSTEM_ARM` 指定产物。
+
+测试不连接用户持久化 image；内部 Flash 用例擦写未使用的末尾 sector 7，并检查镜像
+边界；外部 KV 使用专用字段。该固件面向测试，不能用于含重要数据的实板。USB 真实
+枚举、CORDIC 双参数、UART5 TX 及 plant 物理行为明确 SKIP，RNG 只检查功能和 refill。
+当前固件仅16-bit ADC；低分辨率及其它芯片模式继续由各自下层门验证。此处结果是 HAL/BSP
+consumer 回归，不能据此声明硅级精度、真实电气时序或整机 migration；本轮没有实板烧录。
+
+FDCAN 当前发送侧支持 FIFO 模式（`NDTB=0`、`TFQM=0`），容量最多 32 帧；专用 TX
+buffer、混合 buffer/FIFO 和按优先级排序的 TX queue 尚未支持。地址与容量解码修正后，
+旧 FDCAN v1/v2 组件快照及共享 Message RAM link v1 快照会被拒绝；这不影响普通 ELF
+启动。完整 machine migration 仍未支持。
+
+### trobot motor/MuJoCo test
+
+在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
+
+```bash
+uv sync --locked --group dev --extra mujoco
+cd ../trobot
+cmake --preset MotorTestRelease
+cmake --build --preset MotorTestRelease
+cd ../dm-mc02-qemu
+tools/run-dm-motor-smoke.sh ../trobot/build/MotorTestRelease/trobot.elf build/test-results/trobot-motor.json
+```
+
+也可使用 `MotorTestDebug`。runner 通过实际 `motor::dm`、HAL/BSP 和 FDCAN 交换 195 次
+命令/反馈：禁用时发送控制、启用后小恒定扭矩、禁用滑行、再次启用反向制动和最终禁用。
+既有 MuJoCo 无阻尼单转子模型与独立解析转动惯量核对位置/速度/力矩，固件检查实际回调、
+raw 数据和物理单位。JSON 保存每帧轨迹及 ELF/QEMU/模型哈希；缺失或重复项、错误字节、
+超时和 QMP/socket 清理错误均失败。`DM_MOTOR_DROP_FEEDBACK=1` 可故意丢弃第一帧反馈，
+用同一命令确认失败会保留为 JSON 并返回非零。
+
+测试夹具每条 control 固定推进 1 ms，独立于固件任务周期和 CAN 时间；这不是全局
+lockstep、普通业务 PID、worker pacing 或实时门。四个阶段的解析速度恰好落在量化中点，
+只接受两个相邻码，并在 JSON 写出 `expected_range`；位置与扭矩仍使用精确 raw 断言。
+P/V/T=12.5/30/10 是测试 profile，状态 nibble=0 和温度=25°C 是固定反馈。`ff…fb` 为
+达妙清除错误命令，既有 `reset()` API 不表示机械位置归零。真实物理标定仍显式 SKIP。
+省略 ELF 参数运行原有最小 guest 与 NullEngine smoke，经 v2 RESET/STEP 交换反馈。
 
 ### Canonical test gate
 
@@ -394,7 +621,8 @@ git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2
 | 已有 `/usr/include/zlib.h`，但 `cc` 来自 `.nix-profile/bin` | 编译器与 apt 开发库混用；使用完整 `nix develop` 环境，或改用 Ubuntu 系统工具链 |
 | pytest 或项目 Python 环境不可用 | 使用所选环境的 Python 运行 `uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"` |
 | 测试 guest 编译失败 | 检查 `arm-none-eabi-gcc`、`arm-none-eabi-objcopy` 与 `binutils-arm-none-eabi` |
-| 终端没有 UART 文本 | 核对 `-serial` 顺序；槽位 0 是二进制 co-sim |
+| 终端没有 UART 文本 | 核对 `--uart` 与固件日志配置；当前 `trobot` Release 关闭 logger/terminal。原生 `-serial` 槽位 0 是二进制 co-sim |
+| `trobot` 未进入 `example_task` | 用 GDB 找到首个阻塞位置；INS 初始化需要静止 IMU 输入，按 worker 示例复现 |
 | Unix socket 无法连接 | 确认服务端、路径权限和路径长度；每个进程使用独立短路径 |
 | RTF 采样失败 | 核对 ELF 哈希、`xTickCount`、watchdog、Release 构建、启动期限和宿主负载 |
 | ROS 2/MuJoCo smoke 被跳过 | 安装相应可选依赖；ROS 2 还需 source 系统环境 |
@@ -438,6 +666,14 @@ PATH=/usr/bin:/bin CC=/usr/bin/cc CXX=/usr/bin/c++ \
 
 更新后的脚本会自动迁移 configure 元数据；也可用 `QEMU_RECONFIGURE=1` 明确请求完整配置。仅执行 `meson setup --reconfigure` 不保证重新选择编译器。确认新构建可用后，再删除自己保留的旧备份。
 
+ADC1/2 完整读回三位 `CFGR.RES[4:2]`，目前仅支持编码 0–3（16/14/12/10-bit）。
+编码 4–7 的转换启动被拒绝，并可通过 `-d guest_errors` 查看诊断；拒绝保留已有结果和标志。
+任一转换组正在运行或等待触发时，RES 改写保留旧值。处理时间按 RM0468 第 228 表采用
+8.5/7.5/6.5/5.5 ADC clocks，再加 SMPR 采样时间；虚拟纳秒截止时间向上取整。
+结果从统一的 16 位输入按所选分辨率投影，14/12/10 位分别保留高 14/12/10 位，
+DR/JDR 和 DMA 的范围一致。外部 raw 输入与电压输入仍使用原来的 16 位输入契约。
+这些是数字行为；模拟采样、触发同步延迟、OFR、oversampling/LSHIFT 及优化分辨率模式仍未建模。
+
 诊断 QEMU 未实现寄存器或 guest error 时，可创建输出目录后启用日志：
 
 ```bash
@@ -446,6 +682,9 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
   -nodefaults -display none -serial none -monitor stdio \
   -d unimp,guest_errors -D build/runtime/qemu.log
 ```
+
+EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被拒绝，
+这仍不代表整机快照支持。CORDIC 使用官方 H723 地址 `0x48024400`。
 
 ## Repository map
 
