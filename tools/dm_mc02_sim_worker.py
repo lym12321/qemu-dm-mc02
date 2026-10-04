@@ -214,7 +214,7 @@ class ExternalTimestampMapper:
 
 
 class QemuTimestampMapper:
-    """Translate QEMU virtual timestamps into the worker's step epoch."""
+    """Translate between QEMU virtual time and the worker's step epoch."""
 
     def __init__(self, qemu_origin_ns: int, worker_origin_ns: int):
         self.qemu_origin_ns = qemu_origin_ns
@@ -376,6 +376,11 @@ def wait_v2_response(stream: StepFramedSocket, validator,
                 stream.push_front(received[frame_index + 1:])
                 return frame
             if status != 0:
+                if frame.header.kind == step_protocol.STEP_DONE:
+                    raise RuntimeError(
+                        f"STEP_DONE failed: step={frame.header.step_id} "
+                        f"status={status} consumed={ack.consumed_mask:#x} "
+                        f"missing={ack.missing_mask:#x}")
                 raise RuntimeError(f"v2 response failed with status {status}")
             # One socket read may contain ACK and its later DONE. Preserve
             # frames after the response requested by this call so the next
@@ -1243,11 +1248,14 @@ def parse_args() -> argparse.Namespace:
 
 def send_dm_feedback(can: CanStream, engine, indices: Iterable[int],
                      timestamp_ns: int,
-                     adapter: DmMotorBusAdapter) -> None:
+                     adapter: DmMotorBusAdapter,
+                     timestamp_mapper: QemuTimestampMapper) -> None:
+    wire_timestamp_ns = timestamp_mapper.unmap(
+        timestamp_ns, timestamp_mapper.qemu_origin_ns)
     for index in indices:
         state = adapter.state(engine, index, timestamp_ns)
         feedback_id, payload = adapter.encode_feedback(state)
-        can.send(feedback_id, 0, 8, timestamp_ns,
+        can.send(feedback_id, 0, 8, wire_timestamp_ns,
                  payload)
 
 
@@ -1633,7 +1641,8 @@ def run(args: argparse.Namespace) -> int:
             if can and coordinator.active_indices:
                 send_dm_feedback(can, engine,
                                  sorted(coordinator.active_indices),
-                                 virtual_time_ns, motor_adapter)
+                                 virtual_time_ns, motor_adapter,
+                                 qemu_timestamp_mapper)
             imu_frames += 1
             if args.realtime:
                 # wall_origin corresponds to clock_base_ns, not virtual time
