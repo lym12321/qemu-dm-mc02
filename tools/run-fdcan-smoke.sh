@@ -254,8 +254,9 @@ if not switch_enabled or not system_5v_good:
                        " GPIOC_ODR=%s" % odr_text)
 if not qom_bool("mcu-power-good"):
     raise RuntimeError("MCU power unexpectedly low during transceiver test")
-# Release the guest's deterministic wait; it will now pull PC15 low and hold
-# the rail off long enough for the host to inject a frame during the outage.
+# Keep A15 released; the guest holds PC15 low until this input is pressed.
+command("qom-set", {"path": "/machine", "property": "user-key", "value": False})
+# Release the guest's deterministic wait to begin the switched-rail outage.
 arm = bytearray(WIRE)
 struct.pack_into("<IIB", arm, 0, 0x456, 0, 1)
 arm[20] = ord("A")
@@ -285,6 +286,7 @@ can.sendall(off)
 time.sleep(0.01)
 if rx_fill() != 0:
     raise RuntimeError("FDCAN received a frame while 5 V rail was off")
+command("qom-set", {"path": "/machine", "property": "user-key", "value": True})
 
 deadline = time.monotonic() + 2.0
 while time.monotonic() < deadline:

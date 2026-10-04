@@ -16,6 +16,9 @@
 #define FDCAN1_TXBAR (*(volatile uint32_t *)0x4000a0d0u)
 #define FDCAN1_TXBTO (*(volatile uint32_t *)0x4000a0d8u)
 #define FDCAN1_HPMS  (*(volatile uint32_t *)0x4000a094u)
+#define RCC_AHB4ENR (*(volatile uint32_t *)0x580244e0u)
+#define GPIOA_MODER (*(volatile uint32_t *)0x58020000u)
+#define GPIOA_IDR   (*(volatile uint32_t *)0x58020010u)
 #define GPIOC_MODER  (*(volatile uint32_t *)0x58020800u)
 #define GPIOC_ODR    (*(volatile uint32_t *)0x58020814u)
 #define NVIC_ISER0   (*(volatile uint32_t *)0xe000e100u)
@@ -64,6 +67,9 @@ void Reset_Handler(void)
     RESULT[15]++;
 
     /* Enable the switched 5 V rail for the strict electrical-power smoke. */
+    /* STM32H723 CMSIS: AHB4ENR GPIOAEN=0, GPIOCEN=2; A15 is the board key. */
+    RCC_AHB4ENR |= (1u << 0) | (1u << 2);
+    GPIOA_MODER &= ~(3u << (15u * 2u));
     GPIOC_MODER = (GPIOC_MODER & ~(3u << (15u * 2u))) |
                   (1u << (15u * 2u));
     GPIOC_ODR |= 1u << 15;
@@ -160,7 +166,8 @@ void Reset_Handler(void)
      * MCU and FDCAN register state must survive this transition. */
     GPIOC_ODR &= ~(1u << 15);
     RESULT[12] = 0x354f4646u;      /* 5V off */
-    for (volatile uint32_t delay = 0; delay < 10000000u; ++delay) {
+    /* Hold off until the host finishes its checks and presses the real key. */
+    while (GPIOA_IDR & (1u << 15)) {
         __asm__ volatile ("nop" ::: "memory");
     }
     GPIOC_ODR |= 1u << 15;
