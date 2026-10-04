@@ -616,6 +616,24 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 摩擦与接触参数使用锁定版本的原生默认值。这些参数未经实物标定；它是普通四轮夹具，
 可通过下文的共享 M3508 joint adapter 驱动。BMI088 单样本输入已有下方 SPI 消费门；
 真实四轮固件闭环仍待接入。
+
+同一四轮 plant 可通过专用 worker 同时产生 M3508 反馈和 BMI088 输入：
+
+```bash
+uv run --frozen --extra mujoco python tools/run-chassis-worker.py \
+  --cosim /path/to/cosim.sock --fdcan /path/to/can.sock \
+  --protocol v2 --rate 1000 --realtime
+uv run --frozen --extra mujoco bash tools/run-qemu-worker-smoke.sh --chassis
+```
+
+ID 1–4 固定为左前、右前、左后、右后；默认模型为 `models/four_wheel.xml`，可用
+`--chassis-model` 指定具有相同具名绑定的 XML。默认 command timeout 为 100 ms，
+`--torque-per-amp .02` 是未标定的转子 Nm/A 系数，`--can-delay-ns 0` 无额外交付延迟。
+每步先完成共享 plant 的推进和反馈交付，再读取该目标时刻的原生 IMU；RESET 只重置
+一次 plant，重试不重新推进或采样。此入口要求默认 engine，不组合旧 motor backend。
+原有 `run-worker.sh` 与 `run-can-worker.py` 保持原入口。
+可选 smoke 用实际 SPI guest 核对第一个 1 ms 目标的接触瞬态、六轴量化与 DONE 消费；
+它仍不证明真实四轮固件闭环、实物标定、CPU 锁步或持续实时性能。
 可单独运行物理门：
 
 ```bash

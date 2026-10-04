@@ -6,7 +6,9 @@ not a no-slip rolling equation or a fitted vehicle performance target.
 
 import math
 from pathlib import Path
+import socket
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -283,3 +285,126 @@ def test_shared_m3508_differential_native_imu_and_new_session_reset_repeat():
         assert_shared_feedback(plant, host, devices, (21, 107, 21, 107))
     finally:
         coordinator.close()
+
+
+@pytest.fixture
+def fixed_runtime():
+    from sim.robots.four_wheel import FourWheelRuntime, create_four_wheel_plant
+
+    sys.path.insert(0, str(ROOT / "tools"))
+    import dm_mc02_sim_worker as worker
+
+    left, right = socket.socketpair()
+    left.setblocking(False)
+    right.setblocking(False)
+    plant = runtime = None
+    try:
+        stream, peer = worker.CanStream(left), worker.CanStream(right)
+        plant = create_four_wheel_plant(MODEL)
+        runtime = FourWheelRuntime(plant, stream)
+        yield plant, runtime, stream, peer, worker.QemuTimestampMapper
+    finally:
+        try:
+            if runtime is not None:
+                runtime.close()
+            elif plant is not None:
+                plant.close()
+        finally:
+            left.close()
+            right.close()
+
+
+def test_fixed84_profile_can_shared_advance_target_imu_feedback_and_epoch_reset(
+        fixed_runtime, monkeypatch):
+    from sim.fabric import CanFrame
+
+    plant, runtime, stream, peer, mapper = fixed_runtime
+    native = plant.physics
+    initial_imu = native.get_imu("imu")
+    events = []
+    advance, get_imu = native.step, native.get_imu
+
+    def observed_advance(dt_ns):
+        events.append(("step", dt_ns))
+        advance(dt_ns)
+
+    def observed_imu(name):
+        events.append(("imu", native.time_s))
+        return get_imu(name)
+
+    monkeypatch.setattr(native, "step", observed_advance)
+    monkeypatch.setattr(native, "get_imu", observed_imu)
+    first_state = first_wire = None
+    for session, worker_origin, qemu_origin in ((1, 7_000_000_000, 4_000_000_000),
+                                               (2, 20_000_000_000, 30_000_000_000)):
+        runtime.reset(session, worker_origin, mapper(qemu_origin, worker_origin))
+        assert native.time_s == 0 and runtime.t_sim_ns == worker_origin
+        assert runtime.get_imu() == initial_imu
+        events.clear()
+        # Existing fixed84 stream/codec is the borrowed wire owner.
+        peer.send(0x200, 0, 8, qemu_origin, bytes.fromhex("0015 006b 0015 006b"))
+        ident, flags, dlc, timestamp, payload = stream.receive()[0]
+        runtime.ingest_qemu(CanFrame(ident, flags, dlc, payload, timestamp), worker_origin)
+        assert native.time_s == 0 and runtime.t_sim_ns == worker_origin
+        assert all(device.current_raw == 0 for device in plant.devices)
+        result = runtime.step(1_000_000)
+        sample = runtime.get_imu()
+        assert events == [("step", 1_000_000), ("imu", .001)]
+        assert sample == get_imu("imu") and sample != initial_imu
+        assert all(math.isfinite(value) for value in
+                   (*sample.gyro_rad_s, *sample.accel_m_s2))
+        assert result.status == "ok" and result.reached_time_ns == worker_origin + 1_000_000
+        assert native.time_s == .001 and runtime.t_sim_ns == worker_origin + 1_000_000
+        replies = peer.receive()
+        assert [record[0] for record in replies] == [0x201, 0x202, 0x203, 0x204]
+        assert all(record[3] == qemu_origin + 1_000_000 for record in replies)
+        frames = {ident: CanFrame(ident, flags, dlc, payload, timestamp)
+                  for ident, flags, dlc, timestamp, payload in replies}
+        assert_shared_feedback(native, SimpleNamespace(frames=frames), plant.devices,
+                               (21, 107, 21, 107))
+        state = (sample, tuple(native.get_joint_state(name) for name in JOINTS))
+        wire = tuple(frame.data for frame in frames.values())
+        if first_state is None:
+            first_state, first_wire = state, wire
+        else:
+            assert state == first_state and wire == first_wire
+
+
+def test_runtime_imu_rejects_before_reset_after_step_failure_and_after_close(
+        fixed_runtime, monkeypatch):
+    plant, runtime, stream, peer, mapper = fixed_runtime
+    native = plant.physics
+    reads = []
+    get_imu, advance = native.get_imu, native.step
+
+    def observed_imu(name):
+        reads.append(native.time_s)
+        return get_imu(name)
+
+    def failed_advance(dt_ns):
+        advance(dt_ns)
+        raise RuntimeError("solver boundary failure")
+
+    monkeypatch.setattr(native, "get_imu", observed_imu)
+    with pytest.raises(RuntimeError, match="successful runtime reset/step"):
+        runtime.get_imu()
+    assert reads == []
+    runtime.reset(1, 0, mapper(1_000_000_000, 0))
+    initial = runtime.get_imu()
+    monkeypatch.setattr(native, "step", failed_advance)
+    with pytest.raises(RuntimeError, match="solver boundary failure"):
+        runtime.step(1_000_000)
+    assert native.time_s == .001 and runtime.t_sim_ns == 0
+    with pytest.raises(RuntimeError, match="successful runtime reset/step"):
+        runtime.get_imu()
+    assert reads == [0]
+    monkeypatch.setattr(native, "step", advance)
+    runtime.reset(2, 9_000_000_000, mapper(11_000_000_000, 9_000_000_000))
+    assert runtime.get_imu() == initial and reads == [0, 0]
+    runtime.close()
+    with pytest.raises(RuntimeError, match="successful runtime reset/step"):
+        runtime.get_imu()
+    assert reads == [0, 0] and plant.closed and all(d.closed for d in plant.devices)
+    # Runtime owns devices, while the caller retains both native connections.
+    peer.send(0x123, 0, 4, 0, b"live")
+    assert stream.receive() == [(0x123, 0, 4, 0, b"live")]

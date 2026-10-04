@@ -6,13 +6,14 @@ from __future__ import annotations
 import importlib.util
 import io
 import errno
+import math
 from pathlib import Path
 import socket
 import sys
 import struct
 import unittest
 from contextlib import redirect_stderr
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from types import SimpleNamespace
 
 
@@ -356,6 +357,211 @@ class WorkerRunTests(unittest.TestCase):
         self.assertEqual(calls, ['close'])
         self.assertEqual(self.engine.step_calls, 1)
         self._assert_closed()
+
+    def _shared_plant_runtime(self, *, results=None, sample=None):
+        """Mock only the borrowed plant boundary; retain run, codec and IO."""
+        from sim.core import StepResult
+        from sim.physics import ImuSample
+
+        self.args.backend = self.args.backend_registry = None
+        self.args.engine = "null"
+        self.enterContext(patch.object(worker, "create_engine",
+                                      side_effect=AssertionError("legacy engine acquired")))
+        self.enterContext(patch.object(worker, "StepCoordinator",
+                                      side_effect=AssertionError("legacy coordinator acquired")))
+        calls = []
+        completed = iter(results if results is not None else
+                         (StepResult("ok", 1_000_000),))
+        sample = sample if sample is not None else ImuSample(
+            (math.pi, -math.pi / 2, math.pi / 4),
+            (9.80665, -4.903325, 19.6133))
+
+        def step(dt_ns):
+            calls.append(("step", dt_ns))
+            return next(completed)
+
+        def get_imu():
+            calls.append(("sample",))
+            return sample
+
+        runtime = SimpleNamespace(
+            reset=Mock(side_effect=lambda session, timestamp, mapper: calls.append(
+                ("reset", session, timestamp, mapper.qemu_origin_ns,
+                 mapper.worker_origin_ns))),
+            step=Mock(side_effect=step), get_imu=Mock(side_effect=get_imu),
+            ingest_qemu=Mock(side_effect=lambda *args: calls.append(("qemu", *args))),
+            ingest_socketcan=Mock(side_effect=lambda *args: calls.append(("socketcan", *args))),
+            close=Mock(side_effect=lambda: calls.append(("close",))))
+
+        def factory(can, socketcan):
+            self.assertIs(can.sock, self.sockets[1])
+            self.assertIs(socketcan.sock, self.sockets[2])
+            return runtime
+
+        return runtime, calls, factory
+
+    @staticmethod
+    def _shared_plant_step_wire(timestamp=1_000_000, session=123):
+        # Literal public v2 units, independently of the production converter.
+        header = struct.pack("<IIHHIQQQI", 100, 0x32434D44, 2, 2, 60,
+                             1, timestamp, 1_000_000, session)
+        payload = struct.pack("<12fQI", 180, -90, 45, 1, -.5, 2,
+                              0, 0, 0, 0, 0, 0, timestamp, 1)
+        return header + payload
+
+    def test_shared_plant_steps_before_sample_and_routes_borrowed_inputs(self):
+        from sim.fabric import CanFrame
+        runtime, calls, factory = self._shared_plant_runtime()
+        protocol = worker.step_protocol
+        self.peers[0].sendall(self._reset_ack() + protocol.build_step_frame(
+            protocol.STEP_ACK, 1, 1_000_000, dt_ns=1_000_000,
+            flags=123, payload=bytes(16)))
+        self.peers[1].sendall(struct.pack("<IIB3xQ64s", 0x321, 0, 1,
+                                        10_000_000_000, b"q"))
+        raw_socketcan = struct.pack("<IB3x8s", 0x456, 1, b"s")
+        self.peers[2].sendall(raw_socketcan)
+        self.assertEqual(worker.run(self.args, plant_factory=factory), 0)
+        self.assertEqual(calls, [
+            ("reset", 123, 0, 10_000_000_000, 0),
+            ("qemu", CanFrame(0x321, data=b"q", timestamp_ns=10_000_000_000), 0),
+            ("socketcan", raw_socketcan, 0), ("step", 1_000_000),
+            ("sample",), ("close",)])
+        self.assertEqual(self.peers[0].recv(4096),
+                         self._reset_wire() + self._shared_plant_step_wire())
+        runtime.get_imu.assert_called_once_with()
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_ack_retry_keeps_exact_wire_and_single_sample(self):
+        runtime, calls, factory = self._shared_plant_runtime()
+        clock = SimpleNamespace(now=0.0, waits=0)
+        self.peers[0].sendall(self._reset_ack())
+
+        def select_io(readable, writable, errors, timeout):
+            if not timeout:
+                return [], [], []
+            clock.waits += 1
+            clock.now += timeout if clock.waits == 1 else timeout / 2
+            if clock.waits == 2:
+                self.peers[0].sendall(worker.step_protocol.build_step_frame(
+                    3, 1, 1_000_000, dt_ns=1_000_000, flags=123,
+                    payload=bytes(16)))
+                return [self.sockets[0]], [], []
+            return [], [], []
+
+        with patch.object(worker.time, "monotonic", lambda: clock.now), \
+                patch.object(worker.select, "select", select_io):
+            self.assertEqual(worker.run(self.args, plant_factory=factory), 0)
+        self.assertEqual(clock.now, .375)
+        self.assertEqual(calls, [("reset", 123, 0, 10_000_000_000, 0),
+                                 ("step", 1_000_000), ("sample",), ("close",)])
+        self.assertEqual(self.peers[0].recv(4096),
+                         self._reset_wire() + self._shared_plant_step_wire() * 2)
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_done_retries_do_not_restep_or_resample(self):
+        runtime, calls, factory = self._shared_plant_runtime()
+        sock, clock, observations = self._strict_done_fixture(backpressure=False)
+        with self.assertRaisesRegex(TimeoutError, "timed out waiting for v2 response"):
+            worker.run(self.args, plant_factory=factory)
+        self.assertEqual(clock.now, 8.0)
+        self.assertEqual(observations.waits, [2.0] * 4)
+        self.assertEqual(calls, [("reset", 123, 0, 10_000_000_000, 0),
+                                 ("step", 1_000_000), ("sample",), ("close",)])
+        self.assertEqual(bytes(sock.output),
+                         self._reset_wire() + self._shared_plant_step_wire() * 4)
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_wrong_target_never_samples_or_sends_step(self):
+        from sim.core import StepResult
+        runtime, calls, factory = self._shared_plant_runtime(
+            results=(StepResult("ok", 999_999),))
+        self.peers[0].sendall(self._reset_ack())
+        with self.assertRaisesRegex(RuntimeError, "CAN runtime did not reach target"):
+            worker.run(self.args, plant_factory=factory)
+        runtime.get_imu.assert_not_called()
+        self.assertEqual(calls, [("reset", 123, 0, 10_000_000_000, 0),
+                                 ("step", 1_000_000), ("close",)])
+        self.assertEqual(self.peers[0].recv(4096), self._reset_wire())
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_invalid_getter_rejected_before_reset_and_closed(self):
+        runtime, calls, factory = self._shared_plant_runtime()
+        runtime.get_imu = None
+        with self.assertRaisesRegex(TypeError, "shared plant runtime requires get_imu"):
+            worker.run(self.args, plant_factory=factory)
+        self.assertEqual(calls, [("close",)])
+        self.assertEqual(self.peers[0].recv(4096), b"")
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_bad_completed_sample_sends_no_step_and_closes(self):
+        from sim.physics import ImuSample
+        runtime, calls, factory = self._shared_plant_runtime(
+            sample=ImuSample((float("nan"), 0, 0), (0, 0, 9.80665)))
+        self.peers[0].sendall(self._reset_ack())
+        with self.assertRaisesRegex(ValueError, "finite"):
+            worker.run(self.args, plant_factory=factory)
+        self.assertEqual(calls, [("reset", 123, 0, 10_000_000_000, 0),
+                                 ("step", 1_000_000), ("sample",), ("close",)])
+        self.assertEqual(self.peers[0].recv(4096), self._reset_wire())
+        self._assert_closed(close_calls=0)
+
+    def test_shared_plant_configuration_rejected_before_acquisition(self):
+        runtime, calls, factory = self._shared_plant_runtime()
+        with self.assertRaisesRegex(ValueError, "mutually exclusive"):
+            worker.run(self.args, plant_factory=factory, can_factory=factory)
+        self.args.backend = "tests:factory"
+        with self.assertRaisesRegex(ValueError, "shared plant requires"):
+            worker.run(self.args, plant_factory=factory)
+        self.assertEqual(calls, [])
+        self.assertTrue(all(sock.fileno() >= 0 for sock in self.sockets))
+        self.assertEqual(self.engine.close_calls, 0)
+
+    def test_shared_plant_reset_ack_precedes_sole_runtime_reset_in_new_epoch(self):
+        from sim.core import StepResult
+        runtime, calls, factory = self._shared_plant_runtime(
+            results=(StepResult("ok", 1_000_000), StepResult("ok", 31_000_000)))
+        protocol = worker.step_protocol
+        clock = SimpleNamespace(now=0.0, stage=0)
+        self.peers[0].sendall(self._reset_ack())
+
+        def select_io(readable, writable, errors, timeout):
+            if not timeout:
+                return [], [], []
+            clock.now += .01
+            if clock.stage == 0:
+                reply = protocol.build_step_frame(protocol.RESET, 0, 30_000_000,
+                                                  flags=124)
+            elif clock.stage == 1:
+                # The runtime remains at its old target until RESET_ACK.
+                self.assertEqual(runtime.reset.call_count, 1)
+                self.assertEqual(runtime.step.call_count, 1)
+                self.assertEqual(runtime.get_imu.call_count, 1)
+                reply = protocol.build_step_frame(
+                    protocol.RESET_ACK, 0, 30_000_000, flags=124,
+                    payload=struct.pack("<IIQII", 0, protocol.CAPABILITY_MASK,
+                                        30_000_000, 0, 0))
+            else:
+                self.assertEqual(clock.stage, 2)
+                self.assertEqual(runtime.reset.call_count, 2)
+                reply = protocol.build_step_frame(
+                    protocol.STEP_ACK, 1, 31_000_000, dt_ns=1_000_000,
+                    flags=124, payload=bytes(16))
+            clock.stage += 1
+            self.peers[0].sendall(reply)
+            return [self.sockets[0]], [], []
+
+        with patch.object(worker.time, "monotonic", lambda: clock.now), \
+                patch.object(worker.select, "select", select_io):
+            self.assertEqual(worker.run(self.args, plant_factory=factory), 0)
+        self.assertEqual(clock.stage, 3)
+        self.assertEqual(calls, [("reset", 123, 0, 10_000_000_000, 0),
+                                 ("step", 1_000_000), ("sample",),
+                                 ("reset", 124, 30_000_000, 30_000_000, 30_000_000),
+                                 ("step", 1_000_000), ("sample",), ("close",)])
+        self.assertEqual(self.peers[0].recv(4096), self._reset_wire() +
+                         self._shared_plant_step_wire() +
+                         self._shared_plant_step_wire(31_000_000, 124))
+        self._assert_closed(close_calls=0)
 
     def test_initial_reset_invalid_ack_closes_all_resources(self):
         self.peers[0].sendall(self._reset_ack(reserved=1))

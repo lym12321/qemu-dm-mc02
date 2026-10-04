@@ -1283,8 +1283,14 @@ def engine_uses_external_time(engine) -> bool:
     return hasattr(engine, "imu_timestamp_ns")
 
 
-def run(args: argparse.Namespace, *, can_factory=None) -> int:
+def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> int:
     _validate_worker_timing(args)
+    if plant_factory is not None:
+        if can_factory is not None:
+            raise ValueError("plant_factory and can_factory are mutually exclusive")
+        if (not callable(plant_factory) or not args.fdcan
+                or args.backend or args.backend_registry or args.engine != "null"):
+            raise ValueError("shared plant requires callable factory, --fdcan and default engine")
     if can_factory is not None and (not callable(can_factory) or not args.fdcan):
         raise ValueError("CAN runtime factory requires callable factory and --fdcan")
     cosim_sock = None
@@ -1293,6 +1299,7 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
     engine = None
     can_runtime = None
     can_runtime_close = None
+    plant_get_imu = None
     primary_error = None
     try:
         cosim_sock = connect_unix(args.cosim, args.connect_timeout)
@@ -1303,16 +1310,23 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
         can = CanStream(can_sock) if can_sock else None
         socketcan_sock = open_socketcan(args.socketcan) if args.socketcan else None
         socketcan_tx = DatagramQueue(socketcan_sock) if socketcan_sock else None
-        engine = create_engine(args)
-        motor_adapter = DmMotorBusAdapter.from_namespace(args)
-        coordinator = StepCoordinator(engine, motor_adapter)
-        if can_factory is not None:
-            can_runtime = can_factory(can, socketcan_tx)
+        coordinator = None
+        if plant_factory is None:
+            engine = create_engine(args)
+            motor_adapter = DmMotorBusAdapter.from_namespace(args)
+            coordinator = StepCoordinator(engine, motor_adapter)
+        runtime_factory = plant_factory if plant_factory is not None else can_factory
+        if runtime_factory is not None:
+            can_runtime = runtime_factory(can, socketcan_tx)
             # Resolve cleanup before any other plugin-owned descriptor.
             can_runtime_close = getattr(can_runtime, "close", None)
             if any(not callable(getattr(can_runtime, name, None)) for name in
                    ("reset", "step", "ingest_qemu", "ingest_socketcan")) or not callable(can_runtime_close):
                 raise TypeError("CAN runtime requires reset/step/ingress/close methods")
+            if plant_factory is not None:
+                plant_get_imu = getattr(can_runtime, "get_imu", None)
+                if not callable(plant_get_imu):
+                    raise TypeError("shared plant runtime requires get_imu")
         cosim_sock.setblocking(False)
         # The initial telemetry timestamp is the best available common clock
         # origin for v1. v2 deliberately starts the plant clock at zero and
@@ -1387,7 +1401,8 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
                 b"")
             v2_tx_validator.reset()
             v2_tx_validator.accept(reset_frame)
-            coordinator.reset()
+            if coordinator is not None:
+                coordinator.reset()
             if hasattr(engine, "reset"):
                 engine.reset()
             clock_base_ns = reset.t_sim_ns
@@ -1519,7 +1534,8 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
 
         while args.frames == 0 or imu_frames < args.frames:
             service_worker_io(0)
-            gyro, accel = coordinator.advance(virtual_time_ns, dt)
+            if coordinator is not None:
+                gyro, accel = coordinator.advance(virtual_time_ns, dt)
             adc_count = (len(args.adc_input_values) +
                          len(args.adc_voltage_values)
                          if args.protocol == "v1" else 0)
@@ -1554,6 +1570,8 @@ def run(args: argparse.Namespace, *, can_factory=None) -> int:
                         or type(result.reached_time_ns) is not int
                         or result.reached_time_ns != virtual_time_ns):
                     raise RuntimeError(f"CAN runtime did not reach target: {result!r}")
+            if plant_get_imu is not None:
+                gyro, accel = imu_to_bmi088_units(plant_get_imu())
             if args.protocol == "v1":
                 for input_index, (channel, raw) in enumerate(
                         args.adc_input_values):
