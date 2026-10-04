@@ -1571,6 +1571,9 @@ static void cosim_schedule_tx_retry(DmMc02CosimLink *link)
 
 static void cosim_flush_tx(DmMc02CosimLink *link)
 {
+    if (!link->enabled || !link->opened) {
+        return;
+    }
     if (!link->tx_queue_count) {
         if (link->tx_timer) {
             if (link->telemetry_pending && link->enabled && link->opened) {
@@ -1625,6 +1628,12 @@ static bool cosim_queue_tx(DmMc02CosimLink *link, const uint8_t *wire,
     unsigned slot;
 
     cosim_flush_tx(link);
+    /* A socket write may synchronously close the backend and clear its queue.
+     * Do not enqueue an old-session frame for a later connection. */
+    if (!link->enabled || !link->opened) {
+        link->tx_dropped++;
+        return false;
+    }
     if (length > DM_MC02_COSIM_TX_FRAME_SIZE ||
         link->tx_queue_count == DM_MC02_COSIM_TX_QUEUE_SIZE) {
         if (length > DM_MC02_COSIM_TX_FRAME_SIZE) {
@@ -1831,7 +1840,15 @@ void dm_mc02_cosim_link_reset(DmMc02CosimLink *link)
     link->tx_time_valid = false;
     link->telemetry_valid = false;
     link->telemetry_pending = false;
-    cosim_clear_tx(link);
+    /* On the same byte stream an already-started frame must finish before
+     * RESET. Cancel only old frames whose bytes have not reached the peer.
+     * CLOSED still clears everything: a new connection has a fresh stream. */
+    if (link->opened && link->tx_queue_count &&
+        link->tx_queue_offset[link->tx_queue_head] != 0) {
+        link->tx_queue_count = 1;
+    } else {
+        cosim_clear_tx(link);
+    }
     if (link->enabled && link->opened) {
         if (protocol_version == DM_MC02_V2_WIRE_VERSION) {
             virtual_time_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -1849,6 +1866,8 @@ void dm_mc02_cosim_link_reset(DmMc02CosimLink *link)
                           virtual_time_ns, 0, 0,
                           NULL, 0);
             send_v2_reset_ack(link, 0, virtual_time_ns);
+            link->tx_last_virtual_time_ns = virtual_time_ns;
+            link->tx_time_valid = true;
             send_telemetry(link, true);
         } else {
             send_reset(link);
@@ -1962,6 +1981,8 @@ static void cosim_event(void *opaque, QEMUChrEvent event)
             send_v2_frame(link, DM_MC02_V2_WIRE_RESET, 0, virtual_time_ns,
                           0, 0, NULL, 0);
             send_v2_reset_ack(link, 0, virtual_time_ns);
+            link->tx_last_virtual_time_ns = virtual_time_ns;
+            link->tx_time_valid = true;
         } else if (reconnect) {
             send_reset(link);
         }

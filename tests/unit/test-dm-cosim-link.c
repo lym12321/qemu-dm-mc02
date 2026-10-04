@@ -446,6 +446,112 @@ static void test_reset_does_not_reuse_sources(void)
     fixture_free(f);
 }
 
+static void test_partial_frame_survives_machine_reset(void)
+{
+    /* Literal v2 DIAGNOSTICS frame: 4-byte length, magic, 36-byte header,
+     * and a 40-byte payload. No encoder supplies the expected bytes. */
+    static const uint8_t old_wire[84] = {
+        [0] = 80, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+        [8] = 2, [10] = 4, [12] = 40, [16] = 100,
+    };
+    uint8_t payload[40] = { 0 };
+    Fixture *f = fixture_new();
+    DmMc02V2WireFrame reset, ack, snapshot;
+    uint64_t short_writes = f->link.tx_short_writes;
+
+    /* The ring has wrapped before the failing frame begins. */
+    f->link.tx_queue_head = DM_MC02_COSIM_TX_QUEUE_SIZE - 1;
+    test_tx_budget = 47; /* Header plus three payload bytes. */
+    g_assert_true(send_v2_frame(&f->link, 4, 100, 0, 0, 0,
+                                payload, sizeof(payload)));
+    g_assert_cmpmem(test_tx->data, test_tx->len, old_wire, 47);
+    g_assert_cmpuint(f->link.tx_short_writes, ==, short_writes + 1);
+    g_assert_true(send_v2_frame(&f->link, 4, 101, 0, 0, 0,
+                                payload, sizeof(payload)));
+    dm_mc02_cosim_link_reset(&f->link);
+    /* A second reset cancels the first reset's unstarted frames as well. */
+    dm_mc02_cosim_link_reset(&f->link);
+    g_assert_cmpuint(test_tx->len, ==, 47);
+
+    test_tx_budget = -1;
+    f->link.tx_timer->cb(f->link.tx_timer->opaque);
+    g_assert_cmpuint(test_tx->len, >=, sizeof(old_wire));
+    g_assert_cmpmem(test_tx->data, sizeof(old_wire),
+                    old_wire, sizeof(old_wire));
+    take_frame(4, 100);
+    reset = take_frame(1, 0);
+    ack = take_frame(5, 0);
+    g_assert_cmpuint(reset.header.session_id, ==, f->link.v2_session_id);
+    g_assert_cmpuint(ack.header.session_id, ==, reset.header.session_id);
+    snapshot = take_frame(7, UINT64_MAX);
+    g_assert_cmpuint(snapshot.header.t_sim_ns, >, reset.header.t_sim_ns);
+    g_assert_cmpuint(test_tx->len, ==, 0); /* No frame 101 or stale RESET. */
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 0);
+    feed_step(f, 1, true);
+    expect_ack(1);
+    fixture_free(f);
+}
+
+static void test_partial_v1_header_survives_machine_reset(void)
+{
+    /* Literal empty v1 RESET: a 28-byte body. */
+    static const uint8_t old_wire[32] = {
+        [0] = 28, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+        [8] = 1, [10] = 1,
+    };
+    Fixture *f = fixture_new();
+    DmMc02WireFrame frame;
+
+    f->link.rx_protocol_version = 1;
+    f->link.rx_last_protocol_version = 1;
+    test_tx_budget = 2; /* Half of the outer length word. */
+    g_assert_true(send_v1_frame(&f->link, 1, 0, 0, NULL, 0, true));
+    dm_mc02_cosim_link_reset(&f->link);
+    test_tx_budget = -1;
+    f->link.tx_timer->cb(f->link.tx_timer->opaque);
+    g_assert_cmpuint(test_tx->len, >=, sizeof(old_wire) * 2);
+    g_assert_cmpmem(test_tx->data, sizeof(old_wire),
+                    old_wire, sizeof(old_wire));
+    g_byte_array_remove_range(test_tx, 0, sizeof(old_wire));
+    g_assert_cmpmem(test_tx->data, sizeof(old_wire),
+                    old_wire, sizeof(old_wire));
+    g_byte_array_remove_range(test_tx, 0, sizeof(old_wire));
+    g_assert_cmpuint(dm_mc02_wire_get32(test_tx->data), ==,
+                     test_tx->len - 4);
+    g_assert_true(dm_mc02_wire_decode(&frame, test_tx->data + 4,
+                                      test_tx->len - 4));
+    g_assert_cmpuint(frame.header.type, ==, 3);
+    fixture_free(f);
+}
+
+static void test_disconnect_drops_partial_frame_and_reentrant_enqueue(void)
+{
+    uint8_t payload[40] = { 0 };
+    Fixture *f = fixture_new();
+    DmMc02V2WireFrame reset;
+
+    test_tx_budget = 47;
+    g_assert_true(send_v2_frame(&f->link, 4, 100, 0, 0, 0,
+                                payload, sizeof(payload)));
+    test_tx_close_on_write = true;
+    /* Socket CharBackend may raise CLOSED synchronously during a write. */
+    g_assert_false(send_v2_frame(&f->link, 4, 101, 0, 0, 0,
+                                 payload, sizeof(payload)));
+    g_assert_false(f->link.opened);
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 0);
+    g_assert_cmpint(f->link.tx_timer->expire_time, ==, -1);
+
+    g_byte_array_set_size(test_tx, 0); /* The peer discarded its old socket. */
+    test_tx_budget = -1;
+    cosim_event(&f->link, CHR_EVENT_OPENED);
+    reset = take_frame(1, 0);
+    g_assert_cmpuint(reset.header.session_id, ==, f->link.v2_session_id);
+    take_frame(5, 0);
+    take_frame(7, UINT64_MAX);
+    g_assert_cmpuint(test_tx->len, ==, 0);
+    fixture_free(f);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -459,5 +565,11 @@ int main(int argc, char **argv)
                     test_reset_does_not_reuse_sources);
     g_test_add_func("/dm-cosim-link/exhaustion-before-motor",
                     test_source_exhaustion_precedes_motor_commit);
+    g_test_add_func("/dm-cosim-link/partial-tx-machine-reset",
+                    test_partial_frame_survives_machine_reset);
+    g_test_add_func("/dm-cosim-link/partial-v1-header-reset",
+                    test_partial_v1_header_survives_machine_reset);
+    g_test_add_func("/dm-cosim-link/partial-tx-disconnect",
+                    test_disconnect_drops_partial_frame_and_reentrant_enqueue);
     return g_test_run();
 }
