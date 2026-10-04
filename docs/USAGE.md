@@ -614,12 +614,32 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 坐标为 +X 前、+Y 左、+Z 上；四轮等正力矩向前，右侧更快产生正 yaw。
 模型总质量 0.6 kg、轮半径 0.03 m、轴距 0.14 m、轮距 0.12 m、轮轴阻尼 0.03 Nm·s/rad，
 摩擦与接触参数使用锁定版本的原生默认值。这些参数未经实物标定；它是普通四轮夹具，
-可通过下文的共享 M3508 joint adapter 驱动。BMI088 输入与固件闭环仍待接入。
+可通过下文的共享 M3508 joint adapter 驱动。BMI088 单样本输入已有下方 SPI 消费门；
+真实四轮固件闭环仍待接入。
 可单独运行物理门：
 
 ```bash
 uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
 ```
+
+`sim.devices.bmi088.imu_to_bmi088_units(plant.get_imu("imu"))` 将已完成的 native
+site 采样转换为现有 BMI088 输入单位 `(gyro_deg_s, accel_g)`，其中 `1g=9.80665 m/s²`。
+它保持三轴方向，不推进 plant、减去重力、添加 bias 或分配样本身份；已有器件负责
+量程、ODR、filter 与 raw 字节，co-sim link 负责读取来源身份。
+
+用同一四轮模型验证单个静止或转向采样的 QEMU SPI 读回：
+
+```bash
+uv run --frozen --extra mujoco bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source rest
+uv run --frozen --extra mujoco bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source turn
+```
+
+该门先完成 500 ms 静止步进；`turn` 再通过四台 M3508 的实际 CAN 分组命令推进
+500 ms。原生 readback guest 配置 ±1000°/s 和 ±6g，读取两颗 BMI088 的六轴 raw 字节，
+按 float32 输入及官方量程核对量化区间，并要求 DONE consumed=3、missing=0 与相同重放。
+输出 `PROFILE` 保存实际 SI、wire、raw 与独立的 plant/transport 时间。
+这只覆盖全新器件的第一个物理采样，不声明后续 filter 时序、实物标定或 CPU 锁步。
+无参数运行该 smoke 仍验证原有消费、拒绝、覆盖与 reset 行为。
 
 BMI088 的完整 raw burst/FIFO data 消费通知携带实际样本身份；默认字节、部分读取或跨样本混合不产生完整消费确认。raw 目前逐字节读取寄存器，没有已验证的硬件 shadow snapshot。`--wait-step-done` 用于 BMI088 消费门：输入已接受后，器件未接收该样本或未读来源被覆盖/器件复位，会返回失败 DONE（status=2），并报告真实已消费和缺失掩码。严格等待会立即报错，适用于传感器已经配置、每个样本都应被完整读取的场景；默认模式继续按 ACK 推进。来源按实际读取身份匹配，跨会话重用外部序号不会误确认；完成响应按 ACK 顺序发送，并保留最近结果供重放。此门不提供 CPU/电机全局锁步。SPI 独立组件的 v1 状态恢复会清除缺失的来源身份，SPI/BMI088 组合的旧 v1 快照拒绝；这些组件状态不代表整机迁移。
 

@@ -30,6 +30,7 @@ from sim.transports import (
 )
 from sim.core import StepResult
 from sim.physics import MujocoPhysics, integrate_rotor
+from sim.devices.bmi088 import imu_to_bmi088_units
 
 try:
     from dm_mc02_socketcan import (CanFrame, SocketCANError, open_socketcan,
@@ -852,9 +853,7 @@ class MujocoEngine:
             self.motor_values[index] = applied
             self.physics.set_joint_effort(self.joint_names[index], applied)
         self.physics.step_seconds(dt)
-        imu = self.physics.get_imu("imu")
-        return (tuple(v * 180.0 / math.pi for v in imu.gyro_rad_s),
-                tuple(v / 9.80665 for v in imu.accel_m_s2))
+        return imu_to_bmi088_units(self.physics.get_imu("imu"))
 
 
 class Ros2Engine:
