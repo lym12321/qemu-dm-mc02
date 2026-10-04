@@ -49,6 +49,61 @@ Lab 配置使用锁定的 PyYAML 6.0.3；运行 Python 工具前执行 `uv sync 
 UART 判断用读取后 QMP 上界，CAN 用原始 wire 时间，数字用快照时间；观测较晚可能保守失败，
 失败后不会被迟到数据改成通过。串口匹配只保留最小尾部，不缓存完整运行记录。
 
+## Virtual Lab
+
+先安装固定 Python 依赖，再运行实验：
+
+```bash
+uv sync --frozen
+uv run tools/sim lab run path/to/lab.yaml --report build/lab-result.json
+# 验证公共示例，自动编译专用裸机测试固件：
+nix develop -c bash tools/run-lab-channels-smoke.sh
+```
+
+[board-io.yaml](../examples/labs/board-io.yaml) 展示 UART、按键/LED、GPIO、CAN 和 ADC1。
+`firmware` 相对 YAML 目录，普通固件应填写自身实际输出的 `ready` 文本；省略 ready 时以
+QEMU 首次恢复前的虚拟快照作为时间起点，不判断应用已就绪。显式 ready 的时间起点取读取
+该串口批次后的 QMP 上界，可能晚于真正的 ready 字节。实验只连接配置引用的端点。
+
+```yaml
+schema: 1
+name: uart-check
+board: dm-mc02
+firmware: build/student.elf
+stimulus:
+  - {at: 100ms, endpoint: uart1, bytes: hello}
+assertions:
+  - before: 200ms
+    uart_contains: {endpoint: uart2, text: received 5 bytes}
+  - before: 250ms
+    digital_equals: {endpoint: led, value: 1}
+```
+
+UART 端点为 `uart1/2/3/5/7/10`，CAN 为 `can1/2/3`。输入还支持 `key`+`pressed`、
+`gpio.A0`+`value`、`adc1.ch4`+`raw` 或 `voltage_uv`，CAN 使用 `frame` 的 `id/flags/dlc/data_hex`。
+CAN 断言 `can_seen` 要求 `endpoint/id`，可再指定精确 flags、DLC 和完整 data_hex；输出 payload
+较短时沿用既有 wire 零填充。UART 文本使用 UTF-8。ADC2 注入和自动 IMU 环境尚未支持。
+
+`--qemu` 覆盖 QEMU 路径；`--timeout` 默认 30 秒，`--startup-timeout` 默认 10 秒，都从
+启动前开始计入。QMP 连接和实际 ready 等待共用 startup 期限，不能以 socket 出现代替 ready。
+输入在观测到 QEMU 时间到期后发送，存在轮询延迟；报告保留计划时间和发送时的观测样本。
+串口显示 polling sample，CAN 显示原生 wire 时间。实验失败、进程退出、中断或清理失败都非零。
+这些检查证明声明的数字边界，不建立 CPU/plant 全局锁步或物理真实性。
+
+```bash
+# Lab 内部 monitor 与用户 QMP 独立；GDB 使用 QEMU 原生 server：
+uv run tools/sim lab run lab.yaml --qmp /tmp/student-qmp.sock --gdb-port 1234 --paused
+# 在 startup 期限内从 GDB 恢复，或增大 --startup-timeout/--timeout：
+arm-none-eabi-gdb build/student.elf
+# (gdb) target remote 127.0.0.1:1234
+# (gdb) continue
+# 原生 UART terminal、monitor mux、GDB 和 QMP 仍可直接使用：
+uv run tools/sim board run --elf build/student.elf --debug --qmp /tmp/student-qmp.sock
+```
+
+从仓库根目录可用 `uv run python -m sim`；`tools/sim` 也可从任意目录启动，或将 `tools`
+加入 PATH 后直接使用 `sim`。`board run` 原样调用现有 launcher，不重建调试协议。
+
 ## Contents
 
 - [项目范围](#project-scope)

@@ -15,7 +15,10 @@ import tempfile
 import time
 from typing import Any, Callable, Iterable, Sequence, TextIO, TypeVar
 
-from dm_mc02_qmp import QmpSession
+if __package__:
+    from .dm_mc02_qmp import QmpSession
+else:
+    from dm_mc02_qmp import QmpSession
 
 
 UINT32_MASK = 0xFFFF_FFFF

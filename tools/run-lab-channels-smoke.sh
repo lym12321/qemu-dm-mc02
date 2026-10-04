@@ -226,5 +226,38 @@ finally:
             raise error
 print("Lab consumer observations:", observation_batches, "batches", flush=True)
 PY
-# The harness has checked QEMU quit and completed cleanup before announcing PASS.
-printf '%s\n' 'RESULT: Lab UART/CAN/ADC and KEY→GPIO LED consumer passed'
+# The lower channel gate precedes the manifest consumer. Reuse this compiled
+# fixture and the public example; PyYAML and CLI dependencies are lock-pinned.
+command -v uv >/dev/null 2>&1 || {
+    printf '%s\n' 'blocked: uv is required for the pinned Lab manifest consumer' >&2; exit 1;
+}
+cd -- "$root_dir"
+uv run --frozen python - "$root_dir/examples/labs/board-io.yaml" \
+    "$guest_elf" "$run_dir/lab.yaml" <<'PY'
+from pathlib import Path
+import sys
+import yaml
+
+example, firmware, destination = sys.argv[1:]
+manifest = yaml.safe_load(Path(example).read_text())
+manifest["firmware"] = firmware
+Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
+PY
+uv run --frozen python tools/sim lab run "$run_dir/lab.yaml" \
+    --qemu "$qemu_bin" --report "$run_dir/lab-report.json"
+python3 - "$run_dir/lab-report.json" <<'PY'
+from pathlib import Path
+import json
+import sys
+
+report = json.loads(Path(sys.argv[1]).read_text())
+assert report["status"] == "passed", report
+result = report["result"]
+assert result["status"] == ["pass"] * 8 and not result["failures"], result
+assert len(result["dispatched"]) == 7, result
+assert result["end_ns"] - result["origin_ns"] >= 400_000_000, result
+assert all(actual - result["origin_ns"] >= scheduled
+           for scheduled, actual, endpoint in result["dispatched"]), result
+print("Manifest consumer: eight assertions passed after owner cleanup")
+PY
+printf '%s\n' 'RESULT: Lab channels and YAML manifest consumers passed'
