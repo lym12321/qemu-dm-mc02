@@ -26,6 +26,8 @@
 #define USART_CR1_TE   (1u << 3)
 #define USART_CR1_OVER8 (1u << 15)
 #define USART_CR1_IDLEIE (1u << 4)
+#define USART_CR1_TCIE (1u << 6)
+#define USART_CR1_TXEIE (1u << 7)
 #define USART_CR3_DMAR (1u << 6)
 #define USART_CR3_DMAT (1u << 7)
 #define USART_CR3_DEM  (1u << 14)
@@ -39,6 +41,7 @@
 #define USART_ISR_TEACK (1u << 21)
 #define USART_ICR_IDLECF (1u << 4)
 #define USART_ICR_ORECF  (1u << 3)
+#define USART_ICR_TCCF   (1u << 6)
 #define USART_CR3_EIE    (1u << 0)
 #define DM_MC02_UART_DMA_BATCH_MAX 32
 
@@ -47,6 +50,7 @@ static uint32_t uart_load(const DmMc02Uart *s, hwaddr offset,
 static void uart_store(DmMc02Uart *s, hwaddr offset, uint64_t value,
                        unsigned size);
 static void uart_dma_tx_tick(void *opaque);
+static void uart_update_irq(DmMc02Uart *s);
 static bool uart_tx_allowed(const DmMc02Uart *s);
 static void uart_tx_flush(void *opaque);
 static void uart_tx_timer_tick(void *opaque);
@@ -161,6 +165,7 @@ static void uart_tx_flush(void *opaque)
         uart_timer_del(s->tx_timer, &s->tx_next_ns);
         uart_store(s, USART_ISR,
                    uart_load(s, USART_ISR, 4) | USART_ISR_TC, 4);
+        uart_update_irq(s);
         uart_dma_tx_kick(s);
         return;
     }
@@ -199,6 +204,7 @@ static void uart_tx_flush(void *opaque)
      * queued byte is not complete merely because it was accepted by TDR. */
     uart_store(s, USART_ISR,
                uart_load(s, USART_ISR, 4) | USART_ISR_TC, 4);
+    uart_update_irq(s);
     uart_dma_tx_kick(s);
 }
 
@@ -212,6 +218,7 @@ static void uart_tx_timer_tick(void *opaque)
     if (s->tx_fifo_len == 0) {
         uart_store(s, USART_ISR,
                    uart_load(s, USART_ISR, 4) | USART_ISR_TC, 4);
+        uart_update_irq(s);
         uart_dma_tx_kick(s);
         return;
     }
@@ -238,6 +245,7 @@ static void uart_tx_timer_tick(void *opaque)
     } else {
         uart_store(s, USART_ISR,
                    uart_load(s, USART_ISR, 4) | USART_ISR_TC, 4);
+        uart_update_irq(s);
     }
     uart_dma_tx_kick(s);
 }
@@ -266,6 +274,8 @@ static void uart_update_irq(DmMc02Uart *s)
     uint32_t isr = uart_load(s, USART_ISR, 4);
     bool asserted = ((cr1 & USART_CR1_IDLEIE) &&
                      (isr & USART_ISR_IDLE)) ||
+                    ((cr1 & USART_CR1_TCIE) && (isr & USART_ISR_TC)) ||
+                    ((cr1 & USART_CR1_TXEIE) && (isr & USART_ISR_TXE)) ||
                     ((cr3 & USART_CR3_EIE) && (isr & USART_ISR_ORE));
 
     if (s->irq && (!s->irq_level_valid || s->irq_level != asserted)) {
@@ -546,6 +556,7 @@ static void uart_tdr_write(DmMc02Uart *s, uint8_t byte)
         isr &= ~USART_ISR_TC;
     }
     uart_store(s, USART_ISR, isr, 4);
+    uart_update_irq(s);
 }
 
 /* Endpoint callbacks own only UART data-register side effects.  DMA remains
@@ -838,11 +849,6 @@ static uint32_t uart_status(const DmMc02Uart *s)
     uint32_t isr = uart_load(s, USART_ISR, 4);
 
     isr |= USART_ISR_TXE;
-    if (s->tx_fifo_len == 0) {
-        isr |= USART_ISR_TC;
-    } else {
-        isr &= ~USART_ISR_TC;
-    }
     if (cr1 & USART_CR1_RE) {
         isr |= USART_ISR_REACK;
     }
@@ -899,6 +905,9 @@ static void dm_mc02_uart_write(void *opaque, hwaddr offset, uint64_t value,
         }
         if (clear & USART_ICR_ORECF) {
             isr &= ~USART_ISR_ORE;
+        }
+        if (clear & USART_ICR_TCCF) {
+            isr &= ~USART_ISR_TC;
         }
         uart_store(s, USART_ISR, isr, 4);
         uart_update_irq(s);

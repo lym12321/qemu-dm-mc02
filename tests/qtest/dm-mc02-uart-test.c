@@ -16,10 +16,14 @@
 #define USART1_TDR        (USART1_BASE + 0x28u)
 #define USART_CR1_RE      (1u << 2)
 #define USART_CR1_TE      (1u << 3)
+#define USART_CR1_TCIE    (1u << 6)
+#define USART_CR1_TXEIE   (1u << 7)
 #define USART_CR3_EIE     (1u << 0)
 #define USART_CR3_DMAT    (1u << 7)
 #define USART_ISR_ORE     (1u << 3)
+#define USART_ISR_TC      (1u << 6)
 #define USART_ICR_ORECF   (1u << 3)
+#define USART_ICR_TCCF    (1u << 6)
 
 #define PPB_BASE          0xe000e000ull
 #define NVIC_ISER1        (PPB_BASE + 0x104)
@@ -258,6 +262,62 @@ static void test_uart_rx_wire_overrun(void)
     g_rmdir(socket_dir);
 }
 
+static void test_uart_tx_interrupts(void)
+{
+    const uint8_t transmit[] = { 0x00, 0xa5 };
+    uint8_t received[sizeof(transmit)];
+    const uint32_t irq_mask = UINT32_C(1) << (USART1_IRQ % 32);
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02 -nodefaults -chardev ringbuf,id=uart1 "
+        "-serial none -serial chardev:uart1");
+
+    /* ST HAL UART_DMATransmitCplt enables TCIE after DMA finishes; only
+     * USART TC, after the last wire frame, completes the HAL transfer. */
+    qtest_writel(qts, RCC_D2CCIP2R, 3u << 3);
+    qtest_writel(qts, USART1_BRR, UART_RX_BAUD_DIVIDER);
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE);
+    qtest_writel(qts, NVIC_ISER1, irq_mask);
+    qtest_memwrite(qts, DMA_SOURCE, transmit, sizeof(transmit));
+    qtest_writel(qts, DMAMUX1_C1CR, DMAMUX_USART1_TX);
+    qtest_writel(qts, DMA1_S1NDTR, sizeof(transmit));
+    qtest_writel(qts, DMA1_S1PAR, USART1_TDR);
+    qtest_writel(qts, DMA1_S1M0AR, DMA_SOURCE);
+    qtest_writel(qts, DMA1_S1CR, DMA_CR_EN | DMA_CR_DIR_M2P | DMA_CR_MINC);
+    qtest_writel(qts, USART1_CR3, USART_CR3_DMAT);
+    qtest_clock_step(qts, 1);
+    g_assert_cmphex(qtest_readl(qts, DMA1_S1NDTR), ==, 0);
+    qtest_writel(qts, USART1_CR3, 0);
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE | USART_CR1_TCIE);
+
+    qtest_clock_step(qts, 2 * UART_RX_FRAME_NS - 1);
+    g_assert_cmphex(qtest_readl(qts, USART1_ISR) & USART_ISR_TC, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, 0);
+    g_assert_cmpuint(read_ringbuf(qts, received, sizeof(received)), ==, 1);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(read_ringbuf(qts, received + 1, 1), ==, 1);
+    g_assert_cmpmem(received, sizeof(received), transmit, sizeof(transmit));
+    g_assert_cmphex(qtest_readl(qts, USART1_ISR) & USART_ISR_TC, ==, USART_ISR_TC);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, irq_mask);
+
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE);
+    qtest_writel(qts, NVIC_ICPR1, irq_mask);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, 0);
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE | USART_CR1_TCIE);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, irq_mask);
+    qtest_writel(qts, USART1_ICR, USART_ICR_TCCF);
+    qtest_writel(qts, NVIC_ICPR1, irq_mask);
+    g_assert_cmphex(qtest_readl(qts, USART1_ISR) & USART_ISR_TC, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, 0);
+
+    /* CMSIS CR1.TXEIE bit 7 is used by HAL_UART_Transmit_IT. */
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE | USART_CR1_TXEIE);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, irq_mask);
+    qtest_writel(qts, USART1_CR1, USART_CR1_TE);
+    qtest_writel(qts, NVIC_ICPR1, irq_mask);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR1) & irq_mask, ==, 0);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -267,5 +327,6 @@ int main(int argc, char **argv)
                     test_uart_dma_tx_backpressure);
     g_test_add_func("/dm-mc02/uart/rx-wire-overrun",
                     test_uart_rx_wire_overrun);
+    g_test_add_func("/dm-mc02/uart/tx-interrupts", test_uart_tx_interrupts);
     return g_test_run();
 }
