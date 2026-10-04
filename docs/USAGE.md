@@ -2,6 +2,22 @@
 
 本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；固件 ELF 由用户另行提供。
 
+板级状态可通过原生 QMP 读取，无需检查固件内存：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"board-state"}}
+```
+
+返回 schema 1 对象：`timestamp_ns` 是 QEMU 虚拟时间，`gpio` 包含 A–H 的
+`moder`、`sampled`（与 IDR 相同）、`odr` 和 `output_mask`；`key` 给出 profile 引脚、
+active-low 按下状态和采样值，`led` 给出引脚、RGB、亮度和来源，`vin_mv` 给出配置电压。
+该属性只读，读取不会推进时间或消费外设状态。输入仍使用 `qom-set` 的 `user-key`
+布尔值或 `gpio-input` 字符串，例如 `A15=0`。
+
+LED 的 `ws2812-dma` 来源是既有 DMA 波形观察近似；`gpio-latch` 来源将 LED 引脚 ODR
+映射成白/黑，适合初期调试。它不表示实际引脚电气驱动，应结合 GPIO mode 和 output mask
+检查。AF/analog、电气波形和全局 CPU/plant 锁步仍未由这个接口验证。
+
 ## Contents
 
 - [项目范围](#project-scope)
