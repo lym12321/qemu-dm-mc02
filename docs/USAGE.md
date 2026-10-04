@@ -27,6 +27,17 @@ Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是�
 外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
 socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
 
+`sim.boards.channels.LabChannels` 可借用既有 UART、CAN 和 co-sim 连接：UART 使用无帧
+`StreamTransport`，CAN 使用固定 84 字节 `CanStream` 与 CAN Fabric，ADC1 使用 v1
+`FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns)`
+每个连接只读一次有界数据；CAN 观察保留原始 QEMU 时间，UART 时间只是调用者的轮询样本。
+需要截止时间判断时，应在读取后再查询 QMP 虚拟时间作为观察上界。
+
+ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(time)`，输入时间严格递增。
+收到 QEMU RESET 后必须重新显式 reset。逻辑 reset 保留物理流尾部，不提供 CAN/v1 历史输入隔离。
+可运行 `tools/run-lab-channels-smoke.sh` 验证真实固件 UART/CAN/ADC 与按键驱动 LED；
+该裸机测试夹具是数字模型消费者，不代表实板校准或完整 HAL 初始化。
+
 ## Contents
 
 - [项目范围](#project-scope)
