@@ -615,7 +615,7 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 模型总质量 0.6 kg、轮半径 0.03 m、轴距 0.14 m、轮距 0.12 m、轮轴阻尼 0.03 Nm·s/rad，
 摩擦与接触参数使用锁定版本的原生默认值。这些参数未经实物标定；它是普通四轮夹具，
 可通过下文的共享 M3508 joint adapter 驱动。BMI088 单样本输入已有下方 SPI 消费门；
-真实四轮固件闭环仍待接入。
+真实四轮固件可使用下面的专用消费者测试。
 
 同一四轮 plant 可通过专用 worker 同时产生 M3508 反馈和 BMI088 输入：
 
@@ -634,6 +634,29 @@ ID 1–4 固定为左前、右前、左后、右后；默认模型为 `models/fo
 原有 `run-worker.sh` 与 `run-can-worker.py` 保持原入口。
 可选 smoke 用实际 SPI guest 核对第一个 1 ms 目标的接触瞬态、六轴量化与 DONE 消费；
 它仍不证明真实四轮固件闭环、实物标定、CPU 锁步或持续实时性能。
+
+`trobot` 的默认关闭 `ChassisTestDebug/Release` 使用四个真实 `motor::dji` M3508
+对象、现有 PID 与 BSP IMU，测试静止、前进、右轮更快转向、停止和禁用：
+
+```bash
+cd ../trobot
+cmake --preset ChassisTestRelease
+cmake --build --preset ChassisTestRelease
+cd ../dm-mc02-qemu
+uv run --frozen --extra mujoco bash tools/run-trobot-chassis-test.sh \
+  ../trobot/build/ChassisTestRelease/trobot.elf build/test-results/chassis-release
+```
+
+第二个参数是新结果目录，可选第三个参数指定对应的固件源码目录。结果保留 UART
+逐项报告、公开 plant 状态、实际 CAN 命令、已排队反馈、原生 DONE 掩码及精确输入哈希；
+已有结果不得覆盖。主机运行 7500 个 1 ms plant step，前四个固件阶段各持续 1000 ms，
+检查最后 250 ms 的速度和 IMU，最后禁用 20 ms。固定 PID/模型参数和阈值用于 toy 回归。
+反馈排队不能证明 guest 接收；固件 freshness 与实际更新另行检查。BSP accel 为 800 Hz，
+每 1 ms 输入可能被拒绝，报告保留缺失 DONE 和未观察的响应，不要求每步完整消费。
+UART 阶段窗口按主机读取时间分段，ACK/DONE 和 CAN 时间戳不建立 CPU/plant 时间屏障。
+只有消费者、进程清理和输入哈希核对成功后报告才为 passed；物理标定明确 SKIP，
+此功能测试不作持续实时或实板真实性声明。
+
 可单独运行物理门：
 
 ```bash
