@@ -192,14 +192,61 @@ class MotorProtocolTests(unittest.TestCase):
                  "smoke" / "dm_mc02_mujoco_smoke.xml")
         adapter = adapter_module.DmMotorBusAdapter(1, motor_protocol="dm-mit")
         engine = worker.MujocoEngine(str(model), 1, 0.001, torque_limit=2.0)
-        command = decode_packet(
-            adapter, 1, bytes((0x80, 0, 0x80, 0, 0, 0, 0x8, 0)))
+        command = adapter_module.MotorCommand("dm-control", 0, torque=0.005)
+        adapter.apply(engine, command)
+        engine.step(0.001)
+        self.assertEqual(engine.motor_feedback(0), (0.0, 0.0, 0.0))
+        adapter.apply(engine, adapter_module.MotorCommand("dm-enable", 0))
+        # Box Izz = 0.1 * (0.1**2 + 0.1**2) / 12 = 1/6000 kg m^2;
+        # torque 0.005 Nm gives 30 rad/s^2. MuJoCo's default Euler uses
+        # the new velocity for position: q_n = a*h^2*n*(n+1)/2.
+        # https://mujoco.readthedocs.io/en/3.12.0/computation/index.html#numerical-integration
+        for steps, position, velocity, time in (
+                (1, 0.00003, 0.03, 0.002), (99, 0.1515, 3.0, 0.101)):
+            for _ in range(steps):
+                engine.step(0.001)
+            with self.subTest(time=time):
+                actual_position, actual_velocity, effort = engine.motor_feedback(0)
+                self.assertAlmostEqual(actual_position, position, places=10)
+                self.assertAlmostEqual(actual_velocity, velocity, places=10)
+                self.assertAlmostEqual(effort, 0.005, places=10)
+                self.assertAlmostEqual(engine.data.time, time, places=10)
+        adapter.apply(engine, adapter_module.MotorCommand("dm-disable", 0))
+        engine.step(0.001)
+        position, velocity, effort = engine.motor_feedback(0)
+        self.assertAlmostEqual(position, 0.1545, places=10)
+        self.assertAlmostEqual(velocity, 3.0, places=10)
+        self.assertEqual(effort, 0.0)
+        self.assertAlmostEqual(engine.data.time, 0.102, places=10)
+        adapter.apply(engine, adapter_module.MotorCommand("dm-enable", 0))
         adapter.apply(engine, replace(command, torque=9.0))
         engine.step(0.001)
-        self.assertAlmostEqual(engine.motor_feedback(0)[2], 0.0, places=5)
-        apply_packet(adapter, engine, 1, adapter_module.DM_ENABLE_COMMAND)
-        engine.step(0.001)
-        self.assertAlmostEqual(engine.motor_feedback(0)[2], 2.0, places=5)
+        self.assertAlmostEqual(engine.motor_feedback(0)[2], 2.0, places=10)
+
+    def test_mujoco_business_bench_damping_and_stationary_imu(self):
+        try:
+            import mujoco  # noqa: F401
+        except ImportError:
+            self.skipTest("MuJoCo extra is not installed")
+        model = (Path(__file__).resolve().parents[1] /
+                 "smoke" / "dm_mc02_trobot_bench.xml")
+        engine = worker.MujocoEngine(str(model), 1, 0.001)
+        engine.set_motor_dm(0, {"position": 0.0, "speed": 0.0,
+                                "kp": 0.0, "kd": 0.0, "torque": 0.3})
+        # I=0.02, b=0.05: implicit damping gives
+        # v_next = (I*v + h*torque)/(I + h*b), h=0.001 s.
+        # https://mujoco.readthedocs.io/en/3.12.0/computation/index.html#integrators
+        for enabled, velocity, effort in (
+                (True, 0.014962593516209476, 0.3),
+                (False, 0.014925280315420924, 0.0)):
+            engine.set_motor_enabled(0, enabled)
+            gyro, accel = engine.step(0.001)
+            with self.subTest(enabled=enabled):
+                _, actual_velocity, actual_effort = engine.motor_feedback(0)
+                self.assertAlmostEqual(actual_velocity, velocity, places=14)
+                self.assertEqual(actual_effort, effort)
+                self.assertEqual(gyro, (0.0, 0.0, 0.0))
+                self.assertEqual(accel, (0.0, 0.0, 1.0))
 
     def test_joint_state_missing_fields_do_not_retain_old_feedback(self):
         engine = object.__new__(worker.Ros2Engine)
