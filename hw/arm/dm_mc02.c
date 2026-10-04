@@ -395,7 +395,7 @@ static char *dm_mc02_get_cosim_diagnostics(Object *obj, Error **errp)
     return g_strdup_printf(
         "enabled=%u,opened=%u,rx_protocol=%u,v2_initialized=%u"
         ",v2_session=%u,v2_next_session=%u,tx_sequence=%" PRIu64
-        ",rx_frames=%" PRIu64
+        ",rx_frames=%" PRIu64 ",rx_buffered=%zu"
         ",rx_bad_frames=%" PRIu64 ",rx_dropped_bytes=%" PRIu64
         ",tx_frames=%" PRIu64 ",tx_dropped=%" PRIu64
         ",tx_short_writes=%" PRIu64 ",imu_dropped=%" PRIu64
@@ -404,7 +404,7 @@ static char *dm_mc02_get_cosim_diagnostics(Object *obj, Error **errp)
         ",telemetry_pending=%u",
         link->enabled, link->opened, link->rx_protocol_version,
         link->v2_initialized, link->v2_session_id,
-        link->v2_next_session_id, link->tx_sequence, link->rx_frames,
+        link->v2_next_session_id, link->tx_sequence, link->rx_frames, link->rx_len,
         link->rx_bad_frames, link->rx_dropped_bytes, link->tx_frames,
         link->tx_dropped, link->tx_short_writes, link->imu_dropped,
         link->consume_dropped, link->adc_dropped, link->imu_queue_count,

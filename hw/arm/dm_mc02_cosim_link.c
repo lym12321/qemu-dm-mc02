@@ -94,10 +94,12 @@ static bool known_type(uint16_t type)
     return dm_mc02_wire_known_type(type);
 }
 
-static void rx_reset(DmMc02CosimLink *link)
+static void rx_reset(DmMc02CosimLink *link, bool discard_buffer)
 {
-    link->rx_head = 0;
-    link->rx_len = 0;
+    if (discard_buffer) {
+        link->rx_head = 0;
+        link->rx_len = 0;
+    }
     link->rx_initialized = false;
     link->rx_protocol_version = 0;
     link->rx_last_sequence = 0;
@@ -1126,6 +1128,10 @@ static bool validate_v2_frame(DmMc02CosimLink *link, uint16_t kind,
         link->rx_protocol_version = DM_MC02_V2_WIRE_VERSION;
         link->rx_last_protocol_version = DM_MC02_V2_WIRE_VERSION;
         link->v2_session_id = flags;
+        /* The peer chooses this session's ID. Continue allocating from it
+         * so machine resets cannot recycle that ID while its STEP is still
+         * partially received, including across repeated resets. */
+        link->v2_next_session_id = flags;
         link->v2_initialized = true;
         link->v2_last_step_id = step_id;
         link->v2_last_t_sim_ns = t_sim_ns;
@@ -1834,7 +1840,10 @@ void dm_mc02_cosim_link_reset(DmMc02CosimLink *link)
     if (protocol_version == 0) {
         protocol_version = link->rx_last_protocol_version;
     }
-    rx_reset(link);
+    /* Machine reset keeps the same byte stream. A received prefix must stay
+     * paired with its later suffix; the identified v2 session rejects the old
+     * STEP after the parser has reconstructed its complete frame. */
+    rx_reset(link, false);
     imu_schedule_clear(link);
     link->tx_sequence = 1;
     link->tx_time_valid = false;
@@ -1963,7 +1972,7 @@ static void cosim_event(void *opaque, QEMUChrEvent event)
          * session is actually established; until then the queued samples are
          * still valid input for the running QEMU virtual clock. */
         imu_schedule_clear(link);
-        rx_reset(link);
+        rx_reset(link, true);
         link->tx_sequence = 1;
         link->tx_time_valid = false;
         link->telemetry_valid = false;
@@ -1993,7 +2002,7 @@ static void cosim_event(void *opaque, QEMUChrEvent event)
         link->telemetry_valid = false;
         link->telemetry_pending = false;
         cosim_clear_tx(link);
-        rx_reset(link);
+        rx_reset(link, true);
         /* Keep already accepted future IMU samples alive. A disconnect is
          * not a machine reset, and clearing here loses finite non-realtime
          * bursts before their virtual timestamps become due. A later OPENED

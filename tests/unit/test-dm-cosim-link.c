@@ -552,8 +552,364 @@ static void test_disconnect_drops_partial_frame_and_reentrant_enqueue(void)
     fixture_free(f);
 }
 
+/* Literal host v2 wire: outer length, magic, 36-byte header, then payload.
+ * Session 7 is identified, so an old frame must not enter a later session.
+ * DIAGNOSTICS at 1 ms precedes a STEP at 2 ms with IMU + MOTOR_COMMAND.
+ * The zero-motor command and IMU fields use the published section layout. */
+static const uint8_t rx_reset_wire[44] = {
+    [0] = 40, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+    [8] = 2, [10] = 1, [40] = 7,
+};
+
+static const uint8_t rx_diagnostics_wire[44] = {
+    [0] = 40, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+    [8] = 2, [10] = 4, [16] = 1,
+    [24] = 0x40, [25] = 0x42, [26] = 0x0f, [40] = 7,
+};
+
+static const uint8_t rx_old_step_wire[128] = {
+    [0] = 124, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+    [8] = 2, [10] = 2, [12] = 84, [16] = 2,
+    [24] = 0x80, [25] = 0x84, [26] = 0x1e,
+    [32] = 0x40, [33] = 0x42, [34] = 0x0f, [40] = 7,
+    [44] = 2, [46] = 0x43, [47] = 0x53, [48] = 1, [52] = 60,
+    [104] = 0x80, [105] = 0x84, [106] = 0x1e, [112] = 42,
+    [116] = 2, [120] = 4,
+};
+
+typedef struct RxResetCase {
+    unsigned prefix_len;
+    bool nonzero_head;
+    uint8_t initial_session;
+    unsigned resets;
+} RxResetCase;
+
+static void start_identified_rx_session(Fixture *f, uint8_t session)
+{
+    uint8_t reset[sizeof(rx_reset_wire)];
+
+    memcpy(reset, rx_reset_wire, sizeof(reset));
+    reset[40] = session;
+    dm_mc02_cosim_link_set_motor_step_handler(&f->link, motor_step);
+    cosim_receive(&f->link, reset, sizeof(reset));
+    take_frame(5, 0);
+    take_frame(7, UINT64_MAX);
+    g_assert_cmpuint(f->link.v2_session_id, ==, session);
+}
+
+static void assert_uncommitted_complete_rx(Fixture *f)
+{
+    g_assert_cmpuint(f->link.rx_head, ==, 44);
+    g_assert_cmpuint(f->link.rx_len, ==, sizeof(rx_old_step_wire));
+    g_assert_cmpmem(f->link.rx_buf + 44, sizeof(rx_old_step_wire),
+                    rx_old_step_wire, sizeof(rx_old_step_wire));
+    g_assert_false(f->link.v2_last_step_valid);
+    g_assert_false(f->link.v2_retry_pending);
+    g_assert_cmpuint(f->link.imu_source_id, ==, 0);
+    g_assert_cmpuint(f->deliveries, ==, 0);
+    g_assert_cmpuint(f->motor_steps, ==, 0);
+    g_assert_cmpuint(f->link.consume_count, ==, 0);
+    g_assert_cmpuint(f->link.imu_queue_count, ==, 0);
+    g_assert_cmpuint(test_tx->len, ==, 0);
+}
+
+static Fixture *fixture_blocked_complete_rx(void)
+{
+    Fixture *f = fixture_new();
+    uint8_t incoming[sizeof(rx_diagnostics_wire) + sizeof(rx_old_step_wire)];
+    uint64_t rx_frames;
+
+    start_identified_rx_session(f, 7);
+    rx_frames = f->link.rx_frames;
+    test_tx_blocked = true;
+    /* Fill replies without advancing the incoming session validator. */
+    for (unsigned i = 0; i < 7; i++) {
+        send_v2_diagnostics(&f->link, 100 + i, 0);
+    }
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 7);
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames);
+    memcpy(incoming, rx_diagnostics_wire, sizeof(rx_diagnostics_wire));
+    memcpy(incoming + sizeof(rx_diagnostics_wire), rx_old_step_wire,
+           sizeof(rx_old_step_wire));
+    cosim_receive(&f->link, incoming, sizeof(incoming));
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 8);
+    for (unsigned i = 0; i < 8; i++) {
+        unsigned slot = (f->link.tx_queue_head + i) % 8;
+
+        g_assert_true(f->link.tx_queue_control[slot]);
+        g_assert_cmpuint(f->link.tx_queue_offset[slot], ==, 0);
+    }
+    g_assert_cmpint(cosim_can_receive(&f->link), ==, 0);
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames + 1);
+    g_assert_cmpuint(f->link.v2_last_step_id, ==, 1);
+    g_assert_cmpuint(f->link.v2_last_t_sim_ns, ==, 1000000);
+    g_assert_cmpint(f->link.tx_timer->expire_time, ==, 1000000);
+    assert_uncommitted_complete_rx(f);
+    return f;
+}
+
+static void expect_literal_rx_step_replies(uint8_t step_id, uint8_t session)
+{
+    /* Literal OK STEP_ACK followed by an empty MOTOR_STATE, both at 2 ms.
+     * Their header and payload oracle does not use the production encoder. */
+    const uint8_t replies[106] = {
+        [0] = 56, [4] = 0x44, [5] = 0x4d, [6] = 0x43, [7] = 0x32,
+        [8] = 2, [10] = 3, [12] = 16, [16] = step_id,
+        [24] = 0x80, [25] = 0x84, [26] = 0x1e,
+        [32] = 0x40, [33] = 0x42, [34] = 0x0f, [40] = session,
+        [60] = 42, [64] = 0x44, [65] = 0x4d, [66] = 0x43, [67] = 0x32,
+        [68] = 2, [70] = 8, [72] = 2, [76] = step_id,
+        [84] = 0x80, [85] = 0x84, [86] = 0x1e,
+        [92] = 0x40, [93] = 0x42, [94] = 0x0f, [100] = session,
+    };
+
+    g_assert_cmpmem(test_tx->data, test_tx->len, replies, sizeof(replies));
+    g_byte_array_set_size(test_tx, 0);
+}
+
+static void test_complete_rx_resumes_after_control_drain(void)
+{
+    Fixture *f = fixture_blocked_complete_rx();
+    uint64_t rx_frames = f->link.rx_frames;
+    uint64_t bad_frames = f->link.rx_bad_frames;
+    uint64_t dropped_bytes = f->link.rx_dropped_bytes;
+
+    test_now_ns = 2000000;
+    test_tx_blocked = false;
+    f->link.tx_timer->cb(f->link.tx_timer->opaque);
+    for (unsigned i = 0; i < 7; i++) {
+        take_frame(4, 100 + i);
+    }
+    take_frame(4, 1);
+    expect_literal_rx_step_replies(2, 7);
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames + 1);
+    g_assert_cmpuint(f->link.rx_bad_frames, ==, bad_frames);
+    g_assert_cmpuint(f->link.rx_dropped_bytes, ==, dropped_bytes);
+    g_assert_cmpuint(f->link.rx_head, ==, 0);
+    g_assert_cmpuint(f->link.rx_len, ==, 0);
+    g_assert_cmpuint(f->deliveries, ==, 1);
+    g_assert_cmpuint(f->motor_steps, ==, 1);
+    g_assert_cmpuint(f->link.imu_source_id, ==, 1);
+    g_assert_cmpuint(f->link.consume_count, ==, 1);
+    g_assert_cmpuint(f->link.imu_queue_count, ==, 0);
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 0);
+    fixture_free(f);
+}
+
+static void test_complete_blocked_rx_survives_repeated_reset(void)
+{
+    Fixture *f = fixture_blocked_complete_rx();
+    uint64_t rx_frames = f->link.rx_frames;
+    uint64_t bad_frames = f->link.rx_bad_frames;
+    uint64_t dropped_bytes = f->link.rx_dropped_bytes;
+    uint32_t previous_session = 7;
+    uint8_t new_step[sizeof(rx_old_step_wire)];
+    DmMc02V2WireFrame reset, ack, telemetry;
+
+    test_now_ns = 1000000;
+    for (unsigned i = 0; i < 2; i++) {
+        dm_mc02_cosim_link_reset(&f->link);
+        assert_uncommitted_complete_rx(f);
+        g_assert_cmpuint(f->link.v2_session_id, >, 0);
+        g_assert_cmpuint(f->link.v2_session_id, !=, previous_session);
+        g_assert_cmpuint(f->link.v2_session_id, !=, 7);
+        previous_session = f->link.v2_session_id;
+        /* All old replies were unstarted; only this handshake is queued. */
+        g_assert_cmpuint(f->link.tx_queue_count, ==, 3);
+        g_assert_cmpuint(f->link.v2_last_step_id, ==, 0);
+        g_assert_cmpuint(f->link.v2_last_t_sim_ns, ==, 1000000);
+        g_assert_cmpuint(f->link.rx_frames, ==, rx_frames);
+        g_assert_cmpint(f->link.tx_timer->expire_time, ==, 2000000);
+    }
+    test_now_ns = f->link.tx_timer->expire_time;
+    test_tx_blocked = false;
+    f->link.tx_timer->cb(f->link.tx_timer->opaque);
+    reset = take_frame(1, 0);
+    ack = take_frame(5, 0);
+    telemetry = take_frame(7, UINT64_MAX);
+    g_assert_cmpuint(reset.header.session_id, ==, previous_session);
+    g_assert_cmpuint(ack.header.session_id, ==, previous_session);
+    g_assert_cmpuint(telemetry.header.session_id, ==, previous_session);
+    g_assert_cmpuint(reset.header.t_sim_ns, ==, 1000000);
+    g_assert_cmpuint(ack.header.t_sim_ns, ==, 1000000);
+    g_assert_cmpuint(test_tx->len, ==, 0); /* No old diagnostic/STEP reply. */
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames);
+    g_assert_cmpuint(f->link.rx_bad_frames, ==, bad_frames + 1);
+    g_assert_cmpuint(f->link.rx_dropped_bytes, ==,
+                     dropped_bytes + sizeof(rx_old_step_wire));
+    g_assert_cmpuint(f->link.rx_head, ==, 0);
+    g_assert_cmpuint(f->link.rx_len, ==, 0);
+    g_assert_cmpuint(f->deliveries, ==, 0);
+    g_assert_cmpuint(f->motor_steps, ==, 0);
+    g_assert_cmpuint(f->link.imu_source_id, ==, 0);
+    g_assert_cmpuint(f->link.consume_count, ==, 0);
+    g_assert_cmpuint(f->link.imu_queue_count, ==, 0);
+
+    memcpy(new_step, rx_old_step_wire, sizeof(new_step));
+    new_step[16] = 1;
+    g_assert_cmpuint(previous_session, <, 256);
+    new_step[40] = previous_session;
+    cosim_receive(&f->link, new_step, sizeof(new_step));
+    expect_literal_rx_step_replies(1, previous_session);
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames + 1);
+    g_assert_cmpuint(f->link.rx_bad_frames, ==, bad_frames + 1);
+    g_assert_cmpuint(f->link.rx_dropped_bytes, ==,
+                     dropped_bytes + sizeof(rx_old_step_wire));
+    g_assert_cmpuint(f->deliveries, ==, 1);
+    g_assert_cmpuint(f->motor_steps, ==, 1);
+    g_assert_cmpuint(f->link.imu_source_id, ==, 1);
+    g_assert_cmpuint(f->link.consume_count, ==, 1);
+    g_assert_cmpuint(f->link.imu_queue_count, ==, 0);
+    g_assert_cmpuint(f->link.tx_queue_count, ==, 0);
+    fixture_free(f);
+}
+
+static void test_partial_rx_survives_machine_reset(gconstpointer data)
+{
+    const RxResetCase *test = data;
+    Fixture *f = fixture_new();
+    uint8_t incoming[sizeof(rx_old_step_wire) * 2];
+    uint8_t new_step[sizeof(rx_old_step_wire)];
+    uint8_t old_step[sizeof(rx_old_step_wire)];
+    uint8_t diagnostic[sizeof(rx_diagnostics_wire)];
+    unsigned expected_head = test->nonzero_head ? 44 : 0;
+    uint64_t rx_frames, bad_frames, dropped_bytes;
+
+    start_identified_rx_session(f, test->initial_session);
+    memcpy(old_step, rx_old_step_wire, sizeof(old_step));
+    old_step[40] = test->initial_session;
+    memcpy(diagnostic, rx_diagnostics_wire, sizeof(diagnostic));
+    diagnostic[40] = test->initial_session;
+    if (test->nonzero_head) {
+        memcpy(incoming, diagnostic, sizeof(diagnostic));
+        memcpy(incoming + sizeof(diagnostic), old_step,
+               test->prefix_len);
+        cosim_receive(&f->link, incoming,
+                      sizeof(rx_diagnostics_wire) + test->prefix_len);
+    } else {
+        cosim_receive(&f->link, diagnostic, sizeof(diagnostic));
+        cosim_receive(&f->link, old_step, test->prefix_len);
+    }
+    take_frame(4, 1);
+    g_assert_cmpuint(f->link.rx_head, ==, expected_head);
+    g_assert_cmpuint(f->link.rx_len, ==, test->prefix_len);
+    g_assert_cmpmem(f->link.rx_buf + expected_head, test->prefix_len,
+                    old_step, test->prefix_len);
+    rx_frames = f->link.rx_frames;
+    bad_frames = f->link.rx_bad_frames;
+    dropped_bytes = f->link.rx_dropped_bytes;
+
+    test_now_ns = 1000000;
+    for (unsigned i = 0; i < test->resets; i++) {
+        DmMc02V2WireFrame reset, ack;
+
+        dm_mc02_cosim_link_reset(&f->link);
+        /* Reset changes session state, but not the same stream's prefix. */
+        g_assert_cmpuint(f->link.rx_head, ==, expected_head);
+        g_assert_cmpuint(f->link.rx_len, ==, test->prefix_len);
+        g_assert_cmpmem(f->link.rx_buf + expected_head, test->prefix_len,
+                        old_step, test->prefix_len);
+        reset = take_frame(1, 0);
+        ack = take_frame(5, 0);
+        take_frame(7, UINT64_MAX);
+        g_assert_cmpuint(reset.header.session_id, ==, f->link.v2_session_id);
+        g_assert_cmpuint(reset.header.session_id, !=, test->initial_session);
+        g_assert_cmpuint(ack.header.session_id, ==, reset.header.session_id);
+        g_assert_cmpuint(reset.header.t_sim_ns, ==, 1000000);
+    }
+
+    /* The old STEP is otherwise valid at the new origin. Complete it, then
+     * parse the new session's first STEP from the very same receive chunk. */
+    memcpy(new_step, old_step, sizeof(new_step));
+    new_step[16] = 1;
+    g_assert_cmpuint(f->link.v2_session_id, <, 256);
+    new_step[40] = f->link.v2_session_id;
+    memcpy(incoming, old_step + test->prefix_len,
+           sizeof(rx_old_step_wire) - test->prefix_len);
+    memcpy(incoming + sizeof(rx_old_step_wire) - test->prefix_len,
+           new_step, sizeof(new_step));
+    test_now_ns = 2000000;
+    cosim_receive(&f->link, incoming,
+                  sizeof(rx_old_step_wire) - test->prefix_len +
+                  sizeof(new_step));
+    expect_ack(1);
+    take_frame(8, 1);
+    g_assert_cmpuint(test_tx->len, ==, 0); /* No old ACK or motor state. */
+    g_assert_cmpuint(f->link.rx_frames, ==, rx_frames + 1);
+    g_assert_cmpuint(f->link.rx_bad_frames, ==, bad_frames + 1);
+    g_assert_cmpuint(f->link.rx_dropped_bytes, ==,
+                     dropped_bytes + sizeof(rx_old_step_wire));
+    g_assert_cmpuint(f->link.rx_head, ==, 0);
+    g_assert_cmpuint(f->link.rx_len, ==, 0);
+    g_assert_cmpuint(f->deliveries, ==, 1);
+    g_assert_cmpuint(f->motor_steps, ==, 1);
+    g_assert_cmpuint(f->link.consume_count, ==, 1);
+    g_assert_cmpuint(f->link.imu_queue_count, ==, 0);
+    g_assert_cmpuint(f->link.v2_last_step_id, ==, 1);
+    fixture_free(f);
+}
+
+static void test_disconnect_discards_partial_rx(void)
+{
+    Fixture *f = fixture_new();
+    uint8_t incoming[sizeof(rx_diagnostics_wire) + 59];
+    uint8_t new_step[sizeof(rx_old_step_wire)];
+    uint64_t bad_frames, dropped_bytes;
+    DmMc02V2WireFrame reset;
+
+    start_identified_rx_session(f, 7);
+    memcpy(incoming, rx_diagnostics_wire, sizeof(rx_diagnostics_wire));
+    memcpy(incoming + sizeof(rx_diagnostics_wire), rx_old_step_wire, 59);
+    cosim_receive(&f->link, incoming, sizeof(incoming));
+    take_frame(4, 1);
+    g_assert_cmpuint(f->link.rx_head, ==, 44);
+    g_assert_cmpuint(f->link.rx_len, ==, 59);
+    bad_frames = f->link.rx_bad_frames;
+    dropped_bytes = f->link.rx_dropped_bytes;
+
+    cosim_event(&f->link, CHR_EVENT_CLOSED);
+    g_assert_false(f->link.opened);
+    g_assert_cmpuint(f->link.rx_head, ==, 0);
+    g_assert_cmpuint(f->link.rx_len, ==, 0);
+    test_now_ns = 1000000;
+    cosim_event(&f->link, CHR_EVENT_OPENED);
+    reset = take_frame(1, 0);
+    take_frame(5, 0);
+    take_frame(7, UINT64_MAX);
+    g_assert_cmpuint(reset.header.session_id, ==, f->link.v2_session_id);
+    g_assert_cmpuint(reset.header.session_id, !=, 7);
+    g_assert_cmpuint(f->link.rx_head, ==, 0);
+    g_assert_cmpuint(f->link.rx_len, ==, 0);
+
+    /* A replacement socket has no suffix from the closed byte stream. */
+    memcpy(new_step, rx_old_step_wire, sizeof(new_step));
+    new_step[16] = 1;
+    g_assert_cmpuint(f->link.v2_session_id, <, 256);
+    new_step[40] = f->link.v2_session_id;
+    test_now_ns = 2000000;
+    cosim_receive(&f->link, new_step, sizeof(new_step));
+    expect_ack(1);
+    take_frame(8, 1);
+    g_assert_cmpuint(test_tx->len, ==, 0);
+    g_assert_cmpuint(f->link.rx_bad_frames, ==, bad_frames);
+    g_assert_cmpuint(f->link.rx_dropped_bytes, ==, dropped_bytes);
+    g_assert_cmpuint(f->deliveries, ==, 1);
+    g_assert_cmpuint(f->motor_steps, ==, 1);
+    g_assert_cmpuint(f->link.consume_count, ==, 1);
+    fixture_free(f);
+}
+
 int main(int argc, char **argv)
 {
+    static const RxResetCase rx_reset_cases[] = {
+        { 2, false, 7, 2 }, /* Half of the outer length. */
+        { 26, false, 7, 2 }, /* Inside the v2 header. */
+        { 59, false, 7, 2 }, /* Three IMU payload bytes. */
+        { 59, true, 7, 2 }, /* Consumed frame before the partial head. */
+        { 59, false, 1, 1 }, /* First allocated ID must differ from the old ID. */
+        { 59, false, 2, 2 }, /* A later reset must not recycle the buffered ID. */
+    };
+
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/dm-cosim-link/rejection-replay",
                     test_rejection_ack_and_exact_replay);
@@ -571,5 +927,29 @@ int main(int argc, char **argv)
                     test_partial_v1_header_survives_machine_reset);
     g_test_add_func("/dm-cosim-link/partial-tx-disconnect",
                     test_disconnect_drops_partial_frame_and_reentrant_enqueue);
+    g_test_add_func("/dm-cosim-link/complete-rx-control-drain",
+                    test_complete_rx_resumes_after_control_drain);
+    g_test_add_func("/dm-cosim-link/complete-rx-blocked-repeated-reset",
+                    test_complete_blocked_rx_survives_repeated_reset);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/outer",
+                         &rx_reset_cases[0],
+                         test_partial_rx_survives_machine_reset);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/header",
+                         &rx_reset_cases[1],
+                         test_partial_rx_survives_machine_reset);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/payload",
+                         &rx_reset_cases[2],
+                         test_partial_rx_survives_machine_reset);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/nonzero-head",
+                         &rx_reset_cases[3],
+                         test_partial_rx_survives_machine_reset);
+    g_test_add_func("/dm-cosim-link/partial-rx-disconnect",
+                    test_disconnect_discards_partial_rx);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/session-collision",
+                         &rx_reset_cases[4],
+                         test_partial_rx_survives_machine_reset);
+    g_test_add_data_func("/dm-cosim-link/partial-rx-reset/repeated-session-collision",
+                         &rx_reset_cases[5],
+                         test_partial_rx_survives_machine_reset);
     return g_test_run();
 }

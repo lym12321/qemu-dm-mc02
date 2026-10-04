@@ -127,6 +127,8 @@ typedef struct DmMc02CosimLink {
     DmMc02CosimMotorStepHandler *motor_step_handler;
     DmMc02CosimTelemetryProvider *telemetry_provider;
     void *opaque;
+    /* Stream bytes survive machine reset; CLOSED/OPENED discard them.
+     * Session validation is reset independently of this framing cursor. */
     uint8_t rx_buf[4096];
     size_t rx_head;
     size_t rx_len;
@@ -142,6 +144,8 @@ typedef struct DmMc02CosimLink {
     /* v2 uses the existing header flags word as an optional session id.
      * Zero keeps compatibility with pre-session-ID v2 peers. */
     uint32_t v2_session_id;
+    /* Allocation cursor follows the latest accepted peer RESET or local
+     * session allocation; subsequent local resets increment and skip zero. */
     uint32_t v2_next_session_id;
     uint64_t v2_last_step_id;
     uint64_t v2_last_t_sim_ns;
