@@ -10,13 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 
-from .base import JointState
-
-
-@dataclass(frozen=True)
-class BodyPose:
-    position_m: tuple[float, float, float]
-    quaternion_wxyz: tuple[float, float, float, float]
+from .base import BodyPose, JointState
 
 
 @dataclass(frozen=True)

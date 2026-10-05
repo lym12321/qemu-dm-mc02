@@ -1,6 +1,7 @@
 // Thin public-API adapter for Gazebo Sim 8.15.0 (Apache-2.0 upstream).
 // Gazebo owns the solver, ECM, reset and threads. No motor or wire semantics.
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +17,7 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <gz/sim/Joint.hh>
+#include <gz/sim/Link.hh>
 #include <gz/sim/Model.hh>
 #include <gz/sim/Server.hh>
 #include <gz/sim/ServerConfig.hh>
@@ -23,6 +25,7 @@
 #include <gz/sim/World.hh>
 #include <gz/sim/Util.hh>
 #include <gz/sim/config.hh>
+#include <gz/sim/components/Pose.hh>
 #include <sdf/Joint.hh>
 #include <sdf/JointAxis.hh>
 #include <sdf/Link.hh>
@@ -35,6 +38,8 @@
 namespace sim = gz::sim;
 using Bindings = std::map<std::string, std::pair<std::string, std::string>>;
 using Samples = std::map<std::string, std::pair<double, double>>;
+using BodySample = std::array<double, 7>;
+using BodySamples = std::map<std::string, BodySample>;
 
 namespace {
 class Guard final {
@@ -64,7 +69,8 @@ class Observation final : public sim::System,
                           public sim::ISystemPostUpdate,
                           public sim::ISystemReset {
 public:
-    explicit Observation(Bindings bindings) : bindings(std::move(bindings))
+    Observation(Bindings bindings, Bindings bodyBindings)
+        : bindings(std::move(bindings)), bodyBindings(std::move(bodyBindings))
     {
         for (const auto &[name, unused] : this->bindings) {
             (void)unused;
@@ -81,6 +87,7 @@ public:
     void Bind(sim::EntityComponentManager &ecm)
     {
         std::map<std::string, sim::Joint> found;
+        std::map<std::string, sim::Link> foundBodies;
         sim::World world(sim::worldEntity(ecm));
         for (const auto &[name, target] : bindings) {
             sim::Model model(world.ModelByName(ecm, target.first));
@@ -91,12 +98,31 @@ public:
             }
             found.emplace(name, joint);
         }
+        for (const auto &[name, target] : bodyBindings) {
+            sim::Model model(world.ModelByName(ecm, target.first));
+            sim::Link link(model.LinkByName(ecm, target.second));
+            if (!link.Valid(ecm)) {
+                error = "native body binding unavailable: " + name;
+                return;
+            }
+            foundBodies.emplace(name, link);
+        }
         // Validate every binding before creating observable ECM components.
         joints = std::move(found);
+        bodies = std::move(foundBodies);
         for (auto &[name, joint] : joints) {
             (void)name;
             joint.EnablePositionCheck(ecm);
             joint.EnableVelocityCheck(ecm);
+        }
+        for (auto &[name, link] : bodies) {
+            (void)name;
+            // Newly requested observation is unavailable until Physics writes
+            // it. A default identity pose must not certify an absent engine.
+            gz::math::Pose3d unobserved;
+            unobserved.Pos().X(std::numeric_limits<double>::quiet_NaN());
+            sim::enableComponent<sim::components::WorldPose>(
+                ecm, link.Entity(), true, sim::components::WorldPose(unobserved));
         }
     }
 
@@ -119,6 +145,7 @@ public:
             return;
         }
         Samples completed;
+        BodySamples completedBodies;
         for (const auto &[name, joint] : joints) {
             const auto position = joint.Position(ecm);
             const auto velocity = joint.Velocity(ecm);
@@ -132,7 +159,25 @@ public:
             }
             completed.emplace(name, std::make_pair(position->front(), velocity->front()));
         }
+        for (const auto &[name, link] : bodies) {
+            const auto pose = link.WorldPose(ecm);
+            if (!pose) {
+                error = "native completed body pose unavailable: " + name;
+                return;
+            }
+            const auto &p = pose->Pos();
+            const auto &q = pose->Rot();
+            const BodySample value{p.X(), p.Y(), p.Z(), q.W(), q.X(), q.Y(), q.Z()};
+            for (const auto field : value) {
+                if (!std::isfinite(field)) {
+                    error = "native completed body pose nonfinite: " + name;
+                    return;
+                }
+            }
+            completedBodies.emplace(name, value);
+        }
         samples = std::move(completed);
+        bodySamples = std::move(completedBodies);
         timeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(info.simTime).count();
         ++observations;
     }
@@ -141,6 +186,7 @@ public:
     {
         error.clear();
         samples.clear();
+        bodySamples.clear();
         for (auto &[name, value] : efforts) {
             (void)name;
             value = 0;
@@ -151,9 +197,12 @@ public:
     }
 
     Bindings bindings;
+    Bindings bodyBindings;
     std::map<std::string, sim::Joint> joints;
+    std::map<std::string, sim::Link> bodies;
     std::map<std::string, double> efforts;
     Samples samples;
+    BodySamples bodySamples;
     std::string error;
     int64_t timeNs = 0;
     uint64_t observations = 0;
@@ -162,10 +211,12 @@ public:
 
 class NativeWorld final {
 public:
-    NativeWorld(const std::string &path, const Bindings &bindings)
+    NativeWorld(const std::string &path, const Bindings &bindings,
+                const Bindings &bodyBindings)
     {
-        if (path.empty() || path.find('\0') != std::string::npos || bindings.empty()) {
-            throw std::invalid_argument("SDF path and joint bindings must be nonempty");
+        if (path.empty() || path.find('\0') != std::string::npos ||
+            (bindings.empty() && bodyBindings.empty())) {
+            throw std::invalid_argument("SDF path and joint/body bindings must be nonempty");
         }
         sdf::Root root;
         const auto errors = root.Load(path);
@@ -243,11 +294,24 @@ public:
             }
             effortLimits[name] = limit;
         }
+        unique.clear();
+        for (const auto &[name, target] : bodyBindings) {
+            Name(name);
+            Name(target.first);
+            Name(target.second);
+            const auto *model = world->ModelByName(target.first);
+            if (!model || model->Static() || !model->LinkByName(target.second)) {
+                throw std::invalid_argument("requires a dynamic model link: " + name);
+            }
+            if (!unique.insert(target).second) {
+                throw std::invalid_argument("duplicate native body binding");
+            }
+        }
         // All SDF/binding admission precedes Server services and callbacks.
         sim::ServerConfig config;
         config.SetSdfRoot(root);
         server = std::make_unique<sim::Server>(config);
-        observer = std::make_shared<Observation>(bindings);
+        observer = std::make_shared<Observation>(bindings, bodyBindings);
         try {
             server->SetUpdatePeriod(std::chrono::steady_clock::duration::zero());
             if (server->AddSystem(observer) != true) {
@@ -392,6 +456,17 @@ public:
         return sample->second;
     }
 
+    BodySample BodyPose(const std::string &name) const
+    {
+        Guard guard(busy);
+        Live();
+        const auto sample = observer->bodySamples.find(name);
+        if (sample == observer->bodySamples.end()) {
+            throw std::invalid_argument("unbound body: " + name);
+        }
+        return sample->second;
+    }
+
     int64_t TimeNs() const { Guard guard(busy); Live(); return observer->timeNs; }
     int64_t TickNs() const { Guard guard(busy); Live(); return tickNs; }
 
@@ -417,7 +492,8 @@ public:
         // adjudicate after native ISystemReset and fresh PostUpdate projection.
         CheckError();
         if (observer->resets != resetCount + 1 || observer->timeNs != 0 ||
-            observer->samples.size() != effortLimits.size()) {
+            observer->samples.size() != effortLimits.size() ||
+            observer->bodySamples.size() != observer->bodyBindings.size()) {
             throw std::runtime_error("Gazebo reset did not complete at native time zero");
         }
         failed = false;
@@ -439,7 +515,9 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
 {
     module.attr("gazebo_version") = GZ_SIM_VERSION_FULL;
     pybind11::class_<NativeWorld>(module, "World")
-        .def(pybind11::init<const std::string &, const Bindings &>())
+        .def(pybind11::init<const std::string &, const Bindings &, const Bindings &>(),
+             pybind11::arg("path"), pybind11::arg("joints"),
+             pybind11::arg("bodies") = Bindings{})
         .def("step", &NativeWorld::Step)
         .def("validate_step", &NativeWorld::ValidateStep)
         .def("validate_steps", &NativeWorld::ValidateSteps)
@@ -448,6 +526,7 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
         .def("set_joint_effort", &NativeWorld::SetEffort)
         .def("validate_joint_effort", &NativeWorld::ValidateEffort)
         .def("get_joint_state", &NativeWorld::JointState)
+        .def("get_body_pose", &NativeWorld::BodyPose)
         .def_property_readonly("time_ns", &NativeWorld::TimeNs)
         .def_property_readonly("timestep_ns", &NativeWorld::TickNs);
 }

@@ -10,6 +10,12 @@ class JointState:
     velocity_rad_s: float
 
 
+@dataclass(frozen=True)
+class BodyPose:
+    position_m: tuple[float, float, float]
+    quaternion_wxyz: tuple[float, float, float, float]
+
+
 class JointPhysics(Protocol):
     """Exclusive execution owner with pure, current-state admission checks.
 

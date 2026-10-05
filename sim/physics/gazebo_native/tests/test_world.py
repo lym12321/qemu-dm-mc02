@@ -7,13 +7,15 @@ rotor helper, motor law, wire codec or MCU clock supplies expected values.
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import math
 import sys
 import threading
 
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-from sim.physics import GazeboPhysics, JointState
+from sim.physics import BodyPose, GazeboPhysics, JointState
+from sim.physics.mujoco import BodyPose as LegacyBodyPose
 from sim.physics.mujoco import JointState as LegacyJointState
 from sim.core import Coordinator, Session
 from sim.devices.dji import M3508Device, M3508JointPlant
@@ -60,6 +62,7 @@ def sdf_path(tmp_path):
 
 def test_joint_state_reexport_preserves_existing_type():
     assert JointState is LegacyJointState
+    assert BodyPose is LegacyBodyPose
     state = JointState(.1, .2)
     with pytest.raises(FrozenInstanceError):
         state.position_rad = 0
@@ -180,8 +183,10 @@ def test_missing_joint_and_bad_sdf_rejected_before_server(native, tmp_path, sdf_
         GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")})
 
 
+@pytest.mark.parametrize("bindings", [dict(joints={"shaft": ("rotor", "shaft")}),
+                                      dict(bodies={"body": ("rotor", "body")})])
 def test_failed_native_initialization_releases_server_before_next_owner(native, tmp_path,
-                                                                        sdf_path):
+                                                                        sdf_path, bindings):
     path = tmp_path / "missing-engine.sdf"
     # Physics.cc:915-920 forwards this native engine selection. SDF admission
     # succeeds; missing engine leaves completed joint data unavailable at time0.
@@ -189,8 +194,8 @@ def test_failed_native_initialization_releases_server_before_next_owner(native, 
         'name="gz::sim::systems::Physics"/>',
         'name="gz::sim::systems::Physics"><engine>'
         '<filename>dm-test-missing-physics-engine</filename></engine></plugin>'))
-    with pytest.raises(RuntimeError, match="completed joint sample unavailable"):
-        GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")})
+    with pytest.raises(RuntimeError, match="completed (joint sample unavailable|body pose nonfinite)"):
+        GazeboPhysics(path, **bindings)
     with GazeboPhysics(sdf_path, joints={"shaft": ("rotor", "shaft")}) as physics:
         physics.step(1_000_000)
         assert physics.time_ns == 1_000_000
@@ -325,6 +330,8 @@ def test_native_gil_release_cannot_close_an_active_server(native, sdf_path):
             physics.validate_steps((1_000_000,))
         with pytest.raises(RuntimeError, match="already in progress"):
             physics.validate_joint_effort("shaft", 0)
+        with pytest.raises(RuntimeError, match="already in progress"):
+            physics.get_body_pose("missing")
         worker.join(10)
         assert not worker.is_alive() and not errors
         assert physics.time_ns == 10_000_000_000
@@ -342,7 +349,7 @@ class CanHost(VirtualCanDevice):
         self.frames.append(frame)
 
 
-def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4):
+def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False):
     xml = rotor_sdf()
     model = xml[xml.index('<model name="rotor">'):xml.index('</model>') + 8]
     models = "".join(model.replace('name="rotor"', f'name="rotor{i}"')
@@ -350,7 +357,9 @@ def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4):
     path = tmp_path / "motor-joints.sdf"
     path.write_text(xml.replace(model, models))
     physics = GazeboPhysics(path, joints={f"j{i}": (f"rotor{i}", "shaft")
-                                          for i in range(1, 5)})
+                                          for i in range(1, 5)}, bodies=(
+        {f"b{i}": (f"rotor{i}", "body") for i in range(1, 5)}
+        if observe_bodies else None))
     bus = CanBus()
     host = CanHost(bus)
     devices = tuple(M3508Device(bus, i, command_timeout_ns=timeout)
@@ -506,3 +515,125 @@ def test_maximum_motor_effort_admitted_before_ownership_transfer(native, tmp_pat
         assert calls == [] and physics.time_ns == 0
         plant.close()
         assert device.closed
+
+
+def test_native_body_pose_is_completed_world_link_frame_and_resets(native, tmp_path):
+    path = tmp_path / "placed-rotor.sdf"
+    path.write_text(rotor_sdf().replace('<model name="rotor">',
+        '<model name="rotor"><pose>1 2 3 0 0 .3</pose>'))
+    world = native.World(str(path), {"shaft": ("rotor", "shaft")},
+                         {"body": ("rotor", "body")})
+    try:
+        initial = [1, 2, 3, math.cos(.15), 0, 0, math.sin(.15)]
+        assert world.time_ns == 0
+        assert world.get_body_pose("body") == pytest.approx(initial, abs=1e-12)
+        world.set_joint_effort("shaft", .4)
+        world.step(100_000_000)
+        pose = world.get_body_pose("body")
+        assert pose[:3] == pytest.approx((1, 2, 3), abs=1e-12)
+        # Independent alpha20 gives theta=.1 plus <=one tick of integration
+        # error. Quaternion is the world link yaw .3 + theta, in wxyz order.
+        assert 2 * math.atan2(pose[6], pose[3]) == pytest.approx(.4, abs=.0021)
+        assert pose[4:6] == pytest.approx((0, 0), abs=1e-12)
+        assert sum(q*q for q in pose[3:]) == pytest.approx(1, abs=1e-12)
+        assert world.get_body_pose("body") == pose and world.time_ns == 100_000_000
+        world.reset()
+        assert world.time_ns == 0
+        assert world.get_body_pose("body") == pytest.approx(initial, abs=1e-12)
+        world.step(1_000_000)
+        assert world.get_body_pose("body") == pytest.approx(initial, abs=1e-12)
+    finally:
+        world.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        world.get_body_pose("body")
+
+
+def test_native_body_pose_binding_admission_precedes_engine_creation(native, tmp_path):
+    path = tmp_path / "body-admission.sdf"
+    path.write_text(rotor_sdf().replace('name="gz::sim::systems::Physics"/>',
+        'name="gz::sim::systems::Physics"><engine>'
+        '<filename>dm-test-missing-physics-engine</filename></engine></plugin>'))
+    for bindings, message in (({"b": ("rotor", "missing")}, "dynamic model link"),
+            ({"b": ("missing", "body")}, "dynamic model link"),
+            ({"a": ("rotor", "body"), "b": ("rotor", "body")}, "duplicate")):
+        with pytest.raises(ValueError, match=message):
+            native.World(str(path), {}, bindings)
+    path.write_text(rotor_sdf(static="true"))
+    with pytest.raises(ValueError, match="dynamic model link"):
+        native.World(str(path), {}, {"b": ("rotor", "body")})
+
+
+def test_python_body_only_observation_and_public_value_type(native, sdf_path):
+    with GazeboPhysics(sdf_path, bodies={"rotor": ("rotor", "body")}) as physics:
+        assert physics.time_ns == 0
+        pose = physics.get_body_pose("rotor")
+        assert pose == BodyPose((0, 0, 0), (1, 0, 0, 0))
+        with pytest.raises(FrozenInstanceError):
+            pose.position_m = (1, 0, 0)
+        physics.step(1_000_000)
+        assert physics.get_body_pose("rotor") == pose
+        with pytest.raises(ValueError, match="unbound joint"):
+            physics.get_joint_state("shaft")
+        with pytest.raises(ValueError, match="unbound body"):
+            physics.get_body_pose("missing")
+        with pytest.raises(ValueError, match="string"):
+            physics.get_body_pose(None)
+        physics.reset()
+        assert physics.time_ns == 0 and physics.get_body_pose("rotor") == pose
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_body_pose("rotor")
+
+
+def test_python_body_only_free_fall_publishes_target_translation(native, tmp_path):
+    xml = rotor_sdf().replace('<gravity>0 0 0</gravity>', '<gravity>0 0 -10</gravity>')
+    joint = xml[xml.index('<joint name="shaft"'):xml.index('</joint>') + 8]
+    path = tmp_path / "free-body.sdf"
+    path.write_text(xml.replace(joint, '').replace('<model name="rotor">',
+        '<model name="rotor"><pose>1 2 3 0 0 .3</pose>'))
+    with GazeboPhysics(path, bodies={"body": ("rotor", "body")}) as physics:
+        assert physics.get_body_pose("body").position_m == (1, 2, 3)
+        physics.step(100_000_000)
+        pose = physics.get_body_pose("body")
+        # z=3 - .5*10*.1², with at most one1ms integration tick of error.
+        assert pose.position_m == pytest.approx((1, 2, 2.95), abs=.0011)
+        assert pose.quaternion_wxyz == pytest.approx(
+            (math.cos(.15), 0, 0, math.sin(.15)), abs=1e-12)
+        assert physics.time_ns == 100_000_000 and physics.get_body_pose("body") == pose
+        physics.reset()
+        assert physics.time_ns == 0 and physics.get_body_pose("body").position_m == (1, 2, 3)
+
+
+def test_python_body_binding_types_reject_before_native_acquisition(native, monkeypatch):
+    calls = []
+    def acquire(*args):
+        calls.append(args)
+        raise AssertionError("invalid Python binding reached native acquisition")
+    monkeypatch.setattr(native, "World", acquire)
+    for bodies in ([], {"b": "link"}, {"": ("rotor", "body")},
+                   {"b": ("rotor", "body\0")},
+                   {"a": ("rotor", "body"), "b": ("rotor", "body")}):
+        with pytest.raises(ValueError):
+            GazeboPhysics("unused.sdf", bodies=bodies)
+    assert calls == []
+
+
+def test_shared_motor_consumer_reads_completed_body_pose(native, tmp_path):
+    physics, _, host, _, _, coordinator = motor_rig(tmp_path, observe_bodies=True)
+    try:
+        coordinator.reset(Session(1))
+        host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000")))
+        coordinator.step(100_000_000)
+        # 5A*.02*gear2/Izz.02=10rad/s² -> theta +/- .05rad in100ms.
+        for name, yaw in (("b1", .05), ("b2", -.05), ("b3", 0), ("b4", 0)):
+            pose = physics.get_body_pose(name)
+            assert pose.position_m == pytest.approx((0, 0, 0), abs=1e-12)
+            w, x, y, z = pose.quaternion_wxyz
+            assert 2 * math.atan2(z, w) == pytest.approx(yaw, abs=.0011)
+            assert (x, y) == pytest.approx((0, 0), abs=1e-12)
+            assert physics.get_body_pose(name) == pose
+        assert physics.time_ns == coordinator.t_sim_ns == 100_000_000
+        coordinator.reset(Session(2, 7))
+        assert physics.time_ns == 0
+        assert physics.get_body_pose("b1") == BodyPose((0, 0, 0), (1, 0, 0, 0))
+    finally:
+        coordinator.close()

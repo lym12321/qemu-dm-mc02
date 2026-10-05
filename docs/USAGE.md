@@ -860,10 +860,12 @@ ctest --test-dir build/gazebo-native --output-on-failure
 from sim.physics import GazeboPhysics
 
 with GazeboPhysics("models/gazebo_rotor.sdf",
-                   joints={"shaft": ("rotor", "shaft")}) as plant:
+                   joints={"shaft": ("rotor", "shaft")},
+                   bodies={"rotor": ("rotor", "body")}) as plant:
     plant.set_joint_effort("shaft", 0.4)  # Nm
     plant.step(100_000_000)               # 100 native 1 ms ticks
     print(plant.time_ns, plant.get_joint_state("shaft"))  # ns, rad, rad/s
+    print(plant.get_body_pose("rotor"))  # world/link frame: m, quaternion wxyz
     plant.reset()                       # completed native reset at time 0
 ```
 
@@ -874,6 +876,10 @@ with GazeboPhysics("models/gazebo_rotor.sdf",
 每个 native tick 写齐全部关节命令；getter 只读取完成状态。`timestep_ns` 沿用
 Gazebo 原生浮点秒到整数时间的截断，不能假定 SDF 十进制值精确可表示；`step`
 必须是实际步长的整数倍，每次 1–10000 ticks。初始化及 reset 不增加积分步。
+`bodies` 绑定逻辑名称到 `(model, link)`，`get_body_pose` 返回完成状态的
+`BodyPose(position_m, quaternion_wxyz)`；位姿由原生 Physics 更新，getter 不推进时间。
+可只配置 bodies，至少需要一个 joint 或 body 绑定。当前 body 观察只接顶层动态
+model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的观察不返回默认零位姿。
 运行错误冻结推进和观测，成功 reset 后恢复；失败不回滚。并发操作明确拒绝。
 `close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
 `validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 使用同一准入规则，只读检查

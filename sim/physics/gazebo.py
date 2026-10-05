@@ -1,4 +1,4 @@
-"""Named SI joints over the optional Gazebo Sim 8.15 native Server adapter.
+"""Named SI joints and link poses over the Gazebo Sim 8.15 native Server adapter.
 
 Owns one synchronous server, with fixed native-ns SDF ticks and one exclusive
 torque owner per bound revolute joint. Getters return completed PostUpdate
@@ -9,7 +9,7 @@ from collections.abc import Mapping
 import math
 from pathlib import Path
 
-from .base import JointState
+from .base import BodyPose, JointState
 
 
 def _step_ns(dt_ns):
@@ -32,23 +32,34 @@ def _effort(name, value):
     return value
 
 
+def _binding_map(values, label):
+    if values is None:
+        return {}
+    if not isinstance(values, Mapping):
+        raise ValueError(f"Gazebo {label} bindings must be a mapping")
+    bindings = {}
+    for name, target in values.items():
+        if not isinstance(target, tuple) or len(target) != 2:
+            raise ValueError(f"Gazebo {label} binding requires (model, entity) names")
+        for value in (name, *target):
+            if (not isinstance(value, str) or not value or "\0" in value
+                    or "::" in value):
+                raise ValueError("Gazebo names must be nonempty and unscoped without NUL")
+        bindings[name] = target
+    if len(set(bindings.values())) != len(bindings):
+        raise ValueError(f"duplicate native {label} binding")
+    return bindings
+
+
 class GazeboPhysics:
-    def __init__(self, path, *, joints: Mapping[str, tuple[str, str]]):
+    def __init__(self, path, *, joints: Mapping[str, tuple[str, str]] | None = None,
+                 bodies: Mapping[str, tuple[str, str]] | None = None):
         if not isinstance(path, (str, Path)) or not str(path) or "\0" in str(path):
             raise ValueError("SDF path must be nonempty without NUL")
-        if not isinstance(joints, Mapping) or not joints:
-            raise ValueError("Gazebo requires nonempty joint bindings")
-        bindings = {}
-        for name, target in joints.items():
-            if not isinstance(target, tuple) or len(target) != 2:
-                raise ValueError("Gazebo joint binding requires (model, joint) names")
-            for value in (name, *target):
-                if (not isinstance(value, str) or not value or "\0" in value
-                        or "::" in value):
-                    raise ValueError("Gazebo names must be nonempty and unscoped without NUL")
-            bindings[name] = target
-        if len(set(bindings.values())) != len(bindings):
-            raise ValueError("each native joint must have one effort owner")
+        bindings = _binding_map(joints, "joint")
+        body_bindings = _binding_map(bodies, "body")
+        if not bindings and not body_bindings:
+            raise ValueError("Gazebo requires at least one joint or body binding")
         try:
             import _dm_gazebo_native as native
         except ImportError as exc:
@@ -56,7 +67,7 @@ class GazeboPhysics:
                               "Python ABI; see docs/USAGE.md") from exc
         if native.gazebo_version != "8.15.0":
             raise RuntimeError("Gazebo adapter requires gz-sim 8.15.0")
-        self._world = native.World(str(Path(path).resolve()), bindings)
+        self._world = native.World(str(Path(path).resolve()), bindings, body_bindings)
 
     @property
     def timestep_ns(self) -> int:
@@ -99,6 +110,13 @@ class GazeboPhysics:
         if not isinstance(name, str):
             raise ValueError("joint name must be a string")
         return JointState(*self._world.get_joint_state(name))
+
+    def get_body_pose(self, name: str) -> BodyPose:
+        """Completed link frame pose in world coordinates (m, wxyz)."""
+        if not isinstance(name, str):
+            raise ValueError("body name must be a string")
+        values = self._world.get_body_pose(name)
+        return BodyPose(tuple(values[:3]), tuple(values[3:]))
 
     def close(self) -> None:
         """Stop and destroy the owned native Server; repeated close is harmless."""
