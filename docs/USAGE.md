@@ -916,6 +916,27 @@ Imu plugin 的 paused 行为或任意 ODR 调度。原生 sensor 仍拥有 publi
 残留的加速度。重建失败会释放部分资源并保持 failed，可再次 reset；
 显式 close 后永久拒绝操作。reset 重建延迟未作性能承诺。
 
+相机和 GPU LiDAR 的原生无窗口验证使用标准 Sensors plugin、Ogre2 EGL 和
+Gazebo transport，不需要 X server。需要额外安装匹配的 gz-rendering 8.2.3
+Ogre2、gz-transport 13.6.0、gz-msgs 10.4.0，以及可用的 EGL/OpenGL 驱动。
+在上述 SDK 环境中显式启用独立测试：
+
+```bash
+cmake -S sim/physics/gazebo_native -B build/gazebo-native \
+  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release \
+  -DDM_GAZEBO_RENDERING_TESTS=ON
+cmake --build build/gazebo-native -j2
+ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering$' --output-on-failure
+```
+
+测试使用本地红色立方体，核验两帧 64×48 RGB 图像、65×1 激光扫描、
+2.5 m 目标距离和递增的原生消息时间戳。最多运行 1 秒虚拟时间；观察期限
+12 秒，CTest 对整个进程（含驱动和清理）设 20 秒超时。缺少驱动、消息或
+清理失败会返回非零。默认关闭此选项，普通关节测试通过不代表渲染测试通过。
+这只是固定场景的原生消息验证；`GazeboPhysics` 尚不接相机、LiDAR 或任意 world，
+ROS 2 交付、资产加载和 MCU 时间同步仍需各自验证。
+
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
 当前接口尚未接入 MCU、ROS 2、相机、
 LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。
