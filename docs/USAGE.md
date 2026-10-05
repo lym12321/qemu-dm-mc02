@@ -252,6 +252,51 @@ gimbal/chassis/shooter；其余字段按官方 unsigned wire 宽度编码，不�
 这四类编码不包含接收 payload parser、定时发送或规则状态。`0x0206` 等其它命令、
 UART endpoint 和赛场仍待独立接入。
 
+独立脚本引擎可用于无赛场的状态回放和固件输入准备：
+
+```python
+from sim.core import Coordinator, Session
+from sim.devices.referee import (
+    RefereeEngine, RefereeState, MatchDurations, ScriptEvent, Hit, Shot,
+)
+
+initial = RefereeState(
+    GameStatus(1, 2, 1, 0),  # 当前自检阶段剩余 1 秒；timestamp 显式填写
+    RobotStatus(3, 1, 200, 200, 10, 100, 80, 7),
+    PowerHeat(60, 0, 0), Buff(0, 0, 0, 0, 0, 0x80),
+)
+engine = RefereeEngine(initial, durations=MatchDurations(countdown_s=3, battle_s=300),
+    events=(ScriptEvent(1_000_000_000, Hit(20)),
+            ScriptEvent(1_000_000_000, Shot(40, 0))))
+coordinator = Coordinator({"referee": engine})
+coordinator.reset(Session(1))
+coordinator.step(2_000_000_000)
+state = engine.get_state()
+assert state.robot.current_hp == 180 and state.power_heat.heat_17mm == 30
+frames = [encode_message(message, sequence=i) for i, message in enumerate(
+    (state.game, state.robot, state.power_heat, state.buff))]
+coordinator.close()
+```
+
+事件必须为至多 1024 项的不可变 tuple，时间是相对每次 reset 的非递减纳秒偏移；
+同时间保持输入顺序，零偏移事件在 reset 时执行。事件接受 `Hit`、`Shot` 或上述四种
+消息；消息事件替换对应状态组。`Hit` 使用显式伤害值，HP 最低为零，输入 HP 不得超过
+最大 HP；`Shot` 使用显式热量增量。17mm 冷却率来自 `RobotStatus.cooling_per_s`，
+42mm 使用构造参数 `cooling_42mm_per_s`，默认零。热量保留分数并向下取整输出；
+超过 65535 热量会拒绝整个步进并冻结，需 reset 后才能继续。`PowerHeat` 替换会重置
+热量余量；`Buff` 只更新消息数据。getter 返回不可变的最近完成快照，不推进时间。
+
+阶段 2→3→4→5 按绝对虚拟截止时间推进，当前剩余时间由 `GameStatus` 提供，后续
+倒计时和比赛时长由 `MatchDurations` 明确配置。阶段 2/3/4 的输入剩余秒数与配置时长
+必须为正，输出剩余秒数向上取整；阶段到期先于同时间脚本事件。其它阶段保留显式数据。
+reset 会从新 session 原点重放原脚本，`sync_timestamp` 不随仿真时间自动改变。
+
+热量计算窄移植自 [rm_control](https://github.com/rm-controls/rm_control/blob/c5205eb193a8cda6147efe760eafedd0a3ed0104/rm_common/include/rm_common/decision/heat_limit.h)
+（BSD-3-Clause），阶段转换参考 [XDU referee mock](https://github.com/XDU-IRobot/rm_referee_ros2/blob/45da10a5317d47cc4b5d5968ec553946c43ebe0d/rm_referee_mock/rm_referee_mock/match_control_timing.py)
+（Apache-2.0）；许可证随模块提供。配置时长和脚本数据是测试输入，不能作为官方赛事
+规则常量。自动装甲/弹丸判定、过热扣血、复活、增益叠加和功率惩罚仍未实现；引擎不拥有
+UART、Gazebo、物理时钟或发送序号，不建立 CPU/plant 全局锁步。
+
 ## Contents
 
 - [项目范围](#project-scope)
