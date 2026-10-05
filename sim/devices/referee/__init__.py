@@ -3,7 +3,8 @@
 from .protocol import Frame, decode_frame, encode_frame
 from .messages import Buff, GameStatus, PowerHeat, RobotStatus, encode_message
 from .engine import Hit, MatchDurations, RefereeEngine, RefereeState, ScriptEvent, Shot
+from .endpoint import RefereeUartEndpoint
 
 __all__ = ["Frame", "decode_frame", "encode_frame", "Buff", "GameStatus",
            "PowerHeat", "RobotStatus", "encode_message", "Hit", "MatchDurations",
-           "RefereeEngine", "RefereeState", "ScriptEvent", "Shot"]
+           "RefereeEngine", "RefereeState", "ScriptEvent", "Shot", "RefereeUartEndpoint"]

@@ -297,6 +297,35 @@ reset 会从新 session 原点重放原脚本，`sync_timestamp` 不随仿真时
 规则常量。自动装甲/弹丸判定、过热扣血、复活、增益叠加和功率惩罚仍未实现；引擎不拥有
 UART、Gazebo、物理时钟或发送序号，不建立 CPU/plant 全局锁步。
 
+UART 输出可借用已有的非阻塞连接：
+
+```python
+from sim.transports import StreamTransport
+from sim.devices.referee import RefereeUartEndpoint
+
+# connected_socket 由调用者连接、设为 nonblocking，并负责关闭。
+transport = StreamTransport(connected_socket, max_pending=16)
+endpoint = RefereeUartEndpoint(transport, sequence=254)
+wire = endpoint.send_state(state)  # 四帧，序号 254/255/0/1，共 82 bytes
+assert endpoint.next_sequence == 2
+endpoint.flush()                  # False 表示仍有未发 suffix
+transport.drain(timeout=1.0)      # 可选，有界 host 等待；不代表 MCU 已消费
+endpoint.close()                  # 不关闭、不 drain 借用的 socket
+```
+
+每份快照以 `GameStatus/RobotStatus/PowerHeat/Buff` 顺序排入一个 transport queue slot；
+所有字段在任何发送前完成校验。队列满时 `BufferError` 拒绝新批次并保留序号，调用者
+可 flush 后重试；容量检查可能已经发送旧队列的字节。其它发送/flush 异常可能发生在
+部分发送后，endpoint 会冻结，禁止自动重发。显式 `reset(sequence=0)` 只恢复逻辑
+序号和状态，保留原队列及 partial suffix；调用者须明确接受该逻辑流重启，协议本身
+没有 session ID。失败后仍须由连接 owner 清理 socket，`close()` 只停用 endpoint。
+
+该 endpoint 只输出显式快照，调用者负责完成的状态、发送频率、读取和连接生命周期，
+并独占该裁判 TX 流的序号所有权。默认 transport 为 256 slots，纯快照最多保留
+20,992 bytes，调用者可以设置更小上限。快照批次没有实现官方不同命令的独立周期
+（`0x0001` 1 Hz、`0x0201/0202` 10 Hz、`0x0204` 3 Hz）；定时组合与真实固件
+UART 消费仍需后续入口验证。
+
 ## Contents
 
 - [项目范围](#project-scope)
