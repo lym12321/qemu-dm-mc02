@@ -169,6 +169,22 @@ def test_missing_joint_and_bad_sdf_rejected_before_server(native, tmp_path, sdf_
         GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")})
 
 
+def test_failed_native_initialization_releases_server_before_next_owner(native, tmp_path,
+                                                                        sdf_path):
+    path = tmp_path / "missing-engine.sdf"
+    # Physics.cc:915-920 forwards this native engine selection. SDF admission
+    # succeeds; missing engine leaves completed joint data unavailable at time0.
+    path.write_text(rotor_sdf().replace(
+        'name="gz::sim::systems::Physics"/>',
+        'name="gz::sim::systems::Physics"><engine>'
+        '<filename>dm-test-missing-physics-engine</filename></engine></plugin>'))
+    with pytest.raises(RuntimeError, match="completed joint sample unavailable"):
+        GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")})
+    with GazeboPhysics(sdf_path, joints={"shaft": ("rotor", "shaft")}) as physics:
+        physics.step(1_000_000)
+        assert physics.time_ns == 1_000_000
+
+
 def test_invalid_commands_do_not_advance_or_replace_drive(native, sdf_path):
     with GazeboPhysics(sdf_path, joints={"shaft": ("rotor", "shaft")}) as physics:
         physics.set_joint_effort("shaft", .4)
