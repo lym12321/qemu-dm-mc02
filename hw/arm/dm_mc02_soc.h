@@ -68,6 +68,7 @@ typedef struct DmMc02SocProfile {
     hwaddr cordic_base;
     /* Appended to preserve the order of the pre-existing profile fields. */
     hwaddr tim2_base;
+    uint8_t irq_priority_bits;
 } DmMc02SocProfile;
 
 /* Memory owned by the H723-class SoC.  Board models may add their own

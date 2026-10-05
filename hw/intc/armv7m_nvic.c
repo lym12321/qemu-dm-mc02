@@ -2484,7 +2484,8 @@ static int nvic_post_load(void *opaque, int version_id)
         return 1;
     }
     for (i = ARMV7M_EXCP_MEM; i < s->num_irq; i++) {
-        if (s->vectors[i].prio & ~0xff) {
+        if (s->vectors[i].prio &
+            ~MAKE_64BIT_MASK(8 - s->num_prio_bits, s->num_prio_bits)) {
             return 1;
         }
     }
@@ -2530,7 +2531,8 @@ static int nvic_security_post_load(void *opaque, int version_id)
         return 1;
     }
     for (i = ARMV7M_EXCP_MEM; i < ARRAY_SIZE(s->sec_vectors); i++) {
-        if (s->sec_vectors[i].prio & ~0xff) {
+        if (s->sec_vectors[i].prio &
+            ~MAKE_64BIT_MASK(8 - s->num_prio_bits, s->num_prio_bits)) {
             return 1;
         }
     }
@@ -2572,6 +2574,7 @@ static const VMStateDescription vmstate_nvic = {
 static Property props_nvic[] = {
     /* Number of external IRQ lines (so excluding the 16 internal exceptions) */
     DEFINE_PROP_UINT32("num-irq", NVICState, num_irq, 64),
+    DEFINE_PROP_UINT8("num-prio-bits", NVICState, num_prio_bits, 0),
     DEFINE_PROP_END_OF_LIST()
 };
 
@@ -2680,12 +2683,20 @@ static void armv7m_nvic_realize(DeviceState *dev, Error **errp)
         return;
     }
 
+    if (s->num_prio_bits == 0) {
+        s->num_prio_bits = arm_feature(&s->cpu->env, ARM_FEATURE_V7) ? 8 : 2;
+    } else if (arm_feature(&s->cpu->env, ARM_FEATURE_V7) ?
+               (s->num_prio_bits < 3 || s->num_prio_bits > 8) :
+               s->num_prio_bits != 2) {
+        error_setg(errp, "num-prio-bits must be 3..8 for Armv7-M/Armv8-M, "
+                   "or 2 for Armv6-M");
+        return;
+    }
+
     qdev_init_gpio_in(dev, set_irq_level, s->num_irq);
 
     /* include space for internal exception vectors */
     s->num_irq += NVIC_FIRST_IRQ;
-
-    s->num_prio_bits = arm_feature(&s->cpu->env, ARM_FEATURE_V7) ? 8 : 2;
 
     /*
      * This device provides a single memory region which covers the

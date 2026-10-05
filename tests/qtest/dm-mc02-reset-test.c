@@ -33,6 +33,59 @@
 #define DMA2_S6NDTR        0x400204a4ull
 #define DMA2_S6PAR         0x400204a8ull
 #define DMA2_S6M0AR        0x400204acull
+#define NVIC_IPR          0xe000e400ull
+#define NVIC_SHPR3        0xe000ed20ull
+
+static void check_priority_width(const char *args, uint32_t ipr,
+                                  uint32_t shpr, uint8_t mask)
+{
+    QTestState *qts = qtest_init(args);
+
+    /* Native byte/word paths and both priority banks share implemented bits. */
+    qtest_writel(qts, NVIC_IPR, 0x12345678);
+    g_assert_cmphex(qtest_readl(qts, NVIC_IPR), ==, ipr);
+    qtest_writeb(qts, NVIC_IPR, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NVIC_IPR), ==, mask);
+    qtest_writel(qts, NVIC_SHPR3, 0x9a730000);
+    g_assert_cmphex(qtest_readl(qts, NVIC_SHPR3), ==, shpr);
+    qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+    g_assert_cmphex(qtest_readl(qts, NVIC_IPR), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, NVIC_SHPR3), ==, 0);
+    qtest_writeb(qts, NVIC_IPR, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NVIC_IPR), ==, mask);
+    qtest_quit(qts);
+}
+
+static void test_native_nvic_configured_width(void)
+{
+    QTestState *qts;
+
+    check_priority_width("-machine mps2-an500 -global armv7m.num-prio-bits=4",
+                         0x10305070, 0x90700000, 0xf0);
+    qts = qtest_init("-machine mps2-an500 -global armv7m.num-prio-bits=4");
+    qobject_unref(qtest_qmp_assert_failure_ref(qts,
+        "{ 'execute': 'qom-set', 'arguments': { 'path': '/machine/armv7m', "
+        "'property': 'num-prio-bits', 'value': 8 } }"));
+    qtest_writeb(qts, NVIC_IPR, 0xff);
+    g_assert_cmphex(qtest_readb(qts, NVIC_IPR), ==, 0xf0);
+    qtest_quit(qts);
+}
+
+static void test_native_nvic_default_width(void)
+{
+    check_priority_width("-machine mps2-an500", 0x12345678, 0x9a730000, 0xff);
+}
+
+static void test_native_nvic_v6_width(void)
+{
+    check_priority_width("-machine microbit", 0x00004040, 0x80400000, 0xc0);
+}
+
+static void test_h723_nvic_width(void)
+{
+    /* ST CMSIS stm32h723xx.h __NVIC_PRIO_BITS=4, independent of firmware. */
+    check_priority_width("-machine dm-mc02", 0x10305070, 0x90700000, 0xf0);
+}
 
 static void set_bool(QTestState *qts, const char *property, bool value)
 {
@@ -322,6 +375,16 @@ static void test_board_state_ws2812_observation(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    if (qtest_has_machine("mps2-an500")) {
+        g_test_add_func("/armv7m/nvic/configured-priority-width",
+                        test_native_nvic_configured_width);
+        g_test_add_func("/armv7m/nvic/default-priority-width",
+                        test_native_nvic_default_width);
+    }
+    if (qtest_has_machine("microbit")) {
+        g_test_add_func("/armv7m/nvic/v6-priority-width", test_native_nvic_v6_width);
+    }
+    g_test_add_func("/dm-mc02/nvic/h723-priority-width", test_h723_nvic_width);
     g_test_add_func("/dm-mc02/board-reset/warm-state",
                     test_warm_reset_reprojects_board_state);
     g_test_add_func("/dm-mc02/board-reset/cold-volatile-memory",

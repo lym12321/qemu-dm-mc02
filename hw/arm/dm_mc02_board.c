@@ -558,7 +558,8 @@ bool dm_mc02_board_validate(const DmMc02BoardProfile *board, Error **errp)
                    DM_MC02_BOARD_GPIO_BANK_COUNT);
         return false;
     }
-    if (!board->soc->irq_count || !board->soc->reset_cpu_hz ||
+    if (!board->soc->irq_count || board->soc->irq_priority_bits < 3 ||
+        board->soc->irq_priority_bits > 8 || !board->soc->reset_cpu_hz ||
         !board->soc->refclk_hz) {
         error_setg(errp, "board profile '%s' has an invalid clock or IRQ configuration",
                    board->name);

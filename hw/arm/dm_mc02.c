@@ -3143,6 +3143,7 @@ static void dm_mc02_init(MachineState *machine)
     object_property_add_child(OBJECT(machine), "armv7m", OBJECT(armv7m));
     /* Include the H723 high-numbered FDCAN3 and TIM24 vectors. */
     qdev_prop_set_uint32(armv7m, "num-irq", soc->irq_count);
+    qdev_prop_set_uint8(armv7m, "num-prio-bits", soc->irq_priority_bits);
     qdev_prop_set_string(armv7m, "cpu-type", soc->cpu_type);
     qdev_prop_set_uint32(armv7m, "init-nsvtor", soc->flash_base);
     qdev_prop_set_bit(armv7m, "enable-bitband", false);
