@@ -249,8 +249,8 @@ gimbal/chassis/shooter；其余字段按官方 unsigned wire 宽度编码，不�
 `Buff` 的 `remaining_energy` 是显式协议 bitmap，默认全量能量可填写 `0x80`；
 编码使用官方第 17 页的 8-byte packed struct，最后字段位于 offset 7。
 第 16 页表格将该偏移写为 6，与总长度/结构冲突；当前消费者结构也支持 offset 7。
-这四类编码不包含接收 payload parser、定时发送或规则状态。`0x0206` 等其它命令、
-UART endpoint 和赛场仍待独立接入。
+这四类编码不包含接收 payload parser、定时发送或规则状态。
+`0x0206` 等其它命令和赛场仍待独立接入。
 
 独立脚本引擎可用于无赛场的状态回放和固件输入准备：
 
@@ -323,8 +323,32 @@ endpoint.close()                  # 不关闭、不 drain 借用的 socket
 该 endpoint 只输出显式快照，调用者负责完成的状态、发送频率、读取和连接生命周期，
 并独占该裁判 TX 流的序号所有权。默认 transport 为 256 slots，纯快照最多保留
 20,992 bytes，调用者可以设置更小上限。快照批次没有实现官方不同命令的独立周期
-（`0x0001` 1 Hz、`0x0201/0202` 10 Hz、`0x0204` 3 Hz）；定时组合与真实固件
-UART 消费仍需后续入口验证。
+（`0x0001` 1 Hz、`0x0201/0202` 10 Hz、`0x0204` 3 Hz）；周期组合仍待接入。
+真实固件 UART 消费可用下列专用测试验证。
+
+默认关闭的专用固件测试复用实际 `robomaster::basic`、HAL UART7 RX DMA、BSP
+回调与 FreeRTOS 消息执行器：
+
+```bash
+# 在 trobot 中，使用已有 ARM 工具链环境构建
+cmake --preset RefereeTestDebug
+cmake --build --preset RefereeTestDebug
+# 在 dm-mc02-qemu 中，先完成 QEMU 构建及 uv sync --locked --group dev
+tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
+  build/test-results/referee-debug ../trobot
+```
+
+可将 preset 换成 `RefereeTestRelease`。测试开关需要 `TROBOT_SELFTEST`，与 Motor、
+Dji、Chassis 测试互斥，普通 Debug/Release 均保持关闭。结果目录必须不存在；
+可用 `--qemu` 指定 QEMU。报告保留真实源码、ELF 和 QEMU 哈希、失败及缺失项，
+只有进程清理完成且输入未变后才发布 `passed`。启动总期限为 10 秒，运行总期限为
+20 秒，均从 QEMU 启动前起算，清理有各自的短期限。
+
+固定脚本输出两份四命令快照，检查 17 个固件通过项和一个 `plant.physics` SKIP。
+第二批先发送 19 字节，固件在 100 ms 内观察旧状态，然后主机补发原队列的 63 字节
+尾部，固件检查四组新 payload 和新时间戳。它验证完整帧消费，不能证明 UART 前缀的
+准确到达时间、操作系统背压、官方独立发送周期或 CPU/plant 全局屏障。当前 `0x0206`
+真实一字节格式与固件两字节结构不符，保持未支持，测试不填充字节掩盖差异。
 
 ## Contents
 
