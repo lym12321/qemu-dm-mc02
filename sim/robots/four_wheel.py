@@ -1,7 +1,7 @@
 """Fixed toy chassis: IDs 1..4 are FL, FR, RL, RR on one shared plant.
 
 The launcher owns the admitted plant until a runtime is successfully returned.
-The runtime then owns its reset, advance and device cleanup; transports remain
+The runtime then owns its reset, advance and physics/device cleanup; transports remain
 borrowed. Native IMU observations use SI and the completed physics state.
 """
 
@@ -21,10 +21,10 @@ def create_four_wheel_plant(model_path, *, delay_ns=0,
     physics = MujocoPhysics.from_xml_path(
         model_path, joints={f"wheel_{c}": f"drive_{c}" for c in corners},
         imus={"imu": ("imu_gyro", "imu_accel")})
-    imu_to_bmi088_units(physics.get_imu("imu"))
-    bus = CanBus(delay_ns=delay_ns)
     devices = []
     try:
+        imu_to_bmi088_units(physics.get_imu("imu"))
+        bus = CanBus(delay_ns=delay_ns)
         for motor_id in range(1, 5):
             devices.append(M3508Device(
                 bus, motor_id, command_timeout_ns=command_timeout_ns,
@@ -37,6 +37,10 @@ def create_four_wheel_plant(model_path, *, delay_ns=0,
                 device.close()
             except BaseException as error:
                 exc.add_note(f"profile device close failed: {error}")
+        try:
+            physics.close()
+        except BaseException as error:
+            exc.add_note(f"profile physics close failed: {error}")
         raise
 
 

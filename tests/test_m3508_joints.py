@@ -7,12 +7,12 @@ the plant's scheduling and feedback helpers are not used to derive expectations.
 
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
 
 from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508, M3508Device, M3508JointPlant
@@ -30,6 +30,7 @@ class Host(VirtualCanDevice):
 
 
 def physics(*, initial_position=0):
+    mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
     bodies = "".join(
         f'<body name="b{i}" pos="{i} 0 0">'
         f'<joint name="j{i}" type="hinge" axis="0 0 1" ref="{initial_position}"/>'
@@ -252,8 +253,14 @@ def test_all_device_plans_are_prepared_before_control_or_shared_advance(monkeypa
     assert calls["step"] == [1_000_000] and not plant.failed
 
 
-def test_close_attempts_each_owned_device_once_and_preserves_borrowed_bus(monkeypatch):
-    bus, host, devices, native, plant = setup()
+def test_close_attempts_each_owned_resource_once_and_preserves_borrowed_bus(monkeypatch):
+    native = SimpleNamespace(
+        reset=lambda: None, step=lambda _: None,
+        get_joint_state=lambda _: JointState(0, 0),
+        set_joint_effort=lambda *_: None, validate_step=lambda _: None,
+        validate_steps=lambda _: None,
+        validate_joint_effort=lambda *_: None, close=lambda: None)
+    bus, host, devices, native, plant = setup(native=native)
     calls = track_physics(monkeypatch, native)
     plant.reset(Session(1))
     host.emit(CanFrame(0x123, data=b"borrowed", timestamp_ns=100_000_000))
@@ -270,14 +277,53 @@ def test_close_attempts_each_owned_device_once_and_preserves_borrowed_bus(monkey
                 raise errors[device.motor_id]
 
         monkeypatch.setattr(device, "close", observed_close)
+    def close_physics():
+        closed.append("physics")
+        raise OSError("physics close")
+    monkeypatch.setattr(native, "close", close_physics)
     with pytest.raises(KeyboardInterrupt) as caught:
         plant.close()
     assert caught.value is primary
     assert any("M3508 2 close failed" in note for note in primary.__notes__)
+    assert any("joint physics close failed" in note for note in primary.__notes__)
     plant.close()
-    assert closed == [4, 3, 2, 1] and all(device.closed for device in devices)
+    assert closed == [4, 3, 2, 1, "physics"] and all(device.closed for device in devices)
     assert plant.closed and plant.failed
     assert calls == {"reset": 1, "step": [], "effort": []}
     assert bus.pending == 1 and bus.t_sim_ns == 0
     host.emit(CanFrame(0x124, data=b"live"))
     assert bus.pending == 2
+
+
+def test_missing_public_physics_methods_reject_without_transferring_inputs():
+    device = M3508Device(CanBus())
+    for method in ("reset", "step", "set_joint_effort", "get_joint_state",
+                   "validate_step", "validate_steps", "validate_joint_effort", "close"):
+        native = SimpleNamespace(**{name: (None if name == method else lambda *_: None)
+            for name in ("reset", "step", "set_joint_effort", "get_joint_state",
+                         "validate_step", "validate_steps", "validate_joint_effort", "close")})
+        with pytest.raises(TypeError, match=f"requires {method}"):
+            M3508JointPlant(native, {device: "joint"})
+        assert not device.closed
+
+
+def test_future_native_float_precision_rejection_precedes_all_control(monkeypatch):
+    bus, host, devices, native, plant = setup(timeouts=((1 << 63) - 2,) * 4)
+    calls = track_physics(monkeypatch, native)
+    try:
+        plant.reset(Session(1))
+        command(bus, host, "1000 0000 0000 0000")
+        with pytest.raises(ValueError, match="advance native time"):
+            plant.step(StepContext(1, 1, (1 << 63) - 1, (1 << 63) - 1))
+        # Both durations were admissible at time0; the final1ns cannot advance
+        # the float time after the long first interval. No torque/step may occur.
+        assert calls == {"reset": 1, "step": [], "effort": []}
+        assert native.time_s == 0 and bus.pending == 0 and host.frames == []
+        assert plant.failed and plant.t_sim_ns == 0
+        assert all(device.t_sim_ns == 0 and device.get_rotor_state() == (0, 0)
+                   for device in devices)
+        plant.reset(Session(2))
+        plant.step(StepContext(2, 1, 1_000_000, 1_000_000))
+        assert not plant.failed and native.time_s == .001
+    finally:
+        plant.close()

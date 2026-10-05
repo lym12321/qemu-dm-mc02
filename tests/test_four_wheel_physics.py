@@ -55,6 +55,59 @@ physics: {{backend: mujoco, model: {MODEL}}}
     finally:
         plant.close()
     assert plant.closed and all(device.closed for device in plant.devices)
+    with pytest.raises(RuntimeError, match="closed"):
+        plant.physics.get_imu("imu")
+
+
+@pytest.mark.parametrize("stage", ["imu", "bus", "device"])
+def test_profile_acquisition_failure_releases_all_owned_resources(monkeypatch, stage):
+    from sim.robots import four_wheel
+
+    native_create = four_wheel.MujocoPhysics.from_xml_path
+    owners, closed = [], []
+    primary = KeyboardInterrupt("profile admission")
+    def create(*args, **kwargs):
+        native = native_create(*args, **kwargs)
+        owners.append(native)
+        close = native.close
+        def close_physics():
+            closed.append("physics")
+            close()
+            raise OSError("physics cleanup")
+        monkeypatch.setattr(native, "close", close_physics)
+        return native
+    monkeypatch.setattr(four_wheel.MujocoPhysics, "from_xml_path", create)
+    def reject(*args, **kwargs):
+        raise primary
+    if stage == "imu":
+        monkeypatch.setattr(four_wheel, "imu_to_bmi088_units", reject)
+    elif stage == "bus":
+        monkeypatch.setattr(four_wheel, "CanBus", reject)
+    else:
+        native_device = four_wheel.M3508Device
+        def device(bus, motor_id, **kwargs):
+            if motor_id == 2:
+                raise primary
+            result = native_device(bus, motor_id, **kwargs)
+            owners.append(result)
+            close = result.close
+            def close_device():
+                closed.append(motor_id)
+                close()
+                raise OSError("device cleanup")
+            monkeypatch.setattr(result, "close", close_device)
+            return result
+        monkeypatch.setattr(four_wheel, "M3508Device", device)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        four_wheel.create_four_wheel_plant(MODEL)
+    assert caught.value is primary
+    assert closed == ([1, "physics"] if stage == "device" else ["physics"])
+    assert "profile physics close failed: physics cleanup" in primary.__notes__
+    if stage == "device":
+        assert owners[1].closed
+        assert "profile device close failed: device cleanup" in primary.__notes__
+    with pytest.raises(RuntimeError, match="closed"):
+        owners[0].get_imu("imu")
 
 
 def test_native_named_geometry_actuation_and_world_axes():

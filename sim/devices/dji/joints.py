@@ -1,4 +1,4 @@
-"""One MuJoCo advance owner for M3508 devices bound to shared joints.
+"""One native physics advance owner for M3508 devices bound to shared joints.
 
 The ratio3591/187 is from DJI M3508 P19 manual V1.0, p7/p13/p19, also used by
 the fixed reference firmware. Lossless conversion is a model approximation,
@@ -11,7 +11,7 @@ from collections.abc import Mapping
 import math
 
 from sim.core import Session, StepContext, StepResult
-from sim.physics import JointState, MujocoPhysics
+from sim.physics.base import JointPhysics, JointState
 
 from .device import M3508Device
 
@@ -29,10 +29,8 @@ def _finite(value, name):
 
 
 class M3508JointPlant:
-    def __init__(self, physics: MujocoPhysics,
+    def __init__(self, physics: JointPhysics,
                  bindings: Mapping[M3508Device, str], *, gear_ratio=3591 / 187):
-        if not isinstance(physics, MujocoPhysics):
-            raise TypeError("joint plant requires MujocoPhysics")
         if not isinstance(bindings, Mapping) or not bindings:
             raise ValueError("joint plant requires nonempty device-to-joint bindings")
         gear_ratio = _finite(gear_ratio, "gear_ratio")
@@ -52,7 +50,8 @@ class M3508JointPlant:
             raise ValueError("joint devices require unique motor IDs")
         if any(device.closed for device, _ in items):
             raise ValueError("joint devices must be open")
-        for method in ("reset", "step", "set_joint_effort", "get_joint_state"):
+        for method in ("reset", "step", "set_joint_effort", "get_joint_state",
+                       "validate_step", "validate_steps", "validate_joint_effort", "close"):
             if not callable(getattr(physics, method, None)):
                 raise TypeError(f"joint physics requires {method}")
         self.physics = physics
@@ -61,7 +60,10 @@ class M3508JointPlant:
         # Getters have no solver/time/control side effects. Validate every
         # binding and maximal effort before ownership and runtime projection.
         for device, name in items:
-            _finite(20 * device.torque_per_amp * gear_ratio, "maximum joint effort")
+            maximum = _finite(20 * device.torque_per_amp * gear_ratio,
+                              "maximum joint effort")
+            physics.validate_joint_effort(name, maximum)
+            physics.validate_joint_effort(name, -maximum)
             self._rotor_sample(name)
         self.devices = tuple(device for device, _ in items)
         self.t_sim_ns = 0
@@ -107,10 +109,21 @@ class M3508JointPlant:
         plans = tuple(device.prepare_step(ctx) for device in self.devices)
         boundaries = sorted({self.t_sim_ns, ctx.t_sim_ns,
                              *(plan.active_until_ns for plan in plans)})
+        # The whole operation must fit the backend's single-step admission,
+        # including cumulative native target range. Check every actual expiry
+        # interval too; a valid total does not imply native-tick aligned splits.
+        self.physics.validate_step(ctx.dt_ns)
+        self.physics.validate_steps(tuple(target - start
+            for start, target in zip(boundaries, boundaries[1:])))
+        efforts = tuple(_finite(plan.effort_nm * self.gear_ratio, "joint effort")
+                        for plan in plans)
+        for (_, name), effort in zip(self._bindings, efforts):
+            self.physics.validate_joint_effort(name, effort)
+            self.physics.validate_joint_effort(name, 0)
         for start, target in zip(boundaries, boundaries[1:]):
-            for (_, name), plan in zip(self._bindings, plans):
-                effort = plan.effort_nm if start < plan.active_until_ns else 0.0
-                self.physics.set_joint_effort(name, effort * self.gear_ratio)
+            for (_, name), plan, effort in zip(self._bindings, plans, efforts):
+                self.physics.set_joint_effort(
+                    name, effort if start < plan.active_until_ns else 0.0)
             self.physics.step(target - start)
         # Collect and validate all target observations before any feedback
         # commit. Solver/sample/emit failures retain partial physical effects;
@@ -138,5 +151,12 @@ class M3508JointPlant:
                     primary = exc
                 else:
                     primary.add_note(f"M3508 {device.motor_id} close failed: {exc}")
+        try:
+            self.physics.close()
+        except BaseException as exc:
+            if primary is None:
+                primary = exc
+            else:
+                primary.add_note(f"joint physics close failed: {exc}")
         if primary is not None:
             raise primary

@@ -12,6 +12,26 @@ from pathlib import Path
 from .base import JointState
 
 
+def _step_ns(dt_ns):
+    if type(dt_ns) is not int or not 0 < dt_ns <= (1 << 63) - 1:
+        raise ValueError("Gazebo dt_ns must be a positive signed-64-bit integer")
+    return dt_ns
+
+
+def _effort(name, value):
+    if not isinstance(name, str):
+        raise ValueError("joint name must be a string")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError("joint effort must be finite")
+    try:
+        value = float(value)
+    except OverflowError as exc:
+        raise ValueError("joint effort must be finite") from exc
+    if not math.isfinite(value):
+        raise ValueError("joint effort must be finite")
+    return value
+
+
 class GazeboPhysics:
     def __init__(self, path, *, joints: Mapping[str, tuple[str, str]]):
         if not isinstance(path, (str, Path)) or not str(path) or "\0" in str(path):
@@ -52,26 +72,28 @@ class GazeboPhysics:
         return self.time_ns / 1_000_000_000
 
     def step(self, dt_ns: int) -> None:
-        if type(dt_ns) is not int or not 0 < dt_ns <= (1 << 63) - 1:
-            raise ValueError("Gazebo dt_ns must be a positive signed-64-bit integer")
-        self._world.step(dt_ns)
+        self._world.step(_step_ns(dt_ns))
+
+    def validate_step(self, dt_ns: int) -> None:
+        """Check exact native tick/target admission without advancing."""
+        self._world.validate_step(_step_ns(dt_ns))
+
+    def validate_steps(self, intervals_ns: tuple[int, ...]) -> None:
+        """Check sequential native targets without writing controls or stepping."""
+        if not isinstance(intervals_ns, tuple) or not intervals_ns:
+            raise ValueError("step intervals must be a nonempty tuple")
+        self._world.validate_steps(tuple(_step_ns(dt) for dt in intervals_ns))
 
     def reset(self) -> None:
         """Complete native reset and paused state projection, without integration."""
         self._world.reset()
 
     def set_joint_effort(self, name: str, value: float) -> None:
-        if not isinstance(name, str):
-            raise ValueError("joint name must be a string")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            raise ValueError("joint effort must be finite")
-        try:
-            value = float(value)
-        except OverflowError as exc:
-            raise ValueError("joint effort must be finite") from exc
-        if not math.isfinite(value):
-            raise ValueError("joint effort must be finite")
-        self._world.set_joint_effort(name, value)
+        self._world.set_joint_effort(name, _effort(name, value))
+
+    def validate_joint_effort(self, name: str, value: float) -> None:
+        """Check binding/finite/SDF limit admission without changing torque."""
+        self._world.validate_joint_effort(name, _effort(name, value))
 
     def get_joint_state(self, name: str) -> JointState:
         if not isinstance(name, str):

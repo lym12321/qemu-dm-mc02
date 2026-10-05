@@ -54,6 +54,7 @@ class MujocoPhysics:
         self._joints = {}
         self._imus = {}
         self._failed = False
+        self._closed = False
         for name, actuator in joints.items():
             joint_id = self._id(mujoco.mjtObj.mjOBJ_JOINT, name)
             actuator_id = self._id(mujoco.mjtObj.mjOBJ_ACTUATOR, actuator)
@@ -139,18 +140,33 @@ class MujocoPhysics:
     @property
     def time_s(self) -> float:
         """Native floating-point plant time, independent of any transport epoch."""
+        self._check_open()
         return float(self._data.time)
 
     def reset(self) -> None:
+        self._check_open()
         self._failed = True
         self._mj.mj_resetData(self._model, self._data)
         self._mj.mj_forward(self._model, self._data)
         self._check_solver()
         self._failed = False
 
+    def _check_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("MuJoCo physics is closed")
+
     def _check_live(self) -> None:
+        self._check_open()
         if self._failed:
             raise RuntimeError("MuJoCo solver failed; reset required")
+
+    def close(self) -> None:
+        """Release the exclusively owned native data and compiled model once."""
+        if self._closed:
+            return
+        self._closed = True
+        self._data = None
+        self._model = None
 
     def _check_solver(self) -> None:
         # Native bad-number handling can replace controls or reset data. Do
@@ -171,18 +187,42 @@ class MujocoPhysics:
             self._failed = True
             raise RuntimeError(f"MuJoCo invalid target {name}; reset required")
 
-    def step(self, dt_ns: int) -> None:
+    def _step_dt_ns(self, dt_ns: int, time_s: float | None = None) -> float:
+        self._check_live()
         if type(dt_ns) is not int or not 0 < dt_ns <= (1 << 63) - 1:
             raise ValueError("MuJoCo dt_ns must be a positive signed-64-bit integer")
-        self.step_seconds(dt_ns / 1_000_000_000)
+        return self._step_dt_seconds(dt_ns / 1_000_000_000, time_s)
+
+    def _step_dt_seconds(self, dt: float, time_s: float | None = None) -> float:
+        self._check_live()
+        dt = _finite(dt, "MuJoCo step dt")
+        time_s = self.time_s if time_s is None else time_s
+        target = time_s + dt
+        if dt <= 0 or not math.isfinite(target) or target <= time_s:
+            raise ValueError("MuJoCo step dt must be positive and advance native time")
+        return dt
+
+    def validate_step(self, dt_ns: int) -> None:
+        """Check a native step without changing time, controls or solver state."""
+        self._step_dt_ns(dt_ns)
+
+    def validate_steps(self, intervals_ns: tuple[int, ...]) -> None:
+        """Check every sequential native float target without advancing."""
+        self._check_live()
+        if not isinstance(intervals_ns, tuple) or not intervals_ns:
+            raise ValueError("step intervals must be a nonempty tuple")
+        target = self.time_s
+        for dt_ns in intervals_ns:
+            target += self._step_dt_ns(dt_ns, target)
+
+    def step(self, dt_ns: int) -> None:
+        self._advance(self._step_dt_ns(dt_ns))
 
     def step_seconds(self, dt: float) -> None:
         """Legacy float-dt admission: preserve the value without ns rounding."""
-        self._check_live()
-        dt = _finite(dt, "MuJoCo step dt")
-        target = self.time_s + dt
-        if dt <= 0 or not math.isfinite(target) or target <= self.time_s:
-            raise ValueError("MuJoCo step dt must be positive and advance native time")
+        self._advance(self._step_dt_seconds(dt))
+
+    def _advance(self, dt: float) -> None:
         self._failed = True
         self._model.opt.timestep = dt
         self._mj.mj_step(self._model, self._data)
@@ -193,12 +233,20 @@ class MujocoPhysics:
         self._check_solver()
         self._failed = False
 
-    def set_joint_effort(self, name: str, value: float) -> None:
+    def _joint_effort(self, name: str, value: float) -> tuple[int, float]:
         self._check_live()
         binding = self._joints.get(name) if isinstance(name, str) else None
         if binding is None:
             raise ValueError(f"unbound joint: {name}")
-        self._data.ctrl[binding[2]] = _finite(value, "joint effort")
+        return binding[2], _finite(value, "joint effort")
+
+    def validate_joint_effort(self, name: str, value: float) -> None:
+        """Check bound finite joint torque without writing the held control."""
+        self._joint_effort(name, value)
+
+    def set_joint_effort(self, name: str, value: float) -> None:
+        control, effort = self._joint_effort(name, value)
+        self._data.ctrl[control] = effort
 
     def get_joint_state(self, name: str) -> JointState:
         self._check_live()

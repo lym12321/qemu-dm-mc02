@@ -312,14 +312,40 @@ public:
         }
     }
 
+    void CheckStep(int64_t dtNs, int64_t timeNs) const
+    {
+        if (dtNs <= 0 || dtNs % tickNs || dtNs / tickNs > 10000 ||
+            timeNs > std::numeric_limits<int64_t>::max() - dtNs) {
+            throw std::invalid_argument("step requires 1..10000 whole SDF ticks without time overflow");
+        }
+    }
+
+    void ValidateStep(int64_t dtNs) const
+    {
+        Guard guard(busy);
+        Live();
+        CheckStep(dtNs, observer->timeNs);
+    }
+
+    void ValidateSteps(const std::vector<int64_t> &intervals) const
+    {
+        Guard guard(busy);
+        Live();
+        if (intervals.empty()) {
+            throw std::invalid_argument("step intervals must be nonempty");
+        }
+        auto target = observer->timeNs;
+        for (const auto dtNs : intervals) {
+            CheckStep(dtNs, target);
+            target += dtNs;
+        }
+    }
+
     void Step(int64_t dtNs)
     {
         Guard guard(busy);
         Live();
-        if (dtNs <= 0 || dtNs % tickNs || dtNs / tickNs > 10000 ||
-            observer->timeNs > std::numeric_limits<int64_t>::max() - dtNs) {
-            throw std::invalid_argument("step requires 1..10000 whole SDF ticks without time overflow");
-        }
+        CheckStep(dtNs, observer->timeNs);
         const auto target = observer->timeNs + dtNs;
         failed = true;
         for (int64_t i = 0; i < dtNs / tickNs; ++i) {
@@ -331,15 +357,27 @@ public:
         failed = false;
     }
 
-    void SetEffort(const std::string &name, double value)
+    void CheckEffort(const std::string &name, double value) const
     {
-        Guard guard(busy);
-        Live();
         const auto limit = effortLimits.find(name);
         if (limit == effortLimits.end() || !std::isfinite(value) ||
             (limit->second > 0 && std::abs(value) > limit->second)) {
             throw std::invalid_argument("unbound joint, nonfinite or out-of-limit effort");
         }
+    }
+
+    void ValidateEffort(const std::string &name, double value) const
+    {
+        Guard guard(busy);
+        Live();
+        CheckEffort(name, value);
+    }
+
+    void SetEffort(const std::string &name, double value)
+    {
+        Guard guard(busy);
+        Live();
+        CheckEffort(name, value);
         observer->efforts.at(name) = value;
     }
 
@@ -403,9 +441,12 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
     pybind11::class_<NativeWorld>(module, "World")
         .def(pybind11::init<const std::string &, const Bindings &>())
         .def("step", &NativeWorld::Step)
+        .def("validate_step", &NativeWorld::ValidateStep)
+        .def("validate_steps", &NativeWorld::ValidateSteps)
         .def("reset", &NativeWorld::Reset)
         .def("close", &NativeWorld::Close)
         .def("set_joint_effort", &NativeWorld::SetEffort)
+        .def("validate_joint_effort", &NativeWorld::ValidateEffort)
         .def("get_joint_state", &NativeWorld::JointState)
         .def_property_readonly("time_ns", &NativeWorld::TimeNs)
         .def_property_readonly("timestep_ns", &NativeWorld::TickNs);

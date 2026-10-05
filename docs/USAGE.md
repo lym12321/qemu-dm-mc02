@@ -828,6 +828,9 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 原生数值异常或无效目标状态会报错，后续推进与观察须先 reset；失败不提供回滚。
 `time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
 不建立 QEMU 时间屏障。四轮底盘、固件 IMU 闭环和物理标定仍需分别验证。
+`validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 只检查准入，不推进模型或
+改写力矩。`validate_steps((dt1_ns, dt2_ns, ...))` 按顺序检查未来 native 时间，提前
+拒绝浮点时间分辨率不足的后续区间。`close()` 释放此实例持有的原生 model/data；重复关闭无害，关闭后操作拒绝。
 
 ### Gazebo 原生关节接口（可选）
 
@@ -873,8 +876,12 @@ Gazebo 原生浮点秒到整数时间的截断，不能假定 SDF 十进制值�
 必须是实际步长的整数倍，每次 1–10000 ticks。初始化及 reset 不增加积分步。
 运行错误冻结推进和观测，成功 reset 后恢复；失败不回滚。并发操作明确拒绝。
 `close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
+`validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 使用同一准入规则，只读检查
+当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
+`validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
 
-这个转子是未标定的验证夹具。当前接口尚未接入 MCU、M3508、IMU、ROS 2、相机、
+这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
+当前接口尚未接入 MCU、IMU、ROS 2、相机、
 LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘
@@ -1239,7 +1246,7 @@ M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输�
 reset/close 会取消它。发送失败保留已提交状态，调用方必须冻结并 reset，不能重复完成
 或重复推进 plant。`M3508` 保留原简单转子用法，并复用这一协议边界。
 
-`M3508JointPlant` 把多个协议器件绑定到同一个 `MujocoPhysics`，取得这些器件与
+`M3508JointPlant` 把多个协议器件绑定到同一个 `MujocoPhysics` 或 `GazeboPhysics`，取得这些器件与
 物理模型的独占执行所有权。绑定必须使用 `M3508Device`，每个 joint 和电机 ID 唯一，
 所有器件位于同一 CAN bus。四轮模型的完整组合如下：
 
@@ -1267,12 +1274,46 @@ coordinator.step(1_000_000)
 coordinator.close()
 ```
 
+在 Gazebo SDK Python 环境中也可用同一 owner 绑定公开转子：
+
+```python
+from sim.core import Coordinator, Session
+from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.fabric import CanBus
+from sim.fabric.runtime import CanParticipant
+from sim.physics import GazeboPhysics
+
+physics = GazeboPhysics("models/gazebo_rotor.sdf",
+                        joints={"shaft": ("rotor", "shaft")})
+bus = CanBus()
+device = M3508Device(bus, 1)
+try:
+    shared = M3508JointPlant(physics, {device: "shaft"})
+except BaseException:
+    device.close()
+    physics.close()
+    raise
+coordinator = Coordinator({"can": CanParticipant(bus, [shared])})
+try:
+    coordinator.reset(Session(1))
+    coordinator.step(1_000_000)
+finally:
+    coordinator.close()  # closes owned devices and physics
+```
+
 默认减速比 `g=3591/187` 来自 [DJI M3508 P19 V1.0 手册](https://rm-static.djicdn.com/tem/17348/RoboMaster%20M3508%20P19%20Brushless%20DC%20Gear%20Motor%20V1.0.pdf)
 的规格表。adapter 使用理想无损换算：转子角度和速度为 joint 的 `g` 倍，joint
 力矩为转子力矩的 `g` 倍；XML motor 保持 gear=1。效率、背隙及转子惯量未经标定。
 每个命令截止区间只推进一次共享物理模型，收齐全部终点采样后才生成反馈。
+构造时先检查所有绑定、初始采样及 ±20 A 对应的最大 joint 力矩；失败时输入仍由
+调用方拥有。每次推进先检查总步长、按顺序投影的全部超时分段和力矩，再写入控制。总步长必须
+符合后端单次 step 的限制，Gazebo 为 1–10000 个实际 native ticks；每个超时分段也
+须精确对齐。命令超时或分段不对齐会拒绝并冻结 owner，不能自动舍入；Session
+绝对起点不需要对齐 native tick。反馈周期不用于物理分段。
 reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍以所给 Session 为原点。
 任一运行失败会冻结这个 owner，直到成功 reset；已推进的物理状态和已排队反馈不回滚。
+`close()` 独立尝试关闭所有拥有的器件与 physics，保留首个错误及其它清理诊断；重复
+调用不重试。借用的 CAN bus 和 transport 由调用方负责。
 
 每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
 命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。

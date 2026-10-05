@@ -9,6 +9,7 @@ from dataclasses import FrozenInstanceError
 import math
 from pathlib import Path
 import sys
+import weakref
 
 import pytest
 
@@ -173,6 +174,7 @@ def test_float_dt_is_preserved_without_nanosecond_round_trip():
 def test_invalid_steps_efforts_and_names_have_no_native_effect(monkeypatch):
     physics = rotor()
     physics.set_joint_effort("shaft", .4)
+    initial = physics.get_joint_state("shaft")
     native_calls = []
     native_step = mujoco.mj_step
     native_forward = mujoco.mj_forward
@@ -184,25 +186,83 @@ def test_invalid_steps_efforts_and_names_have_no_native_effect(monkeypatch):
         return native_forward(model, data)
     monkeypatch.setattr(mujoco, "mj_step", step)
     monkeypatch.setattr(mujoco, "mj_forward", forward)
+    physics.validate_step(10_000_000)
+    physics.validate_steps((3_000_000, 7_000_000))
+    physics.validate_joint_effort("shaft", -.4)
     for value in (0, -1, True, 1.0, 1 << 63):
-        with pytest.raises(ValueError):
-            physics.step(value)
+        for method in (physics.validate_step, physics.step):
+            with pytest.raises(ValueError):
+                method(value)
     for value in (0, -1, True, math.nan, math.inf):
         with pytest.raises(ValueError):
             physics.step_seconds(value)
     for value in (True, math.nan, math.inf, "1"):
-        with pytest.raises(ValueError):
-            physics.set_joint_effort("shaft", value)
+        for method in (physics.validate_joint_effort, physics.set_joint_effort):
+            with pytest.raises(ValueError):
+                method("shaft", value)
     for method, args in ((physics.set_joint_effort, ("missing", .4)),
+                         (physics.validate_joint_effort, ("missing", .4)),
                          (physics.get_joint_state, ("missing",)),
                          (physics.get_body_pose, ("missing",)),
                          (physics.get_imu, ("missing",))):
         with pytest.raises(ValueError):
             method(*args)
     assert native_calls == [] and physics.time_s == 0
+    assert physics.get_joint_state("shaft") == initial
     physics.step(1_000_000)
     assert physics.get_joint_state("shaft").velocity_rad_s == pytest.approx(.02, abs=1e-13)
     assert native_calls == ["step", "forward"]
+
+
+def test_step_validation_checks_native_float_time_resolution_without_advancing():
+    physics = rotor()
+    # A zero-effort stationary hinge admits the largest integer interval. At
+    # this native float time, adding a single nanosecond cannot advance time.
+    physics.validate_step((1 << 63) - 1)
+    with pytest.raises(ValueError, match="advance native time"):
+        physics.validate_steps(((1 << 63) - 2, 1))
+    for intervals in ((), [1], (True,), (1 << 63,)):
+        with pytest.raises(ValueError):
+            physics.validate_steps(intervals)
+    assert physics.time_s == 0
+    physics.step((1 << 63) - 1)
+    completed_time = physics.time_s
+    for method in (physics.validate_step, physics.step):
+        with pytest.raises(ValueError, match="advance native time"):
+            method(1)
+    assert physics.time_s == completed_time
+    assert physics.get_joint_state("shaft") == JointState(0, 0)
+
+
+def test_close_releases_owned_native_resources_once_and_rejects_operations(monkeypatch):
+    refs = []
+    native_data = mujoco.MjData
+    def data_for(model):
+        data = native_data(model)
+        refs.append(weakref.ref(data))
+        return data
+    monkeypatch.setattr(mujoco, "MjData", data_for)
+    model = mujoco.MjModel.from_xml_string(rotor_xml())
+    model_ref = weakref.ref(model)
+    physics = MujocoPhysics(model, joints={"shaft": "drive"},
+                            imus={"imu": ("gyro", "accel")})
+    del model
+    assert refs[0]() is not None and model_ref() is not None
+    physics.close()
+    assert refs[0]() is None and model_ref() is None
+    physics.close()
+    for operation in (lambda: physics.time_s, physics.reset,
+                      lambda: physics.validate_step(1_000_000),
+                      lambda: physics.validate_steps((1_000_000,)),
+                      lambda: physics.step(1_000_000),
+                      lambda: physics.step_seconds(.001),
+                      lambda: physics.validate_joint_effort("shaft", .4),
+                      lambda: physics.set_joint_effort("shaft", .4),
+                      lambda: physics.get_joint_state("shaft"),
+                      lambda: physics.get_body_pose("rotor"),
+                      lambda: physics.get_imu("imu")):
+        with pytest.raises(RuntimeError, match="closed"):
+            operation()
 
 
 def test_complete_binding_admission_precedes_runtime_projection(monkeypatch):
@@ -298,6 +358,9 @@ def test_native_solver_warning_fails_and_freezes_until_reset(tmp_path, monkeypat
         physics.step(1_000_000)
     assert math.isfinite(physics.time_s)  # Diagnostic native time stays readable.
     for method, args in ((physics.step, (1_000_000,)),
+                         (physics.validate_step, (1_000_000,)),
+                         (physics.validate_steps, ((1_000_000,),)),
+                         (physics.validate_joint_effort, ("shaft", .4)),
                          (physics.get_joint_state, ("shaft",)),
                          (physics.get_body_pose, ("rotor",)),
                          (physics.get_imu, ("imu",))):

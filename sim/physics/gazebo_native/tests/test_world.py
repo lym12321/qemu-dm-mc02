@@ -15,6 +15,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 from sim.physics import GazeboPhysics, JointState
 from sim.physics.mujoco import JointState as LegacyJointState
+from sim.core import Coordinator, Session
+from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.fabric import CanBus, CanFrame, VirtualCanDevice
+from sim.fabric.runtime import CanParticipant
 
 
 def rotor_sdf(*, joint_type="revolute", step="0.001", effort="10",
@@ -125,7 +129,10 @@ def test_native_drive_coast_reset_and_closed_owner(native, sdf_path):
     physics.close()
     for action in (lambda: physics.time_ns, lambda: physics.reset(),
                    lambda: physics.step(1_000_000),
+                   lambda: physics.validate_step(1_000_000),
+                   lambda: physics.validate_steps((1_000_000,)),
                    lambda: physics.get_joint_state("shaft"),
+                   lambda: physics.validate_joint_effort("shaft", 0),
                    lambda: physics.set_joint_effort("shaft", 0)):
         with pytest.raises(RuntimeError, match="closed"):
             action()
@@ -138,6 +145,10 @@ def test_direct_native_server_observes_completed_tick_and_reset(native, sdf_path
         assert world.time_ns == 0
         assert world.get_joint_state("shaft") == (0, 0)
         world.set_joint_effort("shaft", .4)
+        world.validate_step(1_000_000)
+        world.validate_steps((1_000_000, 2_000_000))
+        world.validate_joint_effort("shaft", -.4)
+        assert world.time_ns == 0 and world.get_joint_state("shaft") == (0, 0)
         world.step(1_000_000)
         position, velocity = world.get_joint_state("shaft")
         assert world.time_ns == 1_000_000
@@ -189,15 +200,33 @@ def test_invalid_commands_do_not_advance_or_replace_drive(native, sdf_path):
     with GazeboPhysics(sdf_path, joints={"shaft": ("rotor", "shaft")}) as physics:
         physics.set_joint_effort("shaft", .4)
         for dt in (True, 1.0, 0, -1, 1, 10_001_000_000, 1 << 63):
-            with pytest.raises(ValueError):
-                physics.step(dt)
+            for check in (physics.validate_step, physics.step):
+                with pytest.raises(ValueError):
+                    check(dt)
         for effort in (True, "0", float("nan"), float("inf"), 10**1000, 10.01):
+            for check in (physics.validate_joint_effort, physics.set_joint_effort):
+                with pytest.raises(ValueError):
+                    check("shaft", effort)
+        for check in (physics.validate_joint_effort, physics.set_joint_effort):
             with pytest.raises(ValueError):
-                physics.set_joint_effort("shaft", effort)
-        with pytest.raises(ValueError):
-            physics.set_joint_effort("missing", 0)
+                check("missing", 0)
         with pytest.raises(ValueError):
             physics.get_joint_state("missing")
+        assert physics.time_ns == 0
+        assert physics.get_joint_state("shaft") == JointState(0, 0)
+        physics.step(1_000_000)
+        assert physics.get_joint_state("shaft").velocity_rad_s == pytest.approx(.02, abs=1e-10)
+
+
+def test_accepted_preflight_does_not_change_time_or_held_effort(native, sdf_path):
+    with GazeboPhysics(sdf_path, joints={"shaft": ("rotor", "shaft")}) as physics:
+        physics.set_joint_effort("shaft", .4)
+        physics.validate_step(10_000_000_000)  # admitted upper tick-count bound
+        physics.validate_steps((3_000_000, 7_000_000))
+        for intervals in ((), [1_000_000], (True,), (1 << 63,), (1_000_000, 1)):
+            with pytest.raises(ValueError):
+                physics.validate_steps(intervals)
+        physics.validate_joint_effort("shaft", -10)  # inclusive SDF limit
         assert physics.time_ns == 0
         assert physics.get_joint_state("shaft") == JointState(0, 0)
         physics.step(1_000_000)
@@ -290,9 +319,190 @@ def test_native_gil_release_cannot_close_an_active_server(native, sdf_path):
         assert observed_busy, "native parallel PostUpdate must yield an active operation"
         with pytest.raises(RuntimeError, match="already in progress"):
             physics.close()
+        with pytest.raises(RuntimeError, match="already in progress"):
+            physics.validate_step(1_000_000)
+        with pytest.raises(RuntimeError, match="already in progress"):
+            physics.validate_steps((1_000_000,))
+        with pytest.raises(RuntimeError, match="already in progress"):
+            physics.validate_joint_effort("shaft", 0)
         worker.join(10)
         assert not worker.is_alive() and not errors
         assert physics.time_ns == 10_000_000_000
     finally:
         worker.join(10)
         physics.close()
+
+
+class CanHost(VirtualCanDevice):
+    def __init__(self, bus):
+        self.frames = []
+        super().__init__(bus, "host")
+
+    def receive(self, frame):
+        self.frames.append(frame)
+
+
+def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4):
+    xml = rotor_sdf()
+    model = xml[xml.index('<model name="rotor">'):xml.index('</model>') + 8]
+    models = "".join(model.replace('name="rotor"', f'name="rotor{i}"')
+                     for i in range(1, 5))
+    path = tmp_path / "motor-joints.sdf"
+    path.write_text(xml.replace(model, models))
+    physics = GazeboPhysics(path, joints={f"j{i}": (f"rotor{i}", "shaft")
+                                          for i in range(1, 5)})
+    bus = CanBus()
+    host = CanHost(bus)
+    devices = tuple(M3508Device(bus, i, command_timeout_ns=timeout)
+                    for i, timeout in enumerate(timeouts, 1))
+    try:
+        plant = M3508JointPlant(physics, {device: f"j{i}" for i, device
+                                         in enumerate(devices, 1)}, gear_ratio=2)
+        coordinator = Coordinator({"can": CanParticipant(bus, [plant])})
+        return physics, bus, host, devices, plant, coordinator
+    except BaseException:
+        for device in devices:
+            device.close()
+        physics.close()
+        raise
+
+
+def observe_motor_advances(monkeypatch, physics):
+    calls = []
+    effort, step = physics.set_joint_effort, physics.step
+    def set_effort(name, value):
+        calls.append(("effort", name, value))
+        effort(name, value)
+    def advance(dt_ns):
+        calls.append(("step", dt_ns))
+        step(dt_ns)
+    monkeypatch.setattr(physics, "set_joint_effort", set_effort)
+    monkeypatch.setattr(physics, "step", advance)
+    return calls
+
+
+def test_actual_can_four_joint_gear_and_completed_feedback(native, tmp_path, monkeypatch):
+    physics, bus, host, devices, plant, coordinator = motor_rig(tmp_path)
+    calls = observe_motor_advances(monkeypatch, physics)
+    try:
+        # Native epoch remains zero even with a non-grid logical session origin.
+        coordinator.reset(Session(1, 7))
+        host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 2000 e000"),
+                           timestamp_ns=7))
+        result = coordinator.step(10_000_000)["can"]
+        assert calls == [("effort", "j1", .2), ("effort", "j2", -.2),
+                         ("effort", "j3", .4), ("effort", "j4", -.4),
+                         ("step", 10_000_000)]
+        # +/-5/10A, kt=.02, gear2, Izz=.02 -> +/-10/20rad/s².
+        # Continuous theta is bounded by one 1ms native integration tick.
+        for device, name, velocity, position in zip(devices,
+                ("j1", "j2", "j3", "j4"), (.1, -.1, .2, -.2),
+                (.0005, -.0005, .001, -.001)):
+            state = physics.get_joint_state(name)
+            assert state.velocity_rad_s == pytest.approx(velocity, abs=1e-10)
+            assert state.position_rad == pytest.approx(position, abs=abs(velocity) * .0011)
+            assert device.get_rotor_state() == pytest.approx(
+                (2 * state.position_rad, 2 * velocity), abs=1e-10)
+        # Independent C620 literals for completed native semi-implicit samples;
+        # no production encoder/rotor helper produces these expectations.
+        assert [(frame.can_id, frame.timestamp_ns, frame.data) for frame in host.frames] == [
+            (0x201, 10_000_007, bytes.fromhex("0001 0002 1000 19 00")),
+            (0x202, 10_000_007, bytes.fromhex("1ffe fffe f000 19 00")),
+            (0x203, 10_000_007, bytes.fromhex("0002 0004 2000 19 00")),
+            (0x204, 10_000_007, bytes.fromhex("1ffd fffc e000 19 00"))]
+        assert result.status == "ok" and result.reached_time_ns == 10_000_007
+        assert physics.time_ns == 10_000_000
+        assert plant.t_sim_ns == bus.t_sim_ns == coordinator.t_sim_ns == 10_000_007
+        coordinator.reset(Session(2, 17))
+        assert physics.time_ns == 0 and plant.t_sim_ns == 17
+        assert all(device.get_rotor_state() == (0, 0) for device in devices)
+        coordinator.step(1_000_000)
+        assert all(physics.get_joint_state(name) == JointState(0, 0)
+                   for name in ("j1", "j2", "j3", "j4"))
+    finally:
+        coordinator.close()
+    assert plant.closed and all(device.closed for device in devices)
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_joint_state("j1")
+
+
+def test_actual_shared_expiry_intervals_and_coasting(native, tmp_path, monkeypatch):
+    physics, _, host, devices, _, coordinator = motor_rig(tmp_path,
+        timeouts=(3_000_000, 7_000_000, 10_000_000, 3_000_000))
+    calls = observe_motor_advances(monkeypatch, physics)
+    try:
+        coordinator.reset(Session(1))
+        host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 2000 e000")))
+        coordinator.step(10_000_000)
+        assert calls == [
+            ("effort", "j1", .2), ("effort", "j2", -.2),
+            ("effort", "j3", .4), ("effort", "j4", -.4), ("step", 3_000_000),
+            ("effort", "j1", 0), ("effort", "j2", -.2),
+            ("effort", "j3", .4), ("effort", "j4", 0), ("step", 4_000_000),
+            ("effort", "j1", 0), ("effort", "j2", 0),
+            ("effort", "j3", .4), ("effort", "j4", 0), ("step", 3_000_000)]
+        assert [device.get_rotor_state()[1] for device in devices] == pytest.approx(
+            [.06, -.14, .4, -.12], abs=1e-10)
+        assert all(device.current_raw == 0 for device in devices)
+        assert physics.time_ns == 10_000_000
+        assert [frame.data for frame in host.frames] == [
+            bytes.fromhex("0000 0001 0000 19 00"), bytes.fromhex("1ffe ffff 0000 19 00"),
+            bytes.fromhex("0002 0004 0000 19 00"), bytes.fromhex("1ffe ffff 0000 19 00")]
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("dt_ns, timeout", [
+    (10_000_001, 100_000_000),  # unsupported whole dt
+    (10_000_000, 1_500_000),   # aligned total, unsupported interior expiry
+    (10_001_000_000, 100_000_000),  # whole operation exceeds native tick budget
+])
+def test_motor_step_preflight_rejects_before_any_control_or_native_advance(
+        native, tmp_path, monkeypatch, dt_ns, timeout):
+    physics, bus, host, devices, plant, coordinator = motor_rig(
+        tmp_path, timeouts=(timeout,) * 4)
+    calls = observe_motor_advances(monkeypatch, physics)
+    try:
+        coordinator.reset(Session(1, 7))
+        # An already-held valid command must survive failed plant preflight.
+        physics.set_joint_effort("j1", .4)
+        calls.clear()
+        host.emit(CanFrame(0x200, data=bytes.fromhex("1000 0000 0000 0000"),
+                           timestamp_ns=7))
+        with pytest.raises(ValueError, match="whole SDF ticks"):
+            coordinator.step(dt_ns)
+        assert calls == [] and physics.time_ns == 0 and bus.pending == 0
+        assert plant.failed and coordinator.failed
+        assert plant.t_sim_ns == coordinator.t_sim_ns == bus.t_sim_ns == 7
+        assert all(device.t_sim_ns == 7 and device.get_rotor_state() == (0, 0)
+                   for device in devices)
+        assert host.frames == []
+        with pytest.raises(RuntimeError, match="successful reset"):
+            coordinator.step(1_000_000)
+        # Independent backend remains usable: no failed transaction wrote torque.
+        physics.step(1_000_000)
+        assert physics.get_joint_state("j1").velocity_rad_s == pytest.approx(.02, abs=1e-10)
+        coordinator.reset(Session(2, 17))  # cancels all prepared plans and commands
+        calls.clear()
+        coordinator.step(1_000_000)
+        assert physics.time_ns == 1_000_000 and not plant.failed
+        assert all(device.get_rotor_state() == (0, 0) for device in devices)
+    finally:
+        coordinator.close()
+
+
+def test_maximum_motor_effort_admitted_before_ownership_transfer(native, tmp_path, monkeypatch):
+    path = tmp_path / "motor-limit.sdf"
+    path.write_text(rotor_sdf(effort="0.5"))
+    with GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")}) as physics:
+        device = M3508Device(CanBus())
+        calls = observe_motor_advances(monkeypatch, physics)
+        with pytest.raises(ValueError, match="out-of-limit"):
+            M3508JointPlant(physics, {device: "shaft"}, gear_ratio=2)  # +/- .8Nm
+        assert calls == [] and physics.time_ns == 0 and not device.closed
+        # A caller retains ownership after rejection; the inclusive full-scale
+        # +/-20A envelope at gear1 (.4Nm) is admitted without executing physics.
+        plant = M3508JointPlant(physics, {device: "shaft"}, gear_ratio=1)
+        assert calls == [] and physics.time_ns == 0
+        plant.close()
+        assert device.closed
