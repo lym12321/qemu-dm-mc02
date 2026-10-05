@@ -1,0 +1,94 @@
+"""Named SI joints over the optional Gazebo Sim 8.15 native Server adapter.
+
+Owns one synchronous server, with fixed native-ns SDF ticks and one exclusive
+torque owner per bound revolute joint. Getters return completed PostUpdate
+observations. No ROS, sensor, motor, CAN or QEMU clock policy lives here.
+"""
+
+from collections.abc import Mapping
+import math
+from pathlib import Path
+
+from .base import JointState
+
+
+class GazeboPhysics:
+    def __init__(self, path, *, joints: Mapping[str, tuple[str, str]]):
+        if not isinstance(path, (str, Path)) or not str(path) or "\0" in str(path):
+            raise ValueError("SDF path must be nonempty without NUL")
+        if not isinstance(joints, Mapping) or not joints:
+            raise ValueError("Gazebo requires nonempty joint bindings")
+        bindings = {}
+        for name, target in joints.items():
+            if not isinstance(target, tuple) or len(target) != 2:
+                raise ValueError("Gazebo joint binding requires (model, joint) names")
+            for value in (name, *target):
+                if (not isinstance(value, str) or not value or "\0" in value
+                        or "::" in value):
+                    raise ValueError("Gazebo names must be nonempty and unscoped without NUL")
+            bindings[name] = target
+        if len(set(bindings.values())) != len(bindings):
+            raise ValueError("each native joint must have one effort owner")
+        try:
+            import _dm_gazebo_native as native
+        except ImportError as exc:
+            raise ImportError("Gazebo requires the optional native adapter built for this "
+                              "Python ABI; see docs/USAGE.md") from exc
+        if native.gazebo_version != "8.15.0":
+            raise RuntimeError("Gazebo adapter requires gz-sim 8.15.0")
+        self._world = native.World(str(Path(path).resolve()), bindings)
+
+    @property
+    def timestep_ns(self) -> int:
+        return self._world.timestep_ns
+
+    @property
+    def time_ns(self) -> int:
+        """Native completed plant time; independent of transport/session epoch."""
+        return self._world.time_ns
+
+    @property
+    def time_s(self) -> float:
+        return self.time_ns / 1_000_000_000
+
+    def step(self, dt_ns: int) -> None:
+        if type(dt_ns) is not int or not 0 < dt_ns <= (1 << 63) - 1:
+            raise ValueError("Gazebo dt_ns must be a positive signed-64-bit integer")
+        self._world.step(dt_ns)
+
+    def reset(self) -> None:
+        """Complete native reset and paused state projection, without integration."""
+        self._world.reset()
+
+    def set_joint_effort(self, name: str, value: float) -> None:
+        if not isinstance(name, str):
+            raise ValueError("joint name must be a string")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError("joint effort must be finite")
+        try:
+            value = float(value)
+        except OverflowError as exc:
+            raise ValueError("joint effort must be finite") from exc
+        if not math.isfinite(value):
+            raise ValueError("joint effort must be finite")
+        self._world.set_joint_effort(name, value)
+
+    def get_joint_state(self, name: str) -> JointState:
+        if not isinstance(name, str):
+            raise ValueError("joint name must be a string")
+        return JointState(*self._world.get_joint_state(name))
+
+    def close(self) -> None:
+        """Stop and destroy the owned native Server; repeated close is harmless."""
+        self._world.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, kind, primary, traceback):
+        try:
+            self.close()
+        except BaseException as exc:
+            if primary is None:
+                raise
+            primary.add_note(f"Gazebo close failed: {exc}")

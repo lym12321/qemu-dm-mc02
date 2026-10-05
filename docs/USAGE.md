@@ -829,6 +829,56 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 `time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
 不建立 QEMU 时间屏障。四轮底盘、固件 IMU 闭环和物理标定仍需分别验证。
 
+### Gazebo 原生关节接口（可选）
+
+这个独立接口使用 Gazebo Harmonic `gz-sim8 8.15.0`，通过原生 Server
+读取完成的关节状态，验收使用默认 DART 求解器。当前 SDK profile 使用 ROS Jazzy 与 CPython 3.12；不要将模块
+放入默认 Python 3.11 环境。先安装匹配的 SDK、系统 C++ 编译器、Python 开发头文件
+和 pybind11 2.11.1，然后在仓库根目录运行标准构建：
+
+```bash
+source /opt/ros/jazzy/setup.bash
+UV_PROJECT_ENVIRONMENT=build/venv-gazebo uv sync --frozen --python /usr/bin/python3
+cmake -S sim/physics/gazebo_native -B build/gazebo-native \
+  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release
+cmake --build build/gazebo-native -j2
+ctest --test-dir build/gazebo-native --output-on-failure
+```
+
+使用新的构建目录，并避免 Conda 等环境的 Protobuf 覆盖系统 SDK 依赖。若本机 CMake
+仍搜索 `/opt/anaconda3`，可显式增加 `-DCMAKE_IGNORE_PREFIX_PATH=/opt/anaconda3`。
+专用 CTest 使用这个 Python 环境；缺少模块、依赖或测试失败会返回非零。默认 QEMU
+门使用原有环境，Gazebo SDK 门需要单独执行，不会将未执行的 Gazebo 测试记为通过。
+
+设置 `PYTHONPATH="$PWD/build/gazebo-native"` 后，在上述 Python 环境中调用：
+
+```python
+from sim.physics import GazeboPhysics
+
+with GazeboPhysics("models/gazebo_rotor.sdf",
+                   joints={"shaft": ("rotor", "shaft")}) as plant:
+    plant.set_joint_effort("shaft", 0.4)  # Nm
+    plant.step(100_000_000)               # 100 native 1 ms ticks
+    print(plant.time_ns, plant.get_joint_state("shaft"))  # ns, rad, rad/s
+    plant.reset()                       # completed native reset at time 0
+```
+
+首版接受一个 world、一个 physics profile、顶层动态 model 中的 revolute 关节，
+以及唯一的显式 Physics plugin。绑定和 SDF 准入先于 Server 创建；model/visual
+插件、nested model、actor 和 sensor 明确拒绝。关节需要显式有限的 effort limit
+（负值表示不限制）；非有限力矩或超过正 limit 的输入拒绝，并保留原命令。
+每个 native tick 写齐全部关节命令；getter 只读取完成状态。`timestep_ns` 沿用
+Gazebo 原生浮点秒到整数时间的截断，不能假定 SDF 十进制值精确可表示；`step`
+必须是实际步长的整数倍，每次 1–10000 ticks。初始化及 reset 不增加积分步。
+运行错误冻结推进和观测，成功 reset 后恢复；失败不回滚。并发操作明确拒绝。
+`close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
+
+这个转子是未标定的验证夹具。当前接口尚未接入 MCU、M3508、IMU、ROS 2、相机、
+LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。
+
+### MuJoCo 四轮底盘
+
 `models/four_wheel.xml` 是独立的四轮物理夹具，沿用官方 car 示例的圆柱轮与原生地面接触，
 绑定为 `wheel_fl → drive_fl`、`wheel_fr → drive_fr`、`wheel_rl → drive_rl`、
 `wheel_rr → drive_rr`；`chassis` 提供 body pose，IMU 配对仍为 `imu_gyro/imu_accel`。

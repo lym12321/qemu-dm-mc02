@@ -10,11 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 import math
 
-
-@dataclass(frozen=True)
-class JointState:
-    position_rad: float
-    velocity_rad_s: float
+from .base import JointState
 
 
 @dataclass(frozen=True)

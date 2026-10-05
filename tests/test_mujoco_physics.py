@@ -15,6 +15,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
 from sim.physics.mujoco import MujocoPhysics
+from sim.physics.base import JointState
+from sim.physics.mujoco import JointState as LegacyJointState
 
 
 def rotor_xml(*, site_pos="0 0 0", site_quat="1 0 0 0", ref=0,
@@ -42,6 +44,10 @@ def rotor(**kwargs):
     model = mujoco.MjModel.from_xml_string(rotor_xml(**kwargs))
     return MujocoPhysics(model, joints={"shaft": "drive"},
                          imus={"imu": ("gyro", "accel")})
+
+
+def test_shared_joint_state_preserves_existing_reexport():
+    assert JointState is LegacyJointState
 
 
 def test_positive_negative_drive_and_coast_have_independent_euler_solution():
