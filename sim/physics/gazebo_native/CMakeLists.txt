@@ -19,6 +19,10 @@ target_link_libraries(_dm_gazebo_native PRIVATE gz-sim8::gz-sim8
 
 include(CTest)
 option(DM_GAZEBO_RENDERING_TESTS "Test native headless Ogre2 camera and GPU lidar" OFF)
+option(DM_GAZEBO_ROS_TESTS "Test rendered messages through the official ROS bridge" OFF)
+if(DM_GAZEBO_ROS_TESTS AND NOT DM_GAZEBO_RENDERING_TESTS)
+    message(FATAL_ERROR "DM_GAZEBO_ROS_TESTS requires DM_GAZEBO_RENDERING_TESTS")
+endif()
 if(DM_GAZEBO_RENDERING_TESTS AND NOT BUILD_TESTING)
     message(FATAL_ERROR "DM_GAZEBO_RENDERING_TESTS requires BUILD_TESTING")
 endif()
@@ -40,5 +44,28 @@ if(BUILD_TESTING)
         add_test(NAME gazebo-native-rendering COMMAND gazebo-rendering-smoke
             "${CMAKE_CURRENT_SOURCE_DIR}/tests/rendering.sdf")
         set_tests_properties(gazebo-native-rendering PROPERTIES TIMEOUT 20)
+        if(DM_GAZEBO_ROS_TESTS)
+            find_package(ros_gz_bridge 1.0.24 EXACT REQUIRED)
+            find_package(rclcpp REQUIRED)
+            find_package(sensor_msgs REQUIRED)
+            find_program(DM_GAZEBO_BRIDGE_NODE bridge_node
+                HINTS "${ros_gz_bridge_DIR}/../../../lib/ros_gz_bridge" NO_DEFAULT_PATH)
+            if(NOT DM_GAZEBO_BRIDGE_NODE)
+                message(FATAL_ERROR "The official ros_gz_bridge bridge_node is required")
+            endif()
+            add_executable(gazebo-ros-rendering-smoke tests/rendering_smoke.cc)
+            target_compile_definitions(gazebo-ros-rendering-smoke PRIVATE DM_GAZEBO_WITH_ROS)
+            target_compile_features(gazebo-ros-rendering-smoke PRIVATE cxx_std_17)
+            target_compile_options(gazebo-ros-rendering-smoke PRIVATE -Wall -Wextra -Werror)
+            target_link_libraries(gazebo-ros-rendering-smoke PRIVATE gz-sim8::gz-sim8
+                gz-transport13::gz-transport13 gz-msgs10::gz-msgs10 rclcpp::rclcpp
+                sensor_msgs::sensor_msgs__rosidl_typesupport_cpp)
+            add_test(NAME gazebo-native-ros COMMAND "${Python3_EXECUTABLE}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/ros_smoke.py"
+                "${DM_GAZEBO_BRIDGE_NODE}" "$<TARGET_FILE:gazebo-ros-rendering-smoke>"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/rendering.sdf"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tests/ros_bridge.yaml")
+            set_tests_properties(gazebo-native-ros PROPERTIES TIMEOUT 30)
+        endif()
     endif()
 endif()

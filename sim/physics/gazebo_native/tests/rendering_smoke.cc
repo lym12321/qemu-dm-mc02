@@ -18,6 +18,10 @@
 #include <string>
 #include <unistd.h>
 
+#ifdef DM_GAZEBO_WITH_ROS
+#include "ros_observer.hh"
+#endif
+
 namespace
 {
 void require(bool condition, const char *message)
@@ -38,6 +42,9 @@ int64_t stamp(const gz::msgs::Header &header)
 // Keep only two observations per sensor. Callbacks never unwind transport.
 struct Observations
 {
+#ifdef DM_GAZEBO_WITH_ROS
+    RosObserver *ros = nullptr; // Borrowed; outlives native transport callbacks.
+#endif
     std::mutex mutex;
     std::condition_variable changed;
     std::array<int64_t, 2> images{}, scans{};
@@ -48,6 +55,10 @@ struct Observations
 
     void image(const gz::msgs::Image &msg)
     {
+#ifdef DM_GAZEBO_WITH_ROS
+        if (ros)
+            ros->native_image(msg);
+#endif
         std::lock_guard<std::mutex> lock(mutex);
         if (imageCount == images.size() || !error.empty())
             return;
@@ -78,6 +89,10 @@ struct Observations
 
     void scan(const gz::msgs::LaserScan &msg)
     {
+#ifdef DM_GAZEBO_WITH_ROS
+        if (ros)
+            ros->native_scan(msg);
+#endif
         std::lock_guard<std::mutex> lock(mutex);
         if (scanCount == scans.size() || !error.empty())
             return;
@@ -111,9 +126,15 @@ struct Observations
 
 int main(int argc, char **argv)
 {
+    bool withRos = false;
+#ifdef DM_GAZEBO_WITH_ROS
+    withRos = argc == 3 && std::string(argv[2]) == "--ros";
+    std::unique_ptr<RosObserver> ros; // Released after Node and Observations.
+#endif
     // Per-process discovery domain, also isolated from interactive Gazebo worlds.
     const auto partition = "dm-render-gate-" + std::to_string(getpid());
-    if (setenv("GZ_PARTITION", partition.c_str(), 1) != 0 || unsetenv("DISPLAY") != 0)
+    if ((!withRos && setenv("GZ_PARTITION", partition.c_str(), 1) != 0) ||
+            unsetenv("DISPLAY") != 0)
     {
         std::cerr << "FAIL: cannot configure isolated headless test environment\n";
         return 1;
@@ -124,8 +145,18 @@ int main(int argc, char **argv)
     int result = 1;
     try
     {
-        require(argc == 2, "usage: gazebo-rendering-smoke rendering.sdf");
+        require(argc == 2 || withRos, "usage: gazebo-rendering-smoke rendering.sdf [--ros]");
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
+#ifdef DM_GAZEBO_WITH_ROS
+        if (withRos)
+        {
+            require(getenv("GZ_PARTITION") && *getenv("GZ_PARTITION"),
+                    "ROS gate requires its owner's isolated GZ_PARTITION");
+            ros = std::make_unique<RosObserver>();
+            observations.ros = ros.get();
+            ros->wait_ready(deadline);
+        }
+#endif
         require(node.Subscribe("/dm_render/image", &Observations::image, &observations) &&
                 node.Subscribe("/dm_render/scan", &Observations::scan, &observations),
                 "native transport subscription failed");
@@ -135,14 +166,30 @@ int main(int argc, char **argv)
         server = std::make_unique<gz::sim::Server>(config);
         server->SetUpdatePeriod(std::chrono::milliseconds(1));
         require(server->Run(false, 1000, false), "native Server failed to start");
-        std::unique_lock<std::mutex> lock(observations.mutex);
-        const bool ready = observations.changed.wait_until(lock, deadline, [&] {
-            return !observations.error.empty() ||
-                (observations.imageCount == 2 && observations.scanCount == 2);
-        });
-        require(observations.error.empty(), observations.error.c_str());
-        require(ready && std::chrono::steady_clock::now() < deadline,
-                "timed out waiting for two real camera/lidar messages");
+#ifdef DM_GAZEBO_WITH_ROS
+        if (withRos)
+        {
+            bool complete = false;
+            do
+            {
+                complete = ros->pump(deadline);
+                std::lock_guard<std::mutex> lock(observations.mutex);
+                require(observations.error.empty(), observations.error.c_str());
+                complete = complete && observations.imageCount == 2 && observations.scanCount == 2;
+            } while (!complete);
+        }
+        else
+#endif
+        {
+            std::unique_lock<std::mutex> lock(observations.mutex);
+            const bool ready = observations.changed.wait_until(lock, deadline, [&] {
+                return !observations.error.empty() ||
+                    (observations.imageCount == 2 && observations.scanCount == 2);
+            });
+            require(observations.error.empty(), observations.error.c_str());
+            require(ready && std::chrono::steady_clock::now() < deadline,
+                    "timed out waiting for two real camera/lidar messages");
+        }
         result = 0;
     }
     catch (const std::exception &failure)
@@ -161,6 +208,19 @@ int main(int argc, char **argv)
         std::cerr << "FAIL: native transport unsubscribe failed\n";
         result = 1;
     }
+#ifdef DM_GAZEBO_WITH_ROS
+    if (ros)
+    {
+        try { ros->close(); }
+        catch (const std::exception &failure)
+        {
+            std::cerr << "FAIL: ROS cleanup: " << failure.what() << '\n';
+            result = 1;
+        }
+        ros->report(std::cout);
+        std::cout << '\n';
+    }
+#endif
     std::lock_guard<std::mutex> lock(observations.mutex);
     if (result != 0)
         std::cerr << "Observed images=" << observations.imageCount

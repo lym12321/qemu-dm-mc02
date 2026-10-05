@@ -937,6 +937,32 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering$' --output-on-
 这只是固定场景的原生消息验证；`GazeboPhysics` 尚不接相机、LiDAR 或任意 world，
 ROS 2 交付、资产加载和 MCU 时间同步仍需各自验证。
 
+要验证实际 ROS 2 消息交付，在同一构建目录额外启用 ROS 门；需要
+ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
+
+```bash
+cmake -S sim/physics/gazebo_native -B build/gazebo-native \
+  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
+  -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release \
+  -DDM_GAZEBO_RENDERING_TESTS=ON -DDM_GAZEBO_ROS_TESTS=ON
+cmake --build build/gazebo-native -j2
+ctest --test-dir build/gazebo-native -R '^gazebo-native-ros$' --output-on-failure
+```
+
+测试启动官方 `bridge_node`，用 `ros_bridge.yaml` 将原生 image/scan topic
+分别映射到 `/dm_render/ros_image`、`/dm_render/ros_scan`，单向桥接并设置
+明确的 frame ID。测试双方再用标准 topic remap 加入唯一运行前缀，隔离并发实例。
+等待实际 ROS publisher 匹配后启动场景；按原生时间戳
+配对两帧，比较完整 RGB 字节和全部扫描值。ROS 使用 SensorDataQoS、深度 5；
+测试每个方向最多保留 24 个样本，不保证无损交付。
+Gazebo 侧 subscriber 队列由 SDK 管理，配置中的 `subscriber_queue` 不建立
+该队列的容量保证。
+
+整个进程组合的执行期限为 20 秒，随后借用既有工具有界 TERM/KILL/reap，
+CTest 总超时为 30 秒。报告保留子进程退出码、输入哈希和清理错误；本机固定
+SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 API 正常析构。
+该门默认关闭，证明固定场景的真实 ROS 交付，不建立 ROS、渲染与 MCU 的全局时间屏障。
+
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
 当前接口尚未接入 MCU、ROS 2、相机、
 LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。

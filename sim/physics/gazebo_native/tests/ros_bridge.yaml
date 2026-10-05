@@ -1,0 +1,21 @@
+# Official ros_gz_bridge 1.0.24 configuration, test-only one-way remapping.
+- gz_topic_name: /dm_render/image
+  ros_topic_name: /dm_render/ros_image
+  gz_type_name: gz.msgs.Image
+  ros_type_name: sensor_msgs/msg/Image
+  direction: GZ_TO_ROS
+  lazy: false
+  qos_profile: SENSOR_DATA
+  subscriber_queue: 5
+  publisher_queue: 5
+  frame_id: fixture_camera
+- gz_topic_name: /dm_render/scan
+  ros_topic_name: /dm_render/ros_scan
+  gz_type_name: gz.msgs.LaserScan
+  ros_type_name: sensor_msgs/msg/LaserScan
+  direction: GZ_TO_ROS
+  lazy: false
+  qos_profile: SENSOR_DATA
+  subscriber_queue: 5
+  publisher_queue: 5
+  frame_id: fixture_lidar
