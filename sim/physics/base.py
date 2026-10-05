@@ -1,4 +1,4 @@
-"""Named SI joint boundary shared by native physics backends."""
+"""Named SI observations and the shared native joint execution boundary."""
 
 from dataclasses import dataclass
 from typing import Protocol
@@ -14,6 +14,12 @@ class JointState:
 class BodyPose:
     position_m: tuple[float, float, float]
     quaternion_wxyz: tuple[float, float, float, float]
+
+
+@dataclass(frozen=True)
+class ImuSample:
+    gyro_rad_s: tuple[float, float, float]
+    accel_m_s2: tuple[float, float, float]
 
 
 class JointPhysics(Protocol):

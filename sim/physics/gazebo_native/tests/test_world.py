@@ -14,11 +14,13 @@ import threading
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-from sim.physics import BodyPose, GazeboPhysics, JointState
+from sim.physics import BodyPose, GazeboPhysics, ImuSample, JointState
 from sim.physics.mujoco import BodyPose as LegacyBodyPose
+from sim.physics.mujoco import ImuSample as LegacyImuSample
 from sim.physics.mujoco import JointState as LegacyJointState
 from sim.core import Coordinator, Session
 from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.fabric.runtime import CanParticipant
 
@@ -45,6 +47,12 @@ def rotor_sdf(*, joint_type="revolute", step="0.001", effort="10",
     </world></sdf>"""
 
 
+def imu_sdf(*, pose="0 0 0 0 0 0", rate=0, imu_xml="<imu/>"):
+    return rotor_sdf().replace('<gravity>0 0 0</gravity>', '<gravity>0 0 -10</gravity>').replace(
+        '</inertial></link>', '</inertial><sensor name="imu" type="imu">'
+        f'<pose>{pose}</pose><update_rate>{rate}</update_rate>{imu_xml}</sensor></link>')
+
+
 @pytest.fixture
 def native():
     # This dedicated SDK gate requires the built extension. A missing or broken
@@ -63,6 +71,7 @@ def sdf_path(tmp_path):
 def test_joint_state_reexport_preserves_existing_type():
     assert JointState is LegacyJointState
     assert BodyPose is LegacyBodyPose
+    assert ImuSample is LegacyImuSample
     state = JointState(.1, .2)
     with pytest.raises(FrozenInstanceError):
         state.position_rad = 0
@@ -332,6 +341,8 @@ def test_native_gil_release_cannot_close_an_active_server(native, sdf_path):
             physics.validate_joint_effort("shaft", 0)
         with pytest.raises(RuntimeError, match="already in progress"):
             physics.get_body_pose("missing")
+        with pytest.raises(RuntimeError, match="already in progress"):
+            physics.get_imu("missing")
         worker.join(10)
         assert not worker.is_alive() and not errors
         assert physics.time_ns == 10_000_000_000
@@ -349,8 +360,13 @@ class CanHost(VirtualCanDevice):
         self.frames.append(frame)
 
 
-def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False):
+def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
+              observe_imus=False):
     xml = rotor_sdf()
+    if observe_imus:
+        xml = xml.replace('</inertial></link>',
+            '</inertial><sensor name="imu" type="imu"><update_rate>0</update_rate>'
+            '<imu/></sensor></link>')
     model = xml[xml.index('<model name="rotor">'):xml.index('</model>') + 8]
     models = "".join(model.replace('name="rotor"', f'name="rotor{i}"')
                      for i in range(1, 5))
@@ -359,7 +375,9 @@ def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False):
     physics = GazeboPhysics(path, joints={f"j{i}": (f"rotor{i}", "shaft")
                                           for i in range(1, 5)}, bodies=(
         {f"b{i}": (f"rotor{i}", "body") for i in range(1, 5)}
-        if observe_bodies else None))
+        if observe_bodies else None), imus=(
+        {f"i{i}": (f"rotor{i}", "body", "imu") for i in range(1, 5)}
+        if observe_imus else None))
     bus = CanBus()
     host = CanHost(bus)
     devices = tuple(M3508Device(bus, i, command_timeout_ns=timeout)
@@ -635,5 +653,158 @@ def test_shared_motor_consumer_reads_completed_body_pose(native, tmp_path):
         coordinator.reset(Session(2, 7))
         assert physics.time_ns == 0
         assert physics.get_body_pose("b1") == BodyPose((0, 0, 0), (1, 0, 0, 0))
+    finally:
+        coordinator.close()
+
+
+def test_native_imu_generates_stationary_and_rotated_proper_acceleration(native, tmp_path):
+    for pitch, expected in ((0, (0, 0, 10)), (math.pi/2, (-10, 0, 0))):
+        path = tmp_path / "stationary-imu.sdf"
+        path.write_text(imu_sdf(pose=f"0 0 0 0 {pitch} 0"))
+        world = native.World(str(path), {}, {}, {"imu": ("rotor", "body", "imu")})
+        try:
+            assert world.time_ns == 0
+            assert world.get_imu("imu") == pytest.approx((0, 0, 0, *expected), abs=1e-12)
+            world.step(2_000_000)
+            # Every native tick reseeds coordinate acceleration. Gravity must
+            # not accumulate in the native sensor's in-place generated fields.
+            assert world.get_imu("imu") == pytest.approx((0, 0, 0, *expected), abs=1e-12)
+            before = world.get_imu("imu")
+            assert world.get_imu("imu") == before and world.time_ns == 2_000_000
+            world.reset()
+            assert world.time_ns == 0
+            assert world.get_imu("imu") == pytest.approx((0, 0, 0, *expected), abs=1e-12)
+        finally:
+            world.close()
+
+
+def test_native_imu_free_fall_is_zero_proper_acceleration(native, tmp_path):
+    xml = imu_sdf()
+    joint = xml[xml.index('<joint name="shaft"'):xml.index('</joint>') + 8]
+    path = tmp_path / "free-fall-imu.sdf"
+    path.write_text(xml.replace(joint, ''))
+    world = native.World(str(path), {}, {}, {"imu": ("rotor", "body", "imu")})
+    try:
+        world.step(10_000_000)
+        assert world.time_ns == 10_000_000
+        # Physical free fall: a=g, so accelerometer specific force is zero.
+        assert world.get_imu("imu") == pytest.approx((0,)*6, abs=1e-12)
+    finally:
+        world.close()
+
+
+def test_native_imu_torque_and_offset_use_completed_sensor_frame(native, tmp_path):
+    path = tmp_path / "offset-imu.sdf"
+    path.write_text(imu_sdf(pose=f".25 0 0 {math.pi/2} 0 0"))
+    world = native.World(str(path), {"shaft": ("rotor", "shaft")}, {},
+                         {"imu": ("rotor", "body", "imu")})
+    try:
+        world.set_joint_effort("shaft", .4)
+        world.step(100_000_000)
+        # alpha=tau/Izz=20, omega=2rad/s. At radius .25m, local x centripetal
+        # acceleration=-1 and y tangential=5. Sensor roll pi/2 maps gyro z->y
+        # and proper body (x,y,z)->sensor (x,z,-y), including support +10z.
+        assert world.get_imu("imu") == pytest.approx((0, 2, 0, -1, 10, -5), abs=.01)
+        path.unlink()  # reset must use the admitted DOM, not reread the file
+        world.reset()
+        assert world.time_ns == 0
+        assert world.get_joint_state("shaft") == (0, 0)
+        assert world.get_imu("imu") == pytest.approx((0, 0, 0, 0, 10, 0), abs=1e-12)
+        world.step(1_000_000)
+        assert world.get_imu("imu") == pytest.approx((0, 0, 0, 0, 10, 0), abs=1e-12)
+    finally:
+        world.close()
+
+
+def test_native_imu_missing_engine_never_accepts_default_components(native, tmp_path):
+    path = tmp_path / "missing-engine-imu.sdf"
+    path.write_text(imu_sdf().replace('name="gz::sim::systems::Physics"/>',
+        'name="gz::sim::systems::Physics"><engine>'
+        '<filename>dm-test-missing-physics-engine</filename></engine></plugin>'))
+    with pytest.raises(RuntimeError, match="completed IMU kinematics unavailable"):
+        native.World(str(path), {}, {}, {"imu": ("rotor", "body", "imu")})
+    path.write_text(imu_sdf())
+    world = native.World(str(path), {}, {}, {"imu": ("rotor", "body", "imu")})
+    try:
+        assert world.get_imu("imu") == pytest.approx((0, 0, 0, 0, 0, 10), abs=1e-12)
+    finally:
+        world.close()
+
+
+def test_native_imu_admission_precedes_engine_creation(native, tmp_path):
+    path = tmp_path / "imu-admission.sdf"
+    xml = imu_sdf().replace('name="gz::sim::systems::Physics"/>',
+        'name="gz::sim::systems::Physics"><engine>'
+        '<filename>dm-test-missing-physics-engine</filename></engine></plugin>')
+    path.write_text(xml)
+    for bindings, message in (({"i": ("rotor", "body", "missing")}, "link IMU"),
+            ({"i": ("missing", "body", "imu")}, "link IMU"),
+            ({"a": ("rotor", "body", "imu"), "b": ("rotor", "body", "imu")}, "duplicate")):
+        with pytest.raises(ValueError, match=message):
+            native.World(str(path), {}, {}, bindings)
+    with pytest.raises(ValueError, match="explicit IMU bindings"):
+        native.World(str(path), {"s": ("rotor", "shaft")})
+    for invalid, message in ((xml.replace('<update_rate>0', '<update_rate>100'), "rate zero"),
+            (xml.replace('<imu/>', '<imu><angular_velocity><x><noise type="gaussian">'
+                         '<stddev>.1</stddev></noise></x></angular_velocity></imu>'), "noise"),
+            (xml.replace('<static>false', '<static>true'), "dynamic IMU")):
+        path.write_text(invalid)
+        with pytest.raises(ValueError, match=message):
+            native.World(str(path), {}, {}, {"i": ("rotor", "body", "imu")})
+
+
+def test_python_imu_only_observation_and_binding_admission(native, tmp_path, monkeypatch):
+    path = tmp_path / "python-imu.sdf"
+    path.write_text(imu_sdf())
+    with GazeboPhysics(path, imus={"imu": ("rotor", "body", "imu")}) as physics:
+        initial = physics.get_imu("imu")
+        assert initial == ImuSample((0, 0, 0), (0, 0, 10)) and physics.time_ns == 0
+        with pytest.raises(FrozenInstanceError):
+            initial.accel_m_s2 = (1, 0, 0)
+        physics.step(2_000_000)
+        assert physics.get_imu("imu") == initial and physics.time_ns == 2_000_000
+        with pytest.raises(ValueError, match="unbound IMU"):
+            physics.get_imu("missing")
+        with pytest.raises(ValueError, match="string"):
+            physics.get_imu(None)
+        physics.reset()
+        assert physics.time_ns == 0 and physics.get_imu("imu") == initial
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_imu("imu")
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.reset()
+    calls = []
+    def acquire(*args):
+        calls.append(args)
+        raise AssertionError("invalid IMU binding reached native acquisition")
+    monkeypatch.setattr(native, "World", acquire)
+    for bindings in ([], {"i": ("rotor", "body")}, {"i": ("rotor", "body", "")},
+                     {"i": ("rotor", "body", "imu\0")},
+                     {"i": ("rotor", "body", "imu"), "j": ("rotor", "body", "imu")}):
+        with pytest.raises(ValueError):
+            GazeboPhysics("unused.sdf", imus=bindings)
+    assert calls == []
+
+
+def test_shared_motor_consumer_reads_generated_imu_and_existing_bmi_units(native, tmp_path):
+    physics, _, host, _, _, coordinator = motor_rig(tmp_path, observe_imus=True)
+    try:
+        coordinator.reset(Session(1))
+        host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000")))
+        coordinator.step(100_000_000)
+        # 5A*.02*gear2/Izz.02=10rad/s² -> omega +/-1 at100ms. Sensor at joint
+        # origin has no translation and this fixture's declared gravity is0.
+        for name, velocity in (("i1", 1), ("i2", -1), ("i3", 0), ("i4", 0)):
+            sample = physics.get_imu(name)
+            assert sample.gyro_rad_s == pytest.approx((0, 0, velocity), abs=1e-12)
+            assert sample.accel_m_s2 == pytest.approx((0, 0, 0), abs=1e-12)
+            gyro, accel = imu_to_bmi088_units(sample)
+            assert gyro == pytest.approx((0, 0, velocity*57.29577951308232), abs=1e-10)
+            assert accel == pytest.approx((0, 0, 0), abs=1e-12)
+            assert physics.get_imu(name) == sample
+        assert physics.time_ns == coordinator.t_sim_ns == 100_000_000
+        coordinator.reset(Session(2, 7))
+        assert physics.time_ns == 0
+        assert physics.get_imu("i1") == ImuSample((0, 0, 0), (0, 0, 0))
     finally:
         coordinator.close()

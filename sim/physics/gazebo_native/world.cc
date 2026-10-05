@@ -11,6 +11,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -25,13 +26,20 @@
 #include <gz/sim/World.hh>
 #include <gz/sim/Util.hh>
 #include <gz/sim/config.hh>
+#include <gz/sim/components/AngularVelocity.hh>
+#include <gz/sim/components/Imu.hh>
+#include <gz/sim/components/LinearAcceleration.hh>
 #include <gz/sim/components/Pose.hh>
+#include <gz/sensors/ImuSensor.hh>
+#include <gz/sensors/SensorFactory.hh>
 #include <sdf/Joint.hh>
 #include <sdf/JointAxis.hh>
 #include <sdf/Link.hh>
 #include <sdf/Model.hh>
 #include <sdf/Physics.hh>
 #include <sdf/Root.hh>
+#include <sdf/Imu.hh>
+#include <sdf/Sensor.hh>
 #include <sdf/World.hh>
 #include <sdf/Visual.hh>
 
@@ -40,8 +48,36 @@ using Bindings = std::map<std::string, std::pair<std::string, std::string>>;
 using Samples = std::map<std::string, std::pair<double, double>>;
 using BodySample = std::array<double, 7>;
 using BodySamples = std::map<std::string, BodySample>;
+using ImuTarget = std::tuple<std::string, std::string, std::string>;
+using ImuBindings = std::map<std::string, ImuTarget>;
+using ImuSample = std::array<double, 6>;
+using ImuSamples = std::map<std::string, ImuSample>;
 
 namespace {
+bool Finite(const gz::math::Vector3d &value)
+{
+    return std::isfinite(value.X()) && std::isfinite(value.Y()) &&
+           std::isfinite(value.Z());
+}
+
+bool Finite(const gz::math::Pose3d &value)
+{
+    const auto &q = value.Rot();
+    return Finite(value.Pos()) && std::isfinite(q.W()) && std::isfinite(q.X()) &&
+           std::isfinite(q.Y()) && std::isfinite(q.Z());
+}
+
+struct BoundImu {
+    sim::Entity entity;
+    std::unique_ptr<gz::sensors::ImuSensor> sensor;
+};
+
+struct ImuInput {
+    gz::math::Pose3d pose;
+    gz::math::Vector3d gyro;
+    gz::math::Vector3d accel;
+};
+
 class Guard final {
 public:
     explicit Guard(std::atomic_flag &busy) : busy(busy)
@@ -66,11 +102,11 @@ void Name(const std::string &value)
 class Observation final : public sim::System,
                           public sim::ISystemConfigure,
                           public sim::ISystemPreUpdate,
-                          public sim::ISystemPostUpdate,
-                          public sim::ISystemReset {
+                          public sim::ISystemPostUpdate {
 public:
-    Observation(Bindings bindings, Bindings bodyBindings)
-        : bindings(std::move(bindings)), bodyBindings(std::move(bodyBindings))
+    Observation(const Bindings &bindings, const Bindings &bodyBindings,
+                const ImuBindings &imuBindings)
+        : bindings(bindings), bodyBindings(bodyBindings), imuBindings(imuBindings)
     {
         for (const auto &[name, unused] : this->bindings) {
             (void)unused;
@@ -88,6 +124,7 @@ public:
     {
         std::map<std::string, sim::Joint> found;
         std::map<std::string, sim::Link> foundBodies;
+        std::map<std::string, sim::Entity> foundImus;
         sim::World world(sim::worldEntity(ecm));
         for (const auto &[name, target] : bindings) {
             sim::Model model(world.ModelByName(ecm, target.first));
@@ -107,6 +144,22 @@ public:
             }
             foundBodies.emplace(name, link);
         }
+        for (const auto &[name, target] : imuBindings) {
+            const auto &[modelName, linkName, sensorName] = target;
+            sim::Model model(world.ModelByName(ecm, modelName));
+            sim::Link link(model.LinkByName(ecm, linkName));
+            const auto entity = link.SensorByName(ecm, sensorName);
+            if (!ecm.Component<sim::components::Imu>(entity)) {
+                error = "native IMU binding unavailable: " + name;
+                return;
+            }
+            foundImus.emplace(name, entity);
+        }
+        const auto gravity = world.Gravity(ecm);
+        if (!foundImus.empty() && (!gravity || !Finite(*gravity))) {
+            error = "native IMU gravity unavailable";
+            return;
+        }
         // Validate every binding before creating observable ECM components.
         joints = std::move(found);
         bodies = std::move(foundBodies);
@@ -123,6 +176,31 @@ public:
             unobserved.Pos().X(std::numeric_limits<double>::quiet_NaN());
             sim::enableComponent<sim::components::WorldPose>(
                 ecm, link.Entity(), true, sim::components::WorldPose(unobserved));
+        }
+        gz::sensors::SensorFactory factory;
+        for (const auto &[name, entity] : foundImus) {
+            auto data = ecm.Component<sim::components::Imu>(entity)->Data();
+            data.SetName(sim::scopedName(entity, ecm, "::", false));
+            if (data.Topic().empty()) {
+                data.SetTopic(sim::scopedName(entity, ecm) + "/imu");
+            }
+            auto sensor = factory.CreateSensor<gz::sensors::ImuSensor>(data);
+            if (!sensor) {
+                error = "native IMU creation failed: " + name;
+                return;
+            }
+            sensor->SetGravity(*gravity);
+            imus.emplace(name, BoundImu{entity, std::move(sensor)});
+            // SdfEntityCreator creates default-zero sensor observations. Mark
+            // output-only components unavailable until Physics writes them.
+            const double nan = std::numeric_limits<double>::quiet_NaN();
+            gz::math::Pose3d unobserved;
+            unobserved.Pos().X(nan);
+            ecm.SetComponentData<sim::components::WorldPose>(entity, unobserved);
+            ecm.SetComponentData<sim::components::AngularVelocity>(
+                entity, gz::math::Vector3d(nan, nan, nan));
+            ecm.SetComponentData<sim::components::LinearAcceleration>(
+                entity, gz::math::Vector3d(nan, nan, nan));
         }
     }
 
@@ -141,11 +219,27 @@ public:
     void PostUpdate(const sim::UpdateInfo &info,
                     const sim::EntityComponentManager &ecm) override
     {
+        // Native sensor generation runs on Gazebo's PostUpdate worker. Report
+        // errors to the synchronous owner rather than unwinding that thread.
+        try {
+            Observe(info, ecm);
+        } catch (const std::exception &exc) {
+            error = std::string("native observation failed: ") + exc.what();
+        } catch (...) {
+            error = "native observation failed with unknown exception";
+        }
+    }
+
+    void Observe(const sim::UpdateInfo &info,
+                 const sim::EntityComponentManager &ecm)
+    {
         if (!error.empty()) {
             return;
         }
         Samples completed;
         BodySamples completedBodies;
+        std::map<std::string, ImuInput> imuInputs;
+        ImuSamples completedImus;
         for (const auto &[name, joint] : joints) {
             const auto position = joint.Position(ecm);
             const auto velocity = joint.Velocity(ecm);
@@ -176,47 +270,70 @@ public:
             }
             completedBodies.emplace(name, value);
         }
+        // Admit all completed native kinematics before generating any sample.
+        for (const auto &[name, binding] : imus) {
+            const auto pose = ecm.Component<sim::components::WorldPose>(binding.entity);
+            const auto gyro = ecm.Component<sim::components::AngularVelocity>(binding.entity);
+            const auto accel = ecm.Component<sim::components::LinearAcceleration>(binding.entity);
+            if (!pose || !gyro || !accel || !Finite(pose->Data()) ||
+                !Finite(gyro->Data()) || !Finite(accel->Data())) {
+                error = "native completed IMU kinematics unavailable: " + name;
+                return;
+            }
+            imuInputs.emplace(name, ImuInput{pose->Data(), gyro->Data(), accel->Data()});
+        }
+        for (auto &[name, binding] : imus) {
+            const auto &input = imuInputs.at(name);
+            auto &sensor = *binding.sensor;
+            // gz-sensors8 9348f9fe ImuSensor.cc:232-339 generates in-place,
+            // including native gravity. Reseed all raw inputs for every update.
+            sensor.SetWorldPose(input.pose);
+            sensor.SetAngularVelocity(input.gyro);
+            sensor.SetLinearAcceleration(input.accel);
+            if (!sensor.Update(info.simTime, true)) {
+                error = "native IMU generation failed: " + name;
+                return;
+            }
+            const auto gyro = sensor.AngularVelocity();
+            const auto accel = sensor.LinearAcceleration();
+            if (!Finite(gyro) || !Finite(accel)) {
+                error = "native generated IMU nonfinite: " + name;
+                return;
+            }
+            completedImus.emplace(name, ImuSample{
+                gyro.X(), gyro.Y(), gyro.Z(), accel.X(), accel.Y(), accel.Z()});
+        }
         samples = std::move(completed);
         bodySamples = std::move(completedBodies);
+        imuSamples = std::move(completedImus);
         timeNs = std::chrono::duration_cast<std::chrono::nanoseconds>(info.simTime).count();
         ++observations;
     }
 
-    void Reset(const sim::UpdateInfo &, sim::EntityComponentManager &ecm) override
-    {
-        error.clear();
-        samples.clear();
-        bodySamples.clear();
-        for (auto &[name, value] : efforts) {
-            (void)name;
-            value = 0;
-        }
-        // Native initial ECM predates our Configure-created components.
-        Bind(ecm);
-        ++resets;
-    }
-
-    Bindings bindings;
-    Bindings bodyBindings;
+    const Bindings &bindings;
+    const Bindings &bodyBindings;
+    const ImuBindings &imuBindings;
     std::map<std::string, sim::Joint> joints;
     std::map<std::string, sim::Link> bodies;
+    std::map<std::string, BoundImu> imus;
     std::map<std::string, double> efforts;
     Samples samples;
     BodySamples bodySamples;
+    ImuSamples imuSamples;
     std::string error;
     int64_t timeNs = 0;
     uint64_t observations = 0;
-    uint64_t resets = 0;
 };
 
 class NativeWorld final {
 public:
     NativeWorld(const std::string &path, const Bindings &bindings,
-                const Bindings &bodyBindings)
+                const Bindings &bodyBindings, const ImuBindings &imuBindings)
+        : jointBindings(bindings), bodyBindings(bodyBindings), imuBindings(imuBindings)
     {
         if (path.empty() || path.find('\0') != std::string::npos ||
-            (bindings.empty() && bodyBindings.empty())) {
-            throw std::invalid_argument("SDF path and joint/body bindings must be nonempty");
+            (bindings.empty() && bodyBindings.empty() && imuBindings.empty())) {
+            throw std::invalid_argument("SDF path and joint/body/IMU bindings must be nonempty");
         }
         sdf::Root root;
         const auto errors = root.Load(path);
@@ -252,6 +369,10 @@ public:
             plugins.front().Name() != "gz::sim::systems::Physics") {
             throw std::invalid_argument("world requires only explicit gz-sim-physics-system");
         }
+        if (!imuBindings.empty() && !Finite(world->Gravity())) {
+            throw std::invalid_argument("IMU world gravity must be finite");
+        }
+        std::set<ImuTarget> availableImus;
         for (uint64_t i = 0; i < world->ModelCount(); ++i) {
             const auto *model = world->ModelByIndex(i);
             if (!model->Plugins().empty() || model->ModelCount()) {
@@ -264,8 +385,23 @@ public:
             }
             for (uint64_t j = 0; j < model->LinkCount(); ++j) {
                 const auto *link = model->LinkByIndex(j);
-                if (link->SensorCount()) {
-                    throw std::invalid_argument("link sensors are unsupported");
+                for (uint64_t k = 0; k < link->SensorCount(); ++k) {
+                    const auto *sensor = link->SensorByIndex(k);
+                    const auto *imu = sensor->ImuSensor();
+                    if (model->Static() || sensor->Type() != sdf::SensorType::IMU ||
+                        !imu || !sensor->Plugins().empty() || sensor->EnableMetrics() ||
+                        !std::isfinite(sensor->UpdateRate()) || sensor->UpdateRate() != 0) {
+                        throw std::invalid_argument("link sensors require bound dynamic IMU, rate zero, no plugins/metrics");
+                    }
+                    for (const auto *noise : {&imu->LinearAccelerationXNoise(),
+                            &imu->LinearAccelerationYNoise(), &imu->LinearAccelerationZNoise(),
+                            &imu->AngularVelocityXNoise(), &imu->AngularVelocityYNoise(),
+                            &imu->AngularVelocityZNoise()}) {
+                        if (noise->Type() != sdf::NoiseType::NONE) {
+                            throw std::invalid_argument("IMU noise is unsupported in this profile");
+                        }
+                    }
+                    availableImus.emplace(model->Name(), link->Name(), sensor->Name());
                 }
                 for (uint64_t k = 0; k < link->VisualCount(); ++k) {
                     if (!link->VisualByIndex(k)->Plugins().empty()) {
@@ -273,6 +409,22 @@ public:
                     }
                 }
             }
+        }
+        std::set<ImuTarget> uniqueImus;
+        for (const auto &[name, target] : imuBindings) {
+            Name(name);
+            Name(std::get<0>(target));
+            Name(std::get<1>(target));
+            Name(std::get<2>(target));
+            if (!availableImus.count(target)) {
+                throw std::invalid_argument("requires a dynamic model link IMU: " + name);
+            }
+            if (!uniqueImus.insert(target).second) {
+                throw std::invalid_argument("duplicate native IMU binding");
+            }
+        }
+        if (uniqueImus != availableImus) {
+            throw std::invalid_argument("all link sensors require explicit IMU bindings");
         }
         std::set<std::pair<std::string, std::string>> unique;
         for (const auto &[name, target] : bindings) {
@@ -308,11 +460,15 @@ public:
             }
         }
         // All SDF/binding admission precedes Server services and callbacks.
-        sim::ServerConfig config;
         config.SetSdfRoot(root);
-        server = std::make_unique<sim::Server>(config);
-        observer = std::make_shared<Observation>(bindings, bodyBindings);
+        Initialize();
+    }
+
+    void Initialize()
+    {
         try {
+            server = std::make_unique<sim::Server>(config);
+            observer = std::make_shared<Observation>(jointBindings, bodyBindings, imuBindings);
             server->SetUpdatePeriod(std::chrono::steady_clock::duration::zero());
             if (server->AddSystem(observer) != true) {
                 throw std::runtime_error("Gazebo observer admission failed");
@@ -334,6 +490,7 @@ public:
     void Close()
     {
         Guard guard(busy);
+        closed = true;
         Cleanup();
     }
 
@@ -349,10 +506,10 @@ public:
 
     void Live() const
     {
-        if (!server) {
+        if (closed) {
             throw std::runtime_error("Gazebo physics is closed");
         }
-        if (failed) {
+        if (failed || !server) {
             throw std::runtime_error("Gazebo physics failed; reset required");
         }
     }
@@ -467,44 +624,45 @@ public:
         return sample->second;
     }
 
+    ImuSample Imu(const std::string &name) const
+    {
+        Guard guard(busy);
+        Live();
+        const auto sample = observer->imuSamples.find(name);
+        if (sample == observer->imuSamples.end()) {
+            throw std::invalid_argument("unbound IMU: " + name);
+        }
+        return sample->second;
+    }
+
     int64_t TimeNs() const { Guard guard(busy); Live(); return observer->timeNs; }
     int64_t TickNs() const { Guard guard(busy); Live(); return tickNs; }
 
     void Reset()
     {
         Guard guard(busy);
-        if (!server) {
+        if (closed) {
             throw std::runtime_error("Gazebo physics is closed");
         }
-        failed = true;
-        const auto resetCount = observer->resets;
-        if (server->Reset(0) != true) {
-            throw std::runtime_error("Gazebo reset request rejected");
-        }
-        // Native request processing, ECM/ISystemReset, then completed state.
-        // The reset iteration does not execute PostUpdate; don't invent one.
-        for (int i = 0; i < 3; ++i) {
-            if (!server->RunOnce(true)) {
-                throw std::runtime_error("Gazebo paused reset update failed");
-            }
-        }
-        // The first paused update can still observe a failed old state. Only
-        // adjudicate after native ISystemReset and fresh PostUpdate projection.
-        CheckError();
-        if (observer->resets != resetCount + 1 || observer->timeNs != 0 ||
-            observer->samples.size() != effortLimits.size() ||
-            observer->bodySamples.size() != observer->bodyBindings.size()) {
-            throw std::runtime_error("Gazebo reset did not complete at native time zero");
-        }
-        failed = false;
+        // gz-sim8 Physics::ResetPhysics resets q/qd, but not acceleration or
+        // engine caches. Recreate the complete native producer from the same
+        // admitted SDF snapshot; never zero sensor outputs or integrate warmup.
+        Cleanup();
+        Initialize();
     }
 
 private:
+    sim::ServerConfig config;
+    // Sole immutable input owner; observers borrow it across native lifetime.
+    Bindings jointBindings;
+    Bindings bodyBindings;
+    ImuBindings imuBindings;
     std::unique_ptr<sim::Server> server;
     std::shared_ptr<Observation> observer;
     std::map<std::string, double> effortLimits;
     int64_t tickNs = 0;
     bool failed = true;
+    bool closed = false;
     // Gazebo releases the Python GIL around its parallel PostUpdate barrier.
     // Reject concurrent/reentrant calls before accessing any owned state.
     mutable std::atomic_flag busy = ATOMIC_FLAG_INIT;
@@ -515,9 +673,11 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
 {
     module.attr("gazebo_version") = GZ_SIM_VERSION_FULL;
     pybind11::class_<NativeWorld>(module, "World")
-        .def(pybind11::init<const std::string &, const Bindings &, const Bindings &>(),
+        .def(pybind11::init<const std::string &, const Bindings &, const Bindings &,
+                           const ImuBindings &>(),
              pybind11::arg("path"), pybind11::arg("joints"),
-             pybind11::arg("bodies") = Bindings{})
+             pybind11::arg("bodies") = Bindings{},
+             pybind11::arg("imus") = ImuBindings{})
         .def("step", &NativeWorld::Step)
         .def("validate_step", &NativeWorld::ValidateStep)
         .def("validate_steps", &NativeWorld::ValidateSteps)
@@ -527,6 +687,7 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
         .def("validate_joint_effort", &NativeWorld::ValidateEffort)
         .def("get_joint_state", &NativeWorld::JointState)
         .def("get_body_pose", &NativeWorld::BodyPose)
+        .def("get_imu", &NativeWorld::Imu)
         .def_property_readonly("time_ns", &NativeWorld::TimeNs)
         .def_property_readonly("timestep_ns", &NativeWorld::TickNs);
 }

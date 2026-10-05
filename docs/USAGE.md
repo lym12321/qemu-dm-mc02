@@ -837,7 +837,7 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 这个独立接口使用 Gazebo Harmonic `gz-sim8 8.15.0`，通过原生 Server
 读取完成的关节状态，验收使用默认 DART 求解器。当前 SDK profile 使用 ROS Jazzy 与 CPython 3.12；不要将模块
 放入默认 Python 3.11 环境。先安装匹配的 SDK、系统 C++ 编译器、Python 开发头文件
-和 pybind11 2.11.1，然后在仓库根目录运行标准构建：
+和 pybind11 2.11.1、gz-sensors 8.2.2 IMU 组件，然后在仓库根目录运行标准构建：
 
 ```bash
 source /opt/ros/jazzy/setup.bash
@@ -871,14 +871,14 @@ with GazeboPhysics("models/gazebo_rotor.sdf",
 
 首版接受一个 world、一个 physics profile、顶层动态 model 中的 revolute 关节，
 以及唯一的显式 Physics plugin。绑定和 SDF 准入先于 Server 创建；model/visual
-插件、nested model、actor 和 sensor 明确拒绝。关节需要显式有限的 effort limit
+插件、nested model、actor 和未支持的 sensor 明确拒绝。关节需要显式有限的 effort limit
 （负值表示不限制）；非有限力矩或超过正 limit 的输入拒绝，并保留原命令。
 每个 native tick 写齐全部关节命令；getter 只读取完成状态。`timestep_ns` 沿用
 Gazebo 原生浮点秒到整数时间的截断，不能假定 SDF 十进制值精确可表示；`step`
 必须是实际步长的整数倍，每次 1–10000 ticks。初始化及 reset 不增加积分步。
 `bodies` 绑定逻辑名称到 `(model, link)`，`get_body_pose` 返回完成状态的
 `BodyPose(position_m, quaternion_wxyz)`；位姿由原生 Physics 更新，getter 不推进时间。
-可只配置 bodies，至少需要一个 joint 或 body 绑定。当前 body 观察只接顶层动态
+可只配置 bodies，至少需要一个 joint、body 或 IMU 绑定。当前 body 观察只接顶层动态
 model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的观察不返回默认零位姿。
 运行错误冻结推进和观测，成功 reset 后恢复；失败不回滚。并发操作明确拒绝。
 `close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
@@ -886,8 +886,38 @@ model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的
 当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
 `validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
 
+IMU 使用原生 gz-sensors 的同步生成和公开 getter，配置为
+`imus={逻辑名称: (model, link, sensor)}`：
+
+```python
+from sim.physics import GazeboPhysics
+
+with GazeboPhysics("models/gazebo_imu_rotor.sdf",
+                   joints={"shaft": ("rotor", "shaft")},
+                   imus={"imu": ("rotor", "body", "imu")}) as plant:
+    print(plant.get_imu("imu"))  # time 0: gyro (0,0,0), proper accel (0,0,9.80665)
+    plant.set_joint_effort("shaft", 0.4)
+    plant.step(100_000_000)
+    print(plant.get_imu("imu"))  # sensor-local rad/s and proper acceleration m/s²
+    plant.reset()
+    print(plant.time_ns, plant.get_imu("imu"))  # fresh native time 0, torque cleared
+```
+
+首版所有 link sensor 都须显式绑定，且为动态 model 的 IMU；只接受
+`update_rate=0`、无噪声、无 sensor 插件或 metrics 的配置。每个完成的 native tick
+由 Physics 提供 sensor frame 的运动数据，再由原生 ImuSensor 处理重力并生成样本。
+初始化和 reset 同样生成 time 0 快照，getter 只读已完成样本；这不等同于标准
+Imu plugin 的 paused 行为或任意 ODR 调度。原生 sensor 仍拥有 publication/service，
+此接口只证明本地样本生成，不保证 Gazebo transport 或 ROS 消息交付。
+多 world 的同名 topic 隔离尚未验证。
+
+`reset()` 销毁旧 Server、observer 和 sensor，再从首次准入的 SDF 快照重建完整
+原生 producer；不重新读取文件，不增加积分步，避免沿用原生 in-place reset 后
+残留的加速度。重建失败会释放部分资源并保持 failed，可再次 reset；
+显式 close 后永久拒绝操作。reset 重建延迟未作性能承诺。
+
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
-当前接口尚未接入 MCU、IMU、ROS 2、相机、
+当前接口尚未接入 MCU、ROS 2、相机、
 LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘

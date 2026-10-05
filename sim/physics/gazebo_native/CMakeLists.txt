@@ -9,11 +9,13 @@ endif()
 set(PYBIND11_FINDPYTHON ON)
 find_package(pybind11 2.11.1 EXACT REQUIRED)
 find_package(gz-sim8 8.15.0 EXACT REQUIRED)
+find_package(gz-sensors8 8.2.2 EXACT REQUIRED COMPONENTS imu)
 
 pybind11_add_module(_dm_gazebo_native MODULE world.cc)
 target_compile_features(_dm_gazebo_native PRIVATE cxx_std_17)
 target_compile_options(_dm_gazebo_native PRIVATE -Wall -Wextra -Werror)
-target_link_libraries(_dm_gazebo_native PRIVATE gz-sim8::gz-sim8)
+target_link_libraries(_dm_gazebo_native PRIVATE gz-sim8::gz-sim8
+    gz-sensors8::gz-sensors8-imu)
 
 include(CTest)
 if(BUILD_TESTING)

@@ -7,16 +7,9 @@ admitted. Other model dynamics remain MuJoCo's responsibility.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
 import math
 
-from .base import BodyPose, JointState
-
-
-@dataclass(frozen=True)
-class ImuSample:
-    gyro_rad_s: tuple[float, float, float]
-    accel_m_s2: tuple[float, float, float]
+from .base import BodyPose, ImuSample, JointState
 
 
 def _finite(value, name: str) -> float:

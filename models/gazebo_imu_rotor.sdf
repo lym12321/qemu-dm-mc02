@@ -1,0 +1,34 @@
+<?xml version="1.0"?>
+<!-- Narrow variant of gazebo_rotor.sdf with a native, noiseless IMU.
+     Uncalibrated anchored rotor, Izz=.02 kg m², gravity=-9.80665z m/s².
+     Gazebo Physics owns motion; gz-sensors owns proper acceleration. -->
+<sdf version="1.10">
+  <world name="imu_rotor_world">
+    <gravity>0 0 -9.80665</gravity>
+    <physics name="physics" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <model name="rotor">
+      <link name="body">
+        <inertial>
+          <mass>1</mass>
+          <inertia><ixx>0.015</ixx><iyy>0.015</iyy><izz>0.02</izz></inertia>
+        </inertial>
+        <sensor name="imu" type="imu">
+          <update_rate>0</update_rate>
+          <imu/>
+        </sensor>
+      </link>
+      <joint name="shaft" type="revolute">
+        <parent>world</parent><child>body</child>
+        <axis>
+          <xyz>0 0 1</xyz>
+          <limit><lower>-1e16</lower><upper>1e16</upper><effort>10</effort></limit>
+          <dynamics><damping>0</damping></dynamics>
+        </axis>
+      </joint>
+    </model>
+  </world>
+</sdf>
