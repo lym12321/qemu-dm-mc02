@@ -348,6 +348,10 @@ UART 消费仍需后续入口验证。
 
 项目基于固定的 QEMU v8.2.2 fork，提供 STM32H723 与 DM-MC02 的数字外设模型，面向固件功能验证。
 
+STM32H723 profile 为原生 NVIC 配置 ST CMSIS 定义的 4 位优先级；这使未经修改的
+FreeRTOS 优先级探测与 HAL 分组设置一致。通用 QEMU 板卡保留原有默认值。该有限
+边界不代表完整 CPU 优先级寄存器或整机 migration 已验证，也不提供实板验证。
+
 项目不依赖 Renode，也不分发 `trobot/` 固件。模型不覆盖完整芯片、电气/物理总线时序或整机 snapshot/live migration。USB 的 DM-MC02 profile 使用 Device 角色，不提供该板的 USB Host 或设备透传。外部后端示例用于连接与协议验证；真实机构闭环和具体固件的完整业务就绪仍需用户验证。
 
 ## Environment

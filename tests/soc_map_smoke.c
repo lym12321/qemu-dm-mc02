@@ -19,6 +19,8 @@ static void test_stm32h723_map(void)
     const DmMc02SocProfile *soc = dm_mc02_soc_stm32h723();
 
     CHECK(soc == &dm_mc02_stm32h723_soc);
+    /* ST CMSIS stm32h723xx.h __NVIC_PRIO_BITS, not a model-derived oracle. */
+    CHECK(soc->irq_priority_bits == 4);
     CHECK(dm_mc02_soc_validate_map(soc));
     CHECK(soc->tim2_base == 0x40000000);
     CHECK(soc->adc1_base == 0x40022000);
