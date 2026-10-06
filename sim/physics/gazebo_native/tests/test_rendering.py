@@ -17,7 +17,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import _dm_gazebo_native as native
-from sim.physics import CameraFrame, GazeboPhysics, LidarScan
+from sim.core import Coordinator, Session
+from sim.physics import CameraFrame, GazeboPhysics, LidarScan, PhysicsParticipant
 from test_world import imu_sdf
 
 SCENE = Path(__file__).with_name("rendering.sdf")
@@ -113,14 +114,14 @@ def test_admission_combined_imu_endpoints(tmp_path, topic):
                      cameras=CAMERAS, lidars=LIDARS)
 
 
-def collect(physics, count=2):
+def collect(physics, count=2, *, advance=None):
     """Bound ordinary plant ticks and observation time, without a frame barrier."""
     deadline = time.monotonic() + 8
     frames, scans = [], []
     for _ in range(800):
         if time.monotonic() >= deadline:
             pytest.fail("timed out waiting for actual standard Sensors messages")
-        physics.step(1_000_000)
+        (physics.step if advance is None else advance)(1_000_000)
         frame, scan = physics.get_camera("front"), physics.get_lidar("scan")
         if frame is not None and (not frames or frame.timestamp_ns > frames[-1].timestamp_ns):
             frames.append(frame)
@@ -289,3 +290,21 @@ def test_consumer_imported_texture(tmp_path, monkeypatch, request):
     print("field texture RGB means", means, "stddev", statistics.pstdev(channels[0]),
           "control", plain_means, statistics.pstdev(plain_channels[0]),
           "stamps", textured.timestamp_ns, plain.timestamp_ns)
+
+
+def test_consumer_physics_participant_without_joints(monkeypatch):
+    monkeypatch.setenv("GZ_PARTITION", "dm-world-participant-" + uuid.uuid4().hex)
+    physics = GazeboPhysics(SCENE, cameras=CAMERAS, lidars=LIDARS)
+    coordinator = Coordinator({"world": PhysicsParticipant(physics)})
+    try:
+        coordinator.reset(Session(1, 17))
+        check_samples(*collect(physics, advance=coordinator.step))
+        assert coordinator.t_sim_ns == physics.time_ns + 17
+        coordinator.reset(Session(2, 29))
+        assert coordinator.t_sim_ns == 29 and physics.time_ns == 0
+        for sample in (physics.get_camera("front"), physics.get_lidar("scan")):
+            assert sample is None or sample.timestamp_ns == 0
+        check_samples(*collect(physics, advance=coordinator.step))
+        assert coordinator.t_sim_ns == physics.time_ns + 29
+    finally:
+        coordinator.close()

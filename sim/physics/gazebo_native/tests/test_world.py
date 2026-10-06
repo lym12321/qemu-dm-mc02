@@ -16,7 +16,7 @@ import uuid
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-from sim.physics import BodyPose, GazeboPhysics, ImuSample, JointState
+from sim.physics import BodyPose, GazeboPhysics, ImuSample, JointState, PhysicsParticipant
 from sim.physics.mujoco import BodyPose as LegacyBodyPose
 from sim.physics.mujoco import ImuSample as LegacyImuSample
 from sim.physics.mujoco import JointState as LegacyJointState
@@ -891,3 +891,42 @@ def test_shared_motor_consumer_reads_generated_imu_and_existing_bmi_units(native
         assert physics.get_imu("i1") == ImuSample((0, 0, 0), (0, 0, 0))
     finally:
         coordinator.close()
+
+
+def test_physics_participant_completed_native_world_and_off_grid_rejection(native, tmp_path):
+    path = tmp_path / "participant.sdf"
+    path.write_text(imu_sdf())
+    physics = GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")},
+                           bodies={"body": ("rotor", "body")},
+                           imus={"imu": ("rotor", "body", "imu")})
+    participant = PhysicsParticipant(physics)
+    coordinator = Coordinator({"world": participant})
+    origin = (1 << 80) + 7
+    try:
+        coordinator.reset(Session(1, origin))
+        assert physics.time_ns == 0 and coordinator.t_sim_ns == origin
+        physics.set_joint_effort("shaft", .4)
+        result = coordinator.step(10_000_000)["world"]
+        assert result.reached_time_ns == origin + 10_000_000
+        assert result.diagnostics == {"native_time_s": .01}
+        assert physics.time_ns == 10_000_000
+        # Izz=.02, torque=.4 -> alpha20; stationary origin has proper gravity.
+        state = physics.get_joint_state("shaft")
+        assert state.velocity_rad_s == pytest.approx(.2, abs=1e-12)
+        assert physics.get_imu("imu").gyro_rad_s == pytest.approx((0, 0, .2), abs=1e-12)
+        assert physics.get_imu("imu").accel_m_s2 == pytest.approx((0, 0, 10), abs=1e-12)
+        assert physics.get_body_pose("body").position_m == (0, 0, 0)
+        assert physics.time_ns == 10_000_000  # Observation never advances.
+        with pytest.raises(ValueError):
+            coordinator.step(1)  # Pure backend admission rejects a partial tick.
+        assert coordinator.failed and participant.failed
+        assert coordinator.t_sim_ns == origin + 10_000_000
+        assert physics.time_ns == 10_000_000 and physics.get_joint_state("shaft") == state
+        coordinator.reset(Session(2, 17))
+        assert physics.time_ns == 0 and coordinator.t_sim_ns == 17
+        coordinator.step(1_000_000)
+        assert physics.get_joint_state("shaft").velocity_rad_s == 0
+    finally:
+        coordinator.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_imu("imu")

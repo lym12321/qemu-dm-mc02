@@ -886,6 +886,34 @@ model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的
 当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
 `validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
 
+要由现有 host Coordinator 统一 reset 和推进，可将已构造的 `GazeboPhysics`
+或 `MujocoPhysics` 交给同一个 `PhysicsParticipant`：
+
+```python
+from sim.core import Coordinator, Session
+from sim.physics import GazeboPhysics, PhysicsParticipant
+
+physics = GazeboPhysics("models/gazebo_rotor.sdf",
+                       joints={"shaft": ("rotor", "shaft")})
+coordinator = Coordinator({"world": PhysicsParticipant(physics)})
+try:
+    coordinator.reset(Session(1, 7))
+    physics.set_joint_effort("shaft", 0.4)
+    result = coordinator.step(10_000_000)["world"]
+    print(result.reached_time_ns, result.diagnostics)  # 10000007; native_time_s=.01
+    print(physics.get_joint_state("shaft"))
+finally:
+    coordinator.close()
+```
+
+participant 成功构造后拥有该 physics 的 reset、step 和 close；构造失败时仍由
+调用者清理。可借用 physics 设置 control 或读取观察，不再直接推进、重置，
+也不能与拥有同一 physics 的 `M3508JointPlant` 同时使用。
+每次 step 先复用后端的时长预检，再推进一次；后端失败冻结 participant，须成功 reset。
+session 的整数起点与原生 reset 时间零分别保留，`native_time_s` 是原生浮点秒诊断，
+不用于舍入或重建 session 时间。此 host barrier 不保证目标相机帧已交付或 MCU 同步；
+无关节的渲染 world 同样可以使用这个 participant。
+
 可通过原生 SDFormat include 组合本地静态场景，并用 `resource_paths` 指定
 `model://` 的模型目录。目录以调用者当前路径解析，必须存在且不含冒号或 NUL；
 配置只作用于本次加载，不修改全局环境。原生 SDFormat 的安装路径和 `SDF_PATH`

@@ -15,6 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+from sim.core import Coordinator, Session
+from sim.physics import PhysicsParticipant
 from sim.physics.mujoco import MujocoPhysics
 from sim.physics.base import BodyPose, ImuSample, JointState
 from sim.physics.mujoco import BodyPose as LegacyBodyPose
@@ -145,6 +147,46 @@ def test_reset_uses_native_qpos0_and_clears_previous_effort():
     assert physics.time_s == 0
     physics.step(1_000_000)
     assert physics.get_joint_state("shaft") == state
+
+
+def test_coordinator_owns_native_physics_with_an_independent_logical_epoch():
+    physics = rotor()
+    participant = PhysicsParticipant(physics)
+    coordinator = Coordinator({"world": participant})
+    origin_ns = (1 << 70) + 17
+    dt_ns, dt_s = 1_000_001, .001000001
+    try:
+        coordinator.reset(Session(7, origin_ns))
+        borrowed = participant.physics
+        assert borrowed is physics and borrowed.time_s == 0
+        initial = borrowed.get_joint_state("shaft")
+        borrowed.set_joint_effort("shaft", .4)
+        result = coordinator.step(dt_ns)["world"]
+        assert result.reached_time_ns == coordinator.t_sim_ns == origin_ns + dt_ns
+        assert result.diagnostics["native_time_s"] == borrowed.time_s == dt_s
+        state = borrowed.get_joint_state("shaft")
+        sample = borrowed.get_imu("imu")
+        # The existing fixture's Izz=.02 and tau=.4 give alpha=20 rad/s².
+        assert state.velocity_rad_s == pytest.approx(20 * dt_s, abs=1e-13)
+        assert sample.gyro_rad_s == pytest.approx((0, 0, 20 * dt_s), abs=1e-13)
+        assert sample.accel_m_s2 == pytest.approx((0, 0, 9.81), abs=1e-12)
+        assert borrowed.get_joint_state("shaft") == state
+        assert borrowed.get_imu("imu") == sample
+        assert borrowed.time_s == dt_s
+
+        coordinator.reset(Session(8, origin_ns + 99))
+        assert coordinator.t_sim_ns == origin_ns + 99 and borrowed.time_s == 0
+        assert borrowed.get_joint_state("shaft") == initial
+        result = coordinator.step(dt_ns)["world"]
+        assert result.diagnostics["native_time_s"] == dt_s
+        assert borrowed.get_joint_state("shaft") == initial  # Reset cleared effort.
+        assert borrowed.get_imu("imu").gyro_rad_s == (0, 0, 0)
+    finally:
+        coordinator.close()
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_joint_state("shaft")
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.set_joint_effort("shaft", .4)
 
 
 def test_constructor_reuses_compiled_model_and_getters_do_not_forward(monkeypatch):
