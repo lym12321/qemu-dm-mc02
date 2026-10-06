@@ -2,11 +2,16 @@
 
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+import hashlib
+import json
 import math
 import os
 import sys
 import time
 import uuid
+import shutil
+import statistics
+import xml.etree.ElementTree as ET
 
 import pytest
 
@@ -18,6 +23,9 @@ from test_world import imu_sdf
 SCENE = Path(__file__).with_name("rendering.sdf")
 CAMERAS = {"front": ("sensors", "body", "camera")}
 LIDARS = {"scan": ("sensors", "body", "lidar")}
+MODELS = Path(__file__).resolve().parents[4] / "models"
+FIELD = MODELS / "gazebo_rmua19_sensors.sdf"
+FIELD_RESOURCES = MODELS / "vendor/rmua19/resource/models"
 
 
 def test_compile_off():
@@ -221,3 +229,63 @@ def test_consumer_same_owner_plant_and_rendering(tmp_path, monkeypatch):
         physics.reset()
         assert physics.time_ns == 0
         assert physics.get_joint_state("shaft").velocity_rad_s == 0
+
+
+def test_consumer_imported_texture(tmp_path, monkeypatch, request):
+    """Change only the albedo map to distinguish a rendered local texture."""
+    monkeypatch.setenv("GZ_PARTITION", "dm-field-render-" + uuid.uuid4().hex)
+    receipt = json.loads((MODELS / "vendor/rmua19/SOURCES.json").read_text())
+    # Fixed source receipt, independent from renderer-produced expected bytes.
+    expected = {entry["path"]: entry["sha256"] for entry in receipt["files"]}
+    vendor = MODELS / "vendor/rmua19"
+    before = {name: hashlib.sha256((vendor / name).read_bytes()).hexdigest() for name in expected}
+    assert before == expected
+
+    def verify_assets_unchanged():
+        after = {name: hashlib.sha256((vendor / name).read_bytes()).hexdigest() for name in expected}
+        assert after == before
+
+    # Also preserve canonical asset evidence after a failed render/assertion.
+    # All context managers close before this pytest teardown runs.
+    request.addfinalizer(verify_assets_unchanged)
+    control = tmp_path / "models"
+    shutil.copytree(FIELD_RESOURCES, control)
+    xml = control / "rmua19_battlefield/model.sdf"
+    tree = ET.parse(xml)
+    removed = 0
+    for metal in tree.findall(".//pbr/metal"):
+        albedo = metal.find("albedo_map")
+        if albedo is not None:
+            metal.remove(albedo)
+            removed += 1
+    assert removed == 11
+    tree.write(xml, encoding="utf-8", xml_declaration=True)
+    observations = []
+    for resources in (FIELD_RESOURCES, control):
+        with GazeboPhysics(FIELD, cameras=CAMERAS, lidars=LIDARS,
+                           resource_paths=(resources,)) as world:
+            frames, scans = collect(world)
+            for scan in scans:
+                # Source wall_3 x=4.1 +/- .1 and sensor x=3; every horizontal
+                # ray hits that wall. This is unrelated to the red-box fixture.
+                assert scan.ranges_m[32] == pytest.approx(1, abs=.02)
+                assert scan.ranges_m[0] == pytest.approx(1 / math.cos(.3), abs=.02)
+                assert scan.ranges_m[-1] == pytest.approx(1 / math.cos(.3), abs=.02)
+                assert all(math.isfinite(value) for value in scan.ranges_m)
+            frame = frames[-1]
+            assert (frame.width, frame.height, frame.step, len(frame.data)) == (64, 48, 192, 9216)
+            observations.append(frame)
+    textured, plain = observations
+    channels = [textured.data[index::3] for index in range(3)]
+    plain_channels = [plain.data[index::3] for index in range(3)]
+    means = [statistics.mean(channel) for channel in channels]
+    plain_means = [statistics.mean(channel) for channel in plain_channels]
+    # Fixed JPEG pixels all R>G>B with visible grain; native lighting may alter
+    # scale. The control retains the same PBR/material/geometry/ambient settings.
+    assert means[0] > means[1] > means[2]
+    assert plain_channels[0] == plain_channels[1] == plain_channels[2]
+    assert statistics.pstdev(channels[0]) > statistics.pstdev(plain_channels[0])
+    assert textured.data != plain.data
+    print("field texture RGB means", means, "stddev", statistics.pstdev(channels[0]),
+          "control", plain_means, statistics.pstdev(plain_channels[0]),
+          "stamps", textured.timestamp_ns, plain.timestamp_ns)

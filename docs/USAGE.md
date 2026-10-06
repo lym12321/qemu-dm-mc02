@@ -1018,6 +1018,27 @@ getter 立即返回最新实际交付的不可变快照，未收到消息时返�
 reset 重建 producer 和订阅，清空旧观察；close 完成 Server 线程与订阅清理后释放 owner。
 驱动、RunOnce、Stop/join 为原生阻塞调用，进程外期限仍由调用者负责。
 
+仓库提供带传感器的历史社区场地组合，使用同一接口和固定本地资源：
+
+```python
+from pathlib import Path
+from sim.physics import GazeboPhysics
+
+models = Path("models").resolve()
+with GazeboPhysics(models / "gazebo_rmua19_sensors.sdf",
+                   cameras={"front": ("sensors", "body", "camera")},
+                   lidars={"scan": ("sensors", "body", "lidar")},
+                   resource_paths=(models / "vendor/rmua19/resource/models",)) as world:
+    world.step(50_000_000)
+    print(world.get_camera("front"))
+    print(world.get_lidar("scan"))
+```
+
+相机与 LiDAR 位于 `(3, 0, 0.25)`，朝向原场地墙面；中心扫描距离为 1 米。
+`gazebo-native-rendering-consumer` 用真实快照验证木纹渲染，并与仅去掉贴图的临时
+资源对照比较色彩和空间变化，同时核验原资产哈希。此证据只覆盖固定场景，
+不代表精确像素、相机标定或当前官方赛场；读取仍可能返回 `None` 或较早帧。
+
 要验证实际 ROS 2 消息交付，在同一构建目录额外启用 ROS 门；需要
 ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
 
