@@ -3,6 +3,10 @@
 #include <gz/msgs/laserscan.pb.h>
 #include <gz/sim/Server.hh>
 #include <gz/sim/ServerConfig.hh>
+#include <gz/sim/Sensor.hh>
+#include <gz/sim/System.hh>
+#include <gz/sim/components/Camera.hh>
+#include <gz/sim/components/GpuLidar.hh>
 #include <gz/transport/Node.hh>
 
 #include <array>
@@ -122,6 +126,33 @@ struct Observations
         changed.notify_one();
     }
 };
+
+class Topics final : public gz::sim::System, public gz::sim::ISystemPostUpdate
+{
+public:
+    void PostUpdate(const gz::sim::UpdateInfo &,
+                    const gz::sim::EntityComponentManager &ecm) override
+    {
+        ecm.Each<gz::sim::components::Camera>([&](gz::sim::Entity entity,
+                const gz::sim::components::Camera *) {
+            const auto topic = gz::sim::Sensor(entity).Topic(ecm);
+            if (topic) cameraTopic = *topic;
+            camera = camera || topic == "/dm_render/image";
+            return true;
+        });
+        ecm.Each<gz::sim::components::GpuLidar>([&](gz::sim::Entity entity,
+                const gz::sim::components::GpuLidar *) {
+            // RenderUtil::AddNewSensor records the SDF primary before the
+            // managed GPU lidar changes its internal topic to /points.
+            const auto topic = gz::sim::Sensor(entity).Topic(ecm);
+            if (topic) lidarTopic = *topic;
+            lidar = lidar || topic == "/dm_render/scan";
+            return true;
+        });
+    }
+    bool camera = false, lidar = false; // Read only after native Server joins.
+    std::string cameraTopic, lidarTopic;
+};
 }
 
 int main(int argc, char **argv)
@@ -142,6 +173,7 @@ int main(int argc, char **argv)
     Observations observations;
     gz::transport::Node node;
     std::unique_ptr<gz::sim::Server> server;
+    auto topics = std::make_shared<Topics>();
     int result = 1;
     try
     {
@@ -164,6 +196,7 @@ int main(int argc, char **argv)
         config.SetSdfFile(argv[1]);
         config.SetHeadlessRendering(true); // Native Ogre2 EGL; no X server.
         server = std::make_unique<gz::sim::Server>(config);
+        require(server->AddSystem(topics) == true, "native topic observer admission failed");
         server->SetUpdatePeriod(std::chrono::milliseconds(1));
         require(server->Run(false, 1000, false), "native Server failed to start");
 #ifdef DM_GAZEBO_WITH_ROS
@@ -201,6 +234,11 @@ int main(int argc, char **argv)
     if (server)
         server->Stop();
     server.reset();
+    if (result == 0 && (!topics->camera || !topics->lidar)) {
+        std::cerr << "FAIL: native public Sensor.Topic projection unavailable: camera="
+            << topics->cameraTopic << " lidar=" << topics->lidarTopic << '\n';
+        result = 1;
+    }
     const bool imageClosed = node.Unsubscribe("/dm_render/image");
     const bool scanClosed = node.Unsubscribe("/dm_render/scan");
     if (!imageClosed || !scanClosed)

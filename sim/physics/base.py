@@ -22,6 +22,36 @@ class ImuSample:
     accel_m_s2: tuple[float, float, float]
 
 
+@dataclass(frozen=True)
+class CameraFrame:
+    """Latest native RGB8 image; timestamp is the sensor producer's time."""
+
+    timestamp_ns: int
+    width: int
+    height: int
+    step: int
+    frame_id: str
+    data: bytes
+
+
+@dataclass(frozen=True)
+class LidarScan:
+    """Latest native single-row scan; preserve infinity misses and NaN vertical step."""
+
+    timestamp_ns: int
+    frame_id: str
+    angle_min_rad: float
+    angle_max_rad: float
+    angle_step_rad: float
+    range_min_m: float
+    range_max_m: float
+    vertical_angle_min_rad: float
+    vertical_angle_max_rad: float
+    vertical_angle_step_rad: float
+    ranges_m: tuple[float, ...]
+    intensities: tuple[float, ...]
+
+
 class JointPhysics(Protocol):
     """Exclusive execution owner with pure, current-state admission checks.
 

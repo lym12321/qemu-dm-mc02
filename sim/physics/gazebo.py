@@ -1,15 +1,16 @@
-"""Named SI joints, link poses and IMUs over the Gazebo Sim 8.15 adapter.
+"""Named SI plant observations and optional native rendering snapshots.
 
 Owns one synchronous server, with fixed native-ns SDF ticks and one exclusive
 torque owner per bound revolute joint. Getters return completed PostUpdate
-observations. No ROS, sensor, motor, CAN or QEMU clock policy lives here.
+observations. Camera/LiDAR delivery is asynchronous and keeps its native stamp.
+No ROS, motor, CAN or QEMU clock policy lives here.
 """
 
 from collections.abc import Mapping
 import math
 from pathlib import Path
 
-from .base import BodyPose, ImuSample, JointState
+from .base import BodyPose, CameraFrame, ImuSample, JointState, LidarScan
 
 
 def _step_ns(dt_ns):
@@ -55,14 +56,18 @@ class GazeboPhysics:
     def __init__(self, path, *, joints: Mapping[str, tuple[str, str]] | None = None,
                  bodies: Mapping[str, tuple[str, str]] | None = None,
                  imus: Mapping[str, tuple[str, str, str]] | None = None,
+                 cameras: Mapping[str, tuple[str, str, str]] | None = None,
+                 lidars: Mapping[str, tuple[str, str, str]] | None = None,
                  resource_paths: tuple[str | Path, ...] = ()):
         if not isinstance(path, (str, Path)) or not str(path) or "\0" in str(path):
             raise ValueError("SDF path must be nonempty without NUL")
         bindings = _binding_map(joints, "joint")
         body_bindings = _binding_map(bodies, "body")
         imu_bindings = _binding_map(imus, "IMU", 3)
-        if not bindings and not body_bindings and not imu_bindings:
-            raise ValueError("Gazebo requires at least one joint, body or IMU binding")
+        camera_bindings = _binding_map(cameras, "camera", 3)
+        lidar_bindings = _binding_map(lidars, "LiDAR", 3)
+        if not any((bindings, body_bindings, imu_bindings, camera_bindings, lidar_bindings)):
+            raise ValueError("Gazebo requires at least one observation binding")
         if not isinstance(resource_paths, tuple):
             raise ValueError("Gazebo resource_paths must be a tuple of directories")
         directories = []
@@ -82,7 +87,7 @@ class GazeboPhysics:
         if native.gazebo_version != "8.15.0":
             raise RuntimeError("Gazebo adapter requires gz-sim 8.15.0")
         self._world = native.World(str(Path(path).resolve()), bindings, body_bindings,
-                                   imu_bindings, directories)
+                                   imu_bindings, directories, camera_bindings, lidar_bindings)
 
     @property
     def timestep_ns(self) -> int:
@@ -143,6 +148,20 @@ class GazeboPhysics:
     def close(self) -> None:
         """Stop and destroy the owned native Server; repeated close is harmless."""
         self._world.close()
+
+    def get_camera(self, name: str) -> CameraFrame | None:
+        """Latest actual RGB8 frame or None; never waits or advances physics."""
+        if not isinstance(name, str):
+            raise ValueError("camera name must be a string")
+        values = self._world.get_camera(name)
+        return None if values is None else CameraFrame(*values)
+
+    def get_lidar(self, name: str) -> LidarScan | None:
+        """Latest actual scan or None, with original stamp and native range values."""
+        if not isinstance(name, str):
+            raise ValueError("LiDAR name must be a string")
+        values = self._world.get_lidar(name)
+        return None if values is None else LidarScan(*values[:10], tuple(values[10]), tuple(values[11]))
 
     def __enter__(self):
         return self

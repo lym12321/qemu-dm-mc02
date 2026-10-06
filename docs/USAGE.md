@@ -870,7 +870,7 @@ with GazeboPhysics("models/gazebo_rotor.sdf",
 ```
 
 首版接受一个 world、一个 physics profile、顶层动态 model 中的 revolute 关节，
-以及唯一的显式 Physics plugin。绑定和 SDF 准入先于 Server 创建；model/visual
+以及显式 Physics plugin；启用下述渲染绑定时另需标准 Sensors plugin。绑定和 SDF 准入先于 Server 创建；model/visual
 插件、nested model、actor 和未支持的 sensor 明确拒绝。关节需要显式有限的 effort limit
 （负值表示不限制）；非有限力矩或超过正 limit 的输入拒绝，并保留原命令。
 每个 native tick 写齐全部关节命令；getter 只读取完成状态。`timestep_ns` 沿用
@@ -878,7 +878,7 @@ Gazebo 原生浮点秒到整数时间的截断，不能假定 SDF 十进制值�
 必须是实际步长的整数倍，每次 1–10000 ticks。初始化及 reset 不增加积分步。
 `bodies` 绑定逻辑名称到 `(model, link)`，`get_body_pose` 返回完成状态的
 `BodyPose(position_m, quaternion_wxyz)`；位姿由原生 Physics 更新，getter 不推进时间。
-可只配置 bodies，至少需要一个 joint、body 或 IMU 绑定。当前 body 观察只接顶层动态
+可只配置 bodies，至少需要一个 joint、body、IMU、camera 或 LiDAR 绑定。当前 body 观察只接顶层动态
 model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的观察不返回默认零位姿。
 运行错误冻结推进和观测，成功 reset 后恢复；失败不回滚。并发操作明确拒绝。
 `close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
@@ -966,8 +966,57 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering$' --output-on-
 2.5 m 目标距离和递增的原生消息时间戳。最多运行 1 秒虚拟时间；观察期限
 12 秒，CTest 对整个进程（含驱动和清理）设 20 秒超时。缺少驱动、消息或
 清理失败会返回非零。默认关闭此选项，普通关节测试通过不代表渲染测试通过。
-这只是固定场景的原生消息验证；`GazeboPhysics` 尚不接相机、LiDAR 或任意 world，
-任意场景的 ROS 2 交付、资产渲染和 MCU 时间同步仍需各自验证。
+这项测试验证固定场景的原生消息。公开相机/LiDAR 接口使用下面独立的构建选项；
+资产渲染、任意场景的 ROS 2 交付和 MCU 时间同步仍需各自验证。
+
+要在 `GazeboPhysics` 中读取相机和 LiDAR，启用默认关闭的生产接口选项：
+
+```bash
+cmake -S sim/physics/gazebo_native -B build/gazebo-native \
+  -DDM_GAZEBO_RENDERING=ON
+cmake --build build/gazebo-native -j2
+ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering-(admission|mailbox|consumer)$' --output-on-failure
+```
+
+它独立于 `BUILD_TESTING` 和 ROS 测试选项。沿用上述 SDK/Python 配置和 `PYTHONPATH`，
+可用固定场景读取真实原生快照：
+
+```python
+from sim.physics import GazeboPhysics
+
+with GazeboPhysics("sim/physics/gazebo_native/tests/rendering.sdf",
+                   cameras={"front": ("sensors", "body", "camera")},
+                   lidars={"scan": ("sensors", "body", "lidar")}) as world:
+    world.step(50_000_000)
+    print(world.get_camera("front"))  # CameraFrame or None; RGB8 bytes
+    print(world.get_lidar("scan"))    # LidarScan or None; m/rad
+```
+
+渲染由标准 Sensors/Ogre2 EGL 管理。SDF 必须显式配置 Physics 和
+`gz-sim-sensors-system` / `gz::sim::systems::Sensors`，后者只设置
+`<render_engine>ogre2</render_engine>`。所有 sensor 都须绑定；camera/GPU LiDAR
+可位于静态 link，同一 Server 也可同时消费关节、动态 body 和 IMU。
+与渲染组合的 IMU 也须在 SDF 中给出显式、唯一的绝对 topic，以验证原生服务不会冲突。
+首版最多 8 个渲染 sensor：无噪声 RGB8、宽高各 1–1024、最大 3 MiB 图像；
+无噪声 GPU LiDAR、2–4096 水平 rays、单行、零垂直角、单位 scan resolution。
+两者 SDF 频率为 1–1000 Hz，原生周期有毫秒截断。触发、保存、畸变、自定义 lens/
+投影、visibility override 和其它相机类型明确拒绝；距离 resolution 配置不代表量化精度。
+
+主话题必须显式、绝对且唯一，不自动修正名称。检查也覆盖 CameraInfo、
+LiDAR `/points`、`/set_rate` 与标准 marker 名称；`camera_info_topic` 可显式指定，
+否则由原生相机使用主话题的父路径加 `/camera_info`。调用者须独占这些话题、
+保持 `GZ_PARTITION` 不变，并保持准入的配置，不调用原生 `set_rate` 服务。
+本模块每进程只允许一个渲染 owner；外部进程内渲染器共存未支持。
+
+getter 立即返回最新实际交付的不可变快照，未收到消息时返回 `None`，不等待或
+推进物理时间。`timestamp_ns` 保留原生 sensor 时间（零合法）；`frame_id` 原样保留。
+图像有 `width/height/step/data`，扫描保留完整 `ranges_m/intensities` 和角度/距离元数据；
+原生无穷距离与单行 `vertical_angle_step_rad=NaN` 保留，NaN 距离拒绝。
+最新快照覆盖中间观察，合法时间戳不递增的消息丢弃；新消息的格式错误冻结实例，须 reset。
+该保留上限不限制原生 transport 的总队列。LaserScan 的 `world_pose` 不在首版接口中。
+`step()` 完成不保证目标时刻图像已交付；需要消息时由调用者设置有限观察期限。
+reset 重建 producer 和订阅，清空旧观察；close 完成 Server 线程与订阅清理后释放 owner。
+驱动、RunOnce、Stop/join 为原生阻塞调用，进程外期限仍由调用者负责。
 
 要验证实际 ROS 2 消息交付，在同一构建目录额外启用 ROS 门；需要
 ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
@@ -996,8 +1045,8 @@ SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 A
 该门默认关闭，证明固定场景的真实 ROS 交付，不建立 ROS、渲染与 MCU 的全局时间屏障。
 
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
-当前接口尚未接入 MCU、ROS 2、相机、
-LiDAR 或 Robot manifest；上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
+当前接口尚未接入 MCU、生产 ROS 2 consumer 或 Robot manifest；
+上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘
 
