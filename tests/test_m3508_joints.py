@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT))
 from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508, M3508Device, M3508JointPlant
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
+from sim.fabric.runtime import CanParticipant
 from sim.physics import JointState, MujocoPhysics
 
 
@@ -227,7 +228,8 @@ def test_native_gear_conversion_four_devices_one_advance_and_literal_feedback(mo
         (0x204, 10_000_000, bytes.fromhex("0000 0000 0000 19 00"))]
 
 
-def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch):
+@pytest.mark.parametrize("composed", [False, True])
+def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch, composed):
     native = physics()
     buses = (CanBus(), CanBus())
     hosts = tuple(Host(bus) for bus in buses)
@@ -235,14 +237,17 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
                     for bus in buses for motor_id in (1, 2))
     plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))),
                             gear_ratio=2)
-    coordinator = Coordinator({"world": plant})
+    coordinator = Coordinator({"world": CanParticipant(buses, (plant,)) if composed else plant})
     calls = track_physics(monkeypatch, native)
     try:
         coordinator.reset(Session(1, 7))
         for bus, host, literal in zip(buses, hosts,
                                       ("1000 2000 0000 0000", "f000 e000 0000 0000")):
-            bus.reset(7)
-            command(bus, host, literal, timestamp_ns=7)
+            if composed:
+                host.emit(CanFrame(0x200, data=bytes.fromhex(literal), timestamp_ns=7))
+            else:
+                bus.reset(7)
+                command(bus, host, literal, timestamp_ns=7)
         result = coordinator.step(10_000_000)["world"]
         assert calls == {"reset": 1, "step": [10_000_000], "effort": [
             ("j1", .2), ("j2", .4), ("j3", -.2), ("j4", -.4)]}
@@ -252,10 +257,15 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
                 (.001, .002, -.001, -.002), (.1, .2, -.1, -.2)):
             assert native.get_joint_state(name) == JointState(position, velocity)
         assert native.time_s == .01 and result.reached_time_ns == 10_000_007
-        assert result.diagnostics == {"physics_segments": 1}
-        assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
-        for bus in buses:
-            bus.step(10_000_007)
+        if composed:
+            assert result.diagnostics == {
+                "delivered_start": 2, "delivered_target": 4, "pending": 0}
+            assert all(bus.t_sim_ns == 10_000_007 and bus.pending == 0 for bus in buses)
+        else:
+            assert result.diagnostics == {"physics_segments": 1}
+            assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
+            for bus in buses:
+                bus.step(10_000_007)
         for host, payloads in zip(hosts, (
                 ("0002 0002 1000 19 00", "0005 0004 2000 19 00"),
                 ("1ffd fffe f000 19 00", "1ffa fffc e000 19 00"))):
@@ -265,7 +275,7 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
         coordinator.reset(Session(2, 50_000_000))
         assert calls["reset"] == 2 and native.time_s == 0
         assert all(device.get_rotor_state() == (0, 0) for device in devices)
-        assert all(bus.t_sim_ns == 10_000_007 for bus in buses)
+        assert all(bus.t_sim_ns == (50_000_000 if composed else 10_000_007) for bus in buses)
     finally:
         coordinator.close()
 

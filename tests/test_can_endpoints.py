@@ -15,7 +15,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from sim.core import Session, StepResult
+from sim.core import Coordinator, Session, StepResult
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
 from sim.fabric.frame import WIRE_FD, WIRE_BRS
@@ -250,6 +250,20 @@ def test_future_pending_is_not_mistaken_for_exhausted_start_budget(streams):
     runtime.close()
 
 
+def test_single_bus_target_overflow_rejects_before_start_command_or_device(streams):
+    stream, _ = streams
+    runtime, (device,) = runtime_for(stream)
+    try:
+        runtime.reset(1, 0, worker.QemuTimestampMapper(1000, 0))
+        runtime.ingest_qemu(CanFrame(0x200, data=b"now", timestamp_ns=1000), 0)
+        with pytest.raises(ValueError, match="unsigned 64-bit"):
+            runtime.step(1 << 64)
+        assert runtime.bus.pending == 1 and runtime.bus.t_sim_ns == 0
+        assert device.commands == device.steps == [] and runtime.coordinator.failed
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("result", [StepResult("failed", 10),
                                    StepResult("ok", 9), object()])
 def test_device_invalid_result_freezes_without_target_settle(streams, result):
@@ -335,3 +349,174 @@ def test_runtime_owns_unique_valid_devices_and_matching_endpoints(streams):
     with pytest.raises(RuntimeError, match="closed"):
         runtime.reset(2, 0, worker.QemuTimestampMapper(1000, 0))
     assert device.close_calls == 1
+
+
+def test_multibus_admission_is_complete_before_consuming_owned_devices():
+    bus = CanBus()
+    def forbidden_devices():
+        raise AssertionError("device inputs consumed before bus admission")
+        yield
+    for invalid in ((), (bus, object()), [bus], {bus}, iter((bus,))):
+        with pytest.raises(TypeError, match="CanBus"):
+            CanParticipant(invalid, forbidden_devices())
+    with pytest.raises(ValueError, match="bus must appear once"):
+        CanParticipant((bus, bus), forbidden_devices())
+    single = CanParticipant(bus)
+    assert single.bus is bus and single.buses == (bus,)
+    pair = (bus, CanBus())
+    participant = CanParticipant(pair)
+    assert participant.buses is pair
+    with pytest.raises(RuntimeError, match="multiple buses"):
+        participant.bus
+    single.close()
+    participant.close()
+
+
+def test_multibus_start_then_devices_then_targets_and_aggregate_diagnostics(monkeypatch):
+    buses = (CanBus(), CanBus())
+    devices = tuple(Device(bus) for bus in buses)
+    sources = tuple(SimpleNamespace(receive=lambda _: None) for _ in buses)
+    for bus, source in zip(buses, sources):
+        bus.attach(source)
+    seen = []
+    for device in devices:
+        def observe_reset(session, reset=device.reset):
+            seen.append(tuple((bus.t_sim_ns, bus.pending) for bus in buses))
+            reset(session)
+        monkeypatch.setattr(device, "reset", observe_reset)
+    participant = CanParticipant(buses, devices)
+    coordinator = Coordinator({"can": participant})
+    try:
+        # All bus queues reset before either device reset callback.
+        coordinator.reset(Session(1, 7))
+        assert seen == [((7, 0), (7, 0))] * 2
+        for bus, source in zip(buses, sources):
+            bus.send(source, CanFrame(0x100, data=b"now", timestamp_ns=7))
+            bus.send(source, CanFrame(0x100, data=b"future", timestamp_ns=12))
+        result = coordinator.step(10)["can"]
+        assert result == StepResult("ok", 17, {
+            "delivered_start": 2, "delivered_target": 4, "pending": 0})
+        for device in devices:
+            assert [f.data for f in device.steps[0][1]] == [b"now"]
+            assert [f.data for f in device.commands] == [b"now", b"future"]
+        assert all(bus.t_sim_ns == 17 for bus in buses)
+        # Reset callbacks see every borrowed bus at the new origin, queues empty.
+        for bus, source in zip(buses, sources):
+            bus.send(source, CanFrame(0x123, timestamp_ns=200))
+        coordinator.reset(Session(2, 100))
+        assert seen == [((7, 0), (7, 0))] * 2 + [((100, 0), (100, 0))] * 2
+        for bus, source in zip(buses, sources):
+            bus.send(source, CanFrame(0x123, timestamp_ns=200))
+    finally:
+        coordinator.close()
+    assert all(device.close_calls == 1 for device in devices)
+    assert all(bus.t_sim_ns == 100 and bus.pending == 1 for bus in buses)
+
+
+@pytest.mark.parametrize("invalid", ["later_clock", "target_overflow"])
+def test_multibus_all_time_admission_precedes_any_dispatch_or_device(invalid):
+    buses = (CanBus(), CanBus())
+    devices = tuple(Device(bus) for bus in buses)
+    coordinator = Coordinator({"can": CanParticipant(buses, devices)})
+    try:
+        coordinator.reset(Session(1))
+        devices[0].emit(CanFrame(0x123))
+        if invalid == "later_clock":
+            buses[1].step(1)
+            error, message, dt = RuntimeError, "step start", 10
+        else:
+            error, message, dt = ValueError, "unsigned 64-bit", 1 << 64
+        with pytest.raises(error, match=message):
+            coordinator.step(dt)
+        assert buses[0].pending == 1 and buses[0].t_sim_ns == 0
+        assert all(device.steps == [] and device.commands == [] for device in devices)
+        assert coordinator.failed and coordinator.t_sim_ns == 0
+    finally:
+        coordinator.close()
+
+
+@pytest.mark.parametrize("source_index", [0, 1])
+def test_multibus_cross_callback_uses_one_ordered_start_pass(source_index):
+    buses = (CanBus(), CanBus())
+    destination_index = 1 - source_index
+    sources = tuple(SimpleNamespace(receive=lambda _: None) for _ in buses)
+    for bus, source in zip(buses, sources):
+        bus.attach(source)
+    device = Device(buses[destination_index])
+    bridge = SimpleNamespace(receive=lambda frame: buses[destination_index].send(
+        sources[destination_index], frame))
+    buses[source_index].attach(bridge)
+    coordinator = Coordinator({"can": CanParticipant(buses, (device,))})
+    try:
+        coordinator.reset(Session(1))
+        buses[source_index].send(sources[source_index], CanFrame(0x123, data=b"bridge"))
+        if source_index == 0:
+            result = coordinator.step(10)["can"]
+            assert result.diagnostics == {
+                "delivered_start": 2, "delivered_target": 1, "pending": 0}
+            assert [f.data for f in device.steps[0][1]] == [b"bridge"]
+        else:
+            with pytest.raises(RuntimeError, match="budget exhausted at step start"):
+                coordinator.step(10)
+            assert device.steps == [] and device.commands == []
+            assert buses[0].has_due(0) and buses[0].pending == 1
+            assert coordinator.failed and coordinator.t_sim_ns == 0
+            with pytest.raises(RuntimeError, match="successful reset"):
+                coordinator.step(10)
+    finally:
+        coordinator.close()
+
+
+def test_multibus_target_backlog_settles_at_next_start_without_repeating_world():
+    buses = (CanBus(dispatch_budget=1), CanBus(dispatch_budget=1))
+    devices = tuple(Device(bus) for bus in buses)
+    sources = tuple(SimpleNamespace(receive=lambda _: None) for _ in buses)
+    for bus, source in zip(buses, sources):
+        bus.attach(source)
+    coordinator = Coordinator({"can": CanParticipant(buses, devices)})
+    try:
+        coordinator.reset(Session(1))
+        for bus, source in zip(buses, sources):
+            bus.send(source, CanFrame(0x123, data=b"future", timestamp_ns=10))
+        assert coordinator.step(10)["can"].diagnostics == {
+            "delivered_start": 0, "delivered_target": 2, "pending": 2}
+        assert all(bus.has_due(10) for bus in buses)
+        assert all(len(device.steps) == 1 for device in devices)
+        assert coordinator.step(10)["can"].diagnostics == {
+            "delivered_start": 2, "delivered_target": 2, "pending": 0}
+        assert all(len(device.steps) == 2 for device in devices)
+    finally:
+        coordinator.close()
+
+
+def test_multibus_later_target_callback_error_preserves_partial_effects_until_reset():
+    buses = (CanBus(), CanBus())
+    devices = tuple(Device(bus) for bus in buses)
+    primary = KeyboardInterrupt("second target callback")
+    fail = [True]
+    def receive(_):
+        if fail[0]:
+            raise primary
+    sink = SimpleNamespace(receive=receive)
+    buses[1].attach(sink)
+    coordinator = Coordinator({"can": CanParticipant(buses, devices)})
+    try:
+        coordinator.reset(Session(1))
+        devices[1].emit(CanFrame(0x123, timestamp_ns=100))
+        with pytest.raises(KeyboardInterrupt) as caught:
+            coordinator.step(10)
+        assert caught.value is primary
+        assert all(len(device.steps) == 1 for device in devices)
+        assert all(bus.t_sim_ns == 10 for bus in buses)
+        assert buses[0].pending == 0 and buses[1].pending == 1
+        assert coordinator.failed and coordinator.t_sim_ns == 0
+        with pytest.raises(RuntimeError, match="successful reset"):
+            coordinator.step(10)
+        fail[0] = False
+        coordinator.reset(Session(2))
+        assert all(bus.pending == 0 and device.steps == []
+                   for bus, device in zip(buses, devices))
+        assert coordinator.step(10)["can"].diagnostics == {
+            "delivered_start": 0, "delivered_target": 2, "pending": 0}
+    finally:
+        coordinator.close()

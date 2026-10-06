@@ -1537,11 +1537,51 @@ reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍�
 调用不重试。借用的 CAN bus 和 transport 由调用方负责。
 
 多条独立 CAN bus 可共用一个 `M3508JointPlant`，所有命令截止时间仍在同一 world
-内合并，每个区间只积分一次。plant 不推进或重置总线；调用方须先交付每条总线的
-起点命令，再推进这个唯一 plant，最后交付各总线的目标反馈。不要为每条总线构造
-一个拥有相同 physics 的 plant。当前 `CanParticipant` / `CanRuntime` 只编排单条
-总线，固定 `FourWheelRuntime` 显式拒绝跨总线 plant；多总线编排是独立的后续边界。
-这一接口不构成多 MCU 的虚拟时间屏障。
+内合并，每个区间只积分一次。plant 不推进或重置总线；用
+`CanParticipant((bus_a, bus_b), [shared])` 统一交付起点命令、推进这个唯一 plant，
+再交付目标反馈。总线集合须为非空 tuple，身份唯一；list、set 和 iterator 拒绝。
+`.buses` 保留准入顺序，`.bus` 仅用于单总线。不要为每条总线构造拥有相同 physics
+的 plant；`CanRuntime` 和固定 `FourWheelRuntime` 仍只接单条总线。
+
+这个示例把未标定四轮夹具的前、后轮分别接到独立总线，每条总线使用 ID 1、2：
+
+```python
+from sim.core import Coordinator, Session
+from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.fabric import CanBus
+from sim.fabric.runtime import CanParticipant
+from sim.physics import MujocoPhysics
+
+corners = ("fl", "fr", "rl", "rr")
+physics = MujocoPhysics.from_xml_path(
+    "models/four_wheel.xml",
+    joints={f"wheel_{c}": f"drive_{c}" for c in corners})
+buses = (CanBus(), CanBus())
+bindings = {M3508Device(buses[i // 2], i % 2 + 1): f"wheel_{c}"
+            for i, c in enumerate(corners)}
+try:
+    shared = M3508JointPlant(physics, bindings)
+except BaseException:
+    for device in bindings:
+        device.close()
+    physics.close()
+    raise
+coordinator = Coordinator({"can": CanParticipant(buses, [shared])})
+try:
+    coordinator.reset(Session(1, 7))
+    result = coordinator.step(1_000_000)["can"]
+    print(result.reached_time_ns, result.diagnostics)  # 1000007; target broadcasts=4
+finally:
+    coordinator.close()
+```
+
+编排先校验目标 CAN 时间和全部总线起点，再按 tuple 顺序各交付一次起点帧。
+全部总线的起点到期帧须清空后才推进器件。回调可向其它总线入队；后面的总线向已
+访问总线入队起点帧时，本次 step 会在 plant 推进前失败，需成功 reset 才能继续。
+回调不得自行推进或重置总线。目标时刻同样各交付一次，积压可留到下一步起点；
+诊断的 `delivered_start`、`delivered_target` 是全部总线的广播数之和，`pending`
+为总积压。失败保留已产生的效果，不回滚或重放。这一固定顺序不提供跨总线仲裁、
+公平性或多 MCU 的虚拟时间屏障。
 
 每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
 命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。

@@ -444,7 +444,7 @@ class CanHost(VirtualCanDevice):
 
 
 def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
-              observe_imus=False, independent_buses=False):
+              observe_imus=False, independent_buses=False, composed_buses=False):
     xml = rotor_sdf()
     if observe_imus:
         xml = xml.replace('</inertial></link>',
@@ -470,8 +470,9 @@ def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
     try:
         plant = M3508JointPlant(physics, {device: f"j{i}" for i, device
                                          in enumerate(devices, 1)}, gear_ratio=2)
-        coordinator = Coordinator({"world": plant} if independent_buses else
-                                  {"can": CanParticipant(buses[0], [plant])})
+        participant = (plant if independent_buses and not composed_buses else
+                       CanParticipant(buses if independent_buses else buses[0], [plant]))
+        coordinator = Coordinator({"world" if independent_buses else "can": participant})
         return (physics, buses if independent_buses else buses[0],
                 hosts if independent_buses else hosts[0], devices, plant, coordinator)
     except BaseException:
@@ -566,10 +567,23 @@ def test_actual_shared_expiry_intervals_and_coasting(native, tmp_path, monkeypat
         coordinator.close()
 
 
-def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypatch):
+@pytest.mark.parametrize("composed", [False, True], ids=["manual", "composed"])
+def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypatch,
+                                                     composed):
     physics, buses, hosts, devices, plant, coordinator = motor_rig(tmp_path,
-        independent_buses=True, timeouts=(3_000_000, 3_000_000, 7_000_000, 7_000_000))
+        independent_buses=True, composed_buses=composed,
+        timeouts=(3_000_000, 3_000_000, 7_000_000, 7_000_000))
     calls = observe_motor_advances(monkeypatch, physics)
+    deliveries = []
+    for index, bus in enumerate(buses):
+        step = bus.step
+        def observe_delivery(t_sim_ns, *, index=index, step=step):
+            count = step(t_sim_ns)
+            if t_sim_ns == 7:
+                deliveries.append((index, count,
+                                   tuple(device.current_raw for device in devices)))
+            return count
+        monkeypatch.setattr(bus, "step", observe_delivery)
     resets = []
     reset = physics.reset
     def reset_native():
@@ -578,21 +592,27 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
     monkeypatch.setattr(physics, "reset", reset_native)
     try:
         coordinator.reset(Session(1, 7))
-        # This fixture owns both borrowed bus clocks/delivery. The coordinator
-        # owns only the shared plant; no single-bus participant is generalized.
-        for bus in buses:
-            bus.reset(7)
+        # Manual delivery retains the lower shared-plant consumer. The composed
+        # path delegates both borrowed bus clocks to the sole CanParticipant.
+        if not composed:
+            for bus in buses:
+                bus.reset(7)
         hosts[0].emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000"),
                                timestamp_ns=7))
-        assert buses[0].step(7) == 1
-        assert [device.current_raw for device in devices] == [4096, -4096, 0, 0]
+        if not composed:
+            assert buses[0].step(7) == 1
         hosts[1].emit(CanFrame(0x200, data=bytes.fromhex("f000 1000 0000 0000"),
                                timestamp_ns=7))
-        assert buses[1].step(7) == 1
-        assert [device.current_raw for device in devices] == [4096, -4096, -4096, 4096]
+        if not composed:
+            assert buses[1].step(7) == 1
+        else:
+            assert all(device.current_raw == 0 for device in devices)
+            assert all(bus.t_sim_ns == 7 and bus.pending == 1 for bus in buses)
         assert [device.motor_id for device in devices] == [1, 2, 1, 2]
         assert resets == [0] and physics.time_ns == 0
         result = coordinator.step(10_000_000)["world"]
+        assert deliveries == [(0, 1, (4096, -4096, 0, 0)),
+                              (1, 1, (4096, -4096, -4096, 4096))]
         assert calls == [
             ("effort", "j1", .2), ("effort", "j2", -.2),
             ("effort", "j3", -.2), ("effort", "j4", .2), ("step", 3_000_000),
@@ -613,14 +633,16 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
                 (2 * state.position_rad, 2 * velocity), abs=1e-10)
         assert physics.time_ns == 10_000_000 and resets == [0]
         assert result.status == "ok" and result.reached_time_ns == 10_000_007
-        assert result.diagnostics == {"physics_segments": 3}
+        assert result.diagnostics == ({"delivered_start": 2, "delivered_target": 4,
+                                       "pending": 0} if composed else {"physics_segments": 3})
         assert plant.t_sim_ns == coordinator.t_sim_ns == 10_000_007
         assert all(device.current_raw == 0 and device.t_sim_ns == 10_000_007
                    for device in devices)
-        assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
-        assert all(host.frames == [] for host in hosts)
-        for bus in buses:
-            assert bus.step(10_000_007) == 2
+        if not composed:
+            assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
+            assert all(host.frames == [] for host in hosts)
+            for bus in buses:
+                assert bus.step(10_000_007) == 2
         # Independent completed C620 literals: duplicate IDs stay on their
         # own bus, with distinct signed angles and no active current at expiry.
         assert [[(frame.can_id, frame.timestamp_ns, frame.data) for frame in host.frames]
