@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<!-- Harmonic composition of the unmodified community RMUA 2019 static field.
+     Provenance/license: vendor/rmua19/NOTICE. The two falling cubes are test
+     probes, not robot models. Gazebo/DART owns gravity and contact. -->
+<sdf version="1.10">
+  <world name="rmua19_world">
+    <gravity>0 0 -9.8</gravity>
+    <physics name="physics" type="ignored">
+      <max_step_size>0.001</max_step_size>
+      <real_time_factor>0</real_time_factor>
+    </physics>
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <include><uri>model://rmua19_battlefield</uri></include>
+    <model name="floor_probe">
+      <pose>-1 0 1 0 0 0</pose>
+      <link name="body">
+        <inertial><mass>1</mass><inertia>
+          <ixx>0.006666666667</ixx><iyy>0.006666666667</iyy><izz>0.006666666667</izz>
+        </inertia></inertial>
+        <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></visual>
+      </link>
+    </model>
+    <model name="obstacle_probe">
+      <pose>0 0 1 0 0 0</pose>
+      <link name="body">
+        <inertial><mass>1</mass><inertia>
+          <ixx>0.006666666667</ixx><iyy>0.006666666667</iyy><izz>0.006666666667</izz>
+        </inertia></inertial>
+        <collision name="collision"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></collision>
+        <visual name="visual"><geometry><box><size>0.2 0.2 0.2</size></box></geometry></visual>
+      </link>
+    </model>
+  </world>
+</sdf>

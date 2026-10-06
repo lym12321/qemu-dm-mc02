@@ -27,6 +27,14 @@ if(DM_GAZEBO_RENDERING_TESTS AND NOT BUILD_TESTING)
     message(FATAL_ERROR "DM_GAZEBO_RENDERING_TESTS requires BUILD_TESTING")
 endif()
 if(BUILD_TESTING)
+    add_executable(gazebo-resources-smoke tests/resources_smoke.cc)
+    target_compile_features(gazebo-resources-smoke PRIVATE cxx_std_17)
+    target_compile_options(gazebo-resources-smoke PRIVATE -Wall -Wextra -Werror)
+    target_link_libraries(gazebo-resources-smoke PRIVATE gz-sim8::gz-sim8)
+    add_test(NAME gazebo-native-resources COMMAND gazebo-resources-smoke
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../models/gazebo_rmua19.sdf"
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../../models/vendor/rmua19/resource/models")
+    set_tests_properties(gazebo-native-resources PROPERTIES TIMEOUT 15)
     add_test(NAME gazebo-native-joints COMMAND "${Python3_EXECUTABLE}"
         -m pytest "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_world.py" -q
         --junitxml=${CMAKE_CURRENT_BINARY_DIR}/gazebo-junit.xml)

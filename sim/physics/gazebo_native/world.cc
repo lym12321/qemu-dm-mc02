@@ -43,6 +43,8 @@
 #include <sdf/World.hh>
 #include <sdf/Visual.hh>
 
+#include "resources.hh"
+
 namespace sim = gz::sim;
 using Bindings = std::map<std::string, std::pair<std::string, std::string>>;
 using Samples = std::map<std::string, std::pair<double, double>>;
@@ -328,22 +330,15 @@ public:
 class NativeWorld final {
 public:
     NativeWorld(const std::string &path, const Bindings &bindings,
-                const Bindings &bodyBindings, const ImuBindings &imuBindings)
+                const Bindings &bodyBindings, const ImuBindings &imuBindings,
+                const std::vector<std::string> &resourcePaths)
         : jointBindings(bindings), bodyBindings(bodyBindings), imuBindings(imuBindings)
     {
         if (path.empty() || path.find('\0') != std::string::npos ||
             (bindings.empty() && bodyBindings.empty() && imuBindings.empty())) {
             throw std::invalid_argument("SDF path and joint/body/IMU bindings must be nonempty");
         }
-        sdf::Root root;
-        const auto errors = root.Load(path);
-        if (!errors.empty()) {
-            std::string message = "SDF admission failed";
-            for (const auto &error : errors) {
-                message += ": " + error.Message();
-            }
-            throw std::invalid_argument(message);
-        }
+        auto root = dm_gazebo::LoadSdf(path, resourcePaths);
         if (root.WorldCount() != 1) {
             throw std::invalid_argument("Gazebo joint profile requires exactly one world");
         }
@@ -674,10 +669,11 @@ PYBIND11_MODULE(_dm_gazebo_native, module)
     module.attr("gazebo_version") = GZ_SIM_VERSION_FULL;
     pybind11::class_<NativeWorld>(module, "World")
         .def(pybind11::init<const std::string &, const Bindings &, const Bindings &,
-                           const ImuBindings &>(),
+                           const ImuBindings &, const std::vector<std::string> &>(),
              pybind11::arg("path"), pybind11::arg("joints"),
              pybind11::arg("bodies") = Bindings{},
-             pybind11::arg("imus") = ImuBindings{})
+             pybind11::arg("imus") = ImuBindings{},
+             pybind11::arg("resource_paths") = std::vector<std::string>{})
         .def("step", &NativeWorld::Step)
         .def("validate_step", &NativeWorld::ValidateStep)
         .def("validate_steps", &NativeWorld::ValidateSteps)

@@ -54,7 +54,8 @@ def _binding_map(values, label, arity=2):
 class GazeboPhysics:
     def __init__(self, path, *, joints: Mapping[str, tuple[str, str]] | None = None,
                  bodies: Mapping[str, tuple[str, str]] | None = None,
-                 imus: Mapping[str, tuple[str, str, str]] | None = None):
+                 imus: Mapping[str, tuple[str, str, str]] | None = None,
+                 resource_paths: tuple[str | Path, ...] = ()):
         if not isinstance(path, (str, Path)) or not str(path) or "\0" in str(path):
             raise ValueError("SDF path must be nonempty without NUL")
         bindings = _binding_map(joints, "joint")
@@ -62,6 +63,17 @@ class GazeboPhysics:
         imu_bindings = _binding_map(imus, "IMU", 3)
         if not bindings and not body_bindings and not imu_bindings:
             raise ValueError("Gazebo requires at least one joint, body or IMU binding")
+        if not isinstance(resource_paths, tuple):
+            raise ValueError("Gazebo resource_paths must be a tuple of directories")
+        directories = []
+        for directory in resource_paths:
+            if (not isinstance(directory, (str, Path)) or not str(directory)
+                    or "\0" in str(directory) or ":" in str(directory)):
+                raise ValueError("resource paths require directories without NUL/colon")
+            resolved = Path(directory).resolve()
+            if not resolved.is_dir() or ":" in str(resolved):
+                raise ValueError("resource paths require existing directories without colon")
+            directories.append(str(resolved))
         try:
             import _dm_gazebo_native as native
         except ImportError as exc:
@@ -70,7 +82,7 @@ class GazeboPhysics:
         if native.gazebo_version != "8.15.0":
             raise RuntimeError("Gazebo adapter requires gz-sim 8.15.0")
         self._world = native.World(str(Path(path).resolve()), bindings, body_bindings,
-                                   imu_bindings)
+                                   imu_bindings, directories)
 
     @property
     def timestep_ns(self) -> int:

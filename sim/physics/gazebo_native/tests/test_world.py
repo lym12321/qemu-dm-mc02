@@ -8,8 +8,10 @@ rotor helper, motor law, wire codec or MCU clock supplies expected values.
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 import math
+import shutil
 import sys
 import threading
+import uuid
 
 import pytest
 
@@ -23,6 +25,87 @@ from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.fabric.runtime import CanParticipant
+
+MODELS = Path(__file__).resolve().parents[4] / "models"
+ARENA_PATH = MODELS / "gazebo_rmua19.sdf"
+ARENA_RESOURCES = MODELS / "vendor/rmua19/resource/models"
+PROBE_BINDINGS = {"floor": ("floor_probe", "body"),
+                  "obstacle": ("obstacle_probe", "body")}
+
+
+def test_native_community_field_collision(native):
+    world = native.World(str(ARENA_PATH), {}, PROBE_BINDINGS, {}, [str(ARENA_RESOURCES)])
+    try:
+        assert world.time_ns == 0
+        assert world.get_body_pose("floor")[:3] == [-1, 0, 1]
+        assert world.get_body_pose("obstacle")[:3] == [0, 0, 1]
+        # DART 6.13.2 ContactConstraint.cpp:45-48,397-406 caps penetration
+        # correction at .001 m/s. Keep 2mm gate, allow bounded recovery from
+        # initial impact; pinned upstream plane is a native large-box proxy.
+        world.step(5_000_000_000)
+        # Pinned upstream ground z=0 and obstacle_1 top=.4; each probe's
+        # half-height=.1. Actual DART contact must support both, not freefall.
+        assert world.get_body_pose("floor")[:3] == pytest.approx((-1, 0, .1), abs=.002)
+        assert world.get_body_pose("obstacle")[:3] == pytest.approx((0, 0, .5), abs=.002)
+        world.step(1_000_000_000)
+        assert world.time_ns == 6_000_000_000
+        assert world.get_body_pose("floor")[2] == pytest.approx(.1, abs=.002)
+        assert world.get_body_pose("obstacle")[2] == pytest.approx(.5, abs=.002)
+    finally:
+        world.close()
+
+
+def test_typed_community_world_reset_uses_admitted_dom(native, tmp_path, monkeypatch):
+    resources = tmp_path / "models"
+    shutil.copytree(ARENA_RESOURCES, resources)
+    model_sdf = resources / "rmua19_battlefield/model.sdf"
+    model_sdf.write_text(model_sdf.read_text().replace(
+        "model://rmua19_battlefield/materials/textures/wood.jpg",
+        "materials/textures/wood.jpg"))
+    path = tmp_path / "world.sdf"
+    shutil.copyfile(ARENA_PATH, path)
+    monkeypatch.chdir(tmp_path)
+    with GazeboPhysics(path, bodies=PROBE_BINDINGS, resource_paths=(resources,)) as physics:
+        initial = {name: physics.get_body_pose(name) for name in PROBE_BINDINGS}
+        physics.step(5_000_000_000)
+        assert physics.get_body_pose("floor").position_m == pytest.approx((-1, 0, .1), abs=.002)
+        assert physics.get_body_pose("obstacle").position_m == pytest.approx((0, 0, .5), abs=.002)
+        # Includes are flattened into the retained native DOM. Reset does not
+        # re-read XML; external texture bytes remain separate native resources.
+        path.unlink()
+        model_sdf.unlink()
+        physics.reset()
+        assert physics.time_ns == 0
+        assert {name: physics.get_body_pose(name) for name in PROBE_BINDINGS} == initial
+        physics.step(5_000_000_000)
+        assert physics.get_body_pose("obstacle").position_m[2] == pytest.approx(.5, abs=.002)
+
+
+def test_missing_model_and_pbr_texture_rejected(native, tmp_path):
+    resources = tmp_path / "models"
+    resources.mkdir()
+    # Native SDF_PATH/install fallback remains supported. Unique missing URIs
+    # isolate rejection even when the caller's environment has the real arena.
+    model_name = "missing_" + uuid.uuid4().hex
+    path = tmp_path / "missing.sdf"
+    path.write_text(ARENA_PATH.read_text().replace("model://rmua19_battlefield",
+                                                 "model://" + model_name))
+    with pytest.raises(ValueError, match="SDF admission failed"):
+        native.World(str(path), {}, PROBE_BINDINGS, {}, [str(resources)])
+    model = resources / model_name
+    shutil.copytree(ARENA_RESOURCES / "rmua19_battlefield", model)
+    sdf = model / "model.sdf"
+    sdf.write_text(sdf.read_text().replace("model://rmua19_battlefield",
+                                         "model://" + model_name))
+    (model / "materials/textures/wood.jpg").unlink()
+    with pytest.raises(ValueError, match="material resource unavailable.*wood.jpg"):
+        native.World(str(path), {}, PROBE_BINDINGS, {}, [str(resources)])
+
+
+@pytest.mark.parametrize("directories", ["models", ("",), ("a:b",), (None,)])
+def test_resource_directory_types_rejected_before_acquisition(directories):
+    with pytest.raises(ValueError, match="resource"):
+        GazeboPhysics("unused.sdf", bodies=PROBE_BINDINGS, resource_paths=directories)
 
 
 def rotor_sdf(*, joint_type="revolute", step="0.001", effort="10",

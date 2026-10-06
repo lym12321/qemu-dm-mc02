@@ -1,0 +1,27 @@
+{
+  "repository": "robomaster-oss/rmua19_gazebo_simulator",
+  "commit": "81a5bf7b87d18514541b5bb2e896d2019b19f74a",
+  "license": "Apache-2.0",
+  "files": [
+    {
+      "path": "LICENSE",
+      "sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "bytes": 11357
+    },
+    {
+      "path": "resource/models/rmua19_battlefield/model.config",
+      "sha256": "43291e42c2d9f4eff0215444a7b82a04af6767cadda5f6db181de332627dc117",
+      "bytes": 328
+    },
+    {
+      "path": "resource/models/rmua19_battlefield/model.sdf",
+      "sha256": "384321f37b87e0d30321239779d4b3e701c803f40701856e2b6f9c6360d5c00c",
+      "bytes": 7723
+    },
+    {
+      "path": "resource/models/rmua19_battlefield/materials/textures/wood.jpg",
+      "sha256": "5f2bceca6f64e2585ba161f4c15b466034f6be982ce98af27634568403157a98",
+      "bytes": 15641
+    }
+  ]
+}

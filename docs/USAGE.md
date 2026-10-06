@@ -886,6 +886,38 @@ model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的
 当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
 `validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
 
+可通过原生 SDFormat include 组合本地静态场景，并用 `resource_paths` 指定
+`model://` 的模型目录。目录以调用者当前路径解析，必须存在且不含冒号或 NUL；
+配置只作用于本次加载，不修改全局环境。原生 SDFormat 的安装路径和 `SDF_PATH`
+回退仍可参与查找。这是本地资源接口，不是文件系统沙箱或远程下载器。
+模型 include、mesh、material script 和纹理文件的缺失在 Server 启动前拒绝；
+纹理准入只检查路径和文件存在，不保证可解码或渲染。reset 使用首次准入的
+SDF DOM，外部纹理、mesh 等文件仍需保留，不会随 DOM 保存其内容。
+
+仓库提供固定社区版本的 RMUA 2019 静态场地及两个落体测试立方体：
+
+```python
+from pathlib import Path
+from sim.physics import GazeboPhysics
+
+models = Path("models")
+with GazeboPhysics(models / "gazebo_rmua19.sdf",
+                   resource_paths=(models / "vendor/rmua19/resource/models",),
+                   bodies={"floor": ("floor_probe", "body"),
+                           "obstacle": ("obstacle_probe", "body")}) as world:
+    world.step(5_000_000_000)
+    print(world.get_body_pose("floor"))
+    print(world.get_body_pose("obstacle"))
+    world.reset()
+```
+
+模型配置、几何和木纹图片原样复用；固定来源、哈希和 Apache-2.0 许可见
+`models/vendor/rmua19/NOTICE`、`SOURCES.json` 和 `LICENSE`。场地仅作为历史社区
+夹具，未验证当前比赛尺寸、实物接触参数或图片实际渲染；原生平面的碰撞范围
+可能大于视觉尺寸。该组合只使用 Physics，不包含相机、LiDAR、机器人控制、
+裁判规则或 Arena 调度。SDK 的 `gazebo-native-resources` 测试独立验证资源准入，
+`gazebo-native-joints` 再验证实际接触、公共位姿和 reset。
+
 IMU 使用原生 gz-sensors 的同步生成和公开 getter，配置为
 `imus={逻辑名称: (model, link, sensor)}`：
 
@@ -935,7 +967,7 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering$' --output-on-
 12 秒，CTest 对整个进程（含驱动和清理）设 20 秒超时。缺少驱动、消息或
 清理失败会返回非零。默认关闭此选项，普通关节测试通过不代表渲染测试通过。
 这只是固定场景的原生消息验证；`GazeboPhysics` 尚不接相机、LiDAR 或任意 world，
-ROS 2 交付、资产加载和 MCU 时间同步仍需各自验证。
+任意场景的 ROS 2 交付、资产渲染和 MCU 时间同步仍需各自验证。
 
 要验证实际 ROS 2 消息交付，在同一构建目录额外启用 ROS 门；需要
 ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
@@ -965,7 +997,7 @@ SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 A
 
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
 当前接口尚未接入 MCU、ROS 2、相机、
-LiDAR、赛场或 Robot manifest，也不建立 CPU/plant 全局锁步或实时性能保证。
+LiDAR 或 Robot manifest；上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘
 

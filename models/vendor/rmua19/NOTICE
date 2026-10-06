@@ -1,0 +1,15 @@
+rmua19_battlefield, model version 1.0
+Author and upstream maintainer: Zhenpeng Ge
+Source: https://github.com/robomaster-oss/rmua19_gazebo_simulator
+Commit: 81a5bf7b87d18514541b5bb2e896d2019b19f74a
+License: Apache-2.0 (upstream LICENSE reproduced here).
+
+The model.config, generated model.sdf and materials/textures/wood.jpg are
+unmodified upstream files. Their SHA-256 hashes are listed in SOURCES.json.
+The upstream README declares the repository Apache-2.0; no separate texture
+license is present, and its original artist has not been independently verified.
+
+This project composes the model with Gazebo Harmonic's standard Physics system
+and separate test probes in models/gazebo_rmua19.sdf. The original Fortress
+world, xmacro generator and robot/control/referee stack are not imported.
+This historical community model is not a validated current competition field.
