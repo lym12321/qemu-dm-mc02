@@ -109,6 +109,15 @@ if(BUILD_TESTING)
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/rendering.sdf"
                 "${CMAKE_CURRENT_SOURCE_DIR}/tests/ros_bridge.yaml")
             set_tests_properties(gazebo-native-ros PROPERTIES TIMEOUT 30)
+            if(DM_GAZEBO_RENDERING)
+                add_test(NAME gazebo-native-ros-consumer COMMAND "${Python3_EXECUTABLE}"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/ros_smoke.py"
+                    "${DM_GAZEBO_BRIDGE_NODE}" "$<TARGET_FILE:gazebo-ros-rendering-smoke>"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/rendering.sdf"
+                    "${CMAKE_CURRENT_SOURCE_DIR}/tests/ros_bridge.yaml"
+                    --production "$<TARGET_FILE:_dm_gazebo_native>")
+                set_tests_properties(gazebo-native-ros-consumer PROPERTIES TIMEOUT 30)
+            endif()
         endif()
     endif()
 endif()

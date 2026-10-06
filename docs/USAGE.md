@@ -1046,9 +1046,10 @@ ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
 cmake -S sim/physics/gazebo_native -B build/gazebo-native \
   -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
   -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release \
+  -DDM_GAZEBO_RENDERING=ON \
   -DDM_GAZEBO_RENDERING_TESTS=ON -DDM_GAZEBO_ROS_TESTS=ON
 cmake --build build/gazebo-native -j2
-ctest --test-dir build/gazebo-native -R '^gazebo-native-ros$' --output-on-failure
+ctest --test-dir build/gazebo-native -R '^gazebo-native-ros(-consumer)?$' --output-on-failure
 ```
 
 测试启动官方 `bridge_node`，用 `ros_bridge.yaml` 将原生 image/scan topic
@@ -1060,13 +1061,20 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-ros$' --output-on-failur
 Gazebo 侧 subscriber 队列由 SDK 管理，配置中的 `subscriber_queue` 不建立
 该队列的容量保证。
 
+`gazebo-native-ros` 验证原生场景夹具；`gazebo-native-ros-consumer` 使用独立 Python
+进程中的实际 `GazeboPhysics`。后者在观察器建立两个原生订阅并匹配 ROS publisher
+后启动 producer，验证公开 getter 的两份递增样本及原生/ROS 配对，然后等待 producer
+正常关闭。ready 标记只证明订阅设置与 DDS 匹配；原生跨进程发现和图像交付仍为异步。
+producer 最多推进 900 个 1 ms tick，观察期限为 10 秒。该门沿用固定红色方块场景，
+不扩大为任意场景、导入纹理的 ROS 证据或 MCU 同步。
+
 整个进程组合的执行期限为 20 秒，随后借用既有工具有界 TERM/KILL/reap，
 CTest 总超时为 30 秒。报告保留子进程退出码、输入哈希和清理错误；本机固定
 SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 API 正常析构。
 该门默认关闭，证明固定场景的真实 ROS 交付，不建立 ROS、渲染与 MCU 的全局时间屏障。
 
 这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
-当前接口尚未接入 MCU、生产 ROS 2 consumer 或 Robot manifest；
+当前接口尚未接入 MCU 或 Robot manifest；ROS consumer 仅覆盖上述固定场景；
 上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘

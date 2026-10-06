@@ -194,7 +194,7 @@ private:
         std::map<int64_t, typename Ros::ConstSharedPtr> ros;
         std::array<int64_t, 2> paired{};
         size_t count = 0;
-        int64_t lastNative = 0, lastRos = 0;
+        int64_t lastNative = -1, lastRos = -1;
     };
 
     static void require(bool condition, const char *message)
@@ -205,7 +205,7 @@ private:
 
     static int64_t timestamp(int64_t sec, int64_t nsec)
     {
-        require(sec == 0 && nsec > 0 && nsec < 1000000000,
+        require(sec == 0 && nsec >= 0 && nsec < 1000000000,
                 "ROS/native stamp outside the fixed 1-second run");
         return nsec;
     }

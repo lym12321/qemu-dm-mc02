@@ -15,6 +15,8 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <mutex>
@@ -38,7 +40,7 @@ int64_t stamp(const gz::msgs::Header &header)
 {
     require(header.has_stamp(), "missing native sample stamp");
     const auto &time = header.stamp();
-    require(time.sec() == 0 && time.nsec() > 0 && time.nsec() < 1000000000,
+    require(time.sec() == 0 && time.nsec() >= 0 && time.nsec() < 1000000000,
             "sample outside the fixed 1-second native run");
     return time.nsec();
 }
@@ -158,8 +160,10 @@ public:
 int main(int argc, char **argv)
 {
     bool withRos = false;
+    bool external = false;
 #ifdef DM_GAZEBO_WITH_ROS
-    withRos = argc == 3 && std::string(argv[2]) == "--ros";
+    external = argc == 4 && std::string(argv[2]) == "--ros-external";
+    withRos = external || (argc == 3 && std::string(argv[2]) == "--ros");
     std::unique_ptr<RosObserver> ros; // Released after Node and Observations.
 #endif
     // Per-process discovery domain, also isolated from interactive Gazebo worlds.
@@ -177,7 +181,8 @@ int main(int argc, char **argv)
     int result = 1;
     try
     {
-        require(argc == 2 || withRos, "usage: gazebo-rendering-smoke rendering.sdf [--ros]");
+        require(argc == 2 || withRos,
+                "usage: gazebo-rendering-smoke rendering.sdf [--ros | --ros-external ready-file]");
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(12);
 #ifdef DM_GAZEBO_WITH_ROS
         if (withRos)
@@ -186,19 +191,42 @@ int main(int argc, char **argv)
                     "ROS gate requires its owner's isolated GZ_PARTITION");
             ros = std::make_unique<RosObserver>();
             observations.ros = ros.get();
-            ros->wait_ready(deadline);
         }
 #endif
         require(node.Subscribe("/dm_render/image", &Observations::image, &observations) &&
                 node.Subscribe("/dm_render/scan", &Observations::scan, &observations),
                 "native transport subscription failed");
-        gz::sim::ServerConfig config;
-        config.SetSdfFile(argv[1]);
-        config.SetHeadlessRendering(true); // Native Ogre2 EGL; no X server.
-        server = std::make_unique<gz::sim::Server>(config);
-        require(server->AddSystem(topics) == true, "native topic observer admission failed");
-        server->SetUpdatePeriod(std::chrono::milliseconds(1));
-        require(server->Run(false, 1000, false), "native Server failed to start");
+#ifdef DM_GAZEBO_WITH_ROS
+        if (withRos)
+            ros->wait_ready(deadline);
+        if (external)
+        {
+            // This certifies our subscriptions and matched DDS publishers.
+            // Remote Gazebo discovery is still asynchronous; the separate
+            // production producer owns bounded ordinary ticks and observation.
+            const std::filesystem::path ready(argv[3]);
+            auto temporary = ready;
+            temporary += ".tmp";
+            std::ofstream marker;
+            marker.exceptions(std::ios::failbit | std::ios::badbit);
+            marker.open(temporary);
+            marker << "ready\n";
+            marker.close();
+            require(std::chrono::steady_clock::now() < deadline,
+                    "ROS readiness completed after the deadline");
+            std::filesystem::rename(temporary, ready);
+        }
+        else
+#endif
+        {
+            gz::sim::ServerConfig config;
+            config.SetSdfFile(argv[1]);
+            config.SetHeadlessRendering(true); // Native Ogre2 EGL; no X server.
+            server = std::make_unique<gz::sim::Server>(config);
+            require(server->AddSystem(topics) == true, "native topic observer admission failed");
+            server->SetUpdatePeriod(std::chrono::milliseconds(1));
+            require(server->Run(false, 1000, false), "native Server failed to start");
+        }
 #ifdef DM_GAZEBO_WITH_ROS
         if (withRos)
         {
@@ -234,7 +262,7 @@ int main(int argc, char **argv)
     if (server)
         server->Stop();
     server.reset();
-    if (result == 0 && (!topics->camera || !topics->lidar)) {
+    if (result == 0 && !external && (!topics->camera || !topics->lidar)) {
         std::cerr << "FAIL: native public Sensor.Topic projection unavailable: camera="
             << topics->cameraTopic << " lidar=" << topics->lidarTopic << '\n';
         result = 1;
@@ -270,7 +298,8 @@ int main(int argc, char **argv)
             << observations.images[0] << ',' << observations.images[1]
             << "; lidar 65x1 centre_m=" << observations.centreRange << " stamps_ns="
             << observations.scans[0] << ',' << observations.scans[1]
-            << "; Server and subscriptions cleaned\n";
+            << (external ? "; external subscriptions cleaned\n" :
+                           "; Server and subscriptions cleaned\n");
     }
     return result;
 }
