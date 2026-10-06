@@ -1468,8 +1468,8 @@ reset/close 会取消它。发送失败保留已提交状态，调用方必须�
 或重复推进 plant。`M3508` 保留原简单转子用法，并复用这一协议边界。
 
 `M3508JointPlant` 把多个协议器件绑定到同一个 `MujocoPhysics` 或 `GazeboPhysics`，取得这些器件与
-物理模型的独占执行所有权。绑定必须使用 `M3508Device`，每个 joint 和电机 ID 唯一，
-所有器件位于同一 CAN bus。四轮模型的完整组合如下：
+物理模型的独占执行所有权。绑定必须使用 `M3508Device`，每个 joint 在 world 内唯一，
+电机 ID 在各自 CAN bus 内唯一；独立总线可以复用同一 ID。四轮模型的完整组合如下：
 
 ```python
 from sim.core import Coordinator, Session
@@ -1535,6 +1535,13 @@ reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍�
 任一运行失败会冻结这个 owner，直到成功 reset；已推进的物理状态和已排队反馈不回滚。
 `close()` 独立尝试关闭所有拥有的器件与 physics，保留首个错误及其它清理诊断；重复
 调用不重试。借用的 CAN bus 和 transport 由调用方负责。
+
+多条独立 CAN bus 可共用一个 `M3508JointPlant`，所有命令截止时间仍在同一 world
+内合并，每个区间只积分一次。plant 不推进或重置总线；调用方须先交付每条总线的
+起点命令，再推进这个唯一 plant，最后交付各总线的目标反馈。不要为每条总线构造
+一个拥有相同 physics 的 plant。当前 `CanParticipant` / `CanRuntime` 只编排单条
+总线，固定 `FourWheelRuntime` 显式拒绝跨总线 plant；多总线编排是独立的后续边界。
+这一接口不构成多 MCU 的虚拟时间屏障。
 
 每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
 命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。

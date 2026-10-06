@@ -44,6 +44,16 @@ def physics(*, initial_position=0):
     return MujocoPhysics(model, joints={f"j{i}": f"m{i}" for i in range(1, 5)})
 
 
+def native_stub():
+    # Isolate native dependencies without implementing a solver or motor law.
+    return SimpleNamespace(
+        reset=lambda: None, step=lambda _: None,
+        get_joint_state=lambda _: JointState(0, 0),
+        set_joint_effort=lambda *_: None, validate_step=lambda _: None,
+        validate_steps=lambda _: None,
+        validate_joint_effort=lambda *_: None, close=lambda: None)
+
+
 def setup(*, bus=None, native=None, timeouts=(100_000_000,) * 4):
     bus = bus or CanBus()
     host = Host(bus)
@@ -82,6 +92,116 @@ def command(bus, host, literal, *, timestamp_ns=0):
     bus.step(timestamp_ns)
 
 
+def test_bus_local_identity_admission_precedes_native_effects(monkeypatch):
+    buses, native = (CanBus(), CanBus()), native_stub()
+    devices = tuple(M3508Device(bus, 1) for bus in buses)
+    duplicate = M3508Device(buses[0], 1, name="duplicate")
+    calls = track_physics(monkeypatch, native)
+    try:
+        for bindings, message in (
+                ({devices[0]: "j1", devices[1]: "j1"}, "one M3508 owner"),
+                ({devices[0]: "j1", duplicate: "j2"}, "unique motor IDs")):
+            with pytest.raises(ValueError, match=message):
+                M3508JointPlant(native, bindings)
+            assert all(not device.closed for device in (*devices, duplicate))
+        # Even different buses require every initial sample before ownership.
+        with monkeypatch.context() as patch:
+            patch.setattr(native, "get_joint_state", lambda name:
+                          JointState(float("nan") if name == "j2" else 0, 0))
+            with pytest.raises(ValueError, match="joint position"):
+                M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))))
+        plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))))
+        assert plant.devices == devices
+        assert calls == {"reset": 0, "step": [], "effort": []}
+        plant.close()
+        assert all(device.closed for device in devices) and not duplicate.closed
+    finally:
+        for device in (*devices, duplicate):
+            device.close()
+
+
+def test_multibus_expiry_union_and_lifecycle_leave_buses_borrowed(monkeypatch):
+    buses, native = (CanBus(), CanBus()), native_stub()
+    hosts = tuple(Host(bus) for bus in buses)
+    devices = tuple(M3508Device(bus, 1, command_timeout_ns=timeout)
+                    for bus, timeout in zip(buses, (3_000_000, 7_000_000)))
+    plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))), gear_ratio=2)
+    calls = track_physics(monkeypatch, native)
+    try:
+        plant.reset(Session(1, 7))
+        for bus, host, literal in zip(buses, hosts,
+                                      ("1000 0000 0000 0000", "f000 0000 0000 0000")):
+            bus.reset(7)  # Bus lifecycle/delivery belongs to this fixture.
+            command(bus, host, literal, timestamp_ns=7)
+        result = plant.step(StepContext(1, 1, 10_000_007, 10_000_000))
+        assert result.diagnostics == {"physics_segments": 3}
+        assert calls == {"reset": 1, "step": [3_000_000, 4_000_000, 3_000_000],
+                         "effort": [("j1", .2), ("j2", -.2),
+                                    ("j1", 0), ("j2", -.2),
+                                    ("j1", 0), ("j2", 0)]}
+        assert all(bus.t_sim_ns == 7 and bus.pending == 1 for bus in buses)
+        assert all(host.frames == [] for host in hosts)
+        assert all(device.current_raw == 0 for device in devices)
+        plant.reset(Session(2, 50_000_000))
+        assert calls["reset"] == 2
+        assert all(device.t_sim_ns == 50_000_000 for device in devices)
+        plant.close()
+        plant.close()
+        # Neither reset nor close consumes the already queued feedback.
+        for bus, host in zip(buses, hosts):
+            assert bus.t_sim_ns == 7 and bus.pending == 1
+            bus.step(10_000_007)
+            assert [(f.can_id, f.timestamp_ns, f.data) for f in host.frames] == [
+                (0x201, 10_000_007, bytes.fromhex("0000 0000 0000 19 00"))]
+            host.emit(CanFrame(0x123, data=b"borrowed", timestamp_ns=10_000_007))
+            assert bus.pending == 1
+    finally:
+        plant.close()
+
+
+def test_multibus_feedback_failure_preserves_partial_commits_and_freezes(monkeypatch):
+    buses, native = (CanBus(), CanBus(max_pending=1)), native_stub()
+    hosts = tuple(Host(bus) for bus in buses)
+    devices = tuple(M3508Device(bus, 1) for bus in buses)
+    plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))))
+    calls = track_physics(monkeypatch, native)
+    try:
+        plant.reset(Session(1))
+        hosts[1].emit(CanFrame(0x123, timestamp_ns=100_000_000))
+        ctx = StepContext(1, 1, 1_000_000, 1_000_000)
+        with pytest.raises(BufferError, match="capacity"):
+            plant.step(ctx)
+        assert calls["step"] == [1_000_000]
+        assert all(device.t_sim_ns == 1_000_000 for device in devices)
+        assert all(bus.t_sim_ns == 0 and bus.pending == 1 for bus in buses)
+        assert plant.failed and plant.t_sim_ns == 0
+        with pytest.raises(RuntimeError, match="successful reset"):
+            plant.step(ctx)
+        assert calls["step"] == [1_000_000]
+        plant.reset(Session(2))
+        assert not plant.failed and all(bus.pending == 1 for bus in buses)
+    finally:
+        plant.close()
+
+
+def test_fixed_four_wheel_runtime_rejects_multibus_before_imu_or_endpoint(monkeypatch):
+    from sim.robots import four_wheel
+    buses, native = (CanBus(), CanBus()), native_stub()
+    devices = tuple(M3508Device(buses[i % 2], i + 1) for i in range(4))
+    plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))))
+    effects = []
+    monkeypatch.setattr(native, "get_imu", lambda _: effects.append("imu"), raising=False)
+    monkeypatch.setattr(four_wheel, "QemuCanEndpoint", lambda *_: effects.append("endpoint"))
+    try:
+        with pytest.raises(ValueError, match="one CAN bus"):
+            four_wheel.FourWheelRuntime(plant, object())
+        assert effects == [] and not plant.closed
+        assert all(not device.closed for device in devices)
+        assert all(bus.pending == 0 and bus.t_sim_ns == 0 for bus in buses)
+    finally:
+        plant.close()
+
+
 def test_native_gear_conversion_four_devices_one_advance_and_literal_feedback(monkeypatch):
     bus, host, devices, native, plant = setup()
     calls = track_physics(monkeypatch, native)
@@ -105,6 +225,49 @@ def test_native_gear_conversion_four_devices_one_advance_and_literal_feedback(mo
         (0x202, 10_000_000, bytes.fromhex("1ffd fffe f000 19 00")),
         (0x203, 10_000_000, bytes.fromhex("0000 0000 0000 19 00")),
         (0x204, 10_000_000, bytes.fromhex("0000 0000 0000 19 00"))]
+
+
+def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch):
+    native = physics()
+    buses = (CanBus(), CanBus())
+    hosts = tuple(Host(bus) for bus in buses)
+    devices = tuple(M3508Device(bus, motor_id)
+                    for bus in buses for motor_id in (1, 2))
+    plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))),
+                            gear_ratio=2)
+    coordinator = Coordinator({"world": plant})
+    calls = track_physics(monkeypatch, native)
+    try:
+        coordinator.reset(Session(1, 7))
+        for bus, host, literal in zip(buses, hosts,
+                                      ("1000 2000 0000 0000", "f000 e000 0000 0000")):
+            bus.reset(7)
+            command(bus, host, literal, timestamp_ns=7)
+        result = coordinator.step(10_000_000)["world"]
+        assert calls == {"reset": 1, "step": [10_000_000], "effort": [
+            ("j1", .2), ("j2", .4), ("j3", -.2), ("j4", -.4)]}
+        # Literal Izz=.02, gear2 and +/-5/10A: Euler v=alpha*dt,
+        # theta=v*dt. The second bus must drive opposite native joints.
+        for name, position, velocity in zip(("j1", "j2", "j3", "j4"),
+                (.001, .002, -.001, -.002), (.1, .2, -.1, -.2)):
+            assert native.get_joint_state(name) == JointState(position, velocity)
+        assert native.time_s == .01 and result.reached_time_ns == 10_000_007
+        assert result.diagnostics == {"physics_segments": 1}
+        assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
+        for bus in buses:
+            bus.step(10_000_007)
+        for host, payloads in zip(hosts, (
+                ("0002 0002 1000 19 00", "0005 0004 2000 19 00"),
+                ("1ffd fffe f000 19 00", "1ffa fffc e000 19 00"))):
+            assert [(f.can_id, f.timestamp_ns, f.data) for f in host.frames] == [
+                (0x201 + i, 10_000_007, bytes.fromhex(payload))
+                for i, payload in enumerate(payloads)]
+        coordinator.reset(Session(2, 50_000_000))
+        assert calls["reset"] == 2 and native.time_s == 0
+        assert all(device.get_rotor_state() == (0, 0) for device in devices)
+        assert all(bus.t_sim_ns == 10_000_007 for bus in buses)
+    finally:
+        coordinator.close()
 
 
 def test_distinct_expiries_split_shared_time_once_and_zero_every_expired_joint(monkeypatch):
@@ -195,17 +358,15 @@ def test_invalid_bindings_have_no_reset_control_or_advance_effects(monkeypatch):
     devices = tuple(M3508Device(bus, i) for i in range(1, 5))
     calls = track_physics(monkeypatch, native)
     duplicate = M3508Device(bus, 1, name="duplicate-id")
-    separate = M3508Device(CanBus(), 2)
     for bindings, message in (
             ({}, "nonempty"),
             ({devices[0]: "j1", devices[1]: "j1"}, "one M3508 owner"),
-            ({devices[0]: "j1", separate: "j2"}, "share one CAN bus"),
             ({devices[0]: "j1", duplicate: "j2"}, "unique motor IDs"),
             ({devices[0]: "missing"}, "unbound joint")):
         with pytest.raises(ValueError, match=message):
             M3508JointPlant(native, bindings)
     assert calls == {"reset": 0, "step": [], "effort": []}
-    assert all(not device.closed for device in (*devices, duplicate, separate))
+    assert all(not device.closed for device in (*devices, duplicate))
 
 
 def test_gear_native_methods_and_samples_are_validated_before_runtime_effects(monkeypatch):
@@ -254,12 +415,7 @@ def test_all_device_plans_are_prepared_before_control_or_shared_advance(monkeypa
 
 
 def test_close_attempts_each_owned_resource_once_and_preserves_borrowed_bus(monkeypatch):
-    native = SimpleNamespace(
-        reset=lambda: None, step=lambda _: None,
-        get_joint_state=lambda _: JointState(0, 0),
-        set_joint_effort=lambda *_: None, validate_step=lambda _: None,
-        validate_steps=lambda _: None,
-        validate_joint_effort=lambda *_: None, close=lambda: None)
+    native = native_stub()
     bus, host, devices, native, plant = setup(native=native)
     calls = track_physics(monkeypatch, native)
     plant.reset(Session(1))

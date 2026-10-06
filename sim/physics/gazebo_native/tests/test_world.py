@@ -444,7 +444,7 @@ class CanHost(VirtualCanDevice):
 
 
 def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
-              observe_imus=False):
+              observe_imus=False, independent_buses=False):
     xml = rotor_sdf()
     if observe_imus:
         xml = xml.replace('</inertial></link>',
@@ -461,15 +461,19 @@ def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
         if observe_bodies else None), imus=(
         {f"i{i}": (f"rotor{i}", "body", "imu") for i in range(1, 5)}
         if observe_imus else None))
-    bus = CanBus()
-    host = CanHost(bus)
-    devices = tuple(M3508Device(bus, i, command_timeout_ns=timeout)
+    buses = (CanBus(), CanBus()) if independent_buses else (CanBus(),)
+    hosts = tuple(CanHost(bus) for bus in buses)
+    devices = tuple(M3508Device(buses[(i - 1) // 2] if independent_buses else buses[0],
+                               (i - 1) % 2 + 1 if independent_buses else i,
+                               command_timeout_ns=timeout)
                     for i, timeout in enumerate(timeouts, 1))
     try:
         plant = M3508JointPlant(physics, {device: f"j{i}" for i, device
                                          in enumerate(devices, 1)}, gear_ratio=2)
-        coordinator = Coordinator({"can": CanParticipant(bus, [plant])})
-        return physics, bus, host, devices, plant, coordinator
+        coordinator = Coordinator({"world": plant} if independent_buses else
+                                  {"can": CanParticipant(buses[0], [plant])})
+        return (physics, buses if independent_buses else buses[0],
+                hosts if independent_buses else hosts[0], devices, plant, coordinator)
     except BaseException:
         for device in devices:
             device.close()
@@ -560,6 +564,77 @@ def test_actual_shared_expiry_intervals_and_coasting(native, tmp_path, monkeypat
             bytes.fromhex("0002 0004 0000 19 00"), bytes.fromhex("1ffe ffff 0000 19 00")]
     finally:
         coordinator.close()
+
+
+def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypatch):
+    physics, buses, hosts, devices, plant, coordinator = motor_rig(tmp_path,
+        independent_buses=True, timeouts=(3_000_000, 3_000_000, 7_000_000, 7_000_000))
+    calls = observe_motor_advances(monkeypatch, physics)
+    resets = []
+    reset = physics.reset
+    def reset_native():
+        resets.append(physics.time_ns)
+        reset()
+    monkeypatch.setattr(physics, "reset", reset_native)
+    try:
+        coordinator.reset(Session(1, 7))
+        # This fixture owns both borrowed bus clocks/delivery. The coordinator
+        # owns only the shared plant; no single-bus participant is generalized.
+        for bus in buses:
+            bus.reset(7)
+        hosts[0].emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000"),
+                               timestamp_ns=7))
+        assert buses[0].step(7) == 1
+        assert [device.current_raw for device in devices] == [4096, -4096, 0, 0]
+        hosts[1].emit(CanFrame(0x200, data=bytes.fromhex("f000 1000 0000 0000"),
+                               timestamp_ns=7))
+        assert buses[1].step(7) == 1
+        assert [device.current_raw for device in devices] == [4096, -4096, -4096, 4096]
+        assert [device.motor_id for device in devices] == [1, 2, 1, 2]
+        assert resets == [0] and physics.time_ns == 0
+        result = coordinator.step(10_000_000)["world"]
+        assert calls == [
+            ("effort", "j1", .2), ("effort", "j2", -.2),
+            ("effort", "j3", -.2), ("effort", "j4", .2), ("step", 3_000_000),
+            ("effort", "j1", 0), ("effort", "j2", 0),
+            ("effort", "j3", -.2), ("effort", "j4", .2), ("step", 4_000_000),
+            ("effort", "j1", 0), ("effort", "j2", 0),
+            ("effort", "j3", 0), ("effort", "j4", 0), ("step", 3_000_000)]
+        # +/-5A, kt=.02, gear2, Izz=.02: alpha=+/-10rad/s² until
+        # each bus's 3/7ms expiry, then constant velocity to 10ms. Continuous
+        # positions allow the same one-tick integration bound as the lower gate.
+        for device, name, velocity, position in zip(devices,
+                ("j1", "j2", "j3", "j4"), (.03, -.03, -.07, .07),
+                (.000255, -.000255, -.000455, .000455)):
+            state = physics.get_joint_state(name)
+            assert state.velocity_rad_s == pytest.approx(velocity, abs=1e-10)
+            assert state.position_rad == pytest.approx(position, abs=abs(velocity) * .0011)
+            assert device.get_rotor_state() == pytest.approx(
+                (2 * state.position_rad, 2 * velocity), abs=1e-10)
+        assert physics.time_ns == 10_000_000 and resets == [0]
+        assert result.status == "ok" and result.reached_time_ns == 10_000_007
+        assert result.diagnostics == {"physics_segments": 3}
+        assert plant.t_sim_ns == coordinator.t_sim_ns == 10_000_007
+        assert all(device.current_raw == 0 and device.t_sim_ns == 10_000_007
+                   for device in devices)
+        assert all(bus.t_sim_ns == 7 and bus.pending == 2 for bus in buses)
+        assert all(host.frames == [] for host in hosts)
+        for bus in buses:
+            assert bus.step(10_000_007) == 2
+        # Independent completed C620 literals: duplicate IDs stay on their
+        # own bus, with distinct signed angles and no active current at expiry.
+        assert [[(frame.can_id, frame.timestamp_ns, frame.data) for frame in host.frames]
+                for host in hosts] == [
+            [(0x201, 10_000_007, bytes.fromhex("0000 0001 0000 19 00")),
+             (0x202, 10_000_007, bytes.fromhex("1fff ffff 0000 19 00"))],
+            [(0x201, 10_000_007, bytes.fromhex("1ffe ffff 0000 19 00")),
+             (0x202, 10_000_007, bytes.fromhex("0001 0001 0000 19 00"))]]
+    finally:
+        coordinator.close()
+    assert plant.closed and all(device.closed for device in devices)
+    assert all(bus.t_sim_ns == 10_000_007 and bus.pending == 0 for bus in buses)
+    with pytest.raises(RuntimeError, match="closed"):
+        physics.get_joint_state("j1")
 
 
 @pytest.mark.parametrize("dt_ns, timeout", [

@@ -4,7 +4,9 @@ The ratio3591/187 is from DJI M3508 P19 manual V1.0, p7/p13/p19, also used by
 the fixed reference firmware. Lossless conversion is a model approximation,
 not a C620 wire field or a calibrated gearbox. The XML actuators stay unit gear.
 Construction borrows inputs for admission; successful construction transfers
-exclusive execution ownership of the physics and devices. The bus is borrowed.
+exclusive execution ownership of the physics and devices. Buses are borrowed;
+motor IDs are unique on each bus, while joint bindings are unique in the world.
+The caller settles every bus around the one shared plant advance.
 """
 
 from collections.abc import Mapping
@@ -43,11 +45,9 @@ class M3508JointPlant:
             raise ValueError("joint names must be nonempty strings")
         if len({name for _, name in items}) != len(items):
             raise ValueError("each joint must have one M3508 owner")
-        bus = items[0][0].bus
-        if any(device.bus is not bus for device, _ in items):
-            raise ValueError("joint devices must share one CAN bus")
-        if len({device.motor_id for device, _ in items}) != len(items):
-            raise ValueError("joint devices require unique motor IDs")
+        if len({(id(device.bus), device.motor_id)
+                for device, _ in items}) != len(items):
+            raise ValueError("joint devices require unique motor IDs on each CAN bus")
         if any(device.closed for device, _ in items):
             raise ValueError("joint devices must be open")
         for method in ("reset", "step", "set_joint_effort", "get_joint_state",

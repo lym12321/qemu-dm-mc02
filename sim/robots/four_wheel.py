@@ -50,8 +50,10 @@ class FourWheelRuntime(CanRuntime):
             raise TypeError("four-wheel runtime requires an open joint plant")
         if tuple(device.motor_id for device in plant.devices) != (1, 2, 3, 4):
             raise ValueError("four-wheel runtime requires IDs 1, 2, 3, 4 in order")
-        imu_to_bmi088_units(plant.physics.get_imu("imu"))
         bus = plant.devices[0].bus
+        if any(device.bus is not bus for device in plant.devices):
+            raise ValueError("four-wheel runtime requires one CAN bus")
+        imu_to_bmi088_units(plant.physics.get_imu("imu"))
         endpoint = QemuCanEndpoint(bus, can)
         socket_endpoint = (SocketCanEndpoint(bus, socketcan_tx)
                            if socketcan_tx is not None else None)
