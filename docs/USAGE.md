@@ -1220,8 +1220,9 @@ mapper = QemuTimestampMapper(ack.virtual_time_ns, logical_origin_ns)
 只会等待实际匹配 ACK 并返回最新 RESET 元数据。重复 RESET 不延长同一个
 2 秒期限。握手不清除已有 RX tail、TX suffix 或已解码回复，也不重置 CAN、
 器件、物理世界或 QEMU；这些效果由调用方明确决定。既有单板 worker 仍在
-成功 ACK 后重置其独占 plant。共享世界的多板运行入口尚未实现，各板的
-RESET epoch、STEP_ACK 和 BMI088 消费 DONE 均不能证明 CPU 全局时间屏障。
+成功 ACK 后重置其独占 plant。多板共用一个 plant 可使用下方
+`SharedWorldRuntime`；各板的 RESET epoch、STEP_ACK 和 BMI088 消费 DONE
+仍分别表示时间映射、输入准入和传感器消费。
 `bash tools/run-qemu-v2-step-smoke.sh` 验证旧 worker 和两个真实 QEMU 的独立
 会话、时间原点，以及等待一块板 STEP_ACK 时发现另一块板的原生 RESET，
 随后由调用方完成 RESET_ACK 握手。双板用例复用现有 Lab 测试 ELF；报告保留
@@ -1635,6 +1636,60 @@ finally:
 RESET 保留 transport 的 partial bytes，并更新 QEMU/worker 时间原点。CAN wire 没有
 session 标识，因此不提供跨 reset 的 CAN 历史输入隔离。这个调度不提供位级仲裁、
 真实电气总线、CPU 全局锁步或实物电机标定。
+
+### Shared board/world runtime
+
+`sim.robots.shared_world.SharedWorldRuntime` 将多个独立 QEMU 连接接到同一个
+`M3508JointPlant`。调用方先构造各板的 `QemuCanEndpoint`，再用非空 tuple
+绑定名称、endpoint、`StepFramedSocket` 和具名 IMU。运行时从 endpoint 的只读
+`.stream` 取得实际 CAN transport；所有连接须已打开、非阻塞且互不重复，
+plant 中的器件总线须与绑定总线完全一致。构造会检查全部具名 IMU，成功后
+运行时独占 plant 的推进和关闭；构造失败时仍由调用方清理 plant。
+
+```python
+import time
+from sim.core import Session
+from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
+
+# plant、endpoint_a/b、cosim_a/b 已由调用方配置和连接。
+runtime = SharedWorldRuntime(plant, (
+    BoardBinding("a", endpoint_a, cosim_a, "imu_a"),
+    BoardBinding("b", endpoint_b, cosim_b, "imu_b"),
+))
+try:
+    reset_acks = runtime.start(Session(1, 7), (101, 102),
+                               deadline=time.monotonic() + 2)
+    step_acks = runtime.step(1_000_000, deadline=time.monotonic() + 2)
+    runtime.service(deadline=time.monotonic() + 2, timeout=0)
+finally:
+    runtime.close()
+    # 调用方另行关闭所有借用连接，并清理 QEMU/QMP。
+```
+
+`start()` 只允许尝试一次：全部实际 RESET_ACK 到齐后，将各自 QEMU 时间原点
+映射到所给 Session 原点，再统一重置总线和世界一次。启动期间保留物理 CAN
+输入，不提前消费。每个 `step()` 先有界服务连接，再调用一次 Coordinator；
+plant 沿用既有命令超时分段。全部终点 IMU 编码成功后才发送各板 STEP，返回
+实际 ACK tuple；重试复用编码 bytes。`service()` 只收发和入队，不推进世界。
+
+可传入 `check_running()` 检查调用方拥有的进程；
+`on_response(name, frame, decoded_payload)` 观察返回的 ACK 和闲置连接的回复，
+DONE 保留实际 status/consumed/missing。既有主动等待器会跳过部分 advisory
+回复，因此此回调不是完整录制接口。每条连接的 RX 由主动等待器或闲置 poll
+独占。绝对 monotonic deadline 在收发及推进前后检查；阻塞 solver/callback
+仍须由外层进程限时。ACK 服务期间的回调或 transport `TimeoutError` 会以
+`RuntimeError` 传播并保留原 cause；只有 ACK 等待器自身的超时可以触发重试。
+任一运行失败或观测到原生 RESET 都冻结 owner，须重新
+创建完整 owner 和板卡进程；已推进世界和已发送数据保留。`close()` 仅关闭
+拥有的 plant，不 flush 或关闭借用的连接和总线。
+
+`bash tools/run-qemu-shared-world-smoke.sh` 使用两个真实 QEMU 和同一四 hinge
+MuJoCo 夹具，验证独立会话、实际 CAN 电流命令/反馈、具名 IMU 和 BMI088 raw
+消费。固件先经 ready/按键发送命令，主机保留完整 wire 后暂停 CPU，统一完成
+RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。报告分别保留
+实际 ACK、DONE masks、UART 完成标记以及失败/清理结果；这是固定 bare-MMIO
+夹具，尚未提供 Arena CLI、多底盘组合、HAL/BSP 闭环、CPU 全局时间屏障或
+实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
 
 ### trobot DJI driver test
 

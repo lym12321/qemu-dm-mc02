@@ -29,6 +29,7 @@ from sim.transports import (
     connect_unix as transport_connect_unix, send_datagram,
 )
 from sim.transports import step_codec as step_protocol
+from sim.transports.can_stream import CanStream
 from sim.transports.cosim import (
     MAGIC, VERSION, HEADER, MAX_PAYLOAD, RESET, IMU_SAMPLE, TELEMETRY,
     ADC_INPUT, ADC_VOLTAGE, ADC_VOLTAGE_MAX_UV, ADC_VOLTAGE_FLAGS_MASK,
@@ -242,31 +243,6 @@ def adc_voltage_frame(sequence: int, virtual_time_ns: int,
                                       voltage_uv, 0))
 
 
-
-class CanStream(FixedRecordStream):
-    """FDCAN codec over the shared bounded fixed-record transport."""
-
-    def __init__(self, sock: socket.socket):
-        super().__init__(
-            sock, record_size=CAN_WIRE_SIZE,
-            max_pending=MAX_PENDING_FRAMES, queue_name="FDCAN",
-            endpoint_name="QEMU FDCAN", clock=time, poller=select)
-
-    def receive(self) -> list[tuple[int, int, int, int, bytes]]:
-        frames = []
-        for body in self.receive_records():
-            frame = unpack_wire_frame(body)
-            frames.append((frame.can_id, frame.flags, frame.dlc,
-                           frame.timestamp_ns, frame.data))
-        return frames
-
-    def send(self, can_id: int, flags: int, dlc: int, timestamp_ns: int,
-             data: bytes) -> None:
-        """Send one fixed-width frame to the QEMU FDCAN chardev."""
-        self._check_tx_capacity()
-        payload = pack_wire_frame(CanFrame(
-            can_id, flags, dlc, data, timestamp_ns))
-        self._enqueue(payload)
 
 
 def send_socketcan(sock: socket.socket, frame: CanFrame) -> None:

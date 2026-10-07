@@ -44,9 +44,15 @@ class QemuCanEndpoint:
         if not callable(send):
             raise TypeError("QEMU CAN stream requires callable send")
         self.bus = bus
+        self._stream = stream
         self._send = send
         self._mapper: TimestampMapper | None = None
         bus.attach(self, name)
+
+    @property
+    def stream(self) -> QemuCanStream:
+        """Return the actual borrowed stream without transferring ownership."""
+        return self._stream
 
     def bind_mapper(self, mapper: TimestampMapper) -> None:
         """Bind a validated RESET mapper without changing transport bytes."""
