@@ -1187,6 +1187,44 @@ v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，�
 
 worker 每次从 co-sim/FDCAN stream 最多读取 4096 字节，返回完整帧并保留未完成帧；v2 暂存的已解码回复先处理，再读取新输入。因此持续可读输入期间仍有机会检查等待期限并服务其它就绪方向。此策略不保证各方向吞吐相同或固定的主机延迟；自定义 backend 的阻塞调用仍需自行限时。
 
+需要自行连接多个 QEMU 时，可直接使用 `sim.transports.cosim` 的
+`StepFramedSocket`、`wait_v2_response`、`send_v2_step`、`wait_v2_reset_ack`
+和 `QemuTimestampMapper`。唯一 v2 codec 是 `sim.transports.step_codec`；
+旧 `tools/dm_mc02_step_protocol.py` 和 worker 名称继续导出同一对象。
+每个连接分别持有 directional validator、session ID 和 mapper；调用方负责
+socket 的连接、非阻塞配置与清理。初始握手沿用实际 RESET/RESET_ACK：
+
+```python
+from sim.transports import step_codec as wire
+from sim.transports.cosim import StepFramedSocket, wait_v2_response, QemuTimestampMapper
+
+# cosim_socket 是调用方已连接的 socket；logical_origin_ns 由执行者选择。
+cosim_socket.setblocking(False)
+stream = StepFramedSocket(cosim_socket)
+tx = wire.StepSessionValidator.host_to_qemu()
+rx = wire.StepSessionValidator.qemu_to_host(require_step_done=False)
+session_id = wire.generate_session_id()
+reset = wire.decode_step_frame(wire.build_step_frame(wire.RESET, 0, 0,
+                                                    session_id=session_id))
+tx.accept(reset)
+rx.begin_reset(0, 0, session_id)
+stream.send(wire.encode_step_frame(reset))
+ack_frame = wait_v2_response(stream, rx, wire.RESET_ACK, 0, 0)
+ack = wire.decode_reset_ack_payload(ack_frame.payload)
+mapper = QemuTimestampMapper(ack.virtual_time_ns, logical_origin_ns)
+```
+
+`send_v2_step` 接收调用方已经校验、编码的 STEP bytes，复用上述重试规则，
+不会生成输入或推进 plant。`wait_v2_response` 收到非预期 RESET 时抛出
+`V2SessionReset`；将它交给 `wait_v2_reset_ack(stream, rx, reset_event)`，
+只会等待实际匹配 ACK 并返回最新 RESET 元数据。重复 RESET 不延长同一个
+2 秒期限。握手不清除已有 RX tail、TX suffix 或已解码回复，也不重置 CAN、
+器件、物理世界或 QEMU；这些效果由调用方明确决定。既有单板 worker 仍在
+成功 ACK 后重置其独占 plant。共享世界的多板运行入口尚未实现，各板的
+RESET epoch、STEP_ACK 和 BMI088 消费 DONE 均不能证明 CPU 全局时间屏障。
+`bash tools/run-qemu-v2-step-smoke.sh` 验证旧 worker 和两个真实 QEMU 的独立
+会话、时间原点及单板复位；双板用例复用现有 Lab 测试 ELF，不构造物理世界。
+
 QMP 或固件触发 machine reset 时，同一 co-sim 连接会先完成已开始发送的帧，再发送新会话 RESET、RESET_ACK 和状态快照；尚未开始发送的旧回复会取消。断开连接会清空旧输出，重连建立新会话，不重放丢失的回复。客户端主动发送 RESET 仍按原有队列顺序返回响应；使用严格会话校验的客户端需处理此前的旧会话回复。
 
 同一连接的复位也会保留尚未接收完整的帧前缀。后缀到达后，旧 v2 STEP 按旧会话 ID 整帧拒绝，新会话 STEP 可继续接收；`cosim-diagnostics` 的 `rx_buffered` 表示当前保留的接收字节数。拒绝旧 STEP 会增加 `rx_bad_frames` 和 `rx_dropped_bytes`，不代表帧边界损坏。真正断连会清空旧接收字节。此边界不隔离旧客户端 RESET 帧或无会话 ID 的 v1 输入；会话 ID 完整回绕和客户端主动复用 ID 也不提供历史隔离保证。

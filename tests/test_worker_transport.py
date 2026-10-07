@@ -1874,5 +1874,176 @@ class WorkerTransportTests(unittest.TestCase):
                     self.assertEqual(response.header.step_id, 2)
 
 
+class CosimExchangeTests(unittest.TestCase):
+    """Actual borrowed streams; literal replies independent of codec helpers."""
+
+    @staticmethod
+    def wire(kind, session, timestamp=0, *, step=0, dt=0, payload=b""):
+        body = struct.pack("<IHHIQQQI", 0x32434D44, 2, kind,
+                           len(payload), step, timestamp, dt, session) + payload
+        return struct.pack("<I", len(body)) + body
+
+    def pair(self):
+        local, remote = socket.socketpair()
+        self.addCleanup(local.close)
+        self.addCleanup(remote.close)
+        local.setblocking(False)
+        remote.settimeout(0.5)
+        return local, remote
+
+    def test_cosim_canonical_import_identity_without_worker_dependencies(self):
+        import subprocess
+        root = WORKER.parents[1]
+        code = """
+import importlib, importlib.util, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+sys.path.insert(0, str(root))
+from sim.transports import cosim, step_codec
+assert not any(n.startswith(('sim.physics', 'sim.devices')) for n in sys.modules)
+sys.path.insert(0, str(root / 'tools'))
+modules = [importlib.import_module(n) for n in
+           ('dm_mc02_step_protocol', 'tools.dm_mc02_step_protocol')]
+spec = importlib.util.spec_from_file_location('codec_by_path', root / 'tools/dm_mc02_step_protocol.py')
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+modules.append(module)
+for module in modules:
+    for name in ('StepFrame', 'StepHeader', 'StepSessionValidator',
+                 'StepProtocolError', 'encode_step_frame', '_generate_session_id'):
+        assert getattr(module, name) is getattr(step_codec, name), name
+from tools import dm_mc02_sim_worker as worker
+assert worker.step_protocol is step_codec
+for name in ('FramedSocket', 'StepFramedSocket', 'V2SessionReset',
+             'QemuTimestampMapper', 'wait_v2_response', 'send_v2_step',
+             'wait_v2_reset_ack'):
+    assert getattr(worker, name) is getattr(cosim, name), name
+"""
+        result = subprocess.run([sys.executable, "-I", "-c", code, str(root)],
+                                cwd="/tmp", capture_output=True, text=True,
+                                timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_cosim_two_stream_reset_preserves_other_partial_bytes(self):
+        from sim.transports import cosim, step_codec as protocol
+
+        class WriteBudget:
+            """Inject one short write; actual bytes still use a socketpair."""
+            def __init__(self, sock):
+                self.sock, self.remaining = sock, 3
+
+            def send(self, data):
+                if not self.remaining:
+                    raise BlockingIOError
+                sent = self.sock.send(data[:self.remaining])
+                self.remaining -= sent
+                return sent
+
+            def recv(self, size):
+                return self.sock.recv(size)
+
+            def fileno(self):
+                return self.sock.fileno()
+
+        local_a, remote_a = self.pair()
+        local_b, remote_b = self.pair()
+        limited_b = WriteBudget(local_b)
+        streams = [cosim.StepFramedSocket(local_a), cosim.StepFramedSocket(limited_b)]
+        validators = [protocol.StepSessionValidator.qemu_to_host(require_step_done=True)
+                      for _ in streams]
+        for stream, validator, remote, session, origin in zip(
+                streams, validators, (remote_a, remote_b), (101, 202), (100, 300)):
+            validator.begin_reset(0, 0, session)
+            remote.sendall(self.wire(5, session,
+                                    payload=struct.pack("<IIQII", 0, 63, origin, 0, 0)))
+            ack = cosim.wait_v2_response(stream, validator, 5, 0, 0)
+            self.assertEqual(protocol.decode_reset_ack_payload(ack.payload).virtual_time_ns,
+                             origin)
+        mapper_a, mapper_b = (cosim.QemuTimestampMapper(origin, 17)
+                              for origin in (100, 300))
+        self.assertEqual((mapper_a.map(109, 0), mapper_b.map(309, 0)), (26, 26))
+        self.assertEqual((mapper_a.unmap(26, 0), mapper_b.unmap(26, 0)), (109, 309))
+
+        # B has a partially transmitted valid STEP and a partial received ACK.
+        # Bare 60-byte IMU payload is an existing v2 compatibility shape.
+        step_wire = self.wire(2, 202, 1, step=1, dt=1, payload=bytes(60))
+        streams[1].send(step_wire)
+        self.assertEqual(remote_b.recv(4096), step_wire[:3])
+        ack_wire = self.wire(3, 202, 1, step=1, dt=1, payload=bytes(16))
+        remote_b.sendall(ack_wire[:7])
+        self.assertEqual(streams[1].receive(), [])
+        self.assertEqual(bytes(streams[1].buffer), ack_wire[:7])
+
+        remote_a.sendall(self.wire(1, 303, 600) + self.wire(1, 304, 700) +
+                         self.wire(5, 304, 700,
+                                   payload=struct.pack("<IIQII", 0, 63, 700, 0, 0)))
+        with self.assertRaises(cosim.V2SessionReset) as event:
+            cosim.wait_v2_response(streams[0], validators[0], 3, 1, 1)
+        latest = cosim.wait_v2_reset_ack(streams[0], validators[0], event.exception)
+        self.assertEqual((latest.session_id, latest.t_sim_ns), (304, 700))
+        self.assertEqual(validators[1].session_id, 202)
+        self.assertEqual((validators[1].last_step_id, validators[1].last_t_sim_ns), (0, 0))
+        self.assertEqual([bytes(v) for v in streams[1].tx_queue], [step_wire[3:]])
+        self.assertEqual(bytes(streams[1].buffer), ack_wire[:7])
+        self.assertEqual(mapper_b.qemu_origin_ns, 300)
+
+        # Recover B's original suffix, ACK and decoded DONE in their wire order.
+        limited_b.remaining = len(step_wire)
+        self.assertTrue(streams[1].flush())
+        self.assertEqual(remote_b.recv(4096), step_wire[3:])
+        done_wire = self.wire(6, 202, 1, step=1, dt=1,
+                              payload=struct.pack("<IIIII", 0, 3, 0, 0, 0))
+        remote_b.sendall(ack_wire[7:] + done_wire)
+        cosim.wait_v2_response(streams[1], validators[1], 3, 1, 1)
+        self.assertEqual(len(streams[1].pending_frames), 1)
+        done = cosim.wait_v2_response(streams[1], validators[1], 6, 1, 1)
+        self.assertEqual(done.payload, struct.pack("<IIIII", 0, 3, 0, 0, 0))
+        self.assertFalse(streams[1].tx_pending)
+        self.assertEqual(validators[0].session_id, 304)
+
+    def test_cosim_reset_ack_repeated_markers_do_not_renew_deadline(self):
+        from sim.transports import cosim, step_codec as protocol
+        local, remote = self.pair()
+        stream = cosim.StepFramedSocket(local)
+        validator = protocol.StepSessionValidator.qemu_to_host(require_step_done=False)
+        reset = cosim.V2SessionReset(0, 10, 101)
+        validator.accept(protocol.decode_step_frame(self.wire(1, 101, 10)))
+        now, session = 0.0, 101
+
+        def service(timeout):
+            nonlocal now, session
+            self.assertEqual(timeout, 0)
+            now += 0.75
+            session += 1
+            remote.sendall(self.wire(1, session, session))
+
+        with patch.object(cosim.time, "monotonic", lambda: now):
+            with self.assertRaisesRegex(TimeoutError, "v2 RESET_ACK"):
+                cosim.wait_v2_reset_ack(stream, validator, reset, service)
+        self.assertEqual(now, 2.25)
+        self.assertEqual(validator.session_id, 104)
+        self.assertEqual(local.fileno() >= 0, True)
+
+    def test_cosim_reset_ack_rejects_bad_reply_and_propagates_eof(self):
+        from sim.transports import cosim, step_codec as protocol
+        for outcome in ("stale", "malformed", "eof"):
+            with self.subTest(outcome=outcome):
+                local, remote = self.pair()
+                stream = cosim.StepFramedSocket(local)
+                validator = protocol.StepSessionValidator.qemu_to_host(require_step_done=False)
+                validator.accept(protocol.decode_step_frame(self.wire(1, 101, 10)))
+                if outcome == "eof":
+                    remote.close()
+                    expected, message = ConnectionError, "socket closed"
+                else:
+                    remote.sendall(self.wire(5, 100 if outcome == "stale" else 101, 10,
+                                            payload=bytes(23 if outcome == "malformed" else 24)))
+                    expected, message = protocol.StepProtocolError, "session" if outcome == "stale" else "RESET_ACK"
+                with self.assertRaisesRegex(expected, message):
+                    cosim.wait_v2_reset_ack(stream, validator,
+                                            cosim.V2SessionReset(0, 10, 101))
+                # Rejection never takes ownership of the caller's socket.
+                self.assertGreaterEqual(local.fileno(), 0)
+
+
 if __name__ == "__main__":
     unittest.main()
