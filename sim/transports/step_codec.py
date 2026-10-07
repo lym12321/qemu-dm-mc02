@@ -672,11 +672,7 @@ class StepSessionValidator:
         _uint(session_id, UINT32_MAX, "session_id")
         self._validate_reset_session_id(session_id)
         self.reset()
-        self._session_id = session_id
-        self.initialized = True
-        self.last_step_id = step_id
-        self.last_t_sim_ns = t_sim_ns
-        self._reset_ack_pending = True
+        self._start_reset(step_id, t_sim_ns, session_id)
 
     def _validate_reset_session_id(self, session_id: int) -> None:
         expected = self._configured_session_id

@@ -5,6 +5,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import struct
+import socket
 import sys
 
 import pytest
@@ -673,6 +674,59 @@ def test_optional_done_replay_permission_expires_on_new_ack():
                                  _step_ack_payload()))
     with pytest.raises(protocol.StepProtocolError, match="duplicate"):
         rx.accept(done)
+
+
+@pytest.mark.parametrize("require_step_done", [True, False],
+                         ids=["strict", "advisory"])
+def test_begin_reset_seeds_nonzero_ack_baseline_and_clears_old_history(
+        require_step_done):
+    rx = protocol.StepSessionValidator.qemu_to_host(
+        require_step_done=require_step_done)
+    for session, step, origin in ((81, 17, 500), (82, 4, 700)):
+        rx.begin_reset(step, origin, session)
+        rx.accept(_directional_frame(protocol.RESET_ACK, step, origin,
+                                     payload=_reset_ack_payload(),
+                                     session_id=session))
+        # dt is the increment from RESET's logical origin, not absolute time.
+        with pytest.raises(protocol.StepProtocolError, match="increase strictly"):
+            rx.accept(_directional_frame(protocol.STEP_ACK, step + 1,
+                                         origin + 10, origin + 10,
+                                         _step_ack_payload(), session))
+        rx.accept(_directional_frame(protocol.STEP_ACK, step + 1,
+                                     origin + 10, 10,
+                                     _step_ack_payload(), session))
+        rx.accept(_directional_frame(protocol.STEP_DONE, step + 1,
+                                     origin + 10, 10,
+                                     _step_done_payload(), session))
+        assert (rx.last_step_id, rx.last_t_sim_ns) == (step + 1, origin + 10)
+
+
+def test_nonzero_reset_baseline_through_actual_cosim_waiter():
+    from sim.transports.cosim import StepFramedSocket, wait_v2_response
+
+    local, remote = socket.socketpair()
+    try:
+        local.setblocking(False)
+        stream = StepFramedSocket(local)
+        rx = protocol.StepSessionValidator.qemu_to_host(require_step_done=True)
+        rx.begin_reset(17, 500, 81)
+        frames = (
+            _directional_frame(protocol.RESET_ACK, 17, 500,
+                               payload=_reset_ack_payload(), session_id=81),
+            _directional_frame(protocol.STEP_ACK, 18, 510, 10,
+                               _step_ack_payload(), 81),
+            _directional_frame(protocol.STEP_DONE, 18, 510, 10,
+                               _step_done_payload(), 81),
+        )
+        remote.sendall(b"".join(protocol.encode_step_frame(frame) for frame in frames))
+        for frame in frames:
+            assert wait_v2_response(stream, rx, frame.header.kind,
+                                    frame.header.step_id, frame.header.t_sim_ns,
+                                    timeout=.5) == frame
+        assert not stream.pending_frames and not stream.buffer
+    finally:
+        local.close()
+        remote.close()
 
 
 def test_response_validator_rejects_replayed_done_for_wrong_record():
