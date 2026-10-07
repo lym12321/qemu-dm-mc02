@@ -1891,6 +1891,127 @@ class CosimExchangeTests(unittest.TestCase):
         remote.settimeout(0.5)
         return local, remote
 
+    def test_cosim_poll_one_head_preserves_pending_and_partial_order(self):
+        from sim.transports import cosim, step_codec as protocol
+        local, remote = self.pair()
+        monitored = Mock(wraps=local)
+        stream = cosim.StepFramedSocket(monitored)
+        validator = protocol.StepSessionValidator.qemu_to_host()
+        validator.begin_reset(0, 0, 101)
+        done_payload = bytes.fromhex(
+            "0200000001000000020000000600000007000000")
+        done_wire = self.wire(6, 101, 1, step=1, dt=1,
+                              payload=done_payload)
+        remote.sendall(
+            self.wire(5, 101, payload=struct.pack("<IIQII", 0, 63, 10, 0, 0)) +
+            self.wire(3, 101, 1, step=1, dt=1, payload=bytes(16)) +
+            self.wire(4, 101, 1, step=1, payload=bytes(40)) +
+            self.wire(7, 101, 1, step=1, payload=bytes(24)) +
+            self.wire(8, 101, 1, step=1, dt=1, payload=bytes(2)) +
+            done_wire[:7])
+        # A poll must not opportunistically flush unrelated borrowed TX.
+        monitored.send.side_effect = BlockingIOError
+        stream.send(b"pending TX")
+        monitored.send.reset_mock()
+        frame, payload = cosim.poll_v2_response(stream, validator)
+        self.assertEqual(frame.header.kind, 5)
+        self.assertEqual(payload, protocol.ResetAckPayload(0, 63, 10, 0))
+        self.assertEqual(bytes(stream.buffer), done_wire[:7])
+        self.assertEqual(monitored.recv.call_count, 1)
+
+        remote.sendall(done_wire[7:])
+        for kind in (3, 4, 7, 8):
+            frame, payload = cosim.poll_v2_response(stream, validator)
+            self.assertEqual(frame.header.kind, kind)
+            self.assertEqual(payload, protocol.StepAckPayload(0, 0, 0)
+                             if kind == 3 else None)
+            self.assertEqual(monitored.recv.call_count, 1)
+            self.assertEqual(bytes(stream.buffer), done_wire[:7])
+        frame, payload = cosim.poll_v2_response(stream, validator)
+        self.assertEqual((frame.header.kind, frame.payload), (6, done_payload))
+        # Poll returns the actual terminal observation, including missing data.
+        self.assertEqual(payload, protocol.StepDonePayload(2, 1, 2, 6, 7))
+        self.assertIsNone(cosim.poll_v2_response(stream, validator))
+        self.assertEqual([call.args for call in monitored.recv.call_args_list],
+                         [(4096,)] * 3)
+        self.assertEqual(bytes(stream.buffer), b"")
+        self.assertEqual([bytes(view) for view in stream.tx_queue], [b"pending TX"])
+        monitored.send.assert_not_called()
+
+    def test_cosim_poll_reset_metadata_is_peer_local(self):
+        from sim.transports import cosim, step_codec as protocol
+        local_a, remote_a = self.pair()
+        local_b, remote_b = self.pair()
+        monitored_b = Mock(wraps=local_b)
+        stream_a = cosim.StepFramedSocket(local_a)
+        stream_b = cosim.StepFramedSocket(monitored_b)
+        validator_a = protocol.StepSessionValidator.qemu_to_host()
+        validator_b = protocol.StepSessionValidator.qemu_to_host()
+        validator_b.begin_reset(0, 0, 202)
+        ack_b = self.wire(3, 202, 1, step=1, dt=1, payload=bytes(16))
+        remote_b.sendall(self.wire(5, 202, payload=struct.pack(
+            "<IIQII", 0, 63, 300, 0, 0)) + ack_b[:7])
+        cosim.poll_v2_response(stream_b, validator_b)
+        remote_a.sendall(self.wire(1, 303, 700) + self.wire(
+            5, 303, 700, payload=struct.pack("<IIQII", 0, 63, 700, 0, 0)))
+        frame, payload = cosim.poll_v2_response(stream_a, validator_a)
+        self.assertEqual((frame.header.kind, frame.header.session_id,
+                          frame.header.step_id, frame.header.t_sim_ns),
+                         (1, 303, 0, 700))
+        self.assertIsNone(payload)
+        self.assertEqual(len(stream_a.pending_frames), 1)
+        self.assertEqual((validator_b.session_id, validator_b.last_step_id,
+                          validator_b.last_t_sim_ns), (202, 0, 0))
+        self.assertEqual(bytes(stream_b.buffer), ack_b[:7])
+        self.assertEqual(monitored_b.recv.call_count, 1)
+        remote_b.sendall(ack_b[7:])
+        frame, payload = cosim.poll_v2_response(stream_b, validator_b)
+        self.assertEqual((frame.header.session_id, payload.status), (202, 0))
+
+    def test_cosim_poll_invalid_head_retains_decoded_suffix(self):
+        from sim.transports import cosim, step_codec as protocol
+        for outcome in ("session", "payload", "compatibility_decoder"):
+            with self.subTest(outcome=outcome):
+                local, remote = self.pair()
+                stream = cosim.StepFramedSocket(local)
+                validator = (protocol.StepSessionValidator()
+                             if outcome == "compatibility_decoder" else
+                             protocol.StepSessionValidator.qemu_to_host())
+                validator.begin_reset(0, 0, 101)
+                remote.sendall(
+                    self.wire(5, 100 if outcome == "session" else 101,
+                              payload=bytes(24 if outcome == "session" else 23)) +
+                    self.wire(1, 202, 7) + self.wire(
+                        5, 202, 7, payload=struct.pack("<IIQII", 0, 63, 7, 0, 0)))
+                expected = (RuntimeError if outcome == "compatibility_decoder"
+                            else protocol.StepProtocolError)
+                message = "session" if outcome == "session" else "RESET_ACK"
+                with self.assertRaisesRegex(expected, message):
+                    cosim.poll_v2_response(stream, validator)
+                self.assertEqual([frame.header.kind for frame in stream.pending_frames],
+                                 [1, 5])
+                frame, payload = cosim.poll_v2_response(stream, validator)
+                self.assertEqual((frame.header.kind, frame.header.session_id), (1, 202))
+                self.assertIsNone(payload)
+                frame, payload = cosim.poll_v2_response(stream, validator)
+                self.assertEqual(payload, protocol.ResetAckPayload(0, 63, 7, 0))
+                self.assertGreaterEqual(local.fileno(), 0)
+
+    def test_cosim_poll_empty_and_eof_keep_socket_borrowed(self):
+        from sim.transports import cosim, step_codec as protocol
+        local, remote = self.pair()
+        stream = cosim.StepFramedSocket(local)
+        validator = protocol.StepSessionValidator.qemu_to_host()
+        self.assertIsNone(cosim.poll_v2_response(stream, validator))
+        remote.sendall(self.wire(1, 101, 10)[:7])
+        self.assertIsNone(cosim.poll_v2_response(stream, validator))
+        tail = bytes(stream.buffer)
+        remote.close()
+        with self.assertRaisesRegex(ConnectionError, "socket closed"):
+            cosim.poll_v2_response(stream, validator)
+        self.assertEqual(bytes(stream.buffer), tail)
+        self.assertGreaterEqual(local.fileno(), 0)
+
     def test_cosim_canonical_import_identity_without_worker_dependencies(self):
         import subprocess
         root = WORKER.parents[1]

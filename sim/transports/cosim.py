@@ -73,6 +73,67 @@ class V2SessionReset(RuntimeError):
 
 
 
+def validate_v2_response(frame: step_protocol.StepFrame, validator
+                         ) -> (step_protocol.ResetAckPayload |
+                               step_protocol.StepAckPayload |
+                               step_protocol.StepDonePayload | None):
+    """Validate one response using the canonical session and payload codecs."""
+    validator.accept(frame)
+    if frame.header.kind == step_protocol.RESET:
+        return None
+    if frame.header.kind == step_protocol.RESET_ACK:
+        try:
+            ack = step_protocol.decode_reset_ack_payload(frame.payload)
+        except step_protocol.StepProtocolError as exc:
+            raise RuntimeError("invalid RESET_ACK payload") from exc
+    elif frame.header.kind == step_protocol.STEP_ACK:
+        try:
+            ack = step_protocol.decode_step_ack_payload(frame.payload)
+        except step_protocol.StepProtocolError as exc:
+            raise RuntimeError("invalid STEP_ACK payload") from exc
+    elif frame.header.kind == step_protocol.STEP_DONE:
+        try:
+            ack = step_protocol.decode_step_done_payload(frame.payload)
+        except step_protocol.StepProtocolError as exc:
+            raise RuntimeError("invalid STEP_DONE payload") from exc
+    elif frame.header.kind == step_protocol.DIAGNOSTICS:
+        try:
+            step_protocol.decode_diagnostics_payload(frame.payload)
+        except step_protocol.StepProtocolError as exc:
+            raise RuntimeError("invalid diagnostics payload") from exc
+        ack = None
+    elif frame.header.kind == step_protocol.TELEMETRY:
+        try:
+            step_protocol.decode_board_telemetry_payload(frame.payload)
+        except step_protocol.StepProtocolError as exc:
+            raise RuntimeError("invalid board telemetry payload") from exc
+        ack = None
+    elif frame.header.kind == step_protocol.MOTOR_STATE:
+        try:
+            step_protocol.decode_motor_state(frame.payload)
+        except (ValueError, struct.error) as exc:
+            raise RuntimeError("invalid motor state payload") from exc
+        ack = None
+    else:
+        ack = None
+    return ack
+
+
+def poll_v2_response(stream: StepFramedSocket, validator):
+    """Consume one available head without waiting or flushing borrowed IO.
+
+    Return ``(frame, payload)`` or ``None`` when no frame is available. RESET
+    is returned explicitly; its execution policy belongs to the caller. The
+    decoded suffix is returned before validating the head, including on error.
+    """
+    received = stream.receive()
+    if not received:
+        return None
+    stream.push_front(received[1:])
+    frame = received[0]
+    return frame, validate_v2_response(frame, validator)
+
+
 def wait_v2_response(stream: StepFramedSocket, validator,
                      expected_kind: int, expected_step_id: int,
                      expected_time_ns: int, timeout: float = 2.0,
@@ -90,7 +151,7 @@ def wait_v2_response(stream: StepFramedSocket, validator,
             stream.flush()
         received = stream.receive()
         for frame_index, frame in enumerate(received):
-            validator.accept(frame)
+            ack = validate_v2_response(frame, validator)
             if frame.header.kind == step_protocol.RESET:
                 if (expected_kind != step_protocol.RESET_ACK or
                         interrupt_on_reset):
@@ -101,41 +162,6 @@ def wait_v2_response(stream: StepFramedSocket, validator,
                                          frame.header.t_sim_ns,
                                          frame.header.session_id)
                 continue
-            if frame.header.kind == step_protocol.RESET_ACK:
-                try:
-                    ack = step_protocol.decode_reset_ack_payload(frame.payload)
-                except step_protocol.StepProtocolError as exc:
-                    raise RuntimeError("invalid RESET_ACK payload") from exc
-            elif frame.header.kind == step_protocol.STEP_ACK:
-                try:
-                    ack = step_protocol.decode_step_ack_payload(frame.payload)
-                except step_protocol.StepProtocolError as exc:
-                    raise RuntimeError("invalid STEP_ACK payload") from exc
-            elif frame.header.kind == step_protocol.STEP_DONE:
-                try:
-                    ack = step_protocol.decode_step_done_payload(frame.payload)
-                except step_protocol.StepProtocolError as exc:
-                    raise RuntimeError("invalid STEP_DONE payload") from exc
-            elif frame.header.kind == step_protocol.DIAGNOSTICS:
-                try:
-                    step_protocol.decode_diagnostics_payload(frame.payload)
-                except step_protocol.StepProtocolError as exc:
-                    raise RuntimeError("invalid diagnostics payload") from exc
-                ack = None
-            elif frame.header.kind == step_protocol.TELEMETRY:
-                try:
-                    step_protocol.decode_board_telemetry_payload(frame.payload)
-                except step_protocol.StepProtocolError as exc:
-                    raise RuntimeError("invalid board telemetry payload") from exc
-                ack = None
-            elif frame.header.kind == step_protocol.MOTOR_STATE:
-                try:
-                    step_protocol.decode_motor_state(frame.payload)
-                except (ValueError, struct.error) as exc:
-                    raise RuntimeError("invalid motor state payload") from exc
-                ack = None
-            else:
-                ack = None
             if frame.header.kind != expected_kind:
                 if frame.header.kind == step_protocol.DIAGNOSTICS:
                     continue

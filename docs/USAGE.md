@@ -1223,7 +1223,16 @@ mapper = QemuTimestampMapper(ack.virtual_time_ns, logical_origin_ns)
 成功 ACK 后重置其独占 plant。共享世界的多板运行入口尚未实现，各板的
 RESET epoch、STEP_ACK 和 BMI088 消费 DONE 均不能证明 CPU 全局时间屏障。
 `bash tools/run-qemu-v2-step-smoke.sh` 验证旧 worker 和两个真实 QEMU 的独立
-会话、时间原点及单板复位；双板用例复用现有 Lab 测试 ELF，不构造物理世界。
+会话、时间原点，以及等待一块板 STEP_ACK 时发现另一块板的原生 RESET，
+随后由调用方完成 RESET_ACK 握手。双板用例复用现有 Lab 测试 ELF；报告保留
+实际 DONE 消费 masks，该用例未构造物理世界。
+
+多连接调用方可用 `poll_v2_response(stream, rx)` 检查当前没有等待器读取的
+连接。它非阻塞地返回一个 `(frame, payload)`，无完整回复时返回 `None`；
+使用与等待器相同的会话和 payload 校验，并在校验队首前保留已解码后续帧。
+RESET 原样返回其会话和时间元数据，STEP_DONE 保留实际 status 与消费 masks，
+调用方据此决定是否冻结或握手。每条连接同一时刻只能由 poll 或等待器读取。
+poll 不发送、等待或清理连接；未完成的 RX 字节继续由原 stream 保存。
 
 QMP 或固件触发 machine reset 时，同一 co-sim 连接会先完成已开始发送的帧，再发送新会话 RESET、RESET_ACK 和状态快照；尚未开始发送的旧回复会取消。断开连接会清空旧输出，重连建立新会话，不重放丢失的回复。客户端主动发送 RESET 仍按原有队列顺序返回响应；使用严格会话校验的客户端需处理此前的旧会话回复。
 

@@ -78,7 +78,7 @@ from sim.transports import connect_unix
 from sim.transports import step_codec as protocol
 from sim.transports.cosim import (
     QemuTimestampMapper, StepFramedSocket, V2SessionReset,
-    send_v2_step, wait_v2_reset_ack, wait_v2_response,
+    poll_v2_response, send_v2_step, wait_v2_reset_ack, wait_v2_response,
 )
 from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
@@ -93,10 +93,12 @@ command = [binary, "-machine", "dm-mc02", "-kernel", firmware,
 deadline = time.monotonic() + 20.0
 owners, resources, streams, controls, tx, rx = [], [], [], [], [], []
 identities = []
+idle_resets = {}
 active = None
 primary = None
 report = {"schema": 1, "mode": mode, "status": "running", "epochs": [],
           "initial_reset_acks": [],
+          "native_reset_acks": [], "idle_events": [],
           "acks": [], "cleanup": [],
           "limits": ["Transport admission and epoch metadata only.",
                      "No plant, global CPU barrier, calibration or RTF gate."]}
@@ -137,12 +139,43 @@ def qmp(index, name, arguments=None):
     return value
 
 
+def poll_idle_peer(index, source):
+    stream = streams[index]
+    assert stream is not active
+    response = poll_v2_response(stream, rx[index])
+    if response is None:
+        return None
+    frame, payload = response
+    active_index = streams.index(active)
+    event = {"peer": index, "kind": frame.header.kind,
+             "session": frame.header.session_id, "step": frame.header.step_id,
+             "time_ns": frame.header.t_sim_ns, "source": source,
+             "active_peer": active_index,
+             "active_session": tx[active_index].session_id,
+             "active_step": tx[active_index].last_step_id}
+    if isinstance(payload, protocol.StepDonePayload):
+        # Advisory DONE is reported exactly; missing sensors are not consumed PASS.
+        event.update(status=payload.status, consumed_mask=payload.consumed_mask,
+                     missing_mask=payload.missing_mask)
+    report["idle_events"].append(event)
+    if frame.header.kind == protocol.RESET:
+        assert payload is None
+        idle_resets[index] = V2SessionReset(
+            frame.header.step_id, frame.header.t_sim_ns, frame.header.session_id)
+    return response
+
+
 def service_io(timeout):
-    # The response helper is the sole RX consumer of its active stream.
-    # Each borrowed stream retains its own parser/queue; service only TX here.
+    # Wait owns active RX; nonblocking poll owns only the other streams. Once
+    # RESET is observed, leave that peer's actual ACK queued for caller handshake.
+    for index, stream in enumerate(streams):
+        if stream is not active and index not in idle_resets:
+            poll_idle_peer(index, "service_io")
     budget = min(timeout, .005, remaining())
     _, writable, _ = select.select(
-        [active.sock], [stream.sock for stream in streams if stream.tx_pending],
+        [stream.sock for index, stream in enumerate(streams)
+         if stream is active or index not in idle_resets],
+        [stream.sock for stream in streams if stream.tx_pending],
         [], budget)
     for stream in streams:
         if stream.sock in writable:
@@ -190,6 +223,21 @@ def validator_state(validator):
             validator.require_step_done)
 
 
+def complete_native_reset(index, reset):
+    global active
+    active = streams[index]
+    latest = wait_v2_reset_ack(active, rx[index], reset, service_io=service_io)
+    # ACK commits transport reset metadata. The caller alone changes TX baseline.
+    tx[index].reset()
+    tx[index].accept(protocol.StepFrame(protocol.StepHeader(
+        2, protocol.RESET, 0, latest.step_id, latest.t_sim_ns, 0,
+        latest.session_id), b""))
+    report["native_reset_acks"].append(
+        {"peer": index, "session": latest.session_id, "step": latest.step_id,
+         "time_ns": latest.t_sim_ns})
+    return latest
+
+
 def native_reset(index):
     global active
     qmp(index, "system_reset")
@@ -200,15 +248,9 @@ def native_reset(index):
                          rx[index].last_t_sim_ns + 1_000_000,
                          timeout=min(2., remaining()), service_io=service_io)
     except V2SessionReset as reset:
-        latest = wait_v2_reset_ack(active, rx[index], reset, service_io=service_io)
+        return complete_native_reset(index, reset)
     else:
         raise AssertionError("native system_reset emitted no RESET marker")
-    # ACK commits transport reset metadata. The caller alone changes TX baseline.
-    tx[index].reset()
-    tx[index].accept(protocol.StepFrame(protocol.StepHeader(
-        2, protocol.RESET, 0, latest.step_id, latest.t_sim_ns, 0,
-        latest.session_id), b""))
-    return latest
 
 
 try:
@@ -267,8 +309,7 @@ try:
             for mapper, epoch in zip(mappers, report["epochs"]):
                 assert mapper.map(epoch + 17, 0) == logical_origin + 17
                 assert mapper.unmap(logical_origin + 29, 0) == epoch + 29
-            unaffected = (validator_state(tx[1]), validator_state(rx[1]),
-                          mappers[1].qemu_origin_ns, mappers[1].worker_origin_ns)
+            peer1_session = rx[1].session_id
 
             if mode == "peer-exit":
                 report["stage"] = "negative_peer_exit"
@@ -279,7 +320,33 @@ try:
                 raise AssertionError("native peer early exit was not rejected")
 
             report["stage"] = "unsolicited_reset_peer_0"
-            latest = native_reset(0)
+            # Consume valid old idle heads before the native reset; no physical
+            # tail is deleted. Readiness then arranges a real buffered marker for
+            # the original active exchange's service_io, without a sleep.
+            while poll_idle_peer(0, "pre_reset") is not None:
+                remaining()
+            assert not idle_resets
+            qmp(0, "system_reset")
+            assert qmp(0, "query-status")["running"] is False
+            readable, _, _ = select.select([streams[0].sock], [], [],
+                                            min(2., remaining()))
+            assert readable, "native idle peer reset produced no readable wire"
+            remaining()
+            report["stage"] = "active_peer_1_with_idle_reset"
+            step_peer(1, 2_000_000)
+            assert 0 in idle_resets, "active wait did not poll the idle RESET"
+            reset_events = [event for event in report["idle_events"]
+                            if event["peer"] == 0 and event["kind"] == protocol.RESET]
+            assert len(reset_events) == 1
+            assert reset_events[0]["source"] == "service_io"
+            assert (reset_events[0]["active_peer"], reset_events[0]["active_session"],
+                    reset_events[0]["active_step"]) == (1, peer1_session, 2)
+            assert tx[1].session_id == rx[1].session_id == peer1_session
+            unaffected = (validator_state(tx[1]), validator_state(rx[1]),
+                          mappers[1].qemu_origin_ns, mappers[1].worker_origin_ns)
+            report["stage"] = "caller_handshake_idle_peer_0"
+            latest = complete_native_reset(0, idle_resets[0])
+            del idle_resets[0]
             assert latest.session_id != first_reset.session_id and latest.t_sim_ns >= epoch0
             assert rx[0].session_id == latest.session_id
             assert (validator_state(tx[1]), validator_state(rx[1]),
@@ -288,7 +355,6 @@ try:
             mappers[0] = QemuTimestampMapper(latest.t_sim_ns, logical_origin)
             report["reset"] = {"session": latest.session_id, "time_ns": latest.t_sim_ns}
             step_peer(0, latest.t_sim_ns + 1_000_000)
-            step_peer(1, 2_000_000)
             assert mappers[0].map(latest.t_sim_ns + 17, 0) == logical_origin + 17
             assert mappers[1].map(epoch1 + 17, 0) == logical_origin + 17
             remaining()
