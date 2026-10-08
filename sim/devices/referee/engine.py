@@ -73,6 +73,45 @@ def _deadline(game, now_ns):
             if game.game_progress in (2, 3, 4) else None)
 
 
+def validate_referee_configuration(initial: RefereeState, *, durations: MatchDurations,
+                                   events: tuple[ScriptEvent, ...] = (),
+                                   cooling_42mm_per_s: int = 0) -> None:
+    """Admit a fixture configuration without constructing or executing an owner."""
+    if type(initial) is not RefereeState:
+        raise TypeError("initial must be a RefereeState")
+    for value, expected in ((initial.game, GameStatus), (initial.robot, RobotStatus),
+                            (initial.power_heat, PowerHeat), (initial.buff, Buff)):
+        _admit_message(value, expected)
+    if type(durations) is not MatchDurations:
+        raise TypeError("durations must be MatchDurations")
+    for value, label in ((durations.countdown_s, "countdown_s"),
+                         (durations.battle_s, "battle_s")):
+        if _uint(value, 65535, label) == 0:
+            raise ValueError(f"{label} must be positive")
+    _uint(cooling_42mm_per_s, 65535, "cooling_42mm_per_s")
+    if type(events) is not tuple:
+        raise TypeError("events must be an immutable tuple")
+    if len(events) > MAX_SCRIPT_EVENTS:
+        raise ValueError(f"script exceeds {MAX_SCRIPT_EVENTS} events")
+    previous = 0
+    for event in events:
+        if type(event) is not ScriptEvent:
+            raise TypeError("script requires ScriptEvent values")
+        _uint(event.offset_ns, 0xffffffffffffffff, "event offset_ns")
+        if event.offset_ns < previous:
+            raise ValueError("script offsets must be nondecreasing")
+        previous = event.offset_ns
+        if type(event.value) is Hit:
+            _uint(event.value.damage_hp, 65535, "damage_hp")
+        elif type(event.value) is Shot:
+            _uint(event.value.heat_17mm, 65535, "heat_17mm increment")
+            _uint(event.value.heat_42mm, 65535, "heat_42mm increment")
+        elif type(event.value) in (GameStatus, RobotStatus, PowerHeat, Buff):
+            _admit_message(event.value, type(event.value))
+        else:
+            raise TypeError("unsupported referee script event")
+
+
 class RefereeEngine:
     """Single-owner participant with immutable snapshots and a bounded script.
 
@@ -84,39 +123,8 @@ class RefereeEngine:
 
     def __init__(self, initial: RefereeState, *, durations: MatchDurations,
                  events: tuple[ScriptEvent, ...] = (), cooling_42mm_per_s: int = 0):
-        if type(initial) is not RefereeState:
-            raise TypeError("initial must be a RefereeState")
-        for value, expected in ((initial.game, GameStatus), (initial.robot, RobotStatus),
-                                (initial.power_heat, PowerHeat), (initial.buff, Buff)):
-            _admit_message(value, expected)
-        if type(durations) is not MatchDurations:
-            raise TypeError("durations must be MatchDurations")
-        for value, label in ((durations.countdown_s, "countdown_s"),
-                             (durations.battle_s, "battle_s")):
-            if _uint(value, 65535, label) == 0:
-                raise ValueError(f"{label} must be positive")
-        _uint(cooling_42mm_per_s, 65535, "cooling_42mm_per_s")
-        if type(events) is not tuple:
-            raise TypeError("events must be an immutable tuple")
-        if len(events) > MAX_SCRIPT_EVENTS:
-            raise ValueError(f"script exceeds {MAX_SCRIPT_EVENTS} events")
-        previous = 0
-        for event in events:
-            if type(event) is not ScriptEvent:
-                raise TypeError("script requires ScriptEvent values")
-            _uint(event.offset_ns, 0xffffffffffffffff, "event offset_ns")
-            if event.offset_ns < previous:
-                raise ValueError("script offsets must be nondecreasing")
-            previous = event.offset_ns
-            if type(event.value) is Hit:
-                _uint(event.value.damage_hp, 65535, "damage_hp")
-            elif type(event.value) is Shot:
-                _uint(event.value.heat_17mm, 65535, "heat_17mm increment")
-                _uint(event.value.heat_42mm, 65535, "heat_42mm increment")
-            elif type(event.value) in (GameStatus, RobotStatus, PowerHeat, Buff):
-                _admit_message(event.value, type(event.value))
-            else:
-                raise TypeError("unsupported referee script event")
+        validate_referee_configuration(initial, durations=durations, events=events,
+                                       cooling_42mm_per_s=cooling_42mm_per_s)
         self._initial = initial
         self._durations = durations
         self._events = events

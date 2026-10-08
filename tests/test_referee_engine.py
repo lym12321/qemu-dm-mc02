@@ -13,6 +13,7 @@ from sim.core import Coordinator, Session, StepContext, StepResult
 from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RobotStatus, ScriptEvent, Shot, decode_frame, encode_message,
+    validate_referee_configuration,
 )
 
 NS = 1_000_000_000
@@ -30,6 +31,8 @@ def advance(consumer, target, step_id, session_id=7):
     return consumer.step(StepContext(session_id, step_id, target, target - consumer.t_sim_ns))
 
 
+@pytest.mark.parametrize("admit", [RefereeEngine, validate_referee_configuration],
+                         ids=["engine", "pure"])
 @pytest.mark.parametrize("initial,options", [
     (object(), {}),
     (replace(INITIAL, robot=replace(INITIAL.robot, maximum_hp=99)), {}),
@@ -52,13 +55,28 @@ def advance(consumer, target, step_id, session_id=7):
     (INITIAL, {"events": (ScriptEvent(0, GameStatus(1, 4, 0, 0)),)}),
     (INITIAL, {"events": (ScriptEvent(0, replace(INITIAL.robot, current_hp=201)),)}),
 ])
-def test_configuration_admission_is_pure_and_reuses_wire_constraints(monkeypatch, initial, options):
+def test_configuration_admission_is_pure_and_reuses_wire_constraints(monkeypatch, admit, initial, options):
     def forbidden(*args, **kwargs):
         pytest.fail("referee configuration performed external IO")
     monkeypatch.setattr(socket, "socket", forbidden)
     monkeypatch.setattr(subprocess, "Popen", forbidden)
     with pytest.raises((ValueError, TypeError)):
-        engine(initial, **options)
+        admit(initial, **{"durations": DURATIONS, **options})
+
+
+def test_public_configuration_admission_needs_no_owner_or_runtime(monkeypatch):
+    def forbidden(*args, **kwargs):
+        pytest.fail("pure configuration admission constructed or executed an owner")
+    for method in ("__init__", "reset", "step", "get_state", "close"):
+        monkeypatch.setattr(RefereeEngine, method, forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    # Equal-time entries are admitted in tuple order, without applying the hit.
+    script = (ScriptEvent(0, Hit(20)), ScriptEvent(0, INITIAL.robot),
+              ScriptEvent(0, Shot(5, 7)))
+    assert validate_referee_configuration(INITIAL, durations=DURATIONS,
+                                         events=script, cooling_42mm_per_s=2) is None
+    assert INITIAL.robot.current_hp == 100
 
 
 def test_maximum_script_capacity_and_uint64_offset_are_admitted():

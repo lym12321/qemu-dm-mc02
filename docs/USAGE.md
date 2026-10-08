@@ -426,6 +426,10 @@ coordinator.close()
 超过 65535 热量会拒绝整个步进并冻结，需 reset 后才能继续。`PowerHeat` 替换会重置
 热量余量；`Buff` 只更新消息数据。getter 返回不可变的最近完成快照，不推进时间。
 
+配置工具可以先调用 `validate_referee_configuration(initial, durations=...,
+events=..., cooling_42mm_per_s=...)`。该公共函数与引擎构造器使用相同校验，
+成功时返回 `None`，不创建引擎或执行 reset/step，也不获取外部资源。
+
 阶段 2→3→4→5 按绝对虚拟截止时间推进，当前剩余时间由 `GameStatus` 提供，后续
 倒计时和比赛时长由 `MatchDurations` 明确配置。阶段 2/3/4 的输入剩余秒数与配置时长
 必须为正，输出剩余秒数向上取整；阶段到期先于同时间脚本事件。其它阶段保留显式数据。
