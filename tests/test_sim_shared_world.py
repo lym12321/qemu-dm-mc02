@@ -2,7 +2,8 @@
 
 Only native physics and independent board response producers are isolated.
 Literal protocol bytes and control/expiry expectations are independent of the
-runtime helpers. This does not run QEMU or prove sensor consumption/CPU timing.
+runtime helpers. Referee consumers use real engines and byte transport. This
+does not run QEMU or prove firmware readiness, consumption or CPU timing.
 """
 
 from contextlib import ExitStack
@@ -18,12 +19,17 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sim.core import Session
+from sim.core import Session, StepContext
 from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.devices.referee import (
+    Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
+    RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot, decode_frame,
+)
 from sim.fabric import CanBus
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.physics import ImuSample, JointState
-from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
+from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
+from sim.transports import StreamTransport
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import StepFramedSocket, V2SessionReset
 from sim.transports import step_codec as codec
@@ -128,13 +134,15 @@ class Boards:
 
 
 @pytest.fixture
-def setup():
+def world_resources():
     with ExitStack() as stack:
         native = NativeStub()
         buses = (CanBus(), CanBus())
         devices = tuple(M3508Device(bus, 1) for bus in buses)
         plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))), gear_ratio=2)
-        stack.callback(plant.close)
+        # A successful runtime owns the plant. Only a rejected construction
+        # leaves this fixture responsible for its still-open resource.
+        stack.callback(lambda: None if plant.closed else plant.close())
         streams, can_peers, cosims, cosim_peers = [], [], [], []
         for _ in range(2):
             for stream_class, output, peers in (
@@ -153,11 +161,17 @@ def setup():
                          for name, endpoint, cosim in zip(("left", "right"), endpoints, cosims))
         boards = Boards(cosim_peers, native)
         observations = []
-        runtime = SharedWorldRuntime(
-            plant, bindings, check_running=boards,
-            on_response=lambda *response: observations.append(response))
-        stack.callback(runtime.close)
-        yield runtime, boards, native, bindings, can_peers, observations
+        yield plant, boards, native, bindings, can_peers, observations, stack
+
+
+@pytest.fixture
+def setup(world_resources):
+    plant, boards, native, bindings, peers, observations, stack = world_resources
+    runtime = SharedWorldRuntime(
+        plant, bindings, check_running=boards,
+        on_response=lambda *response: observations.append(response))
+    stack.callback(runtime.close)
+    yield runtime, boards, native, bindings, peers, observations
 
 
 def start(runtime):
@@ -469,3 +483,493 @@ def test_callback_timeout_is_terminal_and_never_replayed(setup, monkeypatch, cal
         runtime.step(1_000_000, deadline=time.monotonic() + 1)
     boards()
     assert [len(frames) for frames in boards.frames] == [2, 1]
+
+
+REFEREE_INITIAL = RefereeState(
+    GameStatus(1, 0, 0, 0x0102030405060708),
+    RobotStatus(3, 2, 100, 200, 3, 100, 80, 7),
+    PowerHeat(40, 10, 20), Buff(0, 0, 0, 0, 0, 0x80))
+# Fixed 2026 V1.1.0 layouts and pinned crccheck literals from the isolated
+# endpoint gate. No production encoder computes the expected bytes.
+REFEREE_INITIAL_WIRE = bytes.fromhex(
+    "a50b00fe690100010000080706050403020138e1"
+    "a50d00ffe6010203026400c80003006400500007ee23"
+    "a50e0000370202000000000000000028000a00140071bd"
+    "a5080001b8040200000000000000806ba9")
+REFEREE_COMPLETED_PAYLOADS = (
+    ((0x0001, "0100000807060504030201"),
+     (0x0201, "03022800c80003006400500007"),
+     (0x0202, "000000000000000028000c001900"),
+     (0x0204, "0000000000000080")),
+    ((0x0001, "0100000807060504030201"),
+     (0x0201, "09025500c80003006400500007"),
+     (0x0202, "0000000000000000280007001200"),
+     (0x0204, "0000000000000080")),
+)
+
+
+class UartBudget:
+    """Real fd/IO; isolate only a write budget, a failure or a late return."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.budget = None
+        self.error = None
+        self.on_send = None
+        self.sends = self.reads = self.closes = 0
+
+    def fileno(self):
+        return self.sock.fileno()
+
+    def gettimeout(self):
+        return self.sock.gettimeout()
+
+    def send(self, data):
+        self.sends += 1
+        if self.error is not None:
+            raise self.error
+        if self.on_send is not None:
+            self.on_send()
+        if self.budget == 0:
+            raise BlockingIOError
+        count = len(data) if self.budget is None else min(self.budget, len(data))
+        written = self.sock.send(data[:count])
+        if self.budget is not None:
+            self.budget -= written
+        return written
+
+    def recv(self, size):
+        self.reads += 1
+        return self.sock.recv(size)
+
+    def close(self):
+        self.closes += 1
+        self.sock.close()
+
+
+def uart_received(peer):
+    result = bytearray()
+    while True:
+        try:
+            part = peer.recv(4096)
+        except BlockingIOError:
+            return bytes(result)
+        assert part, "unexpected referee UART EOF"
+        result.extend(part)
+
+
+def referee_frames(wire):
+    """Use official envelope length and existing validated pure decoder."""
+    result = []
+    while wire:
+        assert wire[0] == 0xa5
+        size = int.from_bytes(wire[1:3], "little") + 9
+        assert len(wire) >= size
+        result.append(decode_frame(wire[:size]))
+        wire = wire[size:]
+    return result
+
+
+@pytest.fixture
+def referee_resources(world_resources):
+    *_, stack = world_resources
+    initial_right = replace(REFEREE_INITIAL,
+                            robot=replace(REFEREE_INITIAL.robot, robot_id=9))
+    replacement = replace(REFEREE_INITIAL.robot, current_hp=50)
+    engines = (
+        RefereeEngine(REFEREE_INITIAL, durations=MatchDurations(3, 4),
+                      cooling_42mm_per_s=2,
+                      events=(ScriptEvent(500_000_000, Hit(30)),
+                              ScriptEvent(500_000_000, replacement),
+                              ScriptEvent(500_000_000, Hit(10)),
+                              ScriptEvent(500_000_000, Shot(5, 7)))),
+        RefereeEngine(initial_right, durations=MatchDurations(3, 4),
+                      cooling_42mm_per_s=2,
+                      events=(ScriptEvent(500_000_000, Hit(15)),)),
+    )
+    pairs, referees = [], []
+    for name, engine, sequence in zip(("left", "right"), engines, (254, 10)):
+        sender, peer = socket.socketpair()
+        for sock in (sender, peer):
+            sock.setblocking(False)
+            stack.callback(sock.close)
+        budget = UartBudget(sender)
+        endpoint = RefereeUartEndpoint(StreamTransport(budget, max_pending=1),
+                                       sequence=sequence)
+        stack.callback(lambda endpoint=endpoint: None if endpoint.closed else endpoint.close())
+        stack.callback(lambda engine=engine: None if engine.closed else engine.close())
+        pairs.append((budget, peer))
+        referees.append(RefereeBinding(name, engine, endpoint))
+    yield world_resources, tuple(referees), tuple(pairs)
+
+
+@pytest.fixture
+def referee_setup(referee_resources):
+    resources, referees, pairs = referee_resources
+    plant, boards, native, bindings, peers, observations, stack = resources
+    runtime = SharedWorldRuntime(
+        plant, bindings, referees=referees, check_running=boards,
+        on_response=lambda *response: observations.append(response))
+    stack.callback(runtime.close)
+    yield runtime, boards, native, bindings, peers, observations, referees, pairs
+
+
+def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, monkeypatch):
+    runtime, boards, native, _, _, _, referees, pairs = referee_setup
+    assert runtime.referees is referees
+    sessions, contexts, reset_observations, endpoint_resets = [], [], [], []
+    for item in referees:
+        original_reset, original_step = item.engine.reset, item.engine.step
+        original_endpoint_reset = item.endpoint.reset
+
+        def reset(session, original=original_reset):
+            sessions.append(session)
+            reset_observations.append((tuple(len(frames) for frames in boards.frames),
+                                       native.resets))
+            return original(session)
+
+        def step(context, original=original_step):
+            contexts.append(context)
+            return original(context)
+
+        def endpoint_reset(sequence, original=original_endpoint_reset, name=item.name):
+            endpoint_resets.append((name, sequence, len(sessions), native.resets))
+            return original(sequence)
+
+        monkeypatch.setattr(item.engine, "reset", reset)
+        monkeypatch.setattr(item.engine, "step", step)
+        monkeypatch.setattr(item.endpoint, "reset", endpoint_reset)
+        with pytest.raises(RuntimeError):
+            item.engine.get_state()  # Admission neither queries nor resets it.
+        with pytest.raises(AttributeError):
+            item.engine.closed = True
+        with pytest.raises(AttributeError):
+            item.endpoint.transport = object()
+        with pytest.raises(AttributeError):
+            item.endpoint.closed = True
+    with pytest.raises(FrozenInstanceError):
+        referees[0].name = "changed"
+    with pytest.raises(RuntimeError):
+        runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    session = Session(7, 500)
+    runtime.start(session, (71, 72), deadline=time.monotonic() + 1)
+    assert sessions == [session, session] and sessions[0] is sessions[1] is session
+    assert reset_observations == [((1, 1), 1), ((1, 1), 1)]
+    assert endpoint_resets == [("left", 254, 2, 1), ("right", 10, 2, 1)]
+    assert [item.endpoint.next_sequence for item in referees] == [254, 10]
+    assert all(sock.sends == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    runtime.step(1_000_000_000, deadline=time.monotonic() + 1)
+    assert contexts == [StepContext(7, 1, 1_000_000_500, 1_000_000_000)] * 2
+    assert contexts[0] is contexts[1]
+    assert all(item.engine.t_sim_ns == runtime.t_sim_ns for item in referees)
+    assert [item.engine.get_state().robot.current_hp for item in referees] == [40, 85]
+    assert all(sock.sends == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    completed = tuple(item.engine.get_state() for item in referees)
+    for item, (sock, peer), sequence, literals in zip(
+            referees, pairs, (254, 10), REFEREE_COMPLETED_PAYLOADS):
+        item.endpoint.transport.buffer.extend(b"read tail")
+        peer.send(b"unread input")
+        emitted = runtime.publish_referee(item.name, deadline=time.monotonic() + 1)
+        actual = uart_received(peer)
+        assert actual == emitted and len(actual) == 82
+        decoded = referee_frames(actual)
+        assert [frame.sequence for frame in decoded] == [(sequence + i) % 256 for i in range(4)]
+        assert [(frame.command_id, frame.payload.hex()) for frame in decoded] == list(literals)
+        assert sock.reads == 0 and item.endpoint.transport.buffer == b"read tail"
+    assert native.steps == [1_000_000_000] and runtime.step_id == 1
+    assert all(item.engine.get_state() is state for item, state in zip(referees, completed))
+    runtime.close()
+    runtime.close()
+    assert native.closed == 1 and all(item.engine.closed and item.endpoint.closed for item in referees)
+    for item, (sock, peer) in zip(referees, pairs):
+        assert sock.closes == sock.reads == 0 and sock.fileno() >= 0
+        item.endpoint.transport.read_once()  # Caller retains the RX/lifetime.
+        assert item.endpoint.transport.buffer == b"read tailunread input"
+        item.endpoint.transport.send(b"caller")
+        assert uart_received(peer) == b"caller"
+
+
+@pytest.mark.parametrize("invalid", [
+    "tuple", "binding_type", "name", "duplicate_name", "engine_type", "endpoint_type",
+    "engine", "endpoint", "transport", "socket", "board_socket",
+    "closed_engine", "closed_endpoint", "closed_socket", "blocking_socket",
+])
+def test_referee_admission_is_complete_before_observation_reset_ownership_or_io(
+        referee_resources, monkeypatch, invalid):
+    resources, referees, pairs = referee_resources
+    plant, boards, native, bindings, _, _, _ = resources
+    first, second = referees
+    if invalid == "tuple":
+        referees = list(referees)
+    elif invalid == "binding_type":
+        referees = (first, object())
+    elif invalid in ("name", "duplicate_name"):
+        referees = (first, replace(second, name="\0" if invalid == "name" else first.name))
+    elif invalid in ("engine_type", "endpoint_type"):
+        referees = (first, replace(second, **{invalid.removesuffix("_type"): object()}))
+    elif invalid in ("engine", "endpoint"):
+        referees = (first, replace(second, **{invalid: getattr(first, invalid)}))
+    elif invalid in ("transport", "socket", "board_socket"):
+        transport = (first.endpoint.transport if invalid == "transport" else StreamTransport(
+            first.endpoint.transport.sock if invalid == "socket" else bindings[1].cosim.sock))
+        referees = (first, replace(second, endpoint=RefereeUartEndpoint(transport)))
+    elif invalid == "closed_engine":
+        second.engine.close()
+    elif invalid == "closed_endpoint":
+        second.endpoint.close()
+    elif invalid == "closed_socket":
+        pairs[1][0].sock.close()
+    else:
+        pairs[1][0].sock.setblocking(True)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("referee admission observed or modified a runtime resource")
+
+    for cls, methods in ((RefereeEngine, ("get_state", "reset", "step")),
+                         (RefereeUartEndpoint, ("reset", "send_state", "flush"))):
+        for method in methods:
+            monkeypatch.setattr(cls, method, forbidden)
+    with pytest.raises((TypeError, ValueError)):
+        SharedWorldRuntime(plant, bindings, referees=referees, check_running=boards)
+    assert not plant.closed and native.resets == native.closed == 0
+    assert native.steps == native.reads == [] and boards.frames == [[], []]
+    assert all(item.endpoint.stream.reads == [] and not item.cosim.tx_pending for item in bindings)
+    assert all(sock.sends == sock.reads == sock.closes == 0 for sock, _ in pairs)
+
+
+def test_referee_start_keeps_queued_partial_bytes_and_active_service_drains_without_tick(referee_setup):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    item, (sock, peer) = referees[0], pairs[0]
+    sock.budget = 19
+    assert item.endpoint.send_state(REFEREE_INITIAL) == REFEREE_INITIAL_WIRE
+    assert uart_received(peer) == REFEREE_INITIAL_WIRE[:19]
+    suffix = REFEREE_INITIAL_WIRE[19:]
+    assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [suffix]
+    sends = sock.sends
+    sock.budget = None  # Startup must not flush even when physically writable.
+    start(runtime)
+    assert sock.sends == sends and uart_received(peer) == b""
+    assert item.endpoint.next_sequence == 2
+    assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [suffix]
+    runtime.service(deadline=time.monotonic() + 1)
+    assert uart_received(peer) == suffix and not item.endpoint.transport.tx_pending
+    assert item.endpoint.next_sequence == 2 and sock.reads == 0
+    assert native.resets == 1 and native.steps == []
+    assert runtime.t_sim_ns == item.engine.t_sim_ns == 500 and runtime.step_id == 0
+
+
+def test_referee_capacity_refusal_keeps_sequence_and_exact_suffix_retry_without_restep(referee_setup):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    item, (sock, peer) = referees[0], pairs[0]
+    sock.budget = 19
+    first = runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    assert first == REFEREE_INITIAL_WIRE and uart_received(peer) == first[:19]
+    sock.budget = 5
+    with pytest.raises(BufferError):
+        runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    assert not runtime.failed and item.endpoint.next_sequence == 2
+    assert uart_received(peer) == first[19:24]
+    assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [first[24:]]
+    sock.budget = None
+    runtime.service(deadline=time.monotonic() + 1)
+    assert uart_received(peer) == first[24:]
+    second = runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    assert uart_received(peer) == second
+    assert [frame.sequence for frame in referee_frames(second)] == [2, 3, 4, 5]
+    assert [(frame.command_id, frame.payload.hex()) for frame in referee_frames(second)] == [
+        (0x0001, "0100000807060504030201"),
+        (0x0201, "03026400c80003006400500007"),
+        (0x0202, "000000000000000028000a001400"),
+        (0x0204, "0000000000000080")]
+    assert native.steps == [] and runtime.step_id == 0 and item.engine.t_sim_ns == 500
+    assert pairs[1][0].sends == 0 and sock.reads == 0
+
+
+@pytest.mark.parametrize("name", ["missing", None])
+def test_referee_publish_bad_name_freezes_before_uart_or_world_effect(referee_setup, name):
+    runtime, _, native, _, _, _, _, pairs = referee_setup
+    start(runtime)
+    with pytest.raises((TypeError, ValueError)):
+        runtime.publish_referee(name, deadline=time.monotonic() + 1)
+    assert runtime.failed and native.steps == []
+    assert all(sock.sends == sock.reads == 0 for sock, _ in pairs)
+    with pytest.raises(RuntimeError):
+        runtime.publish_referee("left", deadline=time.monotonic() + 1)
+
+
+@pytest.mark.parametrize("capacity", [False, True])
+def test_referee_post_attempt_deadline_freezes_even_after_retryable_capacity(
+        referee_setup, monkeypatch, capacity):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    item, (sock, peer) = referees[0], pairs[0]
+    if capacity:
+        sock.budget = 0
+        runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    now = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    sock.on_send = lambda: now.__setitem__(0, now[0] + 10)
+    with pytest.raises(RuntimeError, match="host deadline"):
+        runtime.publish_referee("left", deadline=now[0] + 1)
+    assert runtime.failed and native.steps == []
+    assert item.endpoint.next_sequence == 2
+    if capacity:
+        assert uart_received(peer) == b""
+        assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [REFEREE_INITIAL_WIRE]
+    else:
+        assert uart_received(peer) == REFEREE_INITIAL_WIRE
+    sends = sock.sends
+    with pytest.raises(RuntimeError):
+        runtime.publish_referee("left", deadline=now[0] + 1)
+    assert sock.sends == sends
+
+
+@pytest.mark.parametrize("source", ["liveness", "state"])
+def test_referee_non_send_buffererror_is_terminal_not_snapshot_capacity(
+        referee_setup, monkeypatch, source):
+    runtime, boards, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    primary = BufferError(f"{source} failed")
+    if source == "liveness":
+        boards.failure = primary
+    else:
+        def failed_state():
+            raise primary
+        monkeypatch.setattr(referees[0].engine, "get_state", failed_state)
+    with pytest.raises(BufferError) as caught:
+        runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    assert caught.value is primary and runtime.failed
+    assert native.steps == [] and all(sock.sends == 0 for sock, _ in pairs)
+
+
+def test_later_referee_overflow_retains_first_participant_effects_without_board_step(
+        referee_resources):
+    resources, referees, pairs = referee_resources
+    plant, boards, native, bindings, _, _, stack = resources
+    initial = replace(REFEREE_INITIAL, robot=replace(REFEREE_INITIAL.robot, cooling_per_s=0),
+                      power_heat=PowerHeat(40, 65535, 0))
+    overflow = RefereeEngine(initial, durations=MatchDurations(3, 4),
+                            events=(ScriptEvent(500_000_000, Shot(1, 0)),))
+    stack.callback(lambda: None if overflow.closed else overflow.close())
+    referees = (referees[0], replace(referees[1], engine=overflow))
+    runtime = SharedWorldRuntime(plant, bindings, referees=referees, check_running=boards)
+    stack.callback(runtime.close)
+    start(runtime)
+    before = overflow.get_state()
+    with pytest.raises(OverflowError) as caught:
+        runtime.step(1_000_000_000, deadline=time.monotonic() + 1)
+    assert "participant referee:right failed at step 1" in caught.value.__notes__
+    assert runtime.failed and native.steps == [1_000_000_000]
+    assert runtime.step_id == 0 and runtime.t_sim_ns == 500
+    assert referees[0].engine.t_sim_ns == 1_000_000_500
+    assert referees[0].engine.get_state().robot.current_hp == 40
+    assert overflow.get_state() is before and overflow.t_sim_ns == 500
+    assert all([frame.header.kind for frame in frames] == [1] for frames in boards.frames)
+    assert all(sock.sends == 0 for sock, _ in pairs)
+    for action in (lambda: runtime.step(1, deadline=time.monotonic() + 1),
+                   lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1)):
+        with pytest.raises(RuntimeError):
+            action()
+    assert native.steps == [1_000_000_000]
+
+
+@pytest.mark.parametrize("operation", ["send", "flush"])
+def test_later_referee_uart_failure_preserves_primary_suffix_and_freezes_all(
+        referee_setup, operation):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    first = runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    assert uart_received(pairs[0][1]) == first
+    item, (sock, peer) = referees[1], pairs[1]
+    expected_sequence = 10
+    if operation == "flush":
+        sock.budget = 19
+        second = runtime.publish_referee("right", deadline=time.monotonic() + 1)
+        assert uart_received(peer) == second[:19]
+        suffix, expected_sequence = second[19:], 14
+    primary = OSError("second UART failed")
+    sock.error = primary
+    with pytest.raises(OSError) as caught:
+        if operation == "send":
+            runtime.publish_referee("right", deadline=time.monotonic() + 1)
+        else:
+            runtime.service(deadline=time.monotonic() + 1)
+    assert caught.value is primary and runtime.failed and native.steps == []
+    assert item.endpoint.next_sequence == expected_sequence
+    queued = [bytes(view) for view in item.endpoint.transport.tx_queue]
+    assert len(queued) == 1
+    if operation == "flush":
+        assert queued == [suffix]
+    else:
+        assert [(frame.command_id, frame.payload.hex()) for frame in referee_frames(queued[0])] == [
+            (0x0001, "0100000807060504030201"),
+            (0x0201, "09026400c80003006400500007"),
+            (0x0202, "000000000000000028000a001400"),
+            (0x0204, "0000000000000080")]
+    sends = [budget.sends for budget, _ in pairs]
+    for action in (lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1),
+                   lambda: runtime.service(deadline=time.monotonic() + 1),
+                   lambda: runtime.step(1, deadline=time.monotonic() + 1)):
+        with pytest.raises(RuntimeError):
+            action()
+    runtime.close()
+    assert [budget.sends for budget, _ in pairs] == sends
+    assert [bytes(view) for view in item.endpoint.transport.tx_queue] == queued
+    assert all(budget.closes == budget.reads == 0 for budget, _ in pairs)
+
+
+@pytest.mark.parametrize("shared_error", [False, True])
+def test_referee_close_reentry_and_errors_release_all_owners_once(
+        referee_setup, monkeypatch, shared_error):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    pairs[0][0].budget = 0
+    queued = runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    events = []
+    primary = KeyboardInterrupt("right endpoint close")
+    later = (OSError("left endpoint close"), OSError("right engine close"),
+             OSError("left engine close"), OSError("native close"))
+    later[3].add_note("physics borrowed-storage release failed")
+    for index, item in enumerate(referees):
+        original_endpoint, original_engine = item.endpoint.close, item.engine.close
+
+        def endpoint_close(index=index, original=original_endpoint):
+            events.append(("endpoint", index))
+            for action in (runtime.close,
+                           lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1),
+                           lambda: runtime.service(deadline=time.monotonic() + 1)):
+                with pytest.raises(RuntimeError):
+                    action()
+            original()
+            raise primary if index == 1 or shared_error else later[0]
+
+        def engine_close(index=index, original=original_engine):
+            events.append(("engine", index))
+            original()
+            raise primary if shared_error and index == 1 else later[1 if index == 1 else 2]
+
+        monkeypatch.setattr(item.endpoint, "close", endpoint_close)
+        monkeypatch.setattr(item.engine, "close", engine_close)
+    original_native = native.close
+
+    def native_close():
+        events.append(("native", 0))
+        original_native()
+        raise later[3]
+
+    monkeypatch.setattr(native, "close", native_close)
+    sends = [sock.sends for sock, _ in pairs]
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runtime.close()
+    assert caught.value is primary
+    assert events == [("endpoint", 1), ("endpoint", 0), ("engine", 1), ("engine", 0), ("native", 0)]
+    notes = "\n".join(caught.value.__notes__)
+    assert all(str(error) in notes for error in (later[2:] if shared_error else later))
+    assert "physics borrowed-storage release failed" in notes
+    assert runtime.closed and runtime.failed and native.closed == 1
+    assert all(item.endpoint.closed and item.engine.closed for item in referees)
+    runtime.close()
+    assert len(events) == 5 and [sock.sends for sock, _ in pairs] == sends
+    assert [bytes(view) for view in referees[0].endpoint.transport.tx_queue] == [queued]
+    assert all(sock.reads == sock.closes == 0 and sock.fileno() >= 0 for sock, _ in pairs)

@@ -32,6 +32,15 @@ class RefereeUartEndpoint:
     def next_sequence(self):
         return self._next_sequence
 
+    @property
+    def transport(self):
+        """Borrow the caller's byte transport without taking its ownership."""
+        return self._transport
+
+    @property
+    def closed(self):
+        return self._closed
+
     def _ready(self):
         if self._closed or self._failed:
             raise RuntimeError("referee endpoint is closed or requires reset")

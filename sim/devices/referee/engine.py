@@ -132,6 +132,10 @@ class RefereeEngine:
     def t_sim_ns(self):
         return self._t_sim_ns
 
+    @property
+    def closed(self):
+        return self._closed
+
     def get_state(self) -> RefereeState:
         """Read the latest completed snapshot, including after failure/close."""
         if self._runtime is None:

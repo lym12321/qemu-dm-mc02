@@ -317,6 +317,34 @@ uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena
 
 ## Referee protocol
 
+已有共享世界 owner 可以组合具名裁判引擎和 UART endpoint：
+
+```python
+from sim.robots.shared_world import RefereeBinding, SharedWorldRuntime
+
+world = SharedWorldRuntime(plant, boards, referees=(
+    RefereeBinding("east", east_engine, east_uart_endpoint),
+    RefereeBinding("west", west_engine, west_uart_endpoint),
+))
+world.start(session, wire_sessions, deadline=deadline)
+# 调用者先观察相应固件的实际 UART7 ready 事件，再发布：
+wire = world.publish_referee("east", deadline=deadline)
+world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
+```
+
+`plant`、板绑定、引擎和 endpoint 由调用者预先创建；构造成功后，world 拥有 plant、
+引擎及 endpoint 的执行和清理，socket 与 byte transport 仍由调用者清理。
+所有引擎使用同一个 Session 和 StepContext，`world.step()` 推进它们；发布只消费
+已完成状态。启动及步进不会自动发布。启动保留 endpoint 当前序号及既有排队字节，
+不能用逻辑 reset 清除旧 UART 数据。
+
+快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
+其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
+`close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
+不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
+共享世界的实际 UART7/HAL/RTOS 消费仍需验证。Arena YAML 尚未接入该组合；
+脚本状态也不代表根据世界碰撞进行实时裁决或实现官方独立消息发送周期。
+
 裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：
 
 ```python

@@ -1,9 +1,10 @@
 """Independent board exchanges around one owned joint world.
 
-The runtime borrows preconstructed endpoints and their nonblocking streams.
-One Coordinator/CanParticipant owns the existing plant; this is a synchronous
-host composition, not a CPU target barrier. Any operation failure is terminal:
-recreate the complete owner and board processes, never replay a world tick.
+The runtime borrows board endpoints and all nonblocking streams. One Coordinator
+owns the existing CAN/plant participant and optional referee engines; referee
+endpoints have a separate sequence lifecycle. This is a synchronous host
+composition, not a CPU target barrier. Operation failure is terminal except
+snapshot capacity refusal: recreate the owner and boards, never replay a tick.
 Callbacks may observe state but must not reenter execution or cleanup.
 """
 
@@ -15,6 +16,7 @@ import time
 from sim.core import Coordinator, Session
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
+from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
 from sim.fabric import CanFrame
 from sim.fabric.can import check_can_time
 from sim.fabric.endpoints import QemuCanEndpoint
@@ -35,6 +37,13 @@ class BoardBinding:
     imu: str
 
 
+@dataclass(frozen=True)
+class RefereeBinding:
+    name: str
+    engine: RefereeEngine
+    endpoint: RefereeUartEndpoint
+
+
 def _finite_seconds(value, label):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be finite")
@@ -48,7 +57,12 @@ def _finite_seconds(value, label):
 
 
 class SharedWorldRuntime:
-    """Own one plant, borrowing an ordered plain tuple of board bindings.
+    """Own one plant and optional referees, borrowing board/UART transports.
+
+    Each referee engine shares the sole Coordinator's Session and StepContext.
+    Endpoint sequence reset is separate; startup preserves its current sequence
+    and physical queued bytes. No snapshot is sent automatically. After observing
+    firmware UART readiness, the caller explicitly publishes a completed state.
 
     ``on_response(name, frame, decoded)`` sees returned RESET/STEP ACKs and
     idle observations, including actual advisory DONE masks/status. Existing
@@ -62,12 +76,16 @@ class SharedWorldRuntime:
 
     def __init__(self, plant: M3508JointPlant,
                  bindings: tuple[BoardBinding, ...], *,
+                 referees: tuple[RefereeBinding, ...] = (),
                  check_running=None, on_response=None):
         if not isinstance(plant, M3508JointPlant) or plant.closed:
             raise TypeError("shared world requires an open M3508 joint plant")
         if (type(bindings) is not tuple or not bindings
                 or any(type(item) is not BoardBinding for item in bindings)):
             raise TypeError("shared world requires a nonempty plain BoardBinding tuple")
+        if (type(referees) is not tuple
+                or any(type(item) is not RefereeBinding for item in referees)):
+            raise TypeError("shared world requires a plain RefereeBinding tuple")
         for callback, name in ((check_running, "check_running"),
                                (on_response, "on_response")):
             if callback is not None and not callable(callback):
@@ -82,9 +100,22 @@ class SharedWorldRuntime:
                 raise TypeError("board CAN requires the canonical CanStream")
             if not isinstance(item.cosim, StepFramedSocket):
                 raise TypeError("board co-sim requires StepFramedSocket")
+        for item in referees:
+            if not isinstance(item.name, str) or not item.name or "\0" in item.name:
+                raise ValueError("referee names must be nonempty without NUL")
+            if not isinstance(item.engine, RefereeEngine) or item.engine.closed:
+                raise TypeError("referee binding requires an open RefereeEngine")
+            if not isinstance(item.endpoint, RefereeUartEndpoint) or item.endpoint.closed:
+                raise TypeError("referee binding requires an open RefereeUartEndpoint")
+        for values, label in ((tuple(item.name for item in referees), "referee name"),
+                              (tuple(id(item.engine) for item in referees), "referee engine"),
+                              (tuple(id(item.endpoint) for item in referees), "referee endpoint")):
+            if len(set(values)) != len(values):
+                raise ValueError(f"each {label} must appear once")
         buses = tuple(item.endpoint.bus for item in bindings)
         streams = tuple(stream for item in bindings
-                        for stream in (item.endpoint.stream, item.cosim))
+                        for stream in (item.endpoint.stream, item.cosim)) + tuple(
+                            item.endpoint.transport for item in referees)
         if len({item.name for item in bindings}) != len(bindings):
             raise ValueError("each board name must appear once")
         if len({id(bus) for bus in buses}) != len(buses):
@@ -107,8 +138,10 @@ class SharedWorldRuntime:
             gyro, accel = imu_to_bmi088_units(getter(item.imu))
             codec.encode_imu_sample_v2(codec.ImuSampleV2(
                 gyro, accel, (0.0,) * 3, (0.0,) * 3, 0, 1))
-        coordinator = Coordinator({"can": CanParticipant(buses, (plant,))})
+        coordinator = Coordinator({"can": CanParticipant(buses, (plant,)),
+                                   **{"referee:" + item.name: item.engine for item in referees}})
         self.bindings = bindings
+        self.referees = referees
         self.plant = plant
         self._coordinator = coordinator
         self._check_running = check_running
@@ -172,6 +205,8 @@ class SharedWorldRuntime:
             readable.extend(item.endpoint.stream.sock for item in self.bindings)
             writable.extend(item.endpoint.stream.sock for item in self.bindings
                             if item.endpoint.stream.tx_pending)
+            writable.extend(item.endpoint.transport.sock for item in self.referees
+                            if item.endpoint.transport.tx_pending)
         _, ready_write, _ = select.select(
             readable, writable, [], min(timeout, max(0, deadline - time.monotonic())))
         self._guard(deadline)
@@ -181,6 +216,11 @@ class SharedWorldRuntime:
             if acked is None and item.endpoint.stream.sock in ready_write:
                 item.endpoint.stream.flush()
             self._guard(deadline)
+        if acked is None:
+            for item in self.referees:
+                if item.endpoint.transport.sock in ready_write:
+                    item.endpoint.flush()
+                self._guard(deadline)
         # One canonical CAN read per stream; parsing/ingress never advances
         # time. The bus retains original ordering/future delivery and queues.
         if acked is None:
@@ -255,6 +295,11 @@ class SharedWorldRuntime:
                 item.endpoint.bind_mapper(mapper)
             self._guard(deadline)
             self._coordinator.reset(session)
+            for item in self.referees:
+                self._guard(deadline)
+                # Logical reset preserves configured sequence and physical
+                # queued bytes/suffixes; it does not isolate old UART input.
+                item.endpoint.reset(item.endpoint.next_sequence)
             self._guard(deadline)
             self._failed = False
             return tuple(responses)
@@ -278,6 +323,36 @@ class SharedWorldRuntime:
             self._service(deadline, timeout)
             self._guard(deadline)
             self._failed = False
+        finally:
+            self._busy = False
+
+    def publish_referee(self, name: str, *, deadline) -> bytes:
+        """Admit one completed snapshot; caller decides when UART is ready.
+
+        No world or engine is advanced. Capacity refusal may drain old bytes
+        but admits no new snapshot/sequence and permits retry. Other failures
+        are terminal, including liveness/deadline failure after an attempted send.
+        Pending output is flushed by the existing active service pass.
+        """
+        self._enter()
+        try:
+            deadline = _finite_seconds(deadline, "deadline")
+            if not isinstance(name, str):
+                raise TypeError("referee name must be a string")
+            item = next((item for item in self.referees if item.name == name), None)
+            if item is None:
+                raise ValueError(f"unknown referee: {name!r}")
+            self._guard(deadline)
+            state = item.engine.get_state()
+            try:
+                wire = item.endpoint.send_state(state)
+            except BufferError:
+                self._guard(deadline)
+                self._failed = False
+                raise
+            self._guard(deadline)
+            self._failed = False
+            return wire
         finally:
             self._busy = False
 
@@ -334,8 +409,35 @@ class SharedWorldRuntime:
             self._busy = False
 
     def close(self):
-        """Close only the owned plant; caller cleans all borrowed resources."""
+        """Independently close owned participants/endpoints, preserving errors."""
         if self._busy:
             raise RuntimeError("shared world callbacks must not reenter cleanup")
+        if self.closed:
+            return
         self._failed = True
-        self._coordinator.close()
+        self._busy = True
+        primary = None
+        try:
+            for item in reversed(self.referees):
+                try:
+                    item.endpoint.close()
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        primary.add_note(f"referee {item.name} endpoint close failed: {type(exc).__name__}: {exc}")
+                        for note in (() if exc is primary else tuple(getattr(exc, "__notes__", ()))):
+                            primary.add_note(note)
+            try:
+                self._coordinator.close()
+            except BaseException as exc:
+                if primary is None:
+                    primary = exc
+                else:
+                    primary.add_note(f"shared world participants close failed: {type(exc).__name__}: {exc}")
+                    for note in (() if exc is primary else tuple(getattr(exc, "__notes__", ()))):
+                        primary.add_note(note)
+            if primary is not None:
+                raise primary
+        finally:
+            self._busy = False
