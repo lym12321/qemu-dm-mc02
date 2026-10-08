@@ -11,18 +11,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 import os
 from pathlib import Path
-import re
 import shutil
 
-from sim.manifest import (ManifestError, fields, load_document, readable_file,
-                          text_bytes)
+from sim.manifest import (ManifestError, fields, file_path as _file,
+                          identifier as _label, load_document, text_bytes)
 
 
 MAX_UPPER_COMPUTERS = 8
 MAX_ARGUMENTS = 128
 MAX_ARGUMENT_BYTES = 4096
 MAX_COMMAND_BYTES = 16 * 1024
-_LABEL = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 _JOINTS = {1: "wheel_fl", 2: "wheel_fr", 3: "wheel_rl", 4: "wheel_rr"}
 _UARTS = ("uart1", "uart2", "uart3", "uart5", "uart7", "uart10")
 
@@ -96,12 +94,6 @@ def _literal(value, expected: str, label: str) -> str:
     return value
 
 
-def _label(value, label: str) -> str:
-    if type(value) is not str or _LABEL.fullmatch(value) is None:
-        raise ManifestError(f"{label} must be an ASCII identifier of 1..64 characters")
-    return value
-
-
 def _single(value, label: str) -> tuple[str, object]:
     if type(value) is not dict or len(value) != 1:
         raise ManifestError(f"{label} must be a mapping containing exactly one entry")
@@ -114,11 +106,6 @@ def _string(value, label: str, *, empty=False, maximum=MAX_ARGUMENT_BYTES) -> by
     if "\0" in value:
         raise ManifestError(f"{label} must not contain NUL")
     return encoded
-
-
-def _file(value, base: Path, label: str) -> Path:
-    _string(value, label)
-    return readable_file(base / value, label)
 
 
 def _executable(value: str, cwd: Path, label: str) -> Path:

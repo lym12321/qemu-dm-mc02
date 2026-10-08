@@ -622,15 +622,25 @@ def test_two_chassis_native_cross_prefix_collision():
     assert not any(warning.number for warning in data.warning)
 
 
-def two_chassis_native_observer(monkeypatch):
-    names = ("alpha", "bravo")
-    joint_groups = tuple(tuple(f"{name}/wheel_{corner}" for corner in CORNERS)
-                         for name in names)
+def two_chassis_native_observer(monkeypatch, arena=None):
+    if arena is None:
+        model = TWO_CHASSIS_MODEL
+        prefixes = ("alpha/", "bravo/")
+        local_joints = (tuple(f"wheel_{corner}" for corner in CORNERS),) * 2
+    else:
+        model = arena.world.model
+        prefixes = tuple(member.prefix for member in arena.robots)
+        local_joints = tuple(tuple(motor.joint for motor in member.robot.devices)
+                             for member in arena.robots)
+    names = tuple(prefix[:-1] for prefix in prefixes)
+    joint_groups = tuple(tuple(prefix + joint for joint in joints)
+                         for prefix, joints in zip(prefixes, local_joints))
     native = MujocoPhysics.from_xml_path(
-        TWO_CHASSIS_MODEL,
-        joints={f"{name}/wheel_{corner}": f"{name}/drive_{corner}"
-                for name in names for corner in CORNERS},
-        imus={name: (f"{name}/imu_gyro", f"{name}/imu_accel") for name in names})
+        model,
+        joints={prefix + joint: prefix + "drive_" + joint.removeprefix("wheel_")
+                for prefix, joints in zip(prefixes, local_joints) for joint in joints},
+        imus={name: (prefix + "imu_gyro", prefix + "imu_accel")
+              for name, prefix in zip(names, prefixes)})
     calls = {"reset": 0, "step": [], "close": 0}
     reset, advance, close = native.reset, native.step, native.close
 
@@ -771,7 +781,8 @@ def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monke
         assert bus.t_sim_ns == 0
 
 
-def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch):
+@pytest.mark.parametrize("admitted", (False, True), ids=("fixed", "arena"))
+def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch, tmp_path, admitted):
     from dataclasses import asdict
     import json
     import struct
@@ -781,8 +792,17 @@ def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch
     from sim.fabric import CanBus, CanFrame
     from sim.fabric.runtime import CanParticipant
 
-    native, names, joint_groups, calls = two_chassis_native_observer(monkeypatch)
-    buses = (CanBus(), CanBus())
+    arena = None
+    if admitted:
+        from sim.arena.manifest import load_manifest
+        from test_arena_manifest import write_arena
+        arena = load_manifest(write_arena(tmp_path))
+        assert [(member.name, member.prefix) for member in arena.robots] == [
+            ("east", "alpha/"), ("west", "bravo/")]
+    native, names, joint_groups, calls = two_chassis_native_observer(monkeypatch, arena)
+    motor_ids = (tuple(tuple(motor.motor_id for motor in member.robot.devices)
+                       for member in arena.robots) if arena else ((1, 2, 3, 4),) * 2)
+    buses = tuple(CanBus() for _ in joint_groups)
     hosts = tuple(TwoChassisHost(bus) for bus in buses)
     devices, groups = [], []
     world = coordinator = None
@@ -791,9 +811,9 @@ def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch
                 bytes.fromhex("ffebff95ffebff95"))
     completed, wire = [], []
     try:
-        for bus in buses:
+        for bus, ids in zip(buses, motor_ids):
             group = []
-            for motor_id in (1, 2, 3, 4):
+            for motor_id in ids:
                 device = M3508Device(bus, motor_id)  # Normal defaults, no short expiry.
                 devices.append(device)
                 group.append(device)
@@ -865,6 +885,7 @@ def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch
     assert world.closed and all(device.closed for device in devices)
     assert calls == {"reset": 1, "step": [dt_ns], "close": 1}
     print("FIRST_SAMPLE_JSON: " + json.dumps({"dt_ns": dt_ns, "warmup_steps": 0,
+        "topology": "arena" if admitted else "fixed",
         "origin_ns": origin_ns, "native_calls": calls,
         "commands_hex": [payload.hex() for payload in payloads],
         "completed": completed, "wire_float32": wire,

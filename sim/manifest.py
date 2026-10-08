@@ -1,15 +1,17 @@
-"""Bounded YAML admission shared by Lab and Robot manifests.
+"""Bounded YAML admission shared by Lab, Robot and Arena manifests.
 
 This module reads configuration files only; it opens no simulation resources.
 UART text may include NUL bytes. Consumers separately admit process paths/argv.
 """
 
 from pathlib import Path
+import re
 
 import yaml
 from yaml.events import AliasEvent
 
 MAX_FILE_BYTES = 1 << 20
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
 
 class ManifestError(ValueError):
@@ -79,6 +81,21 @@ def text_bytes(value, label: str, *, empty: bool = False,
     if len(encoded) > maximum or (not empty and not encoded):
         raise ManifestError(f"{label} must contain {'0' if empty else '1'}..{maximum} UTF-8 bytes")
     return encoded
+
+
+def identifier(value, label: str) -> str:
+    """Admit the ASCII labels shared by Robot and Arena configuration."""
+    if type(value) is not str or _IDENTIFIER.fullmatch(value) is None:
+        raise ManifestError(f"{label} must be an ASCII identifier of 1..64 characters")
+    return value
+
+
+def file_path(value, base: Path, label: str) -> Path:
+    """Resolve bounded literal path text against its manifest directory."""
+    text_bytes(value, label)
+    if "\0" in value:
+        raise ManifestError(f"{label} must not contain NUL")
+    return readable_file(base / value, label)
 
 
 def readable_file(path: Path, label: str) -> Path:

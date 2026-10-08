@@ -204,6 +204,46 @@ worker 独占 co-sim 与 FDCAN1，运行既有 v2、1 kHz、realtime 四轮 prof
 ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控制见下文 ChassisTest；
 持续四轮实时性能、实板标定、多板、DR16、裁判系统和赛场组合仍未由该入口支持。
 
+## Arena 配置准入
+
+`sim.arena.manifest.load_manifest()` 可读取固定双底盘的 schema 1 配置，复用两个
+完整的 Robot 配置。将下面的 `arena.yaml` 放在仓库根目录：
+
+```yaml
+schema: 1
+arena: {name: two-four-wheel}
+world: {backend: mujoco, model: models/two_four_wheel.xml}
+robots:
+  west:
+    manifest: robots/bravo.yaml
+    prefix: bravo/
+    physics: shared-world
+  east:
+    manifest: robots/alpha.yaml
+    prefix: alpha/
+    physics: shared-world
+```
+
+两个子文件使用上文的 Robot schema，各自的 `physics.model` 必须解析到本仓库的
+`models/four_wheel.xml`；例如在 `robots/alpha.yaml` 中写 `../models/four_wheel.xml`。
+固件路径和上位机工作目录仍由子文件目录决定，argv 参数原样保留。ready 保留各自
+实际 UART 标记，省略时仍为 `None`。局部板、总线和电机标签可以相同；上位机合计最多 8 个，
+重复引用同一 Robot 文件也分别计数。
+
+```python
+from sim.arena.manifest import load_manifest
+
+arena = load_manifest("arena.yaml")
+for member in arena.robots:  # 固定按 alpha/、bravo/ 返回，保留 east/west 标签
+    print(member.name, member.prefix, member.robot.board.firmware)
+```
+
+当前只接受上述两个前缀、显式 `shared-world`、canonical 双底盘世界与原始四轮模型。
+指向 canonical 文件的符号链接可用，复制文件或自定义模型会被拒绝；路径一致仅选择
+固定 profile，模型 binding 仍由 native consumer 校验。准入返回不可变记录，只读取配置，
+不启动 QEMU、上位机或物理后端。已验证准入数据驱动同一个 MuJoCo 世界、两条独立
+CAN 总线和八个 M3508 的直接 consumer；Arena 进程运行入口和 CLI 尚未提供。
+
 ## Referee protocol
 
 裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：
