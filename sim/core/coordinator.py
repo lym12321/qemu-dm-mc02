@@ -84,5 +84,8 @@ class Coordinator:
                     primary = exc
                 else:
                     primary.add_note(f"participant {name} close failed: {type(exc).__name__}: {exc}")
+                    if exc is not primary:
+                        for note in tuple(getattr(exc, "__notes__", ())):
+                            primary.add_note(note)
         if primary is not None:
             raise primary

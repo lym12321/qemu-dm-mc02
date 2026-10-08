@@ -69,15 +69,18 @@ def test_failed_or_wrong_barrier_freezes_clock_until_reset(result):
     assert c.t_sim_ns == 10
 
 
-def test_close_attempts_all_resources_once_even_on_interrupt():
+@pytest.mark.parametrize("same_error", [False, True])
+def test_close_attempts_all_resources_once_even_on_interrupt(same_error):
     a, b = Participant(), Participant()
     c = Coordinator({"a": a, "b": b})
     b.error = KeyboardInterrupt("interrupted release")
-    a.error = OSError("release failed")
+    a.error = b.error if same_error else OSError("release failed")
+    a.error.add_note("nested resource release failed")
     with pytest.raises(KeyboardInterrupt) as caught:
         c.close()
     assert caught.value is b.error
-    assert "a close failed" in caught.value.__notes__[0]
+    assert any("a close failed" in note for note in caught.value.__notes__)
+    assert caught.value.__notes__.count("nested resource release failed") == 1
     c.close()
     assert a.events == b.events == ["close"]
     with pytest.raises(RuntimeError):
