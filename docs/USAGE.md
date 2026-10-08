@@ -1691,6 +1691,47 @@ RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。�
 夹具，尚未提供 Arena CLI、多底盘组合、HAL/BSP 闭环、CPU 全局时间屏障或
 实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
 
+### MuJoCo 双底盘场景
+
+`models/two_four_wheel.xml` 在同一个原生世界中组合两个现有四轮夹具，
+名称分别以 `alpha/`、`bravo/` 开头。两个底盘的初始位置为 `(0, 0, .03)`
+和 `(0, .6, .03)` 米，共用一个地面。模型直接引用 `four_wheel.xml`，
+由 MuJoCo 3.12 的 `attach` 处理名称、关节、执行器和传感器引用；
+`compiler conflict="error"` 拒绝子模型与世界的全局参数冲突。
+
+既有物理接口可以直接加载该场景：
+
+```python
+from sim.physics.mujoco import MujocoPhysics
+
+corners = ("fl", "fr", "rl", "rr")
+names = ("alpha", "bravo")
+physics = MujocoPhysics.from_xml_path(
+    "models/two_four_wheel.xml",
+    joints={f"{name}/wheel_{corner}": f"{name}/drive_{corner}"
+            for name in names for corner in corners},
+    imus={name: (f"{name}/imu_gyro", f"{name}/imu_accel") for name in names},
+)
+try:
+    physics.step(1_000_000)
+    for name in names:
+        print(physics.get_body_pose(f"{name}/chassis"), physics.get_imu(name))
+finally:
+    physics.close()
+```
+
+接入电机时，一个 `M3508JointPlant` 拥有全部八个器件和这一个 physics，
+一个 `CanParticipant` 统一服务两条总线；每条总线可独立使用 ID 1–4。
+隔离和直接消费者测试可运行：
+
+```bash
+uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
+```
+
+测试覆盖两个底盘的地面支撑、跨底盘接触、独立电流命令、运动、IMU、反馈和复位。
+尺寸、质量、摩擦及齿轮参数仍未标定。双 QEMU 接入此场景和 Arena CLI 需另行验证；
+已有四 hinge 原生 smoke 的结果只属于其固定夹具。
+
 ### trobot DJI driver test
 
 使用默认关闭的专用固件验证实际 `motor::dji` 驱动。普通业务 preset 不启用它，

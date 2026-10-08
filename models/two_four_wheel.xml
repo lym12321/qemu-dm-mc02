@@ -1,0 +1,20 @@
+<!--
+  Compose the unchanged four_wheel.xml fixture using MuJoCo 3.12 native
+  model attachment. Its upstream source and Apache-2.0 license are recorded
+  in four_wheel.xml and mujoco-LICENSE.txt. No geometry is duplicated here.
+  +X forward, +Y left, +Z up; alpha and bravo share one physical floor.
+  Toy parameters remain uncalibrated.
+-->
+<mujoco model="two-four-wheel-fixture">
+  <compiler angle="radian" conflict="error"/>
+  <option timestep="0.001" gravity="0 0 -9.80665" integrator="Euler"/>
+  <asset>
+    <model name="toy" file="four_wheel.xml"/>
+  </asset>
+  <worldbody>
+    <attach model="toy" prefix="alpha/"/>
+    <frame name="bravo_spawn" pos="0 .6 0">
+      <attach model="toy" body="chassis" prefix="bravo/"/>
+    </frame>
+  </worldbody>
+</mujoco>

@@ -296,8 +296,8 @@ def shared_drive(plant, bus, host, coordinator, payload):
     return start, plant.get_body_pose("chassis"), sum(gyros) / len(gyros)
 
 
-def assert_shared_feedback(plant, host, devices, currents):
-    for motor, name, current in zip(devices, JOINTS, currents):
+def assert_shared_feedback(plant, host, devices, currents, *, joints=JOINTS):
+    for motor, name, current in zip(devices, joints, currents):
         wheel = plant.get_joint_state(name)
         rotor_position = GEAR_RATIO * wheel.position_rad
         rotor_velocity = GEAR_RATIO * wheel.velocity_rad_s
@@ -494,3 +494,272 @@ def test_runtime_imu_rejects_before_reset_after_step_failure_and_after_close(
     # Runtime owns devices, while the caller retains both native connections.
     peer.send(0x123, 0, 4, 0, b"live")
     assert stream.receive() == [(0x123, 0, 4, 0, b"live")]
+
+
+# MuJoCo3.12 XMLreference #asset-model/#body-attach/#frame specifies native
+# namespace/reference copying and frame accumulation. #compiler-conflict
+# rejects different authored global options. The original car/license remains
+# canonical; these tests consume the fixed scene without a geometry copier.
+TWO_CHASSIS_MODEL = ROOT / "models" / "two_four_wheel.xml"
+
+
+def test_two_chassis_native_names_references_and_shared_floor():
+    model = mujoco.MjModel.from_xml_path(str(TWO_CHASSIS_MODEL))
+    assert (model.nq, model.nv, model.nu, model.njnt, model.nbody,
+            model.ngeom, model.nsite, model.nsensor) == (22, 20, 8, 10, 11, 11, 2, 4)
+    assert model.body_mass.sum() == pytest.approx(1.2, abs=1e-15)
+    plane_ids = np.flatnonzero(model.geom_type == mujoco.mjtGeom.mjGEOM_PLANE)
+    assert plane_ids.tolist() == [model.geom("alpha/floor").id]
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    for prefix, offset_y in (("alpha/", 0), ("bravo/", .6)):
+        body = model.body(prefix + "chassis").id
+        freejoint = model.joint(prefix + "chassis_free").id
+        assert model.jnt_type[freejoint] == mujoco.mjtJoint.mjJNT_FREE
+        assert model.jnt_bodyid[freejoint] == body
+        assert data.xpos[body] == pytest.approx((0, offset_y, .03), abs=1e-15)
+        assert data.xquat[body] == pytest.approx((1, 0, 0, 0), abs=1e-15)
+        qpos = model.jnt_qposadr[freejoint]
+        assert model.qpos0[qpos:qpos + 7] == pytest.approx(
+            (0, offset_y, .03, 1, 0, 0, 0), abs=1e-15)
+        for corner, xy in zip(CORNERS, ((.07, .06), (.07, -.06),
+                                       (-.07, .06), (-.07, -.06))):
+            name = prefix + "wheel_" + corner
+            joint, geom = model.joint(name).id, model.geom(name).id
+            actuator = model.actuator(prefix + "drive_" + corner).id
+            assert model.jnt_type[joint] == mujoco.mjtJoint.mjJNT_HINGE
+            assert data.xaxis[joint] == pytest.approx((0, 1, 0), abs=1e-14)
+            assert data.xpos[model.body(name).id] == pytest.approx(
+                (xy[0], offset_y + xy[1], .03), abs=1e-15)
+            # Native attachment must retain the canonical wheel defaults.
+            assert model.geom_type[geom] == mujoco.mjtGeom.mjGEOM_CYLINDER
+            assert model.geom_size[geom][:2] == pytest.approx((.03, .01), abs=1e-15)
+            assert model.body_mass[model.body(name).id] == pytest.approx(.05, abs=1e-15)
+            assert model.dof_damping[model.jnt_dofadr[joint]] == .03
+            assert model.actuator_trntype[actuator] == mujoco.mjtTrn.mjTRN_JOINT
+            assert model.actuator_trnid[actuator, 0] == joint
+            assert model.actuator_gear[model.actuator_outadr[actuator]] == pytest.approx(
+                (1, 0, 0, 0, 0, 0))
+            assert not model.actuator_ctrllimited[model.actuator_ctrladr[actuator]]
+            assert not model.actuator_forcelimited[actuator]
+        gyro, accel = (model.sensor(prefix + name).id
+                       for name in ("imu_gyro", "imu_accel"))
+        site = model.site(prefix + "imu_site").id
+        assert model.sensor_type[gyro] == mujoco.mjtSensor.mjSENS_GYRO
+        assert model.sensor_type[accel] == mujoco.mjtSensor.mjSENS_ACCELEROMETER
+        assert model.sensor_objtype[gyro] == model.sensor_objtype[accel] == mujoco.mjtObj.mjOBJ_SITE
+        assert model.sensor_objid[gyro] == model.sensor_objid[accel] == site
+        assert model.site_bodyid[site] == body
+
+
+@pytest.mark.parametrize("old,new,error", [
+    ('prefix="bravo/"', 'prefix="alpha/"', "already exists with prefix alpha/"),
+    ('body="chassis"', 'body="missing_chassis"', "body"),
+    ('timestep="0.001"', 'timestep="0.002"', "timestep"),
+])
+def test_two_chassis_native_rejects_bad_attachment_before_runtime(old, new, error):
+    # Native asset input stays canonical; only the parent test fixture changes.
+    xml = TWO_CHASSIS_MODEL.read_text().replace('file="four_wheel.xml"',
+                                              f'file="{MODEL}"')
+    assert old in xml
+    with pytest.raises(ValueError, match=error):
+        mujoco.MjModel.from_xml_string(xml.replace(old, new))
+
+
+def test_two_chassis_native_one_floor_supports_both_static_weights():
+    model = mujoco.MjModel.from_xml_path(str(TWO_CHASSIS_MODEL))
+    data = mujoco.MjData(model)
+    floor = model.geom("alpha/floor").id
+    wheels = {prefix: {model.geom(prefix + "wheel_" + corner).id for corner in CORNERS}
+              for prefix in ("alpha/", "bravo/")}
+    totals = {prefix: [] for prefix in wheels}
+    for tick in range(500):
+        mujoco.mj_step(model, data)
+        mujoco.mj_forward(model, data)
+        if tick < 400:
+            continue
+        supported = {prefix: set() for prefix in wheels}
+        reactions = {prefix: 0.0 for prefix in wheels}
+        for index in range(data.ncon):
+            contact = data.contact[index]
+            pair = {int(contact.geom1), int(contact.geom2)}
+            assert floor in pair
+            owners = [prefix for prefix, ids in wheels.items() if pair & ids]
+            assert len(owners) == 1
+            prefix = owners[0]
+            force = np.zeros(6)
+            mujoco.mj_contactForce(model, data, index, force)
+            assert force[0] > 0
+            reactions[prefix] += force[0]
+            supported[prefix].update(pair & wheels[prefix])
+        for prefix in wheels:
+            assert supported[prefix] == wheels[prefix]
+            totals[prefix].append(reactions[prefix])
+    for reactions in totals.values():
+        assert sum(reactions) / len(reactions) == pytest.approx(.6 * 9.80665, rel=.01)
+    assert data.time == pytest.approx(.5, abs=1e-14)
+    assert not any(warning.number for warning in data.warning)
+
+
+def test_two_chassis_native_cross_prefix_collision():
+    xml = TWO_CHASSIS_MODEL.read_text().replace('file="four_wheel.xml"',
+                                              f'file="{MODEL}"')
+    assert 'pos="0 .6 0"' in xml
+    # Move only the native spawn frame. Original +/- .07 wheel centers and
+    # .03 cylinder radii overlap front-alpha/rear-bravo by .01m at x=.19.
+    model = mujoco.MjModel.from_xml_string(xml.replace('pos="0 .6 0"',
+                                                    'pos=".19 0 0"'))
+    data = mujoco.MjData(model)
+    mujoco.mj_forward(model, data)
+    expected = {frozenset((model.geom("alpha/wheel_f" + side).id,
+                           model.geom("bravo/wheel_r" + side).id))
+                for side in ("l", "r")}
+    cross_pairs = {frozenset((int(contact.geom1), int(contact.geom2)))
+                   for contact in data.contact[:data.ncon]
+                   if contact.dist < 0}
+    assert expected <= cross_pairs
+    assert data.time == 0  # Native contact projection needs no warmup/clock.
+    assert not any(warning.number for warning in data.warning)
+
+
+def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monkeypatch):
+    from sim.core import Coordinator, Session
+    from sim.devices.dji import M3508Device, M3508JointPlant
+    from sim.fabric import CanBus, CanFrame
+    from sim.fabric.runtime import CanParticipant
+
+    names = ("alpha", "bravo")
+    joint_groups = tuple(tuple(f"{name}/wheel_{corner}" for corner in CORNERS)
+                         for name in names)
+    native = MujocoPhysics.from_xml_path(
+        TWO_CHASSIS_MODEL,
+        joints={f"{name}/wheel_{corner}": f"{name}/drive_{corner}"
+                for name in names for corner in CORNERS},
+        imus={name: (f"{name}/imu_gyro", f"{name}/imu_accel") for name in names})
+    calls = {"reset": 0, "step": [], "close": 0}
+    reset, advance, close = native.reset, native.step, native.close
+
+    def observed_reset():
+        calls["reset"] += 1
+        reset()
+
+    def observed_step(dt_ns):
+        calls["step"].append(dt_ns)
+        advance(dt_ns)
+
+    def observed_close():
+        calls["close"] += 1
+        close()
+
+    monkeypatch.setattr(native, "reset", observed_reset)
+    monkeypatch.setattr(native, "step", observed_step)
+    monkeypatch.setattr(native, "close", observed_close)
+
+    class Host:
+        def __init__(self, bus):
+            self.frames = {}
+            self.expected_time = 0
+            bus.attach(self, "host")
+
+        def receive(self, frame):
+            assert frame.can_id in (0x201, 0x202, 0x203, 0x204)
+            assert frame.timestamp_ns == self.expected_time
+            assert frame.can_id not in self.frames
+            self.frames[frame.can_id] = frame
+
+    buses = (CanBus(), CanBus())
+    hosts = tuple(Host(bus) for bus in buses)
+    devices, groups = [], []
+    world = coordinator = None
+    try:
+        # Deliberately different short timeouts exercise the existing expiry
+        # union. Refreshes below keep both groups live during the motion gate.
+        for bus, timeout in zip(buses, (3_000_000, 7_000_000)):
+            group = []
+            for motor_id in (1, 2, 3, 4):
+                device = M3508Device(bus, motor_id, command_timeout_ns=timeout)
+                devices.append(device)
+                group.append(device)
+            groups.append(tuple(group))
+        world = M3508JointPlant(native, {
+            device: joint for group, joints in zip(groups, joint_groups)
+            for device, joint in zip(group, joints)}, gear_ratio=GEAR_RATIO)
+        coordinator = Coordinator({"can": CanParticipant(buses, (world,))})
+
+        def snapshot():
+            return tuple((native.get_body_pose(name + "/chassis"),
+                          native.get_imu(name),
+                          tuple(native.get_joint_state(joint) for joint in joints))
+                         for name, joints in zip(names, joint_groups))
+
+        def tick(payloads, dt_ns=1_000_000):
+            for bus, host, payload in zip(buses, hosts, payloads):
+                host.frames.clear()
+                host.expected_time = coordinator.t_sim_ns + dt_ns
+                bus.send(host, CanFrame(0x200, dlc=8, data=payload,
+                                       timestamp_ns=coordinator.t_sim_ns))
+            coordinator.step(dt_ns)
+            for host in hosts:
+                assert set(host.frames) == {0x201, 0x202, 0x203, 0x204}
+
+        coordinator.reset(Session(1))
+        initial = snapshot()
+        for _ in range(500):
+            tick((bytes(8), bytes(8)))
+        start = tuple(native.get_body_pose(name + "/chassis") for name in names)
+        # Independent C620 wire literals: alpha +64 on all motors, bravo
+        # left -21/right -107. No producer encoder supplies expected values.
+        payloads = (bytes.fromhex("0040 0040 0040 0040"),
+                    bytes.fromhex("ffeb ff95 ffeb ff95"))
+        gyros = [[], []]
+        for iteration in range(500):
+            tick(payloads)
+            if iteration >= 250:
+                for values, name in zip(gyros, names):
+                    values.append(native.get_imu(name).gyro_rad_s[2])
+        end = snapshot()
+        assert end[0][0].position_m[0] - start[0].position_m[0] > 1e-4
+        assert end[1][0].position_m[0] - start[1].position_m[0] < -1e-4
+        assert abs(yaw(end[0][0]) - yaw(start[0])) < 1e-3
+        assert yaw(end[1][0]) - yaw(start[1]) < -1e-4
+        assert abs(sum(gyros[0]) / len(gyros[0])) < 1e-3
+        assert sum(gyros[1]) / len(gyros[1]) < -1e-4
+        for state, direction in zip(end, (1, -1)):
+            assert all(direction * joint.velocity_rad_s > 1e-3 for joint in state[2])
+            assert all(math.isfinite(value) for value in
+                       (*state[1].gyro_rad_s, *state[1].accel_m_s2))
+        for host, group, joints, currents in zip(
+                hosts, groups, joint_groups, ((64,) * 4, (-21, -107, -21, -107))):
+            assert_shared_feedback(native, host, group, currents, joints=joints)
+        assert coordinator.t_sim_ns == 1_000_000_000
+        assert native.time_s == pytest.approx(1, abs=1e-13)
+        assert calls["reset"] == 1 and calls["step"] == [1_000_000] * 1000
+
+        coordinator.reset(Session(2, 7_000_000_000))
+        assert native.time_s == 0 and coordinator.t_sim_ns == 7_000_000_000
+        assert snapshot() == initial and all(device.current_raw == 0 for device in devices)
+        calls["step"].clear()
+        tick(payloads, dt_ns=10_000_000)
+        assert calls["reset"] == 2 and calls["step"] == [3_000_000, 4_000_000, 3_000_000]
+        assert native.time_s == pytest.approx(.01, abs=1e-15)
+        assert coordinator.t_sim_ns == 7_010_000_000
+        assert all(device.current_raw == 0 for device in devices)
+        for host, group, joints in zip(hosts, groups, joint_groups):
+            assert_shared_feedback(native, host, group, (0,) * 4, joints=joints)
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        elif world is not None:
+            world.close()
+        else:
+            for device in reversed(devices):
+                device.close()
+            native.close()
+    assert world.closed and all(device.closed for device in devices)
+    assert calls["close"] == 1
+    with pytest.raises(RuntimeError, match="closed"):
+        native.get_imu("alpha")
+    # Borrowed buses remain available after closing their sole device/world owner.
+    for bus in buses:
+        bus.reset(0)
+        assert bus.t_sim_ns == 0
