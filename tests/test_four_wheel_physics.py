@@ -59,55 +59,101 @@ physics: {{backend: mujoco, model: {MODEL}}}
         plant.physics.get_imu("imu")
 
 
-@pytest.mark.parametrize("stage", ["imu", "bus", "device"])
-def test_profile_acquisition_failure_releases_all_owned_resources(monkeypatch, stage):
-    from sim.robots import four_wheel
+@pytest.mark.parametrize("profile", ["four-wheel", "arena"])
+@pytest.mark.parametrize("stage", ["imu", "bus", "device", "plant"])
+def test_profile_acquisition_failure_releases_all_owned_resources(monkeypatch, tmp_path,
+                                                                 stage, profile):
+    if profile == "arena":
+        from sim.arena import world as factory
+        from sim.arena.manifest import load_manifest
+        from test_arena_manifest import write_arena
+        argument = load_manifest(write_arena(tmp_path))
+        acquire, note_prefix, imu_name = factory.create_arena_plant, "Arena", "alpha"
+        rejection_group = 1
+    else:
+        from sim.robots import four_wheel as factory
+        argument = MODEL
+        acquire, note_prefix, imu_name = factory.create_four_wheel_plant, "profile", "imu"
+        rejection_group = 0
 
-    native_create = four_wheel.MujocoPhysics.from_xml_path
-    owners, closed = [], []
+    native_create = factory.MujocoPhysics.from_xml_path
+    owners, closed, buses, samples = [], [], [], []
     primary = KeyboardInterrupt("profile admission")
     def create(*args, **kwargs):
         native = native_create(*args, **kwargs)
         owners.append(native)
         close = native.close
         def close_physics():
+            assert native.time_s == 0
             closed.append("physics")
             close()
             raise OSError("physics cleanup")
         monkeypatch.setattr(native, "close", close_physics)
         return native
-    monkeypatch.setattr(four_wheel.MujocoPhysics, "from_xml_path", create)
-    def reject(*args, **kwargs):
-        raise primary
-    if stage == "imu":
-        monkeypatch.setattr(four_wheel, "imu_to_bmi088_units", reject)
-    elif stage == "bus":
-        monkeypatch.setattr(four_wheel, "CanBus", reject)
-    else:
-        native_device = four_wheel.M3508Device
-        def device(bus, motor_id, **kwargs):
-            if motor_id == 2:
-                raise primary
-            result = native_device(bus, motor_id, **kwargs)
-            owners.append(result)
-            close = result.close
-            def close_device():
-                closed.append(motor_id)
-                close()
-                raise OSError("device cleanup")
-            monkeypatch.setattr(result, "close", close_device)
-            return result
-        monkeypatch.setattr(four_wheel, "M3508Device", device)
+    monkeypatch.setattr(factory.MujocoPhysics, "from_xml_path", create)
+    convert = factory.imu_to_bmi088_units
+    def sample(imu):
+        samples.append(imu)
+        if stage == "imu" and len(samples) == rejection_group + 1:
+            raise primary
+        return convert(imu)
+    monkeypatch.setattr(factory, "imu_to_bmi088_units", sample)
+    native_bus = factory.CanBus
+    def bus(**kwargs):
+        # Every complete IMU was admitted before any bus or device.
+        assert len(samples) == rejection_group + 1
+        if stage == "bus" and len(buses) == rejection_group:
+            raise primary
+        result = native_bus(**kwargs)
+        buses.append(result)
+        return result
+    monkeypatch.setattr(factory, "CanBus", bus)
+    native_device = factory.M3508Device
+    def device(bus, motor_id, **kwargs):
+        group = buses.index(bus)
+        if stage == "device" and group == rejection_group and motor_id == 2:
+            raise primary
+        result = native_device(bus, motor_id, **kwargs)
+        owners.append(result)
+        close = result.close
+        def close_device():
+            closed.append((group, motor_id))
+            close()
+            raise OSError("device cleanup")
+        monkeypatch.setattr(result, "close", close_device)
+        return result
+    monkeypatch.setattr(factory, "M3508Device", device)
+    if stage == "plant":
+        def reject_plant(*args, **kwargs):
+            raise primary
+        monkeypatch.setattr(factory, "M3508JointPlant", reject_plant)
     with pytest.raises(KeyboardInterrupt) as caught:
-        four_wheel.create_four_wheel_plant(MODEL)
+        acquire(argument)
     assert caught.value is primary
-    assert closed == ([1, "physics"] if stage == "device" else ["physics"])
-    assert "profile physics close failed: physics cleanup" in primary.__notes__
-    if stage == "device":
-        assert owners[1].closed
-        assert "profile device close failed: device cleanup" in primary.__notes__
+    previous = [(0, 4), (0, 3), (0, 2), (0, 1)] if profile == "arena" else []
+    expected_devices = ({"imu": [], "bus": previous,
+                         "device": [(rejection_group, 1)] + previous,
+                         "plant": [(rejection_group, 4), (rejection_group, 3),
+                                   (rejection_group, 2), (rejection_group, 1)] + previous}[stage])
+    assert closed == expected_devices + ["physics"]
+    assert f"{note_prefix} physics close failed: physics cleanup" in primary.__notes__
+    assert all(owner.closed for owner in owners[1:])
+    assert primary.__notes__.count(f"{note_prefix} device close failed: device cleanup") == len(
+        expected_devices)
+    if stage == "imu":
+        assert not buses and len(owners) == 1
     with pytest.raises(RuntimeError, match="closed"):
-        owners[0].get_imu("imu")
+        owners[0].get_imu(imu_name)
+
+
+def test_arena_world_rejects_non_manifest_before_native_acquisition(monkeypatch):
+    from sim.arena import world
+
+    def reject(*args, **kwargs):
+        pytest.fail("native world acquired before manifest type admission")
+    monkeypatch.setattr(world.MujocoPhysics, "from_xml_path", reject)
+    with pytest.raises(TypeError, match="ArenaManifest"):
+        world.create_arena_plant(None)
 
 
 def test_native_named_geometry_actuation_and_world_axes():
@@ -622,7 +668,7 @@ def test_two_chassis_native_cross_prefix_collision():
     assert not any(warning.number for warning in data.warning)
 
 
-def two_chassis_native_observer(monkeypatch, arena=None):
+def two_chassis_native_observer(monkeypatch, arena=None, native=None):
     if arena is None:
         model = TWO_CHASSIS_MODEL
         prefixes = ("alpha/", "bravo/")
@@ -635,12 +681,13 @@ def two_chassis_native_observer(monkeypatch, arena=None):
     names = tuple(prefix[:-1] for prefix in prefixes)
     joint_groups = tuple(tuple(prefix + joint for joint in joints)
                          for prefix, joints in zip(prefixes, local_joints))
-    native = MujocoPhysics.from_xml_path(
-        model,
-        joints={prefix + joint: prefix + "drive_" + joint.removeprefix("wheel_")
-                for prefix, joints in zip(prefixes, local_joints) for joint in joints},
-        imus={name: (prefix + "imu_gyro", prefix + "imu_accel")
-              for name, prefix in zip(names, prefixes)})
+    if native is None:
+        native = MujocoPhysics.from_xml_path(
+            model,
+            joints={prefix + joint: prefix + "drive_" + joint.removeprefix("wheel_")
+                    for prefix, joints in zip(prefixes, local_joints) for joint in joints},
+            imus={name: (prefix + "imu_gyro", prefix + "imu_accel")
+                  for name, prefix in zip(names, prefixes)})
     calls = {"reset": 0, "step": [], "close": 0}
     reset, advance, close = native.reset, native.step, native.close
 
@@ -793,34 +840,49 @@ def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch
     from sim.fabric.runtime import CanParticipant
 
     arena = None
+    world = coordinator = None
+    native = None
+    devices, groups = [], []
     if admitted:
         from sim.arena.manifest import load_manifest
+        from sim.arena.world import create_arena_plant
         from test_arena_manifest import write_arena
         arena = load_manifest(write_arena(tmp_path))
         assert [(member.name, member.prefix) for member in arena.robots] == [
             ("east", "alpha/"), ("west", "bravo/")]
-    native, names, joint_groups, calls = two_chassis_native_observer(monkeypatch, arena)
-    motor_ids = (tuple(tuple(motor.motor_id for motor in member.robot.devices)
-                       for member in arena.robots) if arena else ((1, 2, 3, 4),) * 2)
-    buses = tuple(CanBus() for _ in joint_groups)
-    hosts = tuple(TwoChassisHost(bus) for bus in buses)
-    devices, groups = [], []
-    world = coordinator = None
     origin_ns, dt_ns = 123_456_789, 10_000_000
     payloads = (bytes.fromhex("0040004000400040"),
                 bytes.fromhex("ffebff95ffebff95"))
     completed, wire = [], []
     try:
-        for bus, ids in zip(buses, motor_ids):
-            group = []
-            for motor_id in ids:
-                device = M3508Device(bus, motor_id)  # Normal defaults, no short expiry.
-                devices.append(device)
-                group.append(device)
-            groups.append(tuple(group))
-        world = M3508JointPlant(native, {
-            device: joint for group, joints in zip(groups, joint_groups)
-            for device, joint in zip(group, joints)})
+        if admitted:
+            world = create_arena_plant(arena)
+        native, names, joint_groups, calls = two_chassis_native_observer(
+            monkeypatch, arena, world.physics if world is not None else None)
+        motor_ids = (tuple(tuple(motor.motor_id for motor in member.robot.devices)
+                           for member in arena.robots) if arena else ((1, 2, 3, 4),) * 2)
+        if world is not None:
+            groups = tuple(tuple(world.devices[index * 4:index * 4 + 4])
+                           for index in range(len(arena.robots)))
+            buses = tuple(group[0].bus for group in groups)
+            devices = list(world.devices)
+            assert tuple(tuple(device.motor_id for device in group) for group in groups) == motor_ids
+            assert buses[0] is not buses[1]
+            assert all(device.bus is bus for group, bus in zip(groups, buses) for device in group)
+        else:
+            buses = tuple(CanBus() for _ in joint_groups)
+        hosts = tuple(TwoChassisHost(bus) for bus in buses)
+        if world is None:
+            for bus, ids in zip(buses, motor_ids):
+                group = []
+                for motor_id in ids:
+                    device = M3508Device(bus, motor_id)  # Normal defaults, no short expiry.
+                    devices.append(device)
+                    group.append(device)
+                groups.append(tuple(group))
+            world = M3508JointPlant(native, {
+                device: joint for group, joints in zip(groups, joint_groups)
+                for device, joint in zip(group, joints)})
         coordinator = Coordinator({"can": CanParticipant(buses, (world,))})
         coordinator.reset(Session(17, origin_ns))
         start = tuple(native.get_body_pose(name + "/chassis") for name in names)
@@ -881,7 +943,8 @@ def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch
         else:
             for device in devices:
                 device.close()
-            native.close()
+            if native is not None:
+                native.close()
     assert world.closed and all(device.closed for device in devices)
     assert calls == {"reset": 1, "step": [dt_ns], "close": 1}
     print("FIRST_SAMPLE_JSON: " + json.dumps({"dt_ns": dt_ns, "warmup_steps": 0,

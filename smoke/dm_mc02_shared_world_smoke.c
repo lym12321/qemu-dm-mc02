@@ -11,6 +11,14 @@
 #define TWO_CHASSIS 0
 #endif
 
+#ifndef ARENA_RUNTIME
+#define ARENA_RUNTIME 0
+#endif
+
+#if ARENA_RUNTIME && !TWO_CHASSIS
+#error "ARENA_RUNTIME requires the composed two-chassis profile"
+#endif
+
 #if TWO_CHASSIS
 #define MOTOR_COUNT 4u
 #define FEEDBACK_LAST_ID 0x204u
@@ -121,9 +129,13 @@ void Reset_Handler(void)
     uart_text("WORLD_READY=");
     uart_hex(PEER, 1);
     uart_char('\n');
-    /* Only an actual host key event releases this command. */
+    /* The Arena runtime does not drive a test key. This explicit test-only
+     * profile sends its command itself; the original profiles keep their
+     * actual host-key handshake. */
+#if !ARENA_RUNTIME
     while (GPIOA_IDR & (1u << 15)) {
     }
+#endif
     tx[0] = 0x200u << 18;
     tx[1] = 8u << 16;
 #if TWO_CHASSIS
@@ -180,6 +192,11 @@ void Reset_Handler(void)
     uart_char(' ');
     uart_hex(final_sensor_time, 6);
     uart_char('\n');
+#if ARENA_RUNTIME
+    uart_text("ARENA_READY=");
+    uart_hex(PEER, 1);
+    uart_char('\n');
+#endif
     for (;;) {
         __asm__ volatile ("wfi" ::: "memory");
     }

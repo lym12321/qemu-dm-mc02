@@ -65,7 +65,7 @@ def source_origins():
     """Cumulative currently loaded sources, not first-import times or coverage."""
     result = {}
     for name, module in sorted(sys.modules.items()):
-        if name == "__main__" or name.startswith(("sim.", "dm_mc02_", "qemu.")):
+        if name == "__main__" or name.startswith(("sim.", "tools.", "dm_mc02_", "qemu.")):
             value = getattr(module, "__file__", None)
             if value is None:
                 continue

@@ -13,6 +13,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from sim import processes
 from sim.robots import runtime
 from sim.robots.manifest import load_manifest
 from tools import dm_mc02_firmware_rtf as rtf
@@ -226,18 +227,19 @@ def test_partial_child_acquisition_releases_every_owned_resource(environment, mo
 
 
 def test_real_pipe_reads_are_bounded_keep_binary_tail_and_remove_eof(tmp_path, monkeypatch):
+    assert runtime._Child is processes.ChildProcess
     pipes, writers = [], []
     for _ in range(2):
         reader, writer = os.pipe()
         pipes.append(os.fdopen(reader, "rb", buffering=0))
         writers.append(writer)
     process = SimpleNamespace(stdout=pipes[0], stderr=pipes[1])
-    child = runtime._Child("fixture", process)
+    child = processes.ChildProcess("fixture", process)
     real_read, reads = os.read, []
     def read(fd, size):
         reads.append((fd, size))
         return real_read(fd, size)
-    monkeypatch.setattr(runtime.os, "read", read)
+    monkeypatch.setattr(processes.os, "read", read)
     try:
         child.prepare()
         for data in (b"a" * 4096, b"b" * 4096, b"c" * 4096, b"\xff" + b"d" * 4095):

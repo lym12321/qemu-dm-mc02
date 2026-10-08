@@ -4,8 +4,7 @@ The worker alone consumes co-sim/CAN; this parent observes native QMP and UART.
 QEMU, plant and host clocks remain distinct. Duration uses QEMU virtual time.
 """
 
-from dataclasses import dataclass, field
-import os
+from dataclasses import dataclass
 import select
 import subprocess
 import sys
@@ -15,44 +14,13 @@ from sim.boards import QemuBoard
 from sim.boards.channels import LabChannels
 from sim.boards.launch import (PROJECT_ROOT, positive_seconds, qemu_command,
                                qmp_socket_path, regular_file, resolve_qemu)
+from sim.processes import ChildProcess as _Child
 from sim.transports import StreamTransport, connect_unix
 from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_test_harness import running_qemu, stop
 
 from .manifest import RobotManifest
-
-
-@dataclass
-class _Child:
-    label: str
-    process: subprocess.Popen
-    tails: dict = field(default_factory=lambda: {"stdout": b"", "stderr": b""})
-    eof: set = field(default_factory=set)
-
-    def prepare(self):
-        for name in self.tails:
-            os.set_blocking(getattr(self.process, name).fileno(), False)
-
-    def pump(self):
-        # One bounded read per pipe, including children with continuous output.
-        for name in self.tails:
-            if name in self.eof:
-                continue
-            try:
-                data = os.read(getattr(self.process, name).fileno(), 4096)
-            except BlockingIOError:
-                continue
-            if not data:
-                self.eof.add(name)
-            else:
-                self.tails[name] = (self.tails[name] + data)[-12000:]
-
-    def readers(self):
-        return [getattr(self.process, name) for name in self.tails if name not in self.eof]
-
-    def diagnostics(self):
-        return {name: data.decode("utf-8", errors="replace") for name, data in self.tails.items()}
 
 
 class _Connection:

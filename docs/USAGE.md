@@ -242,7 +242,53 @@ for member in arena.robots:  # 固定按 alpha/、bravo/ 返回，保留 east/we
 指向 canonical 文件的符号链接可用，复制文件或自定义模型会被拒绝；路径一致仅选择
 固定 profile，模型 binding 仍由 native consumer 校验。准入返回不可变记录，只读取配置，
 不启动 QEMU、上位机或物理后端。已验证准入数据驱动同一个 MuJoCo 世界、两条独立
-CAN 总线和八个 M3508 的直接 consumer；Arena 进程运行入口和 CLI 尚未提供。
+CAN 总线和八个 M3508 的直接 consumer；Arena CLI 尚未提供。
+
+可通过 Python 运行这两个配置成员，共享一个世界 owner：
+
+```python
+from sim.arena.manifest import load_manifest
+from sim.arena.runtime import run_manifest
+
+result = run_manifest(load_manifest("arena.yaml"), duration=1.0)
+print(result.origin_ns, result.end_ns, result.boards)
+```
+
+使用上文的 MuJoCo extra 和已构建的 QEMU。`qemu` 可显式覆盖二进制。
+`startup_timeout` 默认 10 秒、`timeout` 默认 30 秒，从启动第一进程前计入；
+后续 QEMU、连接、上位机和 ready 等待使用同一期限。模型 binding 在进程启动前准入。
+运行层直接使用两组原生 QMP/co-sim/CAN/UART 连接和唯一 shared-world runtime，
+上位机保持各子配置的原样 argv、工作目录和独立进程组。
+
+`duration` 是所有声明的 UART ready 标记匹配之后的共享世界时间，范围 1 ns–3600 s；
+省略所有标记时从世界时间 0 开始。ready 等待期间继续提供世界输入，匹配后不再次 reset。
+每次世界推进 1 ms，最后一段使用精确余量。结果分别保留每块 QEMU 的 RESET 原点、
+ready 读取后时间上界和最后观察时间，不能将这些时间与共享世界 epoch 混用。
+`emit` 可接收带成员标签的 `ArenaEvent`，`on_response` 可观察实际 co-sim 响应；
+响应观察不构成完整 wire trace，也不保证每步样本消费。
+
+提前退出（包括退出码 0）、期限、RESET/EOF、QMP、transport、solver、输出或清理错误
+均使本次运行失败。成功只在独立清理世界、上位机、连接和两组 QEMU 后返回。
+native 准入及各资源的有界清理不计入 active host 期限，阻塞 native 调用仍需外层 timeout。
+该入口尚不提供 Arena CLI、独立 QMP/GDB 参数、wall-clock pacing 或 CPU 时间屏障。
+
+实际进程与数据交付的验证入口为：
+
+```bash
+uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena-runtime
+```
+
+该默认关闭的夹具生成两份 Robot 配置、一份 Arena 配置和专用 bare-MMIO 固件，
+唯一执行入口是上述 `run_manifest()`。两个固件各自在完成 CAN/SPI 读取及最终
+sensortime 写回后输出实际 UART ready；随后共享世界运行 50 ms。报告保留具名
+SI 样本、实际 float32 STEP、八路 CAN 反馈、DONE masks、原始 UART、独立 QEMU
+时间和进程清理结果，并验证上位机的原样 argv 与工作目录。raw 数据包含实际
+滤波历史；独立首样本量化验证仍由 `--two-chassis` 门完成。
+
+追加 `--reset`、`--peer-exit` 或 `--upper-exit` 可分别验证单板复位、单板退出和
+上位机退出。负例返回非零，保留 failed JSON、停止步进和资源回收证据；QMP
+断连可能先于进程退出检测，清理错误也保留在报告中。缺少 MuJoCo 或 ARM
+工具链时明确返回 SKIP 77。该夹具尚不证明 HAL/BSP 闭环或实物标定。
 
 ## Referee protocol
 
