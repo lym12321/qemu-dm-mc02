@@ -1688,7 +1688,7 @@ MuJoCo 夹具，验证独立会话、实际 CAN 电流命令/反馈、具名 IMU
 消费。固件先经 ready/按键发送命令，主机保留完整 wire 后暂停 CPU，统一完成
 RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。报告分别保留
 实际 ACK、DONE masks、UART 完成标记以及失败/清理结果；这是固定 bare-MMIO
-夹具，尚未提供 Arena CLI、多底盘组合、HAL/BSP 闭环、CPU 全局时间屏障或
+夹具，尚未提供 Arena CLI、HAL/BSP 闭环、CPU 全局时间屏障或
 实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
 
 ### MuJoCo 双底盘场景
@@ -1729,8 +1729,26 @@ uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics
 ```
 
 测试覆盖两个底盘的地面支撑、跨底盘接触、独立电流命令、运动、IMU、反馈和复位。
-尺寸、质量、摩擦及齿轮参数仍未标定。双 QEMU 接入此场景和 Arena CLI 需另行验证；
-已有四 hinge 原生 smoke 的结果只属于其固定夹具。
+尺寸、质量、摩擦及齿轮参数仍未标定。
+
+两个真实 QEMU 接入此固定场景的验证入口为：
+
+```bash
+uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --two-chassis
+```
+
+该选项默认关闭，两个 bare-MMIO 固件分别使用独立 CAN 总线上的 ID 1–4。
+`alpha` 发送四路 `+64` 电流命令，`bravo` 左轮发送 `-21`、右轮发送 `-107`。
+主机从全新原生复位状态推进一次 10 ms，记录两个底盘的位姿、八个关节、
+实际反馈和各自具名 IMU。这里的一次调用只执行一次原生积分，不包含预热或
+十次 1 ms 子步。实际 float32 STEP 与完成的 SI 样本逐轴对应，固件读取的
+BMI088 raw 数据须落在各自半 LSB 区间，并排除另一底盘的来源。
+报告同时要求两个真实 full-consumed DONE 和最终 sensortime 写回后的 UART 标记。
+
+可追加 `--reset` 或 `--peer-exit` 验证单板复位或退出使共享 owner 冻结，
+不再推进世界；这些负例按预期返回非零并保留失败 JSON。原四 hinge 默认门仍
+独立验证其解析轨迹。此入口验证固定双底盘数据交付，Arena CLI、HAL/BSP 闭环、
+实物标定和 CPU 全局时间屏障仍需后续验证。
 
 ### trobot DJI driver test
 

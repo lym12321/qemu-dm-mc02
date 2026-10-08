@@ -622,12 +622,7 @@ def test_two_chassis_native_cross_prefix_collision():
     assert not any(warning.number for warning in data.warning)
 
 
-def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monkeypatch):
-    from sim.core import Coordinator, Session
-    from sim.devices.dji import M3508Device, M3508JointPlant
-    from sim.fabric import CanBus, CanFrame
-    from sim.fabric.runtime import CanParticipant
-
+def two_chassis_native_observer(monkeypatch):
     names = ("alpha", "bravo")
     joint_groups = tuple(tuple(f"{name}/wheel_{corner}" for corner in CORNERS)
                          for name in names)
@@ -655,20 +650,31 @@ def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monke
     monkeypatch.setattr(native, "step", observed_step)
     monkeypatch.setattr(native, "close", observed_close)
 
-    class Host:
-        def __init__(self, bus):
-            self.frames = {}
-            self.expected_time = 0
-            bus.attach(self, "host")
+    return native, names, joint_groups, calls
 
-        def receive(self, frame):
-            assert frame.can_id in (0x201, 0x202, 0x203, 0x204)
-            assert frame.timestamp_ns == self.expected_time
-            assert frame.can_id not in self.frames
-            self.frames[frame.can_id] = frame
 
+class TwoChassisHost:
+    def __init__(self, bus):
+        self.frames = {}
+        self.expected_time = 0
+        bus.attach(self, "host")
+
+    def receive(self, frame):
+        assert frame.can_id in (0x201, 0x202, 0x203, 0x204)
+        assert frame.timestamp_ns == self.expected_time
+        assert frame.can_id not in self.frames
+        self.frames[frame.can_id] = frame
+
+
+def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monkeypatch):
+    from sim.core import Coordinator, Session
+    from sim.devices.dji import M3508Device, M3508JointPlant
+    from sim.fabric import CanBus, CanFrame
+    from sim.fabric.runtime import CanParticipant
+
+    native, names, joint_groups, calls = two_chassis_native_observer(monkeypatch)
     buses = (CanBus(), CanBus())
-    hosts = tuple(Host(bus) for bus in buses)
+    hosts = tuple(TwoChassisHost(bus) for bus in buses)
     devices, groups = [], []
     world = coordinator = None
     try:
@@ -763,3 +769,103 @@ def test_two_chassis_motor_world_independent_buses_motion_reset_and_expiry(monke
     for bus in buses:
         bus.reset(0)
         assert bus.t_sim_ns == 0
+
+
+def test_two_chassis_fresh_first_sample_10ms_has_distinct_bosch_bins(monkeypatch):
+    from dataclasses import asdict
+    import json
+    import struct
+
+    from sim.core import Coordinator, Session
+    from sim.devices.dji import M3508Device, M3508JointPlant
+    from sim.fabric import CanBus, CanFrame
+    from sim.fabric.runtime import CanParticipant
+
+    native, names, joint_groups, calls = two_chassis_native_observer(monkeypatch)
+    buses = (CanBus(), CanBus())
+    hosts = tuple(TwoChassisHost(bus) for bus in buses)
+    devices, groups = [], []
+    world = coordinator = None
+    origin_ns, dt_ns = 123_456_789, 10_000_000
+    payloads = (bytes.fromhex("0040004000400040"),
+                bytes.fromhex("ffebff95ffebff95"))
+    completed, wire = [], []
+    try:
+        for bus in buses:
+            group = []
+            for motor_id in (1, 2, 3, 4):
+                device = M3508Device(bus, motor_id)  # Normal defaults, no short expiry.
+                devices.append(device)
+                group.append(device)
+            groups.append(tuple(group))
+        world = M3508JointPlant(native, {
+            device: joint for group, joints in zip(groups, joint_groups)
+            for device, joint in zip(group, joints)})
+        coordinator = Coordinator({"can": CanParticipant(buses, (world,))})
+        coordinator.reset(Session(17, origin_ns))
+        start = tuple(native.get_body_pose(name + "/chassis") for name in names)
+        assert native.time_s == 0 and calls == {"reset": 1, "step": [], "close": 0}
+        assert all(device.current_raw == 0 and device.command_timeout_ns == 100_000_000
+                   and device.feedback_period_ns == 1_000_000 for device in devices)
+        for bus, host, payload in zip(buses, hosts, payloads):
+            host.expected_time = origin_ns + dt_ns
+            bus.send(host, CanFrame(0x200, dlc=8, data=payload, timestamp_ns=origin_ns))
+        # One actual native10ms integration from fresh0; XML1ms is not a substep.
+        coordinator.step(dt_ns)
+        assert native.time_s == .01 and coordinator.t_sim_ns == origin_ns + dt_ns
+        assert calls == {"reset": 1, "step": [dt_ns], "close": 0}
+        for name, joints, host, group, currents, direction in zip(
+                names, joint_groups, hosts, groups,
+                ((64,) * 4, (-21, -107, -21, -107)), (1, -1)):
+            body, imu = native.get_body_pose(name + "/chassis"), native.get_imu(name)
+            states = tuple(native.get_joint_state(joint) for joint in joints)
+            assert all(math.isfinite(value) for value in
+                       (*body.position_m, *body.quaternion_wxyz,
+                        *imu.gyro_rad_s, *imu.accel_m_s2,
+                        *(value for state in states for value in
+                          (state.position_rad, state.velocity_rad_s))))
+            assert all(direction * state.velocity_rad_s > 0 for state in states)
+            assert set(host.frames) == {0x201, 0x202, 0x203, 0x204}
+            assert_shared_feedback(native, host, group, currents, joints=joints)
+            # Bosch Rev1.9 p39/5.5.5, p30/5.3.11, p27/5.3.4 plus official
+            # SDKv1.9.0 fixes rad/s->dps, proper m/s2->g at9.80665. Never use
+            # the production unit converter/raw quantizer as expected oracle.
+            values = tuple(v * 180 / math.pi for v in imu.gyro_rad_s) + tuple(
+                v / 9.80665 for v in imu.accel_m_s2)
+            wire.append(struct.unpack("<6f", struct.pack("<6f", *values)))
+            completed.append({"name": name, "body": asdict(body), "imu": asdict(imu),
+                              "joints": [asdict(state) for state in states],
+                              "feedback_hex": [host.frames[i].data.hex()
+                                               for i in (0x201, 0x202, 0x203, 0x204)]})
+        assert completed[0]["body"]["position_m"][0] > start[0].position_m[0]
+        assert completed[1]["body"]["position_m"][0] < start[1].position_m[0]
+        assert yaw(native.get_body_pose("bravo/chassis")) < yaw(start[1])
+        assert native.get_imu("bravo").gyro_rad_s[2] < 0
+        scales = (1000,) * 3 + (6,) * 3
+        assert all(abs(value) < scale for sample in wire
+                   for value, scale in zip(sample, scales))
+        # Official ranges give LSB1000/32768dps and6/32768g. A returned raw
+        # code's half-LSB interval cannot contain both sources if separated
+        # by more than one LSB. This admits distinguishable first inputs;
+        # it makes no later filter/ODR-history or actual guest-read claim.
+        separation_lsb = tuple(abs(a - b) / (scale / 32768)
+                               for a, b, scale in zip(*wire, scales))
+        distinct_axes = [axis for axis, separation in enumerate(separation_lsb)
+                         if separation > 1]
+        assert distinct_axes, "fresh alpha/bravo sources fit the same half-LSB bin"
+    finally:
+        if coordinator is not None:
+            coordinator.close()
+        elif world is not None:
+            world.close()
+        else:
+            for device in devices:
+                device.close()
+            native.close()
+    assert world.closed and all(device.closed for device in devices)
+    assert calls == {"reset": 1, "step": [dt_ns], "close": 1}
+    print("FIRST_SAMPLE_JSON: " + json.dumps({"dt_ns": dt_ns, "warmup_steps": 0,
+        "origin_ns": origin_ns, "native_calls": calls,
+        "commands_hex": [payload.hex() for payload in payloads],
+        "completed": completed, "wire_float32": wire,
+        "separation_lsb": separation_lsb, "distinct_axes": distinct_axes}, sort_keys=True))

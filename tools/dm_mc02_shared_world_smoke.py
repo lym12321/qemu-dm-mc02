@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Test-only actual dual-MCU consumer of one shared four-hinge MuJoCo world.
+"""Test-only actual dual-MCU consumer of one shared MuJoCo world.
 
 The analytical fixture has literal inertia .02, gear2, no damping/gravity.
 Expected CAN bytes and Bosch half-LSB gyro bins are independent constants.
+The optional two-chassis scene checks completed public SI and vendor wire bins.
 Native pause is a fixture ordering aid, never a CPU/plant time barrier.
 """
 
@@ -42,6 +43,9 @@ from sim.transports.unix import connect_unix
 COMMANDS = ("1000200000000000", "f000e00000000000")
 FEEDBACK = (("0002000210001900", "0005000420001900"),
             ("1ffdfffef0001900", "1ffafffce0001900"))
+CHASSIS_NAMES = ("alpha", "bravo")
+CORNERS = ("fl", "fr", "rl", "rr")
+CHASSIS_COMMANDS = ("0040004000400040", "ffebff95ffebff95")
 DT_NS = 10_000_000
 ORIGIN_NS = 123_456_789
 
@@ -72,26 +76,51 @@ def source_origins():
     return result
 
 
-def make_world(report):
+def observe_sends(index, cosim, can, report):
+    """Bounded test-only observers; each call delegates to its transport once."""
+    can_send, step_send = can.send, cosim.send
+
+    def send_can(can_id, flags, dlc, timestamp_ns, data):
+        if len(report["can_sends"]) >= 16:
+            raise RuntimeError("fixture CAN send trace exhausted")
+        event = {"peer": index, "can_id": can_id, "flags": flags, "dlc": dlc,
+                 "timestamp_ns": timestamp_ns, "data_hex": data.hex(), "accepted": False}
+        report["can_sends"].append(event)
+        result = can_send(can_id, flags, dlc, timestamp_ns, data)
+        event["accepted"] = True
+        return result
+
+    def send_step(wire):
+        if len(report["cosim_sends"]) >= 16:
+            raise RuntimeError("fixture co-sim send trace exhausted")
+        frame = protocol.decode_step_frame(wire)
+        event = {"peer": index, "header": asdict(frame.header),
+                 "wire_hex": wire.hex(), "accepted": False}
+        if frame.header.kind == protocol.STEP:
+            event["imu"] = asdict(protocol.decode_imu_sample_v2(frame.payload))
+        report["cosim_sends"].append(event)
+        result = step_send(wire)
+        event["accepted"] = True
+        return result
+
+    # QemuCanEndpoint captures send during construction, so install first.
+    can.send, cosim.send = send_can, send_step
+
+
+def make_world(report, two_chassis=False):
     import mujoco
-    bodies = "".join(
-        f'<body name="b{i}" pos="{i} 0 0">'
-        f'<joint name="j{i}" type="hinge" axis="0 0 1"/>'
-        '<inertial pos="0 0 0" mass="1" diaginertia=".015 .015 .02"/>'
-        f'<site name="s{i}" pos="0 0 0"/></body>' for i in range(1, 5))
-    motors = "".join(f'<motor name="m{i}" joint="j{i}"/>' for i in range(1, 5))
-    sensors = "".join(f'<gyro name="g{i}" site="s{i}"/>'
-                       f'<accelerometer name="a{i}" site="s{i}"/>' for i in (1, 3))
-    xml = ('<mujoco><compiler angle="radian"/>'
-           '<option gravity="0 0 0" integrator="Euler"/>'
-           f'<worldbody>{bodies}</worldbody><actuator>{motors}</actuator>'
-           f'<sensor>{sensors}</sensor></mujoco>')
-    report["world"] = {"xml": xml, "sha256": hashlib.sha256(xml.encode()).hexdigest(),
-                       "mujoco_version": mujoco.__version__,
-                       "mujoco_module": str(Path(mujoco.__file__).resolve())}
-    native = MujocoPhysics(mujoco.MjModel.from_xml_string(xml),
-        joints={f"j{i}": f"m{i}" for i in range(1, 5)},
-        imus={f"imu{i}": (f"g{j}", f"a{j}") for i, j in enumerate((1, 3))})
+    if two_chassis:
+        path = ROOT / "models/two_four_wheel.xml"
+        report["world"] = {"model": str(path), "sha256": sha(path),
+                           "mujoco_version": mujoco.__version__,
+                           "mujoco_module": str(Path(mujoco.__file__).resolve())}
+        native = MujocoPhysics.from_xml_path(path,
+            joints={f"{name}/wheel_{corner}": f"{name}/drive_{corner}"
+                    for name in CHASSIS_NAMES for corner in CORNERS},
+            imus={name: (f"{name}/imu_gyro", f"{name}/imu_accel")
+                  for name in CHASSIS_NAMES})
+    else:
+        native = make_hinge_world(report, mujoco)
     calls = report["native_calls"]
     original_reset, original_step, original_close = native.reset, native.step, native.close
 
@@ -111,14 +140,116 @@ def make_world(report):
     return native
 
 
+def make_hinge_world(report, mujoco):
+    bodies = "".join(
+        f'<body name="b{i}" pos="{i} 0 0">'
+        f'<joint name="j{i}" type="hinge" axis="0 0 1"/>'
+        '<inertial pos="0 0 0" mass="1" diaginertia=".015 .015 .02"/>'
+        f'<site name="s{i}" pos="0 0 0"/></body>' for i in range(1, 5))
+    motors = "".join(f'<motor name="m{i}" joint="j{i}"/>' for i in range(1, 5))
+    sensors = "".join(f'<gyro name="g{i}" site="s{i}"/>'
+                       f'<accelerometer name="a{i}" site="s{i}"/>' for i in (1, 3))
+    xml = ('<mujoco><compiler angle="radian"/>'
+           '<option gravity="0 0 0" integrator="Euler"/>'
+           f'<worldbody>{bodies}</worldbody><actuator>{motors}</actuator>'
+           f'<sensor>{sensors}</sensor></mujoco>')
+    report["world"] = {"xml": xml, "sha256": hashlib.sha256(xml.encode()).hexdigest(),
+                       "mujoco_version": mujoco.__version__,
+                       "mujoco_module": str(Path(mujoco.__file__).resolve())}
+    return MujocoPhysics(mujoco.MjModel.from_xml_string(xml),
+        joints={f"j{i}": f"m{i}" for i in range(1, 5)},
+        imus={f"imu{i}": (f"g{j}", f"a{j}") for i, j in enumerate((1, 3))})
+
+
+def verify_chassis_samples(native, report):
+    """Independent DJI/Bosch bins over completed public native observations."""
+    report["bodies"] = [asdict(native.get_body_pose(name + "/chassis"))
+                        for name in CHASSIS_NAMES]
+    report["imus"] = [asdict(native.get_imu(name)) for name in CHASSIS_NAMES]
+    report["joints"] = {f"{name}/wheel_{corner}": asdict(
+        native.get_joint_state(f"{name}/wheel_{corner}"))
+        for name in CHASSIS_NAMES for corner in CORNERS}
+    report["imu_wire_float32"] = []
+    for index, name in enumerate(CHASSIS_NAMES):
+        body, sample = report["bodies"][index], report["imus"][index]
+        assert all(math.isfinite(v) for v in (*body["position_m"],
+            *body["quaternion_wxyz"], *sample["gyro_rad_s"], *sample["accel_m_s2"]))
+        direction = 1 if index == 0 else -1
+        assert direction * (body["position_m"][0] -
+                            report["initial_bodies"][index]["position_m"][0]) > 0
+        # Bosch Rev1.9 p39/p30/p27 and official BMI08x SDK v1.9.0 units.
+        values = tuple(v * 180 / math.pi for v in sample["gyro_rad_s"]) + tuple(
+            v / 9.80665 for v in sample["accel_m_s2"])
+        wire_values = struct.unpack("<6f", struct.pack("<6f", *values))
+        assert all(abs(value) < scale for value, scale in zip(
+            wire_values, (1000,) * 3 + (6,) * 3))
+        report["imu_wire_float32"].append(wire_values)
+        sent = [event for event in report["cosim_sends"] if event["peer"] == index
+                and event["header"]["kind"] == protocol.STEP]
+        assert sent and all(event["accepted"] for event in sent)
+        assert len({event["wire_hex"] for event in sent}) == 1  # Exact retries only.
+        for event in sent:
+            frame = protocol.decode_step_frame(bytes.fromhex(event["wire_hex"]))
+            assert (frame.header.session_id, frame.header.step_id, frame.header.t_sim_ns,
+                    frame.header.dt_ns) == (81 + index, 1, ORIGIN_NS + DT_NS, DT_NS)
+            imu = protocol.decode_imu_sample_v2(frame.payload)
+            assert (*imu.gyro_dps, *imu.accel_g) == wire_values
+            assert imu.gyro_bias_dps == imu.accel_bias_g == (0, 0, 0)
+            assert (imu.sensor_time_ns, imu.sample_id) == (ORIGIN_NS + DT_NS, 1)
+        feedback = [event for event in report["can_sends"] if event["peer"] == index]
+        assert [event["can_id"] for event in feedback] == [0x201, 0x202, 0x203, 0x204]
+        for event, corner, current in zip(feedback, CORNERS,
+                (64,) * 4 if index == 0 else (-21, -107, -21, -107)):
+            assert event["accepted"] and (event["flags"], event["dlc"]) == (0, 8)
+            assert event["timestamp_ns"] == report["reset_acks"][index]["epoch_ns"] + DT_NS
+            data = bytes.fromhex(event["data_hex"])
+            encoder, rpm, raw_current, temperature, reserved = struct.unpack(">HhhBB", data)
+            state = report["joints"][f"{name}/wheel_{corner}"]
+            assert all(math.isfinite(v) for v in state.values())
+            assert direction * state["velocity_rad_s"] > 0
+            # DJI C620 V1.01 rotor8192 bins; M3508 P19 V1.0 ratio3591/187.
+            position = (state["position_rad"] * (3591 / 187)) % math.tau
+            assert 0 <= encoder <= 8191
+            assert encoder * math.tau / 8192 <= position < (encoder + 1) * math.tau / 8192
+            assert abs(state["velocity_rad_s"] * (3591 / 187) - rpm * math.pi / 30) <= math.pi / 60
+            assert (raw_current, temperature, reserved) == (current, 25, 0)
+    separation = [abs(a - b) / (scale / 32768) for a, b, scale in zip(
+        *report["imu_wire_float32"], (1000,) * 3 + (6,) * 3)]
+    report["distinct_axes"] = [axis for axis, value in enumerate(separation) if value > 1]
+    assert report["distinct_axes"]
+
+
+def verify_chassis_raw(index, raw_gyro, raw_accel, report):
+    values = report["imu_wire_float32"][index]
+    other = report["imu_wire_float32"][1 - index]
+    codes = (*raw_gyro, *raw_accel)
+    intervals = [((code - .5) * scale / 32768, (code + .5) * scale / 32768)
+                 for code, scale in zip(codes, (1000,) * 3 + (6,) * 3)]
+    assert all(-32768 < code < 32767 for code in codes)  # No saturation evidence.
+    assert all(low <= value <= high for (low, high), value in zip(intervals, values))
+    rejected = [axis for axis, ((low, high), value) in enumerate(zip(intervals, other))
+                if not low <= value <= high]
+    assert set(rejected) & set(report["distinct_axes"]), "guest raw accepts other chassis source"
+    report["raw_samples"].append({"peer": index, "gyro": raw_gyro, "accel": raw_accel,
+        "intervals": intervals, "other_source_rejected_axes": rejected})
+
+
 def main(args):
     binary = resolve_qemu(args.qemu)
     firmwares = tuple(regular_file(path, "firmware") for path in args.firmware)
+    motor_count = 4 if args.two_chassis else 2
+    commands = CHASSIS_COMMANDS if args.two_chassis else COMMANDS
+    imu_names = CHASSIS_NAMES if args.two_chassis else ("imu0", "imu1")
+    joint_names = (tuple(f"{name}/wheel_{corner}" for name in CHASSIS_NAMES
+                         for corner in CORNERS) if args.two_chassis
+                   else ("j1", "j2", "j3", "j4"))
     report = {"status": "running", "mode": args.mode, "stage": "admission",
+              "scene": "two-chassis" if args.two_chassis else "four-hinge",
               "native_calls": {"reset": 0, "step_ns": [], "close": 0},
               "responses": [], "commands": [], "cleanup": [], "uart": ["", ""],
+              "can_sends": [], "cosim_sends": [], "raw_samples": [],
               "run_statuses": [],
-              "limitations": ["bare-MMIO fixture, not HAL/BSP or two chassis",
+              "limitations": ["fixed bare-MMIO fixture, not HAL/BSP closed loop or Arena",
                 "physical calibration SKIP", "CPU/global lockstep unsupported",
                 "observer does not attest every advisory frame skipped by active waits"],
               "entrypoint": str(Path(__file__).resolve()), "cwd": str(Path.cwd()),
@@ -127,6 +258,10 @@ def main(args):
                   ROOT / "smoke/dm_mc02_bmi088_spi_fixture.h",
                   ROOT / "smoke/dm_mc02_cosim_link_readback_smoke.ld",
                   ROOT / "tools/run-qemu-shared-world-smoke.sh")}}
+    if args.two_chassis:
+        report["inputs"].update({str(path): sha(path) for path in (
+            ROOT / "models/two_four_wheel.xml", ROOT / "models/four_wheel.xml",
+            ROOT / "models/mujoco-LICENSE.txt")})
     origins = source_origins()
     native = None
     devices = ()
@@ -182,11 +317,12 @@ def main(args):
         remaining()
 
     try:
-        native = make_world(report)
+        native = make_world(report, args.two_chassis)
         buses = (CanBus(), CanBus())
-        devices = tuple(M3508Device(bus, identifier) for bus in buses for identifier in (1, 2))
-        plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))),
-                                gear_ratio=2)
+        devices = tuple(M3508Device(bus, identifier) for bus in buses
+                        for identifier in range(1, motor_count + 1))
+        plant = M3508JointPlant(native, dict(zip(devices, joint_names)),
+                                gear_ratio=3591 / 187 if args.two_chassis else 2)
         # Until runtime construction succeeds, caller retains world ownership.
         with ExitStack() as stack:
             try:
@@ -216,6 +352,7 @@ def main(args):
                         sockets_open[name] = sock
                     streams.append((StepFramedSocket(sockets_open["cosim"]),
                                     CanStream(sockets_open["can1"])))
+                    observe_sends(index, *streams[-1], report)
                     uarts.append(StreamTransport(sockets_open["uart1"]))
                     assert qmp(index, "query-status")["running"] is False
                     qmp(index, "cont")
@@ -234,7 +371,7 @@ def main(args):
                         if raw is not None and len(raw) == WIRE_SIZE:
                             frame = unpack_wire_frame(raw)
                             assert (frame.can_id, frame.flags, frame.dlc, frame.data.hex()) == (
-                                0x200, 0, 8, COMMANDS[index])
+                                0x200, 0, 8, commands[index])
                             report["commands"].append({"peer": index, "wire_hex": raw.hex(),
                                 "timestamp_ns": frame.timestamp_ns, "data_hex": frame.data.hex()})
                             break
@@ -244,7 +381,7 @@ def main(args):
 
                 report["stage"] = "start_shared_world"
                 bindings = tuple(BoardBinding(f"peer{i}", QemuCanEndpoint(bus, streams[i][1]),
-                    streams[i][0], f"imu{i}") for i, bus in enumerate(buses))
+                    streams[i][0], imu_names[i]) for i, bus in enumerate(buses))
                 runtime = SharedWorldRuntime(plant, bindings,
                     check_running=remaining, on_response=response)
                 reset_acks = runtime.start(Session(17, ORIGIN_NS), (81, 82), deadline=deadline)
@@ -256,6 +393,9 @@ def main(args):
                 assert report["native_calls"]["reset"] == 1
                 assert report["native_calls"]["step_ns"] == []
                 assert runtime.t_sim_ns == ORIGIN_NS and runtime.step_id == 0
+                if args.two_chassis:
+                    report["initial_bodies"] = [asdict(native.get_body_pose(name + "/chassis"))
+                                                for name in CHASSIS_NAMES]
 
                 report["stage"] = "one_shared_world_tick"
                 acks = runtime.step(DT_NS, deadline=deadline)
@@ -267,18 +407,21 @@ def main(args):
                 assert report["native_calls"]["reset"] == 1
                 assert report["native_calls"]["step_ns"] == [DT_NS]
                 assert native.time_s == .01
-                report["joints"] = {}
-                for name, position, velocity in zip(("j1", "j2", "j3", "j4"),
-                        (.001, .002, -.001, -.002), (.1, .2, -.1, -.2)):
-                    state = native.get_joint_state(name)
-                    assert abs(state.position_rad - position) < 1e-12
-                    assert abs(state.velocity_rad_s - velocity) < 1e-12
-                    report["joints"][name] = asdict(state)
-                report["imus"] = [asdict(native.get_imu(f"imu{i}")) for i in range(2)]
-                for index, sample in enumerate(report["imus"]):
-                    assert all(abs(v) < 1e-12 for v in sample["accel_m_s2"])
-                    assert all(abs(v) < 1e-12 for v in sample["gyro_rad_s"][:2])
-                    assert abs(sample["gyro_rad_s"][2] - (.1 if index == 0 else -.1)) < 1e-12
+                if args.two_chassis:
+                    verify_chassis_samples(native, report)
+                else:
+                    report["joints"] = {}
+                    for name, position, velocity in zip(("j1", "j2", "j3", "j4"),
+                            (.001, .002, -.001, -.002), (.1, .2, -.1, -.2)):
+                        state = native.get_joint_state(name)
+                        assert abs(state.position_rad - position) < 1e-12
+                        assert abs(state.velocity_rad_s - velocity) < 1e-12
+                        report["joints"][name] = asdict(state)
+                    report["imus"] = [asdict(native.get_imu(f"imu{i}")) for i in range(2)]
+                    for index, sample in enumerate(report["imus"]):
+                        assert all(abs(v) < 1e-12 for v in sample["accel_m_s2"])
+                        assert all(abs(v) < 1e-12 for v in sample["gyro_rad_s"][:2])
+                        assert abs(sample["gyro_rad_s"][2] - (.1 if index == 0 else -.1)) < 1e-12
 
                 report["stage"] = "actual_guest_raw_consumption"
                 for index in range(2):
@@ -305,18 +448,25 @@ def main(args):
                              if line.startswith("WORLD_RESULT=")]
                     assert len(lines) == 1
                     fields = lines[0].split()
-                    assert fields[:3] == [f"WORLD_RESULT={index}", *FEEDBACK[index]]
-                    raw_gyro = struct.unpack("<3h", bytes.fromhex(fields[3]))
-                    raw_accel = struct.unpack("<3h", bytes.fromhex(fields[4]))
-                    assert raw_gyro == (0, 0, 188 if index == 0 else -188)
-                    assert raw_accel == (0, 0, 0)
+                    assert len(fields) == motor_count + 4 and fields[0] == f"WORLD_RESULT={index}"
+                    raw_gyro = struct.unpack("<3h", bytes.fromhex(fields[1 + motor_count]))
+                    raw_accel = struct.unpack("<3h", bytes.fromhex(fields[2 + motor_count]))
+                    if args.two_chassis:
+                        feedback = [event["data_hex"] for event in report["can_sends"]
+                                    if event["peer"] == index]
+                        assert fields[1:1 + motor_count] == feedback
+                        verify_chassis_raw(index, raw_gyro, raw_accel, report)
+                    else:
+                        assert fields[:3] == [f"WORLD_RESULT={index}", *FEEDBACK[index]]
+                        assert raw_gyro == (0, 0, 188 if index == 0 else -188)
+                        assert raw_accel == (0, 0, 0)
+                        # Independent half-LSB interval for the analytical fixture.
+                        degrees = struct.unpack("<f", struct.pack("<f", (.1 if index == 0 else -.1) * 180 / math.pi))[0]
+                        code = raw_gyro[2]
+                        assert (code - .5) / 32.768 <= degrees <= (code + .5) / 32.768
                     # Bosch 39.0625us sensortime ticks: one10ms fixture target.
-                    assert int(fields[5], 16) == (ORIGIN_NS + DT_NS) * 256 // 10_000_000
-                    # +/-1000dps => 32.768 LSB/dps. Native float32 input must
-                    # be inside the fixed code's independent half-LSB interval.
-                    degrees = struct.unpack("<f", struct.pack("<f", (.1 if index == 0 else -.1) * 180 / math.pi))[0]
-                    code = raw_gyro[2]
-                    assert (code - .5) / 32.768 <= degrees <= (code + .5) / 32.768
+                    assert int(fields[3 + motor_count], 16) == (
+                        (ORIGIN_NS + DT_NS) * 256 // 10_000_000) & 0xffffff
                 for index in range(2):
                     qmp(index, "stop")
                     assert qmp(index, "query-status")["running"] is False
@@ -435,6 +585,8 @@ if __name__ == "__main__":
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", nargs=2, required=True)
     parser.add_argument("--mode", choices=("normal", "reset", "peer-exit"), default="normal")
+    parser.add_argument("--two-chassis", action="store_true",
+                        help="use the fixed composed two-four-wheel scene")
     parser.add_argument("--result", required=True)
     try:
         sys.exit(main(parser.parse_args()))

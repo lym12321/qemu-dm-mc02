@@ -7,6 +7,18 @@
 #define PEER 0
 #endif
 
+#ifndef TWO_CHASSIS
+#define TWO_CHASSIS 0
+#endif
+
+#if TWO_CHASSIS
+#define MOTOR_COUNT 4u
+#define FEEDBACK_LAST_ID 0x204u
+#else
+#define MOTOR_COUNT 2u
+#define FEEDBACK_LAST_ID 0x202u
+#endif
+
 #define REG32(address) (*(volatile uint32_t *)(address))
 #define USART1_CR1  REG32(0x40011000u)
 #define USART1_BRR  REG32(0x4001100cu)
@@ -77,7 +89,7 @@ static void uart_bytes(const uint8_t *bytes, unsigned count)
 void Reset_Handler(void)
 {
     uint8_t gyro[6], accel[6], sensor_time[3], status;
-    uint8_t feedback[2][8];
+    uint8_t feedback[MOTOR_COUNT][8];
     volatile uint32_t *tx = MSGRAM;
     volatile uint32_t final_sensor_time = 0;
 
@@ -100,10 +112,10 @@ void Reset_Handler(void)
     FDCAN1_CCCR = 3u;
     FDCAN1_TXBC = 1u << 24;
     FDCAN1_TXESC = 0;
-    FDCAN1_RXF0C = 128u | (2u << 16);
+    FDCAN1_RXF0C = 128u | (MOTOR_COUNT << 16);
     FDCAN1_RXESC = 0;
     FDCAN1_SIDFC = 400u | (1u << 16);
-    MSGRAM[100] = (1u << 27) | (0x201u << 16) | 0x202u; /* Range. */
+    MSGRAM[100] = (1u << 27) | (0x201u << 16) | FEEDBACK_LAST_ID; /* Range. */
     FDCAN1_GFC = (2u << 4) | (2u << 2) | 3u;
     FDCAN1_CCCR = 0;
     uart_text("WORLD_READY=");
@@ -114,13 +126,18 @@ void Reset_Handler(void)
     }
     tx[0] = 0x200u << 18;
     tx[1] = 8u << 16;
+#if TWO_CHASSIS
+    tx[2] = PEER ? 0x95ffebffu : 0x40004000u;
+    tx[3] = tx[2];
+#else
     tx[2] = PEER ? 0x00e000f0u : 0x00200010u;
     tx[3] = 0;
+#endif
     FDCAN1_TXBAR = 1u;
     while ((FDCAN1_TXBTO & 1u) == 0) {
     }
 
-    for (unsigned i = 0; i < 2; ++i) {
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
         while ((FDCAN1_RXF0S & 0x7fu) == 0) {
         }
         uint32_t slot = (FDCAN1_RXF0S >> 8) & 0x3fu;
@@ -153,10 +170,10 @@ void Reset_Handler(void)
     uart_text("WORLD_RESULT=");
     uart_hex(PEER, 1);
     uart_char(' ');
-    uart_bytes(feedback[0], 8);
-    uart_char(' ');
-    uart_bytes(feedback[1], 8);
-    uart_char(' ');
+    for (unsigned i = 0; i < MOTOR_COUNT; ++i) {
+        uart_bytes(feedback[i], 8);
+        uart_char(' ');
+    }
     uart_bytes(gyro, 6);
     uart_char(' ');
     uart_bytes(accel, 6);
