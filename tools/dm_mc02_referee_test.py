@@ -2,13 +2,15 @@
 """Actual trobot referee UART/DMA/RTOS consumer of the shared host endpoint.
 
 This fixed fixture controls socket short writes, not OS backpressure or UART
-arrival time. Its explicit engine step does not synchronize the QEMU CPU.
+arrival time. The optional shared owner advances the existing world and engine;
+neither profile synchronizes the QEMU CPU.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter
+from dataclasses import asdict
 import hashlib
 import json
 from pathlib import Path
@@ -33,7 +35,14 @@ from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot,
 )
+from sim.fabric.endpoints import QemuCanEndpoint
+from sim.robots.four_wheel import create_four_wheel_plant
+from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
 from sim.transports import StreamTransport, connect_unix
+from sim.transports.can_stream import CanStream
+from sim.transports.cosim import StepFramedSocket
+from sim.transports import step_codec as codec
+from tools.dm_mc02_shared_world_smoke import sha, source_origins
 
 STAGES = (("referee.initial", 82, 0), ("referee.partial", 19, 82),
           ("referee.complete", 82, 1))
@@ -186,6 +195,12 @@ class SendBudget:
         self.sent = bytearray()
         self.writes = []
 
+    def fileno(self):
+        return self.sock.fileno()
+
+    def gettimeout(self):
+        return self.sock.gettimeout()
+
     def send(self, data):
         if self.budget == 0:
             raise BlockingIOError
@@ -210,10 +225,16 @@ def remaining(owner, deadline):
     return value
 
 
-def drain(owner, deadline, endpoint, sock, *, budget=None):
+def drain(owner, deadline, endpoint, sock, *, budget=None, runtime=None):
     while True:
         remaining(owner, deadline)
-        completed = endpoint.flush()
+        if runtime is not None and budget is not None and budget.budget == 0:
+            return
+        if runtime is None:
+            completed = endpoint.flush()
+        else:
+            runtime.service(deadline=deadline)
+            completed = not endpoint.transport.tx_pending
         remaining(owner, deadline)
         if completed or (budget is not None and budget.budget == 0):
             return
@@ -228,6 +249,9 @@ def consume(owner, report, engine, resources):
     report["processes"] = {"qemu": _identity(owner.process.pid)}
     if report["processes"]["qemu"] is None:
         raise RuntimeError("QEMU identity missing at acquisition")
+    if report.get("shared_world"):
+        report["shared"]["socket_paths"] = {name: str(path) for name, path in owner.sockets.items()}
+        report["shared"]["temporary_directory"] = str(owner.stderr_path.parent)
     timeout = min(2, remaining(owner, startup))
     qmp = resources["QMP"] = QmpSession(str(owner.sockets["qmp"]), timeout=timeout,
                                         connect_timeout=timeout, close_timeout=2)
@@ -244,6 +268,60 @@ def consume(owner, report, engine, resources):
     stream = StreamTransport(budget, max_pending=1, queue_name="referee snapshots")
     endpoint = resources["endpoint"] = RefereeUartEndpoint(stream)
     board = QemuBoard(qmp)
+    runtime = None
+
+    if report.get("shared_world"):
+        cosim_socket = resources["COSIM"] = connect_unix(str(owner.sockets["cosim"]),
+                                                        min(2, remaining(owner, startup)))
+        remaining(owner, startup)
+        can_socket = resources["CAN1"] = connect_unix(str(owner.sockets["can1"]),
+                                                    min(2, remaining(owner, startup)))
+        remaining(owner, startup)
+        plant = resources["plant"]
+        cosim = StepFramedSocket(cosim_socket)
+        send = cosim.send
+
+        def observe_send(wire):
+            sends = report["shared"]["sends"]
+            if len(sends) >= 16:
+                raise BufferError("shared referee STEP observation exceeds fixed bound")
+            frame = codec.decode_step_frame(wire)
+            event = dict(wire_hex=wire.hex(), header=asdict(frame.header), accepted=False)
+            sends.append(event)
+            if frame.header.kind == codec.STEP:
+                event["imu"] = asdict(codec.decode_imu_sample_v2(frame.payload))
+                event["source_si"] = asdict(plant.physics.get_imu("imu"))
+            value = send(wire)
+            event["accepted"] = True
+            return value
+
+        def observe_response(name, frame, decoded):
+            responses = report["shared"]["responses"]
+            if len(responses) >= 128:
+                raise BufferError("shared referee response observation exceeds fixed bound")
+            responses.append(dict(name=name, header=asdict(frame.header),
+                payload_hex=frame.payload.hex(), decoded=None if decoded is None else asdict(decoded)))
+
+        cosim.send = observe_send
+        runtime = SharedWorldRuntime(plant, (BoardBinding("mcu",
+            QemuCanEndpoint(plant.devices[0].bus, CanStream(can_socket)), cosim, "imu"),),
+            referees=(RefereeBinding("fixture", engine, endpoint),),
+            check_running=lambda: remaining(owner, deadline), on_response=observe_response)
+        # A successful constructor transfers these three owners. Register the
+        # new owner before removing the caller's acquisition-failure entries.
+        resources["runtime"] = runtime
+        for name in ("plant", "engine", "endpoint"):
+            resources.pop(name)
+        responses = runtime.start(Session(1, 0), (1,), deadline=startup)
+        if len(responses) != 1:
+            raise ValueError("shared referee requires one actual RESET_ACK")
+        reset = responses[0]
+        if (reset.header.kind != codec.RESET_ACK or
+                (reset.header.step_id, reset.header.t_sim_ns) != (0, 0)):
+            raise ValueError("shared referee did not receive the actual logical-zero RESET_ACK")
+        report["shared"]["reset_qemu_ns"] = codec.decode_reset_ack_payload(reset.payload).virtual_time_ns
+        report["engine_origin_ns"] = runtime.t_sim_ns
+        report["shared"]["origin_ns"] = runtime.t_sim_ns
 
     def call(callback, *, startup_phase=False):
         bound = startup if startup_phase else deadline
@@ -319,6 +397,11 @@ def consume(owner, report, engine, resources):
                     report["next_sequence"] = endpoint.next_sequence
                     if len(budget.sent) != 164 or endpoint.next_sequence != 8 or stream.tx_pending:
                         raise ValueError("incomplete fixed referee wire output")
+                    if runtime is not None:
+                        report["shared"].update(end_ns=runtime.t_sim_ns, steps=runtime.step_id,
+                            engine_end_ns=engine.t_sim_ns, native_time_s=plant.physics.time_s)
+                        if (runtime.t_sim_ns, runtime.step_id, engine.t_sim_ns) != (1_000_000_000, 1, 1_000_000_000):
+                            raise ValueError("shared referee did not retain the single completed logical step")
                     remaining(owner, deadline)
                     return
                 continue
@@ -344,27 +427,41 @@ def consume(owner, report, engine, resources):
             report["stages"].append(row)
             before = len(budget.sent)
             if index == 0:
-                origin = snapshot["timestamp_ns"]
-                engine.reset(Session(1, origin))
-                report["engine_origin_ns"] = origin
-                wire = endpoint.send_state(engine.get_state())
+                if runtime is None:
+                    origin = snapshot["timestamp_ns"]
+                    engine.reset(Session(1, origin))
+                    report["engine_origin_ns"] = origin
+                    wire = endpoint.send_state(engine.get_state())
+                else:
+                    wire = runtime.publish_referee("fixture", deadline=bound)
                 frames = check_wire(wire, 0)
                 report["batches"].append(dict(wire_hex=wire.hex(), frames=frames,
                                                engine_target_ns=engine.t_sim_ns))
-                drain(owner, bound, endpoint, uart7)
+                drain(owner, bound, endpoint, uart7, runtime=runtime)
                 if bytes(budget.sent) != wire or stream.tx_pending:
                     raise ValueError("initial referee batch did not drain exactly")
             elif index == 1:
                 target = report["engine_origin_ns"] + 1_000_000_000
-                result = engine.step(StepContext(1, 1, target, 1_000_000_000))
-                if result.status != "ok" or result.reached_time_ns != target:
-                    raise ValueError("referee engine did not reach explicit target")
+                if runtime is None:
+                    result = engine.step(StepContext(1, 1, target, 1_000_000_000))
+                    if result.status != "ok" or result.reached_time_ns != target:
+                        raise ValueError("referee engine did not reach explicit target")
+                else:
+                    responses = runtime.step(1_000_000_000, deadline=bound)
+                    if len(responses) != 1:
+                        raise ValueError("shared referee requires one actual STEP_ACK")
+                    response = responses[0]
+                    if (response.header.kind != codec.STEP_ACK or
+                            (response.header.step_id, response.header.t_sim_ns) != (1, target) or
+                            codec.decode_step_ack_payload(response.payload).status != codec.STATUS_OK):
+                        raise ValueError("shared referee did not receive the actual accepted STEP_ACK")
                 budget.budget = 19
-                pending_wire = endpoint.send_state(engine.get_state())
+                pending_wire = (endpoint.send_state(engine.get_state()) if runtime is None
+                                else runtime.publish_referee("fixture", deadline=bound))
                 frames = check_wire(pending_wire, 1)
                 report["batches"].append(dict(wire_hex=pending_wire.hex(), frames=frames,
                                                engine_target_ns=engine.t_sim_ns))
-                drain(owner, bound, endpoint, uart7, budget=budget)
+                drain(owner, bound, endpoint, uart7, budget=budget, runtime=runtime)
                 if (len(budget.sent) - before != 19 or bytes(budget.sent[before:]) != pending_wire[:19] or
                         len(stream.tx_queue) != 1 or bytes(stream.tx_queue[0]) != pending_wire[19:] or
                         stream.tx_queue[0].obj is not pending_wire):
@@ -375,11 +472,13 @@ def consume(owner, report, engine, resources):
                 if pending_wire is None or bytes(stream.tx_queue[0]) != pending_wire[19:]:
                     raise ValueError("original referee suffix missing before completion")
                 budget.budget = None
-                drain(owner, bound, endpoint, uart7)
+                drain(owner, bound, endpoint, uart7, runtime=runtime)
                 if len(budget.sent) - before != 63 or bytes(budget.sent[before:]) != pending_wire[19:]:
                     raise ValueError("completion did not send exactly the original suffix")
             row["actual_sent_bytes"] = len(budget.sent) - before
             row["next_sequence"] = endpoint.next_sequence
+            if runtime is not None:
+                row["shared_logical_ns"] = runtime.t_sim_ns
             report["send_writes"] = budget.writes
             report["wire_sent_hex"] = bytes(budget.sent).hex()
             ack(bound)
@@ -387,12 +486,35 @@ def consume(owner, report, engine, resources):
             remaining(owner, bound)
 
 
-def run(elf, output, firmware, *, qemu=None):
+def observe_physics(plant, report):
+    """Record public native calls; delegate each operation exactly once."""
+    calls = report["shared"]["native_calls"]
+    reset, step, close = plant.physics.reset, plant.physics.step, plant.physics.close
+
+    def observed_reset():
+        calls["reset"] += 1
+        return reset()
+
+    def observed_step(dt_ns):
+        if len(calls["step_ns"]) >= 16:
+            raise BufferError("shared referee native-step observation exceeds fixed bound")
+        calls["step_ns"].append(dt_ns)
+        return step(dt_ns)
+
+    def observed_close():
+        calls["close"] += 1
+        return close()
+
+    plant.physics.reset, plant.physics.step, plant.physics.close = observed_reset, observed_step, observed_close
+
+
+def run(elf, output, firmware, *, qemu=None, shared_world=False):
     output = Path(output).resolve()
     if output.exists():
         raise ValueError("refusing to overwrite existing referee result directory: " + str(output))
     report = dict(result="failed", errors=[], notes=[], cleanup_errors=[], cases=[], stages=[],
-                  summaries=[], missing=sorted(REQUIRED), uart_lines=[], batches=[], limits=LIMITS)
+                  summaries=[], missing=sorted(REQUIRED), uart_lines=[], batches=[], limits=list(LIMITS),
+                  shared_world=shared_world)
     output.mkdir(parents=True)
     write_json(output / "report.json", report)
     owner = None
@@ -404,6 +526,15 @@ def run(elf, output, firmware, *, qemu=None):
         raise RuntimeError(f"referee consumer interrupted by signal {sig}")
 
     signal.signal(signal.SIGTERM, interrupted)
+
+    def input_snapshot():
+        inputs = source_snapshot(elf, qemu, firmware)
+        if shared_world:
+            for path in (ROOT / "models/four_wheel.xml", ROOT / "models/mujoco-LICENSE.txt",
+                         ROOT / "tools/dm_mc02_shared_world_smoke.py", ROOT / "flake.lock"):
+                inputs[str(path)] = sha(path)
+        return inputs
+
     try:
         elf = regular_file(elf, "RefereeTest ELF")
         qemu = resolve_qemu(qemu)
@@ -411,12 +542,24 @@ def run(elf, output, firmware, *, qemu=None):
         if not firmware.is_dir():
             raise ValueError("firmware source tree is not a directory: " + str(firmware))
         engine = resources["engine"] = create_engine()
-        report["inputs_before"] = source_snapshot(elf, qemu, firmware)
+        if shared_world:
+            report["shared"] = dict(model=str(ROOT / "models/four_wheel.xml"),
+                native_calls=dict(reset=0, step_ns=[], close=0), responses=[], sends=[])
+            report["limits"][4] = "One shared logical second advances the same Coordinator's world and scripted engine; no CPU barrier or official command rates."
+            report["limits"].extend([
+                "MuJoCo uses one coarse 1s native step, not 1000 integrations at 1ms; this is a state-interface fixture, not calibrated chassis motion.",
+                "Host world exists but firmware plant.physics remains SKIP; this is not a chassis closed-loop consumer.",
+                "Response callback records actual returned observations, not a complete STEP/DONE trace."])
+            plant = resources["plant"] = create_four_wheel_plant(ROOT / "models/four_wheel.xml")
+            observe_physics(plant, report)
+            report["actual_sources_before"] = source_origins()
+        report["inputs_before"] = input_snapshot()
         report["input_checkout"] = checkout_snapshot(firmware)
-        command = qemu_command(elf, qemu, ("qmp", "uart1", "uart7"))
+        sockets = ("qmp", "uart1", "uart7") + (("cosim", "can1") if shared_world else ())
+        command = qemu_command(elf, qemu, sockets)
         command[command.index("-machine") + 1] += ",iwdg-boot-grace-ms=0"
         report["qemu_command_template"] = command
-        with running_qemu(command, sockets=("qmp", "uart1", "uart7"), startup_timeout=10) as owner:
+        with running_qemu(command, sockets=sockets, startup_timeout=10) as owner:
             try:
                 consume(owner, report, engine, resources)
             except BaseException as exc:
@@ -424,7 +567,9 @@ def run(elf, output, firmware, *, qemu=None):
                 raise
             finally:
                 cleanup = []
-                for name in ("endpoint", "engine", "UART7", "UART1", "QMP"):
+                owned_endpoint = (resources["runtime"].referees[0].endpoint
+                                  if "runtime" in resources else resources.get("endpoint"))
+                for name in ("runtime", "endpoint", "engine", "plant", "CAN1", "COSIM", "UART7", "UART1", "QMP"):
                     resource = resources.pop(name, None)
                     if resource is not None:
                         try:
@@ -432,6 +577,19 @@ def run(elf, output, firmware, *, qemu=None):
                         except BaseException as exc:
                             cleanup.append((name, exc))
                             report["cleanup_errors"].append(f"{name}: {exc}")
+                if shared_world and "shared" in report:
+                    try:
+                        report["shared"]["owned_cleanup"] = dict(
+                            plant_closed=plant.closed,
+                            devices_closed=[device.closed for device in plant.devices],
+                            engine_closed=engine.closed,
+                            endpoint_closed=owned_endpoint is not None and owned_endpoint.closed)
+                        if not (plant.closed and engine.closed and owned_endpoint is not None and owned_endpoint.closed
+                                and all(device.closed for device in plant.devices)):
+                            raise RuntimeError("shared referee owned resource cleanup incomplete")
+                    except BaseException as exc:
+                        cleanup.append(("owned observation", exc))
+                        report["cleanup_errors"].append(f"owned observation: {exc}")
                 try:
                     with owner.stderr_path.open("rb") as stream:
                         stream.seek(max(0, owner.stderr_path.stat().st_size - 12000))
@@ -444,19 +602,25 @@ def run(elf, output, firmware, *, qemu=None):
                         primary = cleanup[0][1]
                     for name, exc in cleanup:
                         primary.add_note(f"{name} cleanup failed: {exc}")
+                        if exc is not primary:
+                            for note in tuple(getattr(exc, "__notes__", ())):
+                                primary.add_note(note)
                     raise primary
     except BaseException as exc:
         primary = exc
         report["errors"].append(str(exc) or type(exc).__name__)
     finally:
         # Pure admission may fail before the harness takes over resource scope.
-        for name, resource in resources.items():
+        for name, resource in reversed(tuple(resources.items())):
             try:
                 resource.close()
             except BaseException as exc:
                 report["cleanup_errors"].append(f"{name}: {exc}")
                 if primary is not None:
                     primary.add_note(f"{name} cleanup failed: {exc}")
+                    if exc is not primary:
+                        for note in tuple(getattr(exc, "__notes__", ())):
+                            primary.add_note(note)
         resources.clear()
         report["wire_sent_hex"] = "".join(row["wire_hex"] for row in report.get("send_writes", []))
         report["missing"] = sorted(REQUIRED - {
@@ -479,11 +643,31 @@ def run(elf, output, firmware, *, qemu=None):
             before = report.get("inputs_before")
             if before is None:
                 raise ValueError("pre-run input hashes unavailable")
-            report["inputs_after"] = source_snapshot(elf, qemu, firmware)
+            report["inputs_after"] = input_snapshot()
             if before != report["inputs_after"]:
                 raise ValueError("input sources changed through harness cleanup")
         except BaseException as exc:
             report["errors"].append("final input verification failed: " + str(exc))
+        if shared_world:
+            try:
+                report["actual_sources_after"] = source_origins()
+                before = report.get("actual_sources_before")
+                if before is None or any(report["actual_sources_after"].get(name) != value
+                                         for name, value in before.items()):
+                    raise ValueError("actual imported sources unavailable or changed through cleanup")
+                report["actual_sources_preserved"] = True
+                if owner is not None:
+                    shared = report["shared"]
+                    shared["socket_paths_gone"] = {
+                        name: not Path(path).exists() for name, path in shared.get("socket_paths", {}).items()}
+                    shared["temporary_directory_gone"] = not Path(shared["temporary_directory"]).exists()
+                    if not shared["temporary_directory_gone"] or not all(shared["socket_paths_gone"].values()):
+                        raise ValueError("shared referee harness paths remain after cleanup")
+                calls = report["shared"]["native_calls"]
+                if calls != dict(reset=1, step_ns=[1_000_000_000], close=1):
+                    raise ValueError("shared referee native reset/step/close coverage incomplete")
+            except BaseException as exc:
+                report["errors"].append("shared owner verification failed: " + str(exc))
         if primary is not None:
             report["notes"] = list(getattr(primary, "__notes__", ()))
         signal.signal(signal.SIGTERM, previous_signal)
@@ -504,9 +688,12 @@ def main(argv=None):
     parser.add_argument("output", nargs="?", default=ROOT / "build/test-results/trobot-referee")
     parser.add_argument("firmware_source", nargs="?", default=ROOT.parent / "trobot")
     parser.add_argument("--qemu")
+    parser.add_argument("--shared-world", action="store_true",
+                        help="run this fixed fixture through the existing shared world owner")
     args = parser.parse_args(argv)
     try:
-        return run(args.elf, args.output, args.firmware_source, qemu=args.qemu)
+        return run(args.elf, args.output, args.firmware_source, qemu=args.qemu,
+                   shared_world=args.shared_world)
     except (OSError, ValueError) as exc:
         print("referee consumer failed: " + str(exc), file=sys.stderr)
         return 1

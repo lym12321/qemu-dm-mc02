@@ -342,7 +342,8 @@ world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
 其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
 不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
-共享世界的实际 UART7/HAL/RTOS 消费仍需验证。Arena YAML 尚未接入该组合；
+单板共享路径已通过实际 RefereeTest UART7/HAL/RTOS 消费验证，入口见下文。
+Arena YAML 尚未接入该组合；
 脚本状态也不代表根据世界碰撞进行实时裁决或实现官方独立消息发送周期。
 
 裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：
@@ -488,6 +489,25 @@ Dji、Chassis 测试互斥，普通 Debug/Release 均保持关闭。结果目录
 尾部，固件检查四组新 payload 和新时间戳。它验证完整帧消费，不能证明 UART 前缀的
 准确到达时间、操作系统背压、官方独立发送周期或 CPU/plant 全局屏障。当前 `0x0206`
 真实一字节格式与固件两字节结构不符，保持未支持，测试不填充字节掩盖差异。
+
+追加 `--shared-world` 可用同一个固件验证共享 owner 的裁判发布路径：
+
+```bash
+tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
+  build/test-results/referee-shared-debug ../trobot --shared-world
+```
+
+此默认关闭的单板夹具使用既有四轮 MuJoCo toy plant、CAN1 和 co-sim transport。
+真实 RESET_ACK 后由 `SharedWorldRuntime` 初始化世界及裁判；固件实际 UART7 ready
+事件触发初始快照，第二阶段由同一个 owner 推进逻辑时间，再发布第二批快照。
+剩余 63 字节由原服务接口发送，保持原来的固件观察窗口和协议预期。
+报告分别保留共享逻辑时间、QEMU ready/RESET/STEP 观测、原生世界调用和清理结果。
+此夹具使用一次 1 秒的 MuJoCo step，不是 1000 次 1 ms 积分；它验证完成状态的
+发布与消费，不能用于判断底盘运动精度。
+
+该夹具用于检验实际 UART7/HAL/RTOS 消费边界，原 `plant.physics` SKIP 继续保留。
+它尚不验证底盘固件闭环、双板 Arena 裁判接线、实物标定或 CPU 时间屏障；
+MuJoCo 可选依赖需要先按环境准备中的说明安装。
 
 ## Contents
 
