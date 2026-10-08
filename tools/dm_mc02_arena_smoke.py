@@ -10,9 +10,12 @@ owns the Bosch quantization oracle. This gate establishes no CPU time barrier.
 from contextlib import contextmanager
 from dataclasses import asdict
 import argparse
+import errno
 import json
 import math
+import os
 from pathlib import Path
+import runpy
 import signal
 import struct
 import sys
@@ -83,6 +86,36 @@ class Observation:
         self.plant = self.runtime = None
         self.can_count = self.cosim_count = 0
         self.feedback_sources = {}
+        self.run_result = self.run_error = None
+
+    def run(self, manifest, **options):
+        """Observe the actual CLI's single call; never execute another loop."""
+        evidence = self.report["cli"]
+        evidence["runtime_calls"] += 1
+        assert evidence["runtime_calls"] == 1
+        assert manifest == self.manifest and manifest is not self.manifest
+        entrypoint = Path(sys.modules["__main__"].__file__).resolve()
+        assert entrypoint == ROOT / "sim/__main__.py"
+        evidence.update(entrypoint=str(entrypoint), entrypoint_sha256=sha(entrypoint),
+            module_argv=list(sys.argv), actual_sources=source_origins(),
+            runtime_options={key: str(value) if key == "qemu" else value
+                for key, value in options.items() if key != "emit"})
+        assert evidence["runtime_options"] == {
+            "duration": .05, "qemu": str(self.binary), "startup_timeout": 10., "timeout": 15.}
+        emit = options.pop("emit")
+        assert callable(emit)
+
+        def observed_emit(event):
+            emit(event)
+            self.emit(event)
+
+        try:
+            self.run_result = self.original_run(manifest, **options,
+                emit=observed_emit, on_response=self.response)
+        except BaseException as error:
+            self.run_error = error
+            raise
+        return self.run_result
 
     def world(self, manifest):
         plant = self.original_world(manifest)
@@ -196,7 +229,13 @@ class Observation:
             return result
 
         def observed_receive():
-            frames = receive()
+            try:
+                frames = receive()
+            except ConnectionError as error:
+                append_bounded(self.report, "can_receive_errors", {
+                    "peer": index, "error_type": type(error).__name__,
+                    "error": str(error)}, 8)
+                raise
             for can_id, flags, dlc, stamp, data in frames:
                 append_bounded(self.report, "commands", {"peer": index,
                     "can_id": can_id, "flags": flags, "dlc": dlc,
@@ -228,7 +267,12 @@ class Observation:
                 assert (*imu.gyro_dps, *imu.accel_g) == expected
                 assert (imu.sample_id, imu.sensor_time_ns) == (frame.header.step_id, frame.header.t_sim_ns)
                 event.update(imu=asdict(imu), source_name=name, source_si=asdict(source))
-            result = send(wire)
+            try:
+                result = send(wire)
+            except BrokenPipeError as error:
+                event["send_error"] = {"error_type": type(error).__name__,
+                    "errno": error.errno, "error": str(error)}
+                raise
             event["accepted"] = True
             return result
 
@@ -269,6 +313,19 @@ class Observation:
         close = runtime.close
 
         def observed_close():
+            if self.mode == "interrupt" and self.report.get("injected"):
+                before = list(self.report["native_calls"]["step_ns"])
+                self.report["failed_before_close"] = runtime.failed
+                result = close()
+                try:
+                    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+                except RuntimeError as error:
+                    self.report["retry_error"] = str(error)
+                else:
+                    raise AssertionError("closed Arena runtime accepted another tick")
+                assert self.report["native_calls"]["step_ns"] == before
+                self.report["terminal_retry_verified"] = True
+                return result
             try:
                 before = list(self.report["native_calls"]["step_ns"])
                 self.report["failed_before_close"] = runtime.failed
@@ -322,12 +379,57 @@ class Observation:
         if self.completed_names() != {member.name for member in self.manifest.robots}:
             return
         self.report["injected"] = self.mode
-        if self.mode == "upper-exit":
+        if self.mode == "interrupt":
+            os.kill(os.getpid(), signal.SIGTERM)
+        elif self.mode == "upper-exit":
             (self.manifest.robots[0].robot.path.parent / "exit-upper").write_text("exit0\n")
         else:
             index = 0 if self.mode == "reset" else 1
             self.qmps[index].settimeout(2.)
             self.qmps[index].command("system_reset" if self.mode == "reset" else "quit")
+
+
+def invoke_cli(observer, report_path):
+    """Run the selected package's real module entry within this instrumented fixture."""
+    evidence = observer.report["cli"]
+    argv = ["sim", "arena", "run", str(observer.manifest.path), "--duration", "0.05",
+        "--qemu", str(observer.binary), "--startup-timeout", "10", "--timeout", "15",
+        "--report", str(report_path)]
+    evidence.update(argv=argv, report_path=str(report_path), runtime_calls=0)
+    previous_argv = sys.argv
+    try:
+        sys.argv = list(argv)
+        try:
+            runpy.run_module("sim", run_name="__main__", alter_sys=True)
+        except SystemExit as exit:
+            evidence["exit_code"] = exit.code
+        else:
+            raise AssertionError("sim module entry did not exit")
+    finally:
+        sys.argv = previous_argv
+    try:
+        assert evidence["runtime_calls"] == 1
+        assert evidence["module_argv"] == [str(ROOT / "sim/__main__.py"), *argv[1:]]
+        payload = json.loads(report_path.read_text())
+        evidence.update(report=payload, report_sha256=sha(report_path))
+        error = observer.run_error
+        if error is None:
+            expected = {"status": "passed", "result": asdict(observer.run_result)}
+            assert evidence["exit_code"] == 0
+        else:
+            expected = {"status": "failed", "error": str(error),
+                "error_type": type(error).__name__, "notes": list(getattr(error, "__notes__", ()))}
+            assert evidence["exit_code"] == (130 if isinstance(error, KeyboardInterrupt) else 1)
+        assert payload == json.loads(json.dumps(expected))
+        evidence["verified"] = True
+    except BaseException as verification:
+        evidence["verification_error"] = f"{type(verification).__name__}: {verification}"
+        if observer.run_error is None:
+            raise
+        observer.run_error.add_note(f"Arena CLI verification failed: {verification}")
+    if observer.run_error is not None:
+        raise observer.run_error
+    return observer.run_result
 
 
 def main(args):
@@ -342,7 +444,7 @@ def main(args):
     report = {"status": "running", "mode": args.mode, "scene": "admitted-arena",
         "native_calls": {"reset": 0, "step_ns": [], "close": 0}, "responses": [],
         "transport_done": [],
-        "commands": [], "feedback": [], "cosim_sends": [], "qmp_events": [],
+        "commands": [], "can_receive_errors": [], "feedback": [], "cosim_sends": [], "qmp_events": [],
         "cleanup": [], "upper_cleanup": [], "uart": ["", ""],
         "entrypoint": str(Path(__file__).resolve()), "cwd": str(Path.cwd()),
         "limitations": ["physical calibration SKIP", "bare-MMIO lifecycle consumer, not HAL/BSP closed loop",
@@ -358,15 +460,28 @@ def main(args):
             manifest.path, *(member.robot.path for member in manifest.robots))}}
     origins = source_origins()
     observer = Observation(report, manifest, args.mode)
+    observer.binary = binary
+    if args.cli:
+        report["cli"] = {}
+        report["limitations"].append(
+            "Instrumented runpy sim module entry in the existing shell subprocess; not an unmodified external python -m sim run.")
+        for path in (ROOT / "sim/__main__.py", ROOT / "sim/cli.py"):
+            report["inputs"][str(path)] = sha(path)
     overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
         "CanStream": "can", "StepFramedSocket": "cosim", "SharedWorldRuntime": "shared", "ChildProcess": "child"}
     for original, replacement in overrides.items():
         setattr(observer, "original_" + replacement, getattr(arena, original))
+    if args.cli:
+        observer.original_run = arena.run_manifest
+        overrides["run_manifest"] = "run"
     primary = None
     try:
         with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
-            result = arena.run_manifest(manifest, duration=.05, qemu=binary,
-                startup_timeout=10., timeout=15., emit=observer.emit, on_response=observer.response)
+            if args.cli:
+                result = invoke_cli(observer, result_path.parent / "cli-result.json")
+            else:
+                result = arena.run_manifest(manifest, duration=.05, qemu=binary,
+                    startup_timeout=10., timeout=15., emit=observer.emit, on_response=observer.response)
         report["runtime_result"] = asdict(result)
         assert args.mode == "normal", "negative fixture completed without observing its native event"
         assert result.end_ns - result.origin_ns == 50_000_000
@@ -393,6 +508,12 @@ def main(args):
         current = source_origins()
         assert all(current[name] == value for name, value in origins.items())
         assert all(sha(path) == digest for path, digest in report["inputs"].items())
+        if args.cli:
+            entry_sources = report["cli"]["actual_sources"]
+            assert all(current[name] == value for name, value in entry_sources.items() if name != "__main__")
+            assert sha(report["cli"]["entrypoint"]) == report["cli"]["entrypoint_sha256"]
+            assert sha(report["cli"]["report_path"]) == report["cli"]["report_sha256"]
+            report["cli"]["source_preserved"] = True
         report.update(actual_sources=current, source_preserved=True)
     except BaseException as error:
         verification_errors.append(error)
@@ -429,22 +550,42 @@ def main(args):
         assert output == {"cwd": str(manifest.robots[0].robot.path.parent), "argv": list(LITERAL_ARGS)}
         assert not (manifest.robots[0].robot.path.parent / "forbidden").exists()
         if args.mode != "normal":
-            assert report.get("injected") == args.mode and report.get("freeze_verified")
-            if args.mode == "reset":
+            assert report.get("injected") == args.mode
+            if args.mode == "peer-exit":
+                assert report["cleanup"][1]["returncode"] == 0
+                assert any(event["peer"] == 1 and event["command"] == "quit"
+                           for event in report["qmp_events"])
+            if args.mode == "interrupt":
+                assert args.cli and isinstance(primary, KeyboardInterrupt)
+                assert str(primary) == "interrupted by signal 15"
+                assert report.get("terminal_retry_verified")
+            elif args.mode == "reset":
                 assert isinstance(primary, V2SessionReset)
             elif args.mode == "peer-exit" and isinstance(primary, ExecInterruptedError):
                 # QEMU can disconnect this native QMP before its quit response
                 # or the following snapshot. Require the actual exit0 as well;
                 # a different transport failure is not this expected event.
                 assert str(primary) == "Disconnected"
-                assert report["cleanup"][1]["returncode"] == 0
-                assert any(event["peer"] == 1 and event["command"] == "quit"
-                           for event in report["qmp_events"])
                 report["peer_exit_observation"] = "qmp_disconnect_then_exit0"
+            elif args.mode == "peer-exit" and type(primary) is ConnectionError:
+                assert str(primary) == "QEMU FDCAN socket closed"
+                assert {"peer": 1, "error_type": "ConnectionError", "error": str(primary)} in report["can_receive_errors"]
+                report["peer_exit_observation"] = "fdcan_eof_then_exit0"
+            elif args.mode == "peer-exit" and type(primary) is BrokenPipeError:
+                assert primary.errno == errno.EPIPE
+                assert any(event["peer"] == 1 and not event["accepted"]
+                    and event.get("send_error") == {"error_type": "BrokenPipeError",
+                        "errno": errno.EPIPE, "error": str(primary)}
+                    for event in report["cosim_sends"])
+                report["peer_exit_observation"] = "cosim_broken_pipe_then_exit0"
             else:
                 assert isinstance(primary, RuntimeError) and "exited early (0)" in str(primary)
                 assert ("QEMU west" if args.mode == "peer-exit" else "east/upper:observer") in str(primary)
+            if args.mode != "interrupt":
+                assert report.get("freeze_verified")
             report["expected_failure_verified"] = True
+        if args.cli:
+            assert report["cli"].get("verified") and report["cli"].get("source_preserved")
     except BaseException as error:
         verification_errors.append(error)
     for error in verification_errors:
@@ -470,10 +611,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", nargs=2, required=True)
-    parser.add_argument("--mode", choices=("normal", "reset", "peer-exit", "upper-exit"), default="normal")
+    parser.add_argument("--cli", action="store_true", help="exercise the real sim module CLI entry")
+    parser.add_argument("--mode", choices=("normal", "reset", "peer-exit", "upper-exit", "interrupt"), default="normal")
     parser.add_argument("--result", required=True)
+    args = parser.parse_args()
+    if args.mode == "interrupt" and not args.cli:
+        parser.error("--mode interrupt requires --cli")
     try:
-        sys.exit(main(parser.parse_args()))
+        sys.exit(main(args))
     except ModuleNotFoundError as error:
         if error.name != "mujoco":
             raise

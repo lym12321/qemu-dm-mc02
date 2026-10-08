@@ -39,12 +39,14 @@ def _port(value) -> int:
     return number
 
 
-def _runtime_options(parser, *, timeout: float, paused=True) -> None:
+def _runtime_options(parser, *, timeout: float, paused=True, debug=True) -> None:
     parser.add_argument("--qemu", metavar="PATH", help="QEMU executable (default: project build)")
     parser.add_argument("--timeout", type=_seconds, default=timeout, metavar="SECONDS",
                         help=f"active host deadline including startup; cleanup separate (default: {timeout:g})")
     parser.add_argument("--startup-timeout", type=_seconds, default=10.0, metavar="SECONDS",
                         help="startup deadline from QEMU launch (default: 10)")
+    if not debug:
+        return
     parser.add_argument("--qmp", metavar="PATH", help="additional native QMP Unix socket")
     parser.add_argument("--gdb-port", type=_port, metavar="PORT",
                         help="native GDB port on 127.0.0.1, in 1..65535")
@@ -87,23 +89,37 @@ def _parser() -> argparse.ArgumentParser:
                      help="QEMU virtual duration after optional UART ready (default: 5)")
     _runtime_options(run, timeout=30.0, paused=False)
     run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
+    arena = groups.add_parser("arena", help="two firmware robots sharing one native world")
+    arenas = arena.add_subparsers(dest="action", required=True)
+    run = arenas.add_parser("run", help="run an admitted two-robot Arena manifest")
+    run.add_argument("manifest", type=Path, metavar="PATH",
+                     help="YAML Arena manifest; robot references are relative to its directory")
+    run.add_argument("--duration", type=_seconds, default=5.0, metavar="SECONDS",
+                     help="shared logical world duration after all requested UART ready markers (default: 5)")
+    _runtime_options(run, timeout=30.0, debug=False)
+    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
     return parser
 
 
-def _emit(event) -> None:
+def _emit(event, *, member=None) -> None:
     """Keep serial bytes inert and distinguish the two observation clocks."""
     from sim.fabric import CanFrame
 
+    endpoint = event.endpoint if member is None else f"{member}.{event.endpoint}"
     if isinstance(event.data, bytes):
-        print(f"UART {event.endpoint} poll_sample_ns={event.timestamp_ns} {event.data!r}",
+        print(f"UART {endpoint} poll_sample_ns={event.timestamp_ns} {event.data!r}",
               flush=True)
     elif isinstance(event.data, CanFrame):
         frame = event.data
-        print(f"CAN {event.endpoint} native_timestamp_ns={frame.timestamp_ns} "
+        print(f"CAN {endpoint} native_timestamp_ns={frame.timestamp_ns} "
               f"id=0x{frame.can_id:x} flags=0x{frame.flags:x} dlc={frame.dlc} "
               f"data={frame.data.hex()}", flush=True)
     else:
         raise TypeError("unsupported Lab observation")
+
+
+def _emit_arena(event) -> None:
+    _emit(event.event, member=event.name)
 
 
 def _write_report(path: Path, payload: dict) -> None:
@@ -204,6 +220,36 @@ def _run_robot(args) -> int:
     return code
 
 
+def _run_arena(args) -> int:
+    try:
+        from sim.arena.manifest import load_manifest
+
+        manifest = load_manifest(args.manifest)
+        from sim.arena.runtime import run_manifest
+
+        result = run_manifest(
+            manifest, emit=_emit_arena, duration=args.duration, qemu=args.qemu,
+            startup_timeout=args.startup_timeout, timeout=args.timeout)
+        payload = {"status": "passed", "result": asdict(result)}
+        code = 0
+    except (Exception, KeyboardInterrupt) as error:
+        _diagnose(error)
+        payload = {"status": "failed", "error": str(error),
+                   "error_type": type(error).__name__,
+                   "notes": list(getattr(error, "__notes__", ()))}
+        code = 130 if isinstance(error, KeyboardInterrupt) else 1
+    if args.report is not None:
+        try:
+            _write_report(args.report, payload)
+        except (Exception, KeyboardInterrupt) as error:
+            _diagnose(error)
+            return 130 if isinstance(error, KeyboardInterrupt) else 1
+    if code == 0:
+        print(f"Arena {result.name!r}: passed (shared world {result.origin_ns}..{result.end_ns} ns, "
+              f"{len(result.boards)} boards)", flush=True)
+    return code
+
+
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # The existing native launcher owns all board option admission. Preserve
@@ -221,6 +267,8 @@ def main(argv=None) -> int:
     try:
         if args.group == "robot":
             return _run_robot(args)
+        if args.group == "arena":
+            return _run_arena(args)
         return _run_lab(args) if args.action == "run" else _run_interactive(args)
     finally:
         signal.signal(signal.SIGTERM, previous)

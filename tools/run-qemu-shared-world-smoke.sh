@@ -7,9 +7,10 @@ qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 mode=normal
 two_chassis=0
 arena_runtime=0
+arena_cli=0
 scene_args=()
 usage_error() {
-    printf 'usage: %s [--two-chassis|--arena-runtime] [--peer-exit|--reset|--upper-exit]\n' "$0" >&2
+    printf 'usage: %s [--two-chassis|--arena-runtime|--arena-cli] [--peer-exit|--reset|--upper-exit|--interrupt]\n' "$0" >&2
     exit 2
 }
 for argument in "$@"; do
@@ -24,7 +25,13 @@ for argument in "$@"; do
             arena_runtime=1
             two_chassis=1
             ;;
-        --peer-exit|--reset|--upper-exit)
+        --arena-cli)
+            [[ $two_chassis == 0 && $arena_runtime == 0 ]] || usage_error
+            arena_cli=1
+            arena_runtime=1
+            two_chassis=1
+            ;;
+        --peer-exit|--reset|--upper-exit|--interrupt)
             [[ $mode == normal ]] || usage_error
             mode=${argument#--}
             ;;
@@ -32,6 +39,7 @@ for argument in "$@"; do
     esac
 done
 [[ $mode != upper-exit || $arena_runtime == 1 ]] || usage_error
+[[ $mode != interrupt || $arena_cli == 1 ]] || usage_error
 [[ -x "$qemu_bin" ]] || { printf 'SKIP: QEMU not found: %s\n' "$qemu_bin" >&2; exit 77; }
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'SKIP: arm-none-eabi-gcc required' >&2; exit 77; }
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'SKIP: python3 required' >&2; exit 77; }
@@ -53,6 +61,9 @@ consumer="$script_dir/dm_mc02_shared_world_smoke.py"
 if [[ $arena_runtime == 1 ]]; then
     consumer="$script_dir/dm_mc02_arena_smoke.py"
     scene_args=()
+    if [[ $arena_cli == 1 ]]; then
+        scene_args=(--cli)
+    fi
 fi
 python3 "$consumer" \
     --qemu "$qemu_bin" --firmware "$run_dir/peer0.elf" "$run_dir/peer1.elf" \
@@ -62,7 +73,9 @@ rm -rf -- "$run_dir"
 trap - EXIT
 [[ ! -e "$run_dir" ]]
 printf 'RESULT_JSON: %s\n' "$result_json"
-if [[ $arena_runtime == 1 ]]; then
+if [[ $arena_cli == 1 ]]; then
+    printf '%s\n' 'RESULT: admitted Arena native module CLI smoke passed'
+elif [[ $arena_runtime == 1 ]]; then
     printf '%s\n' 'RESULT: admitted Arena native lifecycle smoke passed'
 else
     printf '%s\n' 'RESULT: native dual-QEMU single-world CAN/BMI088 smoke passed'

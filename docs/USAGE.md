@@ -242,7 +242,21 @@ for member in arena.robots:  # 固定按 alpha/、bravo/ 返回，保留 east/we
 指向 canonical 文件的符号链接可用，复制文件或自定义模型会被拒绝；路径一致仅选择
 固定 profile，模型 binding 仍由 native consumer 校验。准入返回不可变记录，只读取配置，
 不启动 QEMU、上位机或物理后端。已验证准入数据驱动同一个 MuJoCo 世界、两条独立
-CAN 总线和八个 M3508 的直接 consumer；Arena CLI 尚未提供。
+CAN 总线和八个 M3508 的直接 consumer。
+
+命令行运行同一配置：
+
+```bash
+uv run --frozen --extra mujoco python -m sim arena run arena.yaml \
+  --duration 1 --report build/test-results/arena.json
+```
+
+`tools/sim arena run` 使用相同入口。`--qemu`、`--startup-timeout` 和 `--timeout`
+分别选择 QEMU 和设置主机期限；默认值及参数可用 `arena run --help` 查看。
+UART 文本带成员名称，例如 `UART east.uart1 poll_sample_ns=... b'...'`，字节以
+转义形式显示。`poll_sample_ns` 属于该 QEMU 的采样时间；结果中的 `origin_ns`、
+`end_ns` 是共享世界时间。JSON 包含各板独立的 ready 状态和时间，省略 ready
+仍为 `not_waited`。运行、清理或报告写入失败返回非零；中断返回 130，并保留错误诊断。
 
 可通过 Python 运行这两个配置成员，共享一个世界 owner：
 
@@ -270,7 +284,7 @@ ready 读取后时间上界和最后观察时间，不能将这些时间与共�
 提前退出（包括退出码 0）、期限、RESET/EOF、QMP、transport、solver、输出或清理错误
 均使本次运行失败。成功只在独立清理世界、上位机、连接和两组 QEMU 后返回。
 native 准入及各资源的有界清理不计入 active host 期限，阻塞 native 调用仍需外层 timeout。
-该入口尚不提供 Arena CLI、独立 QMP/GDB 参数、wall-clock pacing 或 CPU 时间屏障。
+该固定 profile 尚不提供独立 QMP/GDB 参数、wall-clock pacing 或 CPU 时间屏障。
 
 实际进程与数据交付的验证入口为：
 
@@ -289,6 +303,17 @@ SI 样本、实际 float32 STEP、八路 CAN 反馈、DONE masks、原始 UART�
 上位机退出。负例返回非零，保留 failed JSON、停止步进和资源回收证据；QMP
 断连可能先于进程退出检测，清理错误也保留在报告中。缺少 MuJoCo 或 ARM
 工具链时明确返回 SKIP 77。该夹具尚不证明 HAL/BSP 闭环或实物标定。
+
+命令行入口与 JSON 报告的原生验证使用同一夹具：
+
+```bash
+uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena-cli
+```
+
+它在既有 smoke 进程中执行标准 `sim` 模块入口，保留测试观察以核验单次 runtime
+调用、实际参数、输出与完整报告。该门属于带观察的模块运行。`--reset`、
+`--peer-exit` 和 `--upper-exit` 继续保留实际失败报告；`--interrupt` 发送 SIGTERM，
+要求返回 130，并验证世界、QEMU 与上位机已清理，关闭后的 owner 拒绝再次步进。
 
 ## Referee protocol
 
@@ -1774,7 +1799,7 @@ MuJoCo 夹具，验证独立会话、实际 CAN 电流命令/反馈、具名 IMU
 消费。固件先经 ready/按键发送命令，主机保留完整 wire 后暂停 CPU，统一完成
 RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。报告分别保留
 实际 ACK、DONE masks、UART 完成标记以及失败/清理结果；这是固定 bare-MMIO
-夹具，尚未提供 Arena CLI、HAL/BSP 闭环、CPU 全局时间屏障或
+夹具，尚未验证 HAL/BSP 闭环、CPU 全局时间屏障或
 实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
 
 ### MuJoCo 双底盘场景
@@ -1833,7 +1858,7 @@ BMI088 raw 数据须落在各自半 LSB 区间，并排除另一底盘的来源�
 
 可追加 `--reset` 或 `--peer-exit` 验证单板复位或退出使共享 owner 冻结，
 不再推进世界；这些负例按预期返回非零并保留失败 JSON。原四 hinge 默认门仍
-独立验证其解析轨迹。此入口验证固定双底盘数据交付，Arena CLI、HAL/BSP 闭环、
+独立验证其解析轨迹。此入口验证固定双底盘数据交付，HAL/BSP 闭环、
 实物标定和 CPU 全局时间屏障仍需后续验证。
 
 ### trobot DJI driver test
