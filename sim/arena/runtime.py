@@ -155,6 +155,8 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     """Consume admitted records and return only after all owners are released."""
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
+    if manifest.referees:
+        raise ValueError("Arena referee execution is not yet supported")
     for callback, label in ((emit, "output sink"), (on_response, "response observer")):
         if callback is not None and not callable(callback):
             raise TypeError(f"Arena {label} must be callable")

@@ -244,6 +244,33 @@ for member in arena.robots:  # 固定按 alpha/、bravo/ 返回，保留 east/we
 不启动 QEMU、上位机或物理后端。已验证准入数据驱动同一个 MuJoCo 世界、两条独立
 CAN 总线和八个 M3508 的直接 consumer。
 
+可选 `referees` 先提供裁判配置准入，每个成员最多一份，键使用已有的成员名称：
+
+```yaml
+referees:
+  east:
+    uart: main.uart7
+    initial:
+      game: {game_type: 1, game_progress: 2, stage_remain_time: 1, sync_timestamp: 0}
+      robot: {robot_id: 3, robot_level: 2, current_hp: 100, maximum_hp: 200,
+              cooling_per_s: 3, heat_limit: 100, chassis_power_limit: 80, power_outputs: 5}
+      power_heat: {buffer_energy_j: 40, heat_17mm: 10, heat_42mm: 20}
+      buff: {recovery_percent: 5, cooling_per_s: 9, defence_percent: 7,
+             vulnerability_percent: 11, attack_percent: 13, remaining_energy: 254}
+    durations: {countdown_s: 3, battle_s: 300}
+    cooling_42mm_per_s: 2
+    events:
+      - {offset_ns: 500000000, hit: {damage_hp: 30}}
+```
+
+`uart` 必须精确对应该成员子配置的板名称和 `uart7`。初始四组和时长必须完整，
+数值沿用裁判公共类型的校验；`sync_timestamp` 明确填写，不从世界时间推导。
+`events` 默认空，每项包含 `offset_ns` 及 `hit`、`shot`、`game`、`robot`、
+`power_heat`、`buff` 中恰好一种完整数据；至多 1024 项，偏移非递减，同时间保持原顺序。
+`cooling_42mm_per_s` 默认零。返回的 `arena.referees` 是按成员顺序排列的不可变记录。
+准入不创建裁判引擎或 UART endpoint；运行时接线尚未接入，`arena run` 对非空
+裁判配置会在获取资源前明确报错。省略 `referees` 继续使用原运行路径。
+
 命令行运行同一配置：
 
 ```bash
@@ -343,7 +370,7 @@ world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
 不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
 单板共享路径已通过实际 RefereeTest UART7/HAL/RTOS 消费验证，入口见下文。
-Arena YAML 尚未接入该组合；
+Arena YAML 可校验裁判配置，运行时尚未接入该组合；
 脚本状态也不代表根据世界碰撞进行实时裁决或实现官方独立消息发送周期。
 
 裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：

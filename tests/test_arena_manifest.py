@@ -41,7 +41,7 @@ physics: {backend: mujoco, model: MODEL}
 
 
 def write_arena(directory, *, robot_documents=(ROBOT_DOCUMENT, ROBOT_DOCUMENT),
-                members=None, name="two-four-wheel", world_model=None):
+                members=None, name="two-four-wheel", world_model=None, referees=None):
     """Write only temporary configuration inputs; return the outer manifest.
 
     Native consumers may reuse this fixture and its canonical model references.
@@ -63,6 +63,8 @@ def write_arena(directory, *, robot_documents=(ROBOT_DOCUMENT, ROBOT_DOCUMENT),
     document = {"schema": 1, "arena": {"name": name},
                 "world": {"backend": "mujoco", "model": str(world_model or WORLD_MODEL)},
                 "robots": members}
+    if referees is not None:
+        document["referees"] = referees
     path = directory / "arena.yaml"
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     return path
@@ -73,6 +75,19 @@ def load_manifest(path):
     # importing Arena or any runtime during collection.
     from sim.arena.manifest import load_manifest as load
     return load(path)
+
+
+def forbid_child_reads(directory, monkeypatch):
+    child_paths = {(directory / "robots" / prefix / "robot.yaml").resolve()
+                   for prefix in ("alpha", "bravo")}
+    original_open = Path.open
+
+    def open_file(self, *args, **kwargs):
+        if self.resolve() in child_paths:
+            pytest.fail("outer rejection read a child before complete admission")
+        return original_open(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", open_file)
 
 
 def write_executable(path):
@@ -109,12 +124,20 @@ def test_import_and_success_failure_never_acquire_runtime_resources(tmp_path, mo
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", pure_import)
-    package = importlib.import_module("sim.arena")
-    importlib.reload(package)
-    arena = importlib.import_module("sim.arena.manifest")
-    importlib.reload(arena)  # Exercise source imports even if another test loaded it.
+    importlib.import_module("sim.arena")
+    # Execute source imports without replacing the canonical record classes
+    # already borrowed by runtime consumers collected in the same process.
+    spec = importlib.util.spec_from_file_location("arena_manifest_purity", ROOT / "sim/arena/manifest.py")
+    arena = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, arena)
+    spec.loader.exec_module(arena)
     result = arena.load_manifest(path)
     assert sum(len(member.robot.upper_computers) for member in result.robots) == 2
+    assert result.referees == ()
+    document = yaml.safe_load(path.read_text())
+    document["referees"] = {}
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert arena.load_manifest(path).referees == ()
     child = tmp_path / "robots" / "alpha" / "robot.yaml"
     child.write_text(ROBOT_DOCUMENT + "unexpected: true\n", encoding="utf-8")
     with pytest.raises(ManifestError):
@@ -127,6 +150,7 @@ def test_complete_typed_frozen_records_preserve_aliases_and_canonical_order(tmp_
     from sim.arena.manifest import ArenaManifest, ArenaRobot
 
     assert isinstance(result, ArenaManifest)
+    assert result.referees == ()
     assert (result.path, result.name, result.world) == (
         path.resolve(), "two-four-wheel", Physics("mujoco", WORLD_MODEL.resolve()))
     assert type(result.robots) is tuple
@@ -232,16 +256,7 @@ def test_complete_outer_admission_precedes_any_child_file_open(tmp_path, monkeyp
     else:
         item[location[-1]] = replacement
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-    child_paths = {(tmp_path / "robots" / prefix / "robot.yaml").resolve()
-                   for prefix in ("alpha", "bravo")}
-    original_open = Path.open
-
-    def open_file(self, *args, **kwargs):
-        if self.resolve() in child_paths:
-            pytest.fail("outer rejection opened a child before complete admission")
-        return original_open(self, *args, **kwargs)
-
-    monkeypatch.setattr(Path, "open", open_file)
+    forbid_child_reads(tmp_path, monkeypatch)
     with pytest.raises(ManifestError):
         load_manifest(path)
 
@@ -334,3 +349,227 @@ def test_reference_rejects_nul_before_filesystem_use(tmp_path):
     path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     with pytest.raises(ManifestError, match="NUL"):
         load_manifest(path)
+
+
+def referee_configuration(*, uart="main.uart7", scripted=False):
+    """Explicit protocol values; no engine, owner or rule defaults in this fixture."""
+    initial = {
+        "game": {"game_type": 1, "game_progress": 2, "stage_remain_time": 1,
+                 "sync_timestamp": 0x0102030405060708},
+        "robot": {"robot_id": 3, "robot_level": 2, "current_hp": 100,
+                  "maximum_hp": 200, "cooling_per_s": 3, "heat_limit": 100,
+                  "chassis_power_limit": 80, "power_outputs": 5},
+        "power_heat": {"buffer_energy_j": 40, "heat_17mm": 10, "heat_42mm": 20},
+        "buff": {"recovery_percent": 5, "cooling_per_s": 9, "defence_percent": 7,
+                 "vulnerability_percent": 11, "attack_percent": 13,
+                 "remaining_energy": 254},
+    }
+    result = {"uart": uart, "initial": initial,
+              "durations": {"countdown_s": 3, "battle_s": 4}}
+    if scripted:
+        result["cooling_42mm_per_s"] = 2
+        result["events"] = [
+            {"offset_ns": 0, "hit": {"damage_hp": 20}},
+            {"offset_ns": 0, "robot": initial["robot"].copy()},
+            {"offset_ns": 0, "power_heat": initial["power_heat"].copy()},
+            {"offset_ns": 500_000_000, "shot": {"heat_17mm": 5, "heat_42mm": 7}},
+            {"offset_ns": 500_000_000, "hit": {"damage_hp": 30}},
+            {"offset_ns": 1_000_000_000,
+             "game": {**initial["game"], "game_progress": 3, "stage_remain_time": 3}},
+            {"offset_ns": 1_000_000_000,
+             "robot": {**initial["robot"], "current_hp": 70,
+                       "chassis_power_limit": 120, "power_outputs": 6}},
+            {"offset_ns": 1_000_000_000,
+             "buff": {"recovery_percent": 8, "cooling_per_s": 17, "defence_percent": 19,
+                      "vulnerability_percent": 23, "attack_percent": 29,
+                      "remaining_energy": 128}},
+        ]
+    return result
+
+
+def test_referee_records_are_scoped_frozen_and_canonical_without_resource_acquisition(
+        tmp_path, monkeypatch):
+    from sim.arena.manifest import ArenaReferee
+    from sim.core import Coordinator
+    from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Arena referee admission constructed or executed a runtime owner")
+
+    for owner in (RefereeEngine, RefereeUartEndpoint, Coordinator):
+        monkeypatch.setattr(owner, "__init__", forbidden)
+    for method in ("reset", "step", "get_state", "close"):
+        monkeypatch.setattr(RefereeEngine, method, forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    original_import = builtins.__import__
+
+    def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
+        resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
+                    if level else name)
+        candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
+        for candidate in candidates:
+            if any(candidate == prefix or candidate.startswith(prefix + ".") for prefix in (
+                    "mujoco", "numpy", "sim.physics", "sim.arena.runtime", "sim.robots.runtime",
+                    "sim.robots.shared_world", "sim.lab.runtime", "tools")):
+                pytest.fail(f"Arena referee admission imported a runtime backend: {candidate}")
+        return original_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", pure_import)
+    path = write_arena(tmp_path, referees={"west": referee_configuration(),
+                                            "east": referee_configuration(scripted=True)})
+    result = load_manifest(path)
+    assert type(result.referees) is tuple
+    east, west = result.referees
+    assert all(isinstance(item, ArenaReferee) for item in result.referees)
+    assert [(item.member, item.uart) for item in result.referees] == [
+        ("east", "main.uart7"), ("west", "main.uart7")]
+    assert (west.events, west.cooling_42mm_per_s) == ((), 0)
+    assert east.initial == west.initial and east.cooling_42mm_per_s == 2
+    assert [type(event.value).__name__ for event in east.events] == [
+        "Hit", "RobotStatus", "PowerHeat", "Shot", "Hit", "GameStatus", "RobotStatus", "Buff"]
+    assert [event.offset_ns for event in east.events] == [0, 0, 0, 500_000_000, 500_000_000,
+                                                          1_000_000_000, 1_000_000_000, 1_000_000_000]
+    for record in (east, east.initial, east.initial.game, east.initial.robot,
+                   east.initial.power_heat, east.initial.buff, east.durations,
+                   *east.events, *(event.value for event in east.events)):
+        attribute = fields(record)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, attribute, getattr(record, attribute))
+    document = yaml.safe_load(path.read_text())
+    document["referees"] = dict(reversed(tuple(document["referees"].items())))
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert load_manifest(path) == result
+
+
+@pytest.mark.parametrize("location,replacement", [
+    (("referees",), None),
+    (("referees",), []),
+    (("referees",), {"unknown": {}}),
+    (("referees", "east"), []),
+    (("referees", "east", "period_ns"), 10),
+    (("referees", "east", "uart"), True),
+    (("referees", "east", "uart"), "main\0.uart7"),
+    (("referees", "east", "initial", "buff"), DELETE),
+    (("referees", "east", "initial", "game", "sync_timestamp"), DELETE),
+    (("referees", "east", "initial", "robot", "automatic_revive"), False),
+    (("referees", "east", "initial", "power_heat", "heat_17mm"), True),
+    (("referees", "east", "initial", "buff", "remaining_energy"), 256),
+    (("referees", "east", "initial", "game", "sync_timestamp"), 1 << 64),
+    (("referees", "east", "initial", "robot", "current_hp"), 201),
+    (("referees", "east", "initial", "game", "stage_remain_time"), 0),
+    (("referees", "east", "durations", "countdown_s"), 0),
+    (("referees", "east", "durations", "battle_s"), True),
+    (("referees", "east", "cooling_42mm_per_s"), -1),
+    (("referees", "east", "events"), {}),
+    (("referees", "east", "events"), [{"offset_ns": 0}]),
+    (("referees", "east", "events"), [{"offset_ns": 0, "hit": {"damage_hp": 1},
+                                            "shot": {"heat_17mm": 1, "heat_42mm": 0}}]),
+    (("referees", "east", "events"), [{"offset_ns": 0, "damage": {"damage_hp": 1}}]),
+    (("referees", "east", "events"), [{"offset_ns": True, "hit": {"damage_hp": 0}}]),
+    (("referees", "east", "events"), [{"offset_ns": 1 << 64, "hit": {"damage_hp": 0}}]),
+    (("referees", "east", "events"), [{"offset_ns": 1, "hit": {"damage_hp": 0}},
+                                            {"offset_ns": 0, "hit": {"damage_hp": 0}}]),
+    (("referees", "east", "events"), [{"offset_ns": 0, "hit": {"damage_hp": True}}]),
+    (("referees", "east", "events"), [{"offset_ns": 0, "shot": {"heat_17mm": 0}}]),
+    (("referees", "east", "events"), [{"offset_ns": 0, "shot": {"heat_17mm": 0,
+                                                                         "heat_42mm": 65536}}]),
+], ids=["null-table", "non-mapping-table", "unbound-alias", "non-mapping-entry", "unknown-policy",
+        "bool-uart", "nul-uart", "missing-initial-group", "missing-explicit-timestamp",
+        "unknown-message-field", "bool-wire-field", "uint8-overflow", "timestamp-overflow",
+        "hp-policy", "active-phase-zero", "zero-duration", "bool-duration", "negative-cooling",
+        "non-list-events", "no-event-value", "two-event-values", "unknown-event", "bool-offset",
+        "offset-overflow", "unsorted-offsets", "bool-hit", "partial-shot", "shot-overflow"])
+def test_referee_outer_shape_and_domain_reject_before_any_child_read(
+        tmp_path, monkeypatch, location, replacement):
+    path = write_arena(tmp_path, referees={"west": referee_configuration(),
+                                            "east": referee_configuration()})
+    document = yaml.safe_load(path.read_text())
+    item = document
+    for key in location[:-1]:
+        item = item[key]
+    if replacement is DELETE:
+        del item[location[-1]]
+    else:
+        item[location[-1]] = replacement
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch)
+    with pytest.raises(ManifestError):
+        load_manifest(path)
+
+
+@pytest.mark.parametrize("count,accepted", [(1024, True), (1025, False)])
+def test_referee_script_capacity_and_maximum_offset(tmp_path, monkeypatch, count, accepted):
+    configuration = referee_configuration()
+    configuration["events"] = [{"offset_ns": 0, "hit": {"damage_hp": 0}}
+                               for _ in range(count - 1)]
+    configuration["events"].append({"offset_ns": 0xffffffffffffffff, "hit": {"damage_hp": 1}})
+    path = write_arena(tmp_path, referees={"east": configuration})
+    if accepted:
+        record, = load_manifest(path).referees
+        assert len(record.events) == 1024 and record.events[-1].offset_ns == 0xffffffffffffffff
+    else:
+        forbid_child_reads(tmp_path, monkeypatch)
+        with pytest.raises(ManifestError, match="1024"):
+            load_manifest(path)
+
+
+@pytest.mark.parametrize("uart", ["main.uart7", "bravo_cpu.uart7", "alpha_cpu.uart1"])
+def test_referee_uart_association_uses_its_loaded_child_board(tmp_path, uart):
+    documents = tuple(ROBOT_DOCUMENT.replace("main", name) for name in ("alpha_cpu", "bravo_cpu"))
+    path = write_arena(tmp_path, robot_documents=documents,
+                       referees={"east": referee_configuration(uart=uart)})
+    with pytest.raises(ManifestError, match="uart7"):
+        load_manifest(path)
+    path = write_arena(tmp_path, robot_documents=documents,
+                       referees={"west": referee_configuration(uart="bravo_cpu.uart7"),
+                                 "east": referee_configuration(uart="alpha_cpu.uart7")})
+    assert [(record.member, record.uart) for record in load_manifest(path).referees] == [
+        ("east", "alpha_cpu.uart7"), ("west", "bravo_cpu.uart7")]
+
+
+def test_admitted_referees_feed_real_coordinator_with_literal_wire_and_reset_origins(tmp_path):
+    from sim.core import Coordinator, Session, StepResult
+    from sim.devices.referee import RefereeEngine, encode_message
+
+    admitted = load_manifest(write_arena(tmp_path, referees={"west": referee_configuration(),
+                                                              "east": referee_configuration(scripted=True)}))
+    engines = {record.member: RefereeEngine(record.initial, durations=record.durations,
+                                           events=record.events,
+                                           cooling_42mm_per_s=record.cooling_42mm_per_s)
+               for record in admitted.referees}
+    coordinator = Coordinator(engines)
+    # Official 2026V1.1.0 layouts; fixed CRC bytes calculated independently with
+    # pinned crccheck, as in the existing actual RefereeTest direct consumer.
+    literals = tuple(bytes.fromhex(value) for value in (
+        "a50b000002010021010008070605040302017d07"
+        "a50d00018d010203026400c80003006400500005ef8a"
+        "a50e00028b0202000000000000000028000a001400c1da"
+        "a5080003040402050900070b0d00feec0b",
+        "a50b00046301003103000807060504030201f59e"
+        "a50d0005ec010203024600c800030064007800060a27"
+        "a50e0006ea0202000000000000000028000c001900c5f8"
+        "a508000765040208110013171d0080d577",
+    ))
+
+    def batch(state, sequence):
+        return b"".join(encode_message(value, sequence + index) for index, value in enumerate(
+            (state.game, state.robot, state.power_heat, state.buff)))
+
+    try:
+        for session_id, origin in ((7, 12_345_678), (8, 50_000_000_000)):
+            coordinator.reset(Session(session_id, origin))
+            assert batch(engines["east"].get_state(), 0) == literals[0]
+            assert engines["east"].get_state().robot.current_hp == 100  # hit precedes replacement
+            assert coordinator.step(1_000_000_000) == {
+                "east": StepResult("ok", origin + 1_000_000_000),
+                "west": StepResult("ok", origin + 1_000_000_000)}
+            assert batch(engines["east"].get_state(), 4) == literals[1]
+            west = engines["west"].get_state()
+            assert (west.robot.current_hp, west.power_heat.heat_17mm, west.power_heat.heat_42mm) == (
+                100, 7, 20)
+            assert coordinator.t_sim_ns == engines["east"].t_sim_ns == engines["west"].t_sim_ns == (
+                origin + 1_000_000_000)
+    finally:
+        coordinator.close()
+    assert coordinator.closed and all(engine.closed for engine in engines.values())

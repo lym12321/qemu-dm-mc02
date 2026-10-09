@@ -6,7 +6,7 @@ machine is replaced. Native QEMU and MuJoCo are separate consumer gates.
 """
 
 from contextlib import contextmanager
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import os
 from pathlib import Path
 import signal
@@ -272,6 +272,17 @@ def environment(tmp_path, monkeypatch):
 def test_invalid_options_have_no_physics_process_or_transport_effect(environment, options):
     with pytest.raises((ValueError, TypeError)):
         environment.run(**options)
+    assert environment.events == [] and environment.launches == []
+
+
+def test_referee_configuration_is_rejected_before_options_or_resource_admission(environment, monkeypatch):
+    manifest = replace(environment.manifest(), referees=(object(),))
+    def forbidden(*args, **kwargs):
+        pytest.fail("unsupported Arena referee configuration reached resource admission")
+    monkeypatch.setattr(runtime, "resolve_qemu", forbidden)
+    monkeypatch.setattr(runtime, "regular_file", forbidden)
+    with pytest.raises(ValueError, match="Arena referee execution is not yet supported"):
+        environment.run(manifest, duration=float("nan"), emit=object())
     assert environment.events == [] and environment.launches == []
 
 

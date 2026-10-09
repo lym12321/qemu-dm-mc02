@@ -6,13 +6,19 @@ and two-chassis scene; compiling bindings and owning runtime resources are
 separate consumer operations.
 """
 
-from dataclasses import dataclass
+from __future__ import annotations
+
+from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from sim.manifest import (ManifestError, fields, file_path, identifier,
                           load_document, text_bytes)
 from sim.robots.manifest import (MAX_UPPER_COMPUTERS, Physics, RobotManifest,
                                 load_manifest as load_robot_manifest)
+
+if TYPE_CHECKING:
+    from sim.devices.referee import MatchDurations, RefereeState, ScriptEvent
 
 _MODELS = Path(__file__).resolve().parents[2] / "models"
 _PREFIXES = ("alpha/", "bravo/")
@@ -27,11 +33,87 @@ class ArenaRobot:
 
 
 @dataclass(frozen=True)
+class ArenaReferee:
+    member: str
+    uart: str
+    initial: RefereeState
+    durations: MatchDurations
+    events: tuple[ScriptEvent, ...]
+    cooling_42mm_per_s: int
+
+
+@dataclass(frozen=True)
 class ArenaManifest:
     path: Path
     name: str
     world: Physics
     robots: tuple[ArenaRobot, ...]
+    referees: tuple[ArenaReferee, ...] = ()
+
+
+def _typed_record(record_type, value, label):
+    names = tuple(field.name for field in dataclass_fields(record_type))
+    return record_type(**fields(value, names, names, label))
+
+
+def _referees(value, members) -> dict[str, ArenaReferee]:
+    if type(value) is not dict or len(value) > len(members):
+        raise ManifestError("referees must be a mapping with at most one entry per Arena member")
+    if not value:
+        return {}
+
+    # The old no-referee parser remains independent of optional domain imports.
+    from sim.devices.referee import (
+        Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeState,
+        RobotStatus, ScriptEvent, Shot, validate_referee_configuration,
+    )
+    from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
+
+    groups = {"game": GameStatus, "robot": RobotStatus,
+              "power_heat": PowerHeat, "buff": Buff}
+    event_types = {"hit": Hit, "shot": Shot, **groups}
+    result = {}
+    for alias, configuration in value.items():
+        identifier(alias, "referees label")
+        if alias not in members:
+            raise ManifestError(f"referees.{alias} must name a declared Arena member")
+        label = f"referees.{alias}"
+        required = ("uart", "initial", "durations")
+        item = fields(configuration, (*required, "events", "cooling_42mm_per_s"),
+                      required, label)
+        uart = item["uart"]
+        text_bytes(uart, label + ".uart")
+        if "\0" in uart:
+            raise ManifestError(f"{label}.uart must not contain NUL")
+        initial_fields = fields(item["initial"], groups, groups, label + ".initial")
+        initial = RefereeState(**{
+            name: _typed_record(record_type, initial_fields[name], f"{label}.initial.{name}")
+            for name, record_type in groups.items()
+        })
+        durations = _typed_record(MatchDurations, item["durations"], label + ".durations")
+        script = item.get("events", [])
+        if type(script) is not list or len(script) > MAX_SCRIPT_EVENTS:
+            raise ManifestError(f"{label}.events must be a list with at most {MAX_SCRIPT_EVENTS} entries")
+        events = []
+        for index, configuration in enumerate(script):
+            event_label = f"{label}.events[{index}]"
+            event = fields(configuration, ("offset_ns", *event_types),
+                           ("offset_ns",), event_label)
+            kinds = [kind for kind in event_types if kind in event]
+            if len(kinds) != 1:
+                raise ManifestError(f"{event_label} must contain exactly one referee event value")
+            kind = kinds[0]
+            events.append(ScriptEvent(event["offset_ns"], _typed_record(
+                event_types[kind], event[kind], event_label + "." + kind)))
+        events = tuple(events)
+        cooling = item.get("cooling_42mm_per_s", 0)
+        try:
+            validate_referee_configuration(initial, durations=durations, events=events,
+                                           cooling_42mm_per_s=cooling)
+        except (TypeError, ValueError) as error:
+            raise ManifestError(f"{label}: {error}") from error
+        result[alias] = ArenaReferee(alias, uart, initial, durations, events, cooling)
+    return result
 
 
 def load_manifest(path: str | Path) -> ArenaManifest:
@@ -39,7 +121,7 @@ def load_manifest(path: str | Path) -> ArenaManifest:
     manifest_path, document = load_document(path)
     base = manifest_path.parent
     required = ("schema", "arena", "world", "robots")
-    item = fields(document, required, required, "arena manifest")
+    item = fields(document, (*required, "referees"), required, "arena manifest")
     if type(item["schema"]) is not int or item["schema"] != 1:
         raise ManifestError("unsupported Arena schema; schema must be integer 1")
     arena = fields(item["arena"], ("name",), ("name",), "arena")
@@ -73,6 +155,7 @@ def load_manifest(path: str | Path) -> ArenaManifest:
         attachments.append((prefix, alias, selector, specification["manifest"]))
     if {prefix for prefix, *_ in attachments} != set(_PREFIXES):
         raise ManifestError("robots must bind each of alpha/ and bravo/ exactly once")
+    referees = _referees(item.get("referees", {}), robots)
 
     result = []
     upper_count = 0
@@ -89,4 +172,12 @@ def load_manifest(path: str | Path) -> ArenaManifest:
         if upper_count > MAX_UPPER_COMPUTERS:
             raise ManifestError("Arena upper_computers total must not exceed 8 entries")
         result.append(ArenaRobot(alias, prefix, selector, robot))
-    return ArenaManifest(manifest_path, name, world, tuple(result))
+    bound_referees = []
+    for member in result:
+        if member.name in referees:
+            referee = referees[member.name]
+            expected_uart = member.robot.board.name + ".uart7"
+            if referee.uart != expected_uart:
+                raise ManifestError(f"referees.{member.name}.uart must be {expected_uart}")
+            bound_referees.append(referee)
+    return ArenaManifest(manifest_path, name, world, tuple(result), tuple(bound_referees))
