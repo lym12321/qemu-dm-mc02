@@ -16,7 +16,7 @@ import time
 from sim.core import Coordinator, Session
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
-from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, ScriptEvent
 from sim.fabric import CanFrame
 from sim.fabric.can import check_can_time
 from sim.fabric.endpoints import QemuCanEndpoint
@@ -355,6 +355,23 @@ class SharedWorldRuntime:
             return wire
         finally:
             self._busy = False
+
+    def queue_referee_events(self, name: str, events: tuple[ScriptEvent, ...], *,
+                             session_id: int) -> None:
+        """Admit scoped events without stepping, publishing or servicing IO.
+
+        Offsets use the host reset origin and session ID. Admission refusal
+        preserves runtime readiness; the selected engine owns validation and
+        pending events. Calls during active execution or cleanup are rejected.
+        """
+        if self.closed or self._busy or self.failed:
+            raise RuntimeError("shared world requires a successful start and fresh runtime")
+        if type(name) is not str:
+            raise TypeError("referee name must be a string")
+        item = next((item for item in self.referees if item.name == name), None)
+        if item is None:
+            raise ValueError(f"unknown referee: {name!r}")
+        item.engine.queue_events(events, session_id=session_id)
 
     def step(self, dt_ns: int, *, deadline):
         """Advance the sole world once; return actual per-board STEP_ACKs."""

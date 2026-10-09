@@ -506,6 +506,30 @@ REFEREE_COMPLETED_PAYLOADS = (
      (0x0202, "0000000000000000280007001200"),
      (0x0204, "0000000000000080")),
 )
+REFEREE_COMPLETED_WIRES = tuple(bytes.fromhex(value) for value in (
+    "a50b00fe690100010000080706050403020138e1"
+    "a50d00ffe6010203022800c80003006400500007140c"
+    "a50e0000370202000000000000000028000c0019009346"
+    "a5080001b8040200000000000000806ba9",
+    "a50b000a7c01000100000807060504030201ffd9"
+    "a50d000bf3010209025500c80003006400500007ebf9"
+    "a50e000c94020200000000000000002800070012001500"
+    "a508000d1b04020000000000000080d328",
+))
+# Scoped live Hit10/Shot2,3 follows the static replacement/hit/shot at .5s:
+# HP30, heat17=10-3+5+2=14, heat42=20-2+7+3=28. CRC independently
+# calculated with pinned crccheck from these official packed payload literals.
+REFEREE_QUEUED_LEFT_PAYLOADS = (
+    (0x0001, "0100000807060504030201"),
+    (0x0201, "03021e00c80003006400500007"),
+    (0x0202, "000000000000000028000e001c00"),
+    (0x0204, "0000000000000080"),
+)
+REFEREE_QUEUED_LEFT_WIRE = bytes.fromhex(
+    "a50b00fe690100010000080706050403020138e1"
+    "a50d00ffe6010203021e00c80003006400500007ac6a"
+    "a50e0000370202000000000000000028000e001c005d01"
+    "a5080001b8040200000000000000806ba9")
 
 
 class UartBudget:
@@ -614,13 +638,15 @@ def referee_setup(referee_resources):
     yield runtime, boards, native, bindings, peers, observations, referees, pairs
 
 
-def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, monkeypatch):
+@pytest.mark.parametrize("queued", [False, True], ids=["script", "scoped_queue"])
+def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, monkeypatch, queued):
     runtime, boards, native, _, _, _, referees, pairs = referee_setup
     assert runtime.referees is referees
-    sessions, contexts, reset_observations, endpoint_resets = [], [], [], []
+    sessions, contexts, reset_observations, endpoint_resets, admissions = [], [], [], [], []
     for item in referees:
         original_reset, original_step = item.engine.reset, item.engine.step
         original_endpoint_reset = item.endpoint.reset
+        original_queue = item.engine.queue_events
 
         def reset(session, original=original_reset):
             sessions.append(session)
@@ -636,9 +662,14 @@ def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, m
             endpoint_resets.append((name, sequence, len(sessions), native.resets))
             return original(sequence)
 
+        def queue(events, *, session_id, original=original_queue, name=item.name):
+            admissions.append((name, events, session_id))
+            return original(events, session_id=session_id)
+
         monkeypatch.setattr(item.engine, "reset", reset)
         monkeypatch.setattr(item.engine, "step", step)
         monkeypatch.setattr(item.endpoint, "reset", endpoint_reset)
+        monkeypatch.setattr(item.engine, "queue_events", queue)
         with pytest.raises(RuntimeError):
             item.engine.get_state()  # Admission neither queries nor resets it.
         with pytest.raises(AttributeError):
@@ -658,20 +689,39 @@ def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, m
     assert endpoint_resets == [("left", 254, 2, 1), ("right", 10, 2, 1)]
     assert [item.endpoint.next_sequence for item in referees] == [254, 10]
     assert all(sock.sends == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    if queued:
+        events = (ScriptEvent(500_000_000, Hit(10)), ScriptEvent(500_000_000, Shot(2, 3)))
+        before = tuple(item.engine.get_state() for item in referees)
+        before_reads = list(native.reads)
+        with monkeypatch.context() as admission:
+            admission.setattr(runtime, "_check_running", lambda: pytest.fail("queue admission called liveness"))
+            assert runtime.queue_referee_events("left", events, session_id=7) is None
+        assert admissions == [("left", events, 7)] and admissions[0][1] is events
+        assert all(item.engine.get_state() is state for item, state in zip(referees, before))
+        assert native.reads == before_reads and native.steps == []
+        assert runtime.t_sim_ns == 500 and runtime.step_id == 0 and not runtime.failed
+        assert [item.endpoint.next_sequence for item in referees] == [254, 10]
+        assert all(sock.sends == sock.reads == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    else:
+        assert admissions == []
     runtime.step(1_000_000_000, deadline=time.monotonic() + 1)
     assert contexts == [StepContext(7, 1, 1_000_000_500, 1_000_000_000)] * 2
     assert contexts[0] is contexts[1]
     assert all(item.engine.t_sim_ns == runtime.t_sim_ns for item in referees)
-    assert [item.engine.get_state().robot.current_hp for item in referees] == [40, 85]
+    assert [item.engine.get_state().robot.current_hp for item in referees] == [30 if queued else 40, 85]
     assert all(sock.sends == 0 and uart_received(peer) == b"" for sock, peer in pairs)
     completed = tuple(item.engine.get_state() for item in referees)
-    for item, (sock, peer), sequence, literals in zip(
-            referees, pairs, (254, 10), REFEREE_COMPLETED_PAYLOADS):
+    payloads = (REFEREE_QUEUED_LEFT_PAYLOADS if queued else REFEREE_COMPLETED_PAYLOADS[0],
+                REFEREE_COMPLETED_PAYLOADS[1])
+    wires = (REFEREE_QUEUED_LEFT_WIRE if queued else REFEREE_COMPLETED_WIRES[0],
+             REFEREE_COMPLETED_WIRES[1])
+    for item, (sock, peer), sequence, literals, literal_wire in zip(
+            referees, pairs, (254, 10), payloads, wires):
         item.endpoint.transport.buffer.extend(b"read tail")
         peer.send(b"unread input")
         emitted = runtime.publish_referee(item.name, deadline=time.monotonic() + 1)
         actual = uart_received(peer)
-        assert actual == emitted and len(actual) == 82
+        assert actual == emitted == literal_wire and len(actual) == 82
         decoded = referee_frames(actual)
         assert [frame.sequence for frame in decoded] == [(sequence + i) % 256 for i in range(4)]
         assert [(frame.command_id, frame.payload.hex()) for frame in decoded] == list(literals)
@@ -751,6 +801,12 @@ def test_referee_start_keeps_queued_partial_bytes_and_active_service_drains_with
     assert sock.sends == sends and uart_received(peer) == b""
     assert item.endpoint.next_sequence == 2
     assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [suffix]
+    completed = item.engine.get_state()
+    runtime.queue_referee_events("left", (ScriptEvent(0, Hit(10)),), session_id=7)
+    assert item.engine.get_state() is completed
+    assert sock.sends == sends and uart_received(peer) == b""
+    assert item.endpoint.next_sequence == 2
+    assert [bytes(view) for view in item.endpoint.transport.tx_queue] == [suffix]
     runtime.service(deadline=time.monotonic() + 1)
     assert uart_received(peer) == suffix and not item.endpoint.transport.tx_pending
     assert item.endpoint.next_sequence == 2 and sock.reads == 0
@@ -796,6 +852,97 @@ def test_referee_publish_bad_name_freezes_before_uart_or_world_effect(referee_se
     assert all(sock.sends == sock.reads == 0 for sock, _ in pairs)
     with pytest.raises(RuntimeError):
         runtime.publish_referee("left", deadline=time.monotonic() + 1)
+
+
+@pytest.mark.parametrize("invalid", ["unknown", "name_type", "name_subclass", "wire_session",
+                                    "session_type", "past", "malformed_batch"])
+def test_scoped_queue_refusals_preserve_pending_state_and_leave_runtime_usable(
+        referee_setup, monkeypatch, invalid):
+    runtime, _, native, bindings, _, _, referees, pairs = referee_setup
+    start(runtime)
+    runtime.step(100_000_000, deadline=time.monotonic() + 1)
+    runtime.queue_referee_events("left", (ScriptEvent(200_000_000, Hit(10)),), session_id=7)
+    calls = []
+    for item in referees:
+        original = item.engine.queue_events
+        def queue(events, *, session_id, original=original, name=item.name):
+            calls.append((name, events, session_id))
+            return original(events, session_id=session_id)
+        monkeypatch.setattr(item.engine, "queue_events", queue)
+    before = tuple(item.engine.get_state() for item in referees)
+    world = (runtime.t_sim_ns, runtime.step_id, list(native.steps), list(native.reads))
+    reads = [list(item.endpoint.stream.reads) for item in bindings]
+    name, session_id = "left", 7
+    events = (ScriptEvent(200_000_000, Hit(30)),)
+    if invalid == "unknown":
+        name = "missing"
+    elif invalid == "name_type":
+        name = None
+    elif invalid == "name_subclass":
+        class Alias(str):
+            pass
+        name = Alias("left")
+    elif invalid == "wire_session":
+        session_id = 71  # The host session is7; this is a board wire-session ID.
+    elif invalid == "session_type":
+        session_id = 7.0
+    elif invalid == "past":
+        events = (ScriptEvent(99_000_000, Hit(30)),)
+    else:
+        events = (ScriptEvent(200_000_000, Hit(30)), ScriptEvent(200_000_000, Hit(True)))
+    with monkeypatch.context() as admission:
+        admission.setattr(runtime, "_check_running", lambda: pytest.fail("queue refusal called liveness"))
+        with pytest.raises((TypeError, ValueError)):
+            runtime.queue_referee_events(name, events, session_id=session_id)
+    assert calls == ([] if invalid.startswith("name_") or invalid == "unknown"
+                     else [("left", events, session_id)])
+    if calls:
+        assert calls[0][1] is events
+    assert not runtime.failed and not runtime.closed
+    assert all(item.engine.get_state() is state for item, state in zip(referees, before))
+    assert (runtime.t_sim_ns, runtime.step_id, native.steps, native.reads) == world
+    assert [item.endpoint.stream.reads for item in bindings] == reads
+    assert [item.endpoint.next_sequence for item in referees] == [254, 10]
+    assert all(sock.sends == sock.reads == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    runtime.queue_referee_events("left", (ScriptEvent(200_000_000, Hit(5)),), session_id=7)
+    runtime.step(100_000_000, deadline=time.monotonic() + 1)
+    assert [item.engine.get_state().robot.current_hp for item in referees] == [85, 100]
+    assert native.steps == [100_000_000, 100_000_000] and runtime.step_id == 2
+
+
+def test_scoped_queue_capacity_refusal_and_completed_step_release_use_lower_engine(referee_setup):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    start(runtime)
+    runtime.queue_referee_events("left", (ScriptEvent(100_000_000, Hit(0)),) * 1023 +
+                                (ScriptEvent(200_000_000, Hit(10)),), session_id=7)
+    before = tuple(item.engine.get_state() for item in referees)
+    with pytest.raises(BufferError):
+        runtime.queue_referee_events("left", (ScriptEvent(200_000_000, Hit(30)),), session_id=7)
+    assert not runtime.failed and runtime.t_sim_ns == 500 and runtime.step_id == 0
+    assert all(item.engine.get_state() is state for item, state in zip(referees, before))
+    assert native.steps == [] and [item.endpoint.next_sequence for item in referees] == [254, 10]
+    assert all(sock.sends == sock.reads == 0 and uart_received(peer) == b"" for sock, peer in pairs)
+    runtime.step(100_000_000, deadline=time.monotonic() + 1)
+    runtime.queue_referee_events("left", (ScriptEvent(200_000_000, Hit(0)),) * 1023, session_id=7)
+    runtime.step(100_000_000, deadline=time.monotonic() + 1)
+    assert [item.engine.get_state().robot.current_hp for item in referees] == [90, 100]
+    assert native.steps == [100_000_000, 100_000_000] and not runtime.failed
+
+
+@pytest.mark.parametrize("state", ["prestart", "closed"])
+def test_scoped_queue_lifecycle_guard_rejects_before_lower_delegation(referee_setup, monkeypatch, state):
+    runtime, _, native, _, _, _, referees, pairs = referee_setup
+    if state == "closed":
+        start(runtime)
+        runtime.close()
+    def forbidden(*args, **options):
+        pytest.fail("lifecycle refusal invoked lower queue")
+    for item in referees:
+        monkeypatch.setattr(item.engine, "queue_events", forbidden)
+    with pytest.raises(RuntimeError):
+        runtime.queue_referee_events("left", (), session_id=7)
+    assert native.steps == [] and runtime.step_id == 0
+    assert all(sock.sends == sock.reads == 0 for sock, _ in pairs)
 
 
 @pytest.mark.parametrize("capacity", [False, True])
@@ -868,7 +1015,8 @@ def test_later_referee_overflow_retains_first_participant_effects_without_board_
     assert all([frame.header.kind for frame in frames] == [1] for frames in boards.frames)
     assert all(sock.sends == 0 for sock, _ in pairs)
     for action in (lambda: runtime.step(1, deadline=time.monotonic() + 1),
-                   lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1)):
+                   lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1),
+                   lambda: runtime.queue_referee_events("left", (), session_id=7)):
         with pytest.raises(RuntimeError):
             action()
     assert native.steps == [1_000_000_000]
@@ -934,11 +1082,16 @@ def test_referee_close_reentry_and_errors_release_all_owners_once(
     for index, item in enumerate(referees):
         original_endpoint, original_engine = item.endpoint.close, item.engine.close
 
+        def forbidden_queue(*args, **options):
+            pytest.fail("close reentry invoked lower queue")
+        monkeypatch.setattr(item.engine, "queue_events", forbidden_queue)
+
         def endpoint_close(index=index, original=original_endpoint):
             events.append(("endpoint", index))
             for action in (runtime.close,
                            lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1),
-                           lambda: runtime.service(deadline=time.monotonic() + 1)):
+                           lambda: runtime.service(deadline=time.monotonic() + 1),
+                           lambda: runtime.queue_referee_events("left", (), session_id=7)):
                 with pytest.raises(RuntimeError):
                     action()
             original()

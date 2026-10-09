@@ -365,12 +365,16 @@ uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena
 
 ```python
 from sim.robots.shared_world import RefereeBinding, SharedWorldRuntime
+from sim.devices.referee import ScriptEvent, Hit
 
 world = SharedWorldRuntime(plant, boards, referees=(
     RefereeBinding("east", east_engine, east_uart_endpoint),
     RefereeBinding("west", west_engine, west_uart_endpoint),
 ))
 world.start(session, wire_sessions, deadline=deadline)
+world.queue_referee_events("east", (ScriptEvent(0, Hit(5)),),
+                           session_id=session.session_id)
+world.step(1_000_000, deadline=deadline)  # 由原有步进处理到期事件
 # 调用者先观察相应固件的实际 UART7 ready 事件，再发布：
 wire = world.publish_referee("east", deadline=deadline)
 world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
@@ -382,8 +386,14 @@ world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
 已完成状态。启动及步进不会自动发布。启动保留 endpoint 当前序号及既有排队字节，
 不能用逻辑 reset 清除旧 UART 数据。
 
+`queue_referee_events(name, events, session_id=...)` 只向具名引擎交付动态事件，
+使用 host Session ID 和相对 reset 的偏移，沿用引擎的整批准入、顺序及 1024 项
+pending 限制。该调用不推进时间或发布 UART；名称、输入、session、顺序或容量
+拒绝均保留原状态，可以随后正常准入及 step。启动前、关闭后、执行失败后或
+活动回调中的调用会被拒绝。调用者负责事件来源和去重。
+
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
-其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
+发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
 不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
 单板共享路径已通过实际 RefereeTest UART7/HAL/RTOS 消费验证，入口见下文。
