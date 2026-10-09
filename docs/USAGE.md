@@ -459,6 +459,10 @@ state = engine.get_state()
 assert state.robot.current_hp == 180 and state.power_heat.heat_17mm == 30
 frames = [encode_message(message, sequence=i) for i, message in enumerate(
     (state.game, state.robot, state.power_heat, state.buff))]
+engine.queue_events((ScriptEvent(2_000_000_000, Hit(5)),), session_id=1)
+assert engine.get_state() is state  # 准入不修改已完成快照
+coordinator.step(1_000_000_000)
+assert engine.get_state().robot.current_hp == 175
 coordinator.close()
 ```
 
@@ -469,6 +473,19 @@ coordinator.close()
 42mm 使用构造参数 `cooling_42mm_per_s`，默认零。热量保留分数并向下取整输出；
 超过 65535 热量会拒绝整个步进并冻结，需 reset 后才能继续。`PowerHeat` 替换会重置
 热量余量；`Buff` 只更新消息数据。getter 返回不可变的最近完成快照，不推进时间。
+
+运行中的引擎可通过 `queue_events(events, session_id=...)` 接收动态事件，
+复用同一 `ScriptEvent` 格式与校验。入口需要成功 reset、匹配的整数 session ID；
+调用者负责来源时间、session 标识及去重，并顺序调用准入和步进。偏移不得早于
+最近完成时间或最后排队事件，禁止自动重排。同时间静态脚本先执行，再按准入顺序
+处理动态事件，冷却和阶段到期先于两者。等于最近完成时间的事件在下一次成功
+step 的起点生效，已有快照保持可读。
+
+每批至多 1024 项，pending 总数也至多 1024 项；整批准入失败保持原队列。
+有效批次因总容量不足而抛出 `BufferError`，之后可以正常 step 消费到期事件并释放
+空间。只有成功 step 删除已消费项；计算失败冻结引擎，保留最近快照和 pending。
+成功 reset 或 close 清除动态事件，reset 仍从新原点重放静态脚本。
+此入口接收显式输入；自动命中、射弹和赛场事件来源仍需单独接入。
 
 配置工具可以先调用 `validate_referee_configuration(initial, durations=...,
 events=..., cooling_42mm_per_s=...)`。该公共函数与引擎构造器使用相同校验，

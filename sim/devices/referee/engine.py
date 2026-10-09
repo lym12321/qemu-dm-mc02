@@ -1,4 +1,4 @@
-"""Explicit scripted referee fixture, independent of boards and world backends.
+"""Explicit referee event fixture, independent of boards and world backends.
 
 Heat arithmetic is a narrow port of rm_control's BSD-3-Clause HeatLimit
 heatCB/timerCB at c5205eb193a8cda6147efe760eafedd0a3ed0104 (Qiayuan Liao,
@@ -89,6 +89,10 @@ def validate_referee_configuration(initial: RefereeState, *, durations: MatchDur
         if _uint(value, 65535, label) == 0:
             raise ValueError(f"{label} must be positive")
     _uint(cooling_42mm_per_s, 65535, "cooling_42mm_per_s")
+    _admit_events(events)
+
+
+def _admit_events(events):
     if type(events) is not tuple:
         raise TypeError("events must be an immutable tuple")
     if len(events) > MAX_SCRIPT_EVENTS:
@@ -113,11 +117,12 @@ def validate_referee_configuration(initial: RefereeState, *, durations: MatchDur
 
 
 class RefereeEngine:
-    """Single-owner participant with immutable snapshots and a bounded script.
+    """Single-owner participant with immutable snapshots and bounded events.
 
     Script offsets are relative to each reset origin. Due events apply once in
-    tuple order, after cooling/phase expiry at their timestamp. Only successful
-    reset/step publishes a snapshot; calculation failure freezes until reset.
+    tuple order, after cooling/phase expiry at their timestamp. Queued events use
+    the same offsets, after static events on ties and in admission order. Only
+    successful reset/step publishes a snapshot; calculation failure freezes until reset.
     No method owns a clock, transport, sequence number or external resource.
     """
 
@@ -128,6 +133,7 @@ class RefereeEngine:
         self._initial = initial
         self._durations = durations
         self._events = events
+        self._pending = ()
         self._cooling_42mm_per_s = cooling_42mm_per_s
         self._session = None
         self._t_sim_ns = 0
@@ -150,6 +156,28 @@ class RefereeEngine:
             raise RuntimeError("referee has no completed reset")
         return self._runtime[0]
 
+    def queue_events(self, events: tuple[ScriptEvent, ...], *, session_id: int) -> None:
+        """Admit events for the active session without changing time or snapshot.
+
+        Append in nondecreasing offset order, at or after the completed time.
+        Events at the completed time apply at the next step's start. Capacity
+        refusal preserves the queue and permits a later step to release space.
+        Only successful reset or close cancels pending events. Calls must be
+        serialized with reset/step. The caller owns source time and deduplication.
+        """
+        if self._closed or self._failed or self._session is None:
+            raise RuntimeError("referee requires a successful reset")
+        if type(session_id) is not int or session_id != self._session.session_id:
+            raise ValueError("referee events must match the active session")
+        _admit_events(events)
+        minimum = (self._pending[-1].offset_ns if self._pending
+                   else self._t_sim_ns - self._session.t_sim_ns)
+        if events and events[0].offset_ns < minimum:
+            raise ValueError("referee events must follow completed time and pending order")
+        if len(self._pending) + len(events) > MAX_SCRIPT_EVENTS:
+            raise BufferError(f"pending referee events exceed {MAX_SCRIPT_EVENTS}")
+        self._pending += events
+
     def reset(self, session: Session) -> None:
         if self._closed:
             raise RuntimeError("referee is closed")
@@ -159,12 +187,13 @@ class RefereeEngine:
         runtime = (self._initial, self._initial.power_heat.heat_17mm * _NS,
                    self._initial.power_heat.heat_42mm * _NS,
                    _deadline(self._initial.game, session.t_sim_ns), 0)
-        runtime = self._simulate(runtime, session.t_sim_ns, session.t_sim_ns,
-                                 session.t_sim_ns)
+        runtime, _ = self._simulate(runtime, session.t_sim_ns, session.t_sim_ns,
+                                    session.t_sim_ns, ())
         self._runtime = runtime
         self._session = session
         self._t_sim_ns = session.t_sim_ns
         self._step_id = 0
+        self._pending = ()
         self._failed = False
 
     def step(self, ctx: StepContext) -> StepResult:
@@ -175,11 +204,13 @@ class RefereeEngine:
                 or ctx.t_sim_ns != self._t_sim_ns + ctx.dt_ns):
             raise ValueError("referee step must follow its session and exact target")
         self._failed = True
-        runtime = self._simulate(self._runtime, self._session.t_sim_ns,
-                                 self._t_sim_ns, ctx.t_sim_ns)
+        runtime, consumed = self._simulate(self._runtime, self._session.t_sim_ns,
+                                           self._t_sim_ns, ctx.t_sim_ns, self._pending)
+        pending = self._pending[consumed:]
         self._runtime = runtime
         self._t_sim_ns = ctx.t_sim_ns
         self._step_id = ctx.step_id
+        self._pending = pending
         self._failed = False
         return StepResult("ok", ctx.t_sim_ns)
 
@@ -199,13 +230,19 @@ class RefereeEngine:
             game = replace(game, stage_remain_time=(deadline - target + _NS - 1) // _NS)
         return game, deadline
 
-    def _simulate(self, runtime, origin, start, target):
+    def _simulate(self, runtime, origin, start, target, pending):
         # All calculations are local: an overflow cannot publish a partial state.
         state, heat17, heat42, deadline, cursor = runtime
+        consumed = 0
         now = start
         while True:
-            due = (origin + self._events[cursor].offset_ns
-                   if cursor < len(self._events) else None)
+            event = self._events[cursor] if cursor < len(self._events) else None
+            queued = pending[consumed] if consumed < len(pending) else None
+            from_queue = queued is not None and (event is None
+                                                 or queued.offset_ns < event.offset_ns)
+            if from_queue:
+                event = queued
+            due = origin + event.offset_ns if event is not None else None
             at = target if due is None or due > target else due
             elapsed = at - now
             # Port of HeatLimit::timerCB: rate*dt then saturate at zero.
@@ -216,7 +253,7 @@ class RefereeEngine:
             now = at
             if due is None or due > target:
                 break
-            value = self._events[cursor].value
+            value = event.value
             if type(value) is Hit:
                 state = replace(state, robot=replace(state.robot,
                                 current_hp=max(0, state.robot.current_hp - value.damage_hp)))
@@ -225,7 +262,7 @@ class RefereeEngine:
                 heat17 += value.heat_17mm * _NS
                 heat42 += value.heat_42mm * _NS
                 if heat17 > _MAX_HEAT or heat42 > _MAX_HEAT:
-                    raise OverflowError("script heat exceeds the unsigned16 profile")
+                    raise OverflowError("referee heat exceeds the unsigned16 profile")
             elif type(value) is GameStatus:
                 state = replace(state, game=value)
                 deadline = _deadline(value, at)
@@ -236,10 +273,14 @@ class RefereeEngine:
                 heat17, heat42 = value.heat_17mm * _NS, value.heat_42mm * _NS
             else:  # Buff was admitted before execution.
                 state = replace(state, buff=value)
-            cursor += 1
+            if from_queue:
+                consumed += 1
+            else:
+                cursor += 1
         state = replace(state, power_heat=replace(state.power_heat,
                         heat_17mm=heat17 // _NS, heat_42mm=heat42 // _NS))
-        return state, heat17, heat42, deadline, cursor
+        return (state, heat17, heat42, deadline, cursor), consumed
 
     def close(self) -> None:
         self._closed = True
+        self._pending = ()
