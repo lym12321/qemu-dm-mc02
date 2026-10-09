@@ -11,8 +11,8 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from sim.manifest import (MAX_FILE_BYTES, ManifestError, fields as _fields,
-                          load_document, readable_file as _readable_file,
+from sim.manifest import (MAX_FILE_BYTES, MAX_TIME_NS, ManifestError, fields as _fields,
+                          load_document, parse_time as _time, readable_file as _readable_file,
                           text_bytes as _text)
 
 from sim.boards import validate_gpio_pin
@@ -21,7 +21,6 @@ from sim.fabric.frame import CAN_EFF_MASK, CAN_SFF_MASK, WIRE_EXTENDED, WIRE_FD
 
 MAX_ITEMS = 1024
 MAX_TEXT_BYTES = 4096
-MAX_TIME_NS = 3600 * 1_000_000_000
 _UARTS = frozenset(("uart1", "uart2", "uart3", "uart5", "uart7", "uart10"))
 _CANS = frozenset(("can1", "can2", "can3"))
 
@@ -82,19 +81,6 @@ def _integer(value, maximum: int, label: str) -> int:
     if type(value) is not int or not 0 <= value <= maximum:
         raise ManifestError(f"{label} must be an integer in 0..{maximum}")
     return value
-
-
-def _time(value, label: str, *, zero: bool = True) -> int:
-    if type(value) is not str:
-        raise ManifestError(f"{label} must be an integer ns/us/ms/s string")
-    match = re.fullmatch(r"([0-9]{1,13})(ns|us|ms|s)", value)
-    if match is None:
-        raise ManifestError(f"{label} must be an integer ns/us/ms/s string")
-    number = int(match[1]) * {"ns": 1, "us": 1000, "ms": 1_000_000,
-                             "s": 1_000_000_000}[match[2]]
-    if number > MAX_TIME_NS or (not zero and number == 0):
-        raise ManifestError(f"{label} must be {'nonnegative' if zero else 'positive'} and at most 3600s")
-    return number
 
 
 def _endpoint(value, allowed, label: str) -> str:

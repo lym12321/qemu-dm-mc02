@@ -11,6 +11,8 @@ import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim.lab import CanMatch, ManifestError, load_manifest
+from sim.lab.manifest import MAX_TIME_NS as LAB_MAX_TIME_NS
+from sim.manifest import MAX_TIME_NS, parse_time
 
 
 HEADER = "schema: 1\nname: admission\nboard: dm-mc02\nfirmware: firmware.elf\n"
@@ -127,9 +129,19 @@ assertions:
 def test_time_rejections(tmp_path, body):
     with pytest.raises(ManifestError):
         load_manifest(write_manifest(tmp_path, body))
+    if body.count("\n") == 1 and body.startswith("duration:"):
+        with pytest.raises(ManifestError):
+            parse_time(yaml.safe_load(body)["duration"], "duration", zero=False)
 
 
 def test_integer_time_units_and_maximum_boundary(tmp_path):
+    assert MAX_TIME_NS == LAB_MAX_TIME_NS == 3_600_000_000_000
+    assert [parse_time(value, "time") for value in (
+        "1ns", "1us", "1ms", "1s", "3600000000000ns", "3600s")] == [
+        1, 1000, 1_000_000, 1_000_000_000, 3_600_000_000_000, 3_600_000_000_000]
+    assert parse_time("0ns", "time") == 0
+    with pytest.raises(ManifestError, match="time must be positive and at most 3600s"):
+        parse_time("0ns", "time", zero=False)
     manifest = load_manifest(write_manifest(tmp_path, """duration: 3600s
 stimulus:
   - {at: 1ns, endpoint: key, pressed: true}

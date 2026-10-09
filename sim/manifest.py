@@ -11,11 +11,26 @@ import yaml
 from yaml.events import AliasEvent
 
 MAX_FILE_BYTES = 1 << 20
+MAX_TIME_NS = 3600 * 1_000_000_000
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,63}")
 
 
 class ManifestError(ValueError):
     """Configuration rejected before runtime admission."""
+
+
+def parse_time(value, label: str, *, zero: bool = True) -> int:
+    """Parse bounded integer ns/us/ms/s text into configuration nanoseconds."""
+    if type(value) is not str:
+        raise ManifestError(f"{label} must be an integer ns/us/ms/s string")
+    match = re.fullmatch(r"([0-9]{1,13})(ns|us|ms|s)", value)
+    if match is None:
+        raise ManifestError(f"{label} must be an integer ns/us/ms/s string")
+    number = int(match[1]) * {"ns": 1, "us": 1000, "ms": 1_000_000,
+                             "s": 1_000_000_000}[match[2]]
+    if number > MAX_TIME_NS or (not zero and number == 0):
+        raise ManifestError(f"{label} must be {'nonnegative' if zero else 'positive'} and at most 3600s")
+    return number
 
 
 class _BoundedLoader(yaml.SafeLoader):
