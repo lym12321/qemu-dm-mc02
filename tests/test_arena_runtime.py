@@ -461,15 +461,16 @@ def test_exit_during_result_observation_is_checked_before_cleanup(environment, m
     assert environment.native.steps == [1_000_000, 1_000_000, 500_000]
 
 
-@pytest.mark.parametrize("interrupt", [False, True])
-def test_cleanup_is_independent_and_preserves_interrupt_object(environment, interrupt):
-    environment.world_close_failure = OSError("world close failure")
+@pytest.mark.parametrize("interrupt,same_error", [(False, False), (True, False), (True, True)])
+def test_cleanup_is_independent_and_preserves_interrupt_object(environment, interrupt, same_error):
+    primary = KeyboardInterrupt("output sink interrupted")
+    environment.world_close_failure = primary if same_error else OSError("world close failure")
+    environment.world_close_failure.add_note("nested native release failure")
     environment.stop_failure = OSError("upper group stop failure")
     environment.close_failures = {"upper0 stdout", "upper1 stderr", "peer0 uart1", "peer1 qmp"}
     environment.owner_failures = {0: OSError("first harness failure"),
                                   1: OSError("second harness failure")}
     environment.uart_chunks[0] = [b"observation"]
-    primary = KeyboardInterrupt("output sink interrupted")
     def emit(event):
         if interrupt:
             raise primary
@@ -481,6 +482,8 @@ def test_cleanup_is_independent_and_preserves_interrupt_object(environment, inte
     notes = "\n".join(getattr(caught.value, "__notes__", ())).lower()
     for label in ("world", "stop", "stdout", "stderr", "uart1", "qmp", "first harness", "second harness"):
         assert label in notes or label in str(caught.value)
+    assert "nested native release failure" in notes
+    assert len(getattr(caught.value, "__notes__", ())) < 20
     assert environment.events.count("upper0 stop") == 1
     assert environment.events.count("upper1 stop") == 1
 

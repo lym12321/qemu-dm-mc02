@@ -281,6 +281,9 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             error = primary if primary is not None else errors[0][1]
             for label, exc in errors:
                 BaseException.add_note(error, f"Arena cleanup {label} failed: {exc}")
+                if exc is not error:
+                    for note in tuple(getattr(exc, "__notes__", ())):
+                        BaseException.add_note(error, note)
             for child in children:
                 BaseException.add_note(error, f"Arena {child.label} output tails: {child.diagnostics()!r}")
             if primary is None:
