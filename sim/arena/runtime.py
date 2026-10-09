@@ -12,11 +12,13 @@ import time
 
 from sim.boards import QemuBoard
 from sim.boards.channels import ChannelEvent, LabChannels
-from sim.boards.launch import positive_seconds, qemu_command, regular_file, resolve_qemu
+from sim.boards.launch import UARTS, positive_seconds, qemu_command, regular_file, resolve_qemu
 from sim.core import Session
+from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.processes import ChildProcess
-from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
+from sim.robots.manifest import Ready
+from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
 from sim.transports import StreamTransport, connect_unix
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import StepFramedSocket
@@ -25,7 +27,7 @@ from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_test_harness import running_qemu, stop
 
-from .manifest import ArenaManifest, ArenaRobot
+from .manifest import ArenaManifest, ArenaReferee, ArenaRobot
 from .world import create_arena_plant
 
 
@@ -47,6 +49,17 @@ class ArenaBoardResult:
 
 
 @dataclass(frozen=True)
+class ArenaRefereeResult:
+    member: str
+    uart: str
+    period_ns: int
+    publications: int
+    first_logical_ns: int
+    last_logical_ns: int
+    next_sequence: int
+
+
+@dataclass(frozen=True)
 class ArenaResult:
     name: str
     origin_ns: int
@@ -63,6 +76,18 @@ class ArenaResult:
         "Child output retains bounded sampled tails and may encounter pipe backpressure.",
         "Active host deadline excludes native admission and bounded resource cleanup; blocked native methods require external timeout.",
     )
+    referees: tuple[ArenaRefereeResult, ...] = ()
+
+
+@dataclass
+class _Referee:
+    configuration: ArenaReferee
+    engine: RefereeEngine
+    endpoint: RefereeUartEndpoint | None = None
+    publications: int = 0
+    first_ns: int | None = None
+    last_ns: int | None = None
+    next_due_ns: int | None = None
 
 
 @dataclass
@@ -123,7 +148,7 @@ class _Run:
             before = self.call(peer, peer.board.snapshot)["timestamp_ns"]
             if before < peer.last_ns:
                 raise RuntimeError(f"Arena QEMU {peer.member.name} virtual time moved backwards")
-            events = peer.channels.service(before)
+            events = peer.channels.service(before, flush_uart=False)
             self.guard()
             after = self.call(peer, peer.board.snapshot)["timestamp_ns"]
             if after < before:
@@ -135,7 +160,8 @@ class _Run:
                 if self.emit is not None:
                     self.emit(ArenaEvent(peer.member.name, event))
                     self.guard()
-                if ready is not None and peer.ready_qemu_ns is None:
+                if (ready is not None and peer.ready_qemu_ns is None
+                        and event.endpoint == ready.endpoint.split(".", 1)[1]):
                     combined = peer.tail + event.data
                     if ready.text in combined:
                         peer.ready_qemu_ns = after
@@ -151,12 +177,42 @@ class _Run:
 
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                  on_response=None, qemu=None, startup_timeout=10.0,
-                 timeout=30.0) -> ArenaResult:
-    """Consume admitted records and return only after all owners are released."""
+                 timeout=30.0, referee_period_ns=100_000_000) -> ArenaResult:
+    """Consume admitted records and return only after all owners are released.
+
+    Referees publish the latest completed snapshot when their local UART marker
+    is observed, then at absolute logical deadlines in the existing tick loop.
+    The whole-snapshot cadence is a fixture, not official command periods.
+    Capacity refusal terminates the complete Arena without replaying a tick.
+    """
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
-    if manifest.referees:
-        raise ValueError("Arena referee execution is not yet supported")
+    if (type(manifest.referees) is not tuple
+            or any(type(item) is not ArenaReferee for item in manifest.referees)):
+        raise TypeError("Arena referees require a plain ArenaReferee tuple")
+    members = {member.name: member for member in manifest.robots}
+    if manifest.referees and len(members) != len(manifest.robots):
+        raise ValueError("Arena referee members must be unique")
+    configured = {}
+    for item in manifest.referees:
+        if type(item.member) is not str or item.member not in members:
+            raise ValueError("Arena referee must name a declared member")
+        if item.member in configured:
+            raise ValueError("Arena member must have at most one referee")
+        member = members[item.member]
+        if type(item.uart) is not str or item.uart != member.robot.board.name + ".uart7":
+            raise ValueError("Arena referee UART must be its member board's UART7")
+        ready = member.robot.ready
+        if (type(ready) is not Ready or type(ready.text) is not bytes or not ready.text
+                or type(ready.endpoint) is not str
+                or ready.endpoint not in tuple(member.robot.board.name + "." + port
+                                              for port in UARTS)):
+            raise ValueError("Arena referee requires an explicit member UART ready marker")
+        configured[item.member] = item
+    if type(referee_period_ns) is not int:
+        raise TypeError("referee_period_ns must be an integer")
+    if not 1_000_000 <= referee_period_ns <= 60_000_000_000:
+        raise ValueError("referee_period_ns must be in 1ms..60s")
     for callback, label in ((emit, "output sink"), (on_response, "response observer")):
         if callback is not None and not callable(callback):
             raise TypeError(f"Arena {label} must be callable")
@@ -173,19 +229,30 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     for member in manifest.robots:
         firmware = regular_file(member.robot.board.firmware, "firmware")
         uart = member.robot.ready.endpoint.split(".", 1)[1] if member.robot.ready else "uart1"
-        sockets = ("qmp", "cosim", "can1", uart)
-        commands.append((member, uart, sockets, qemu_command(firmware, binary, sockets)))
+        uarts = tuple(dict.fromkeys((uart, "uart7") if member.name in configured else (uart,)))
+        sockets = ("qmp", "cosim", "can1", *uarts)
+        commands.append((member, uarts, sockets, qemu_command(firmware, binary, sockets)))
     runtime = None
     resources, contexts = [], []
+    referees = []
     run = None
     primary = None
-    plant = create_arena_plant(manifest)
+    plant = None
     try:
+        # Register every domain owner immediately, before native admission or
+        # processes, so a later factory failure still releases earlier owners.
+        for member in manifest.robots:
+            if member.name in configured:
+                item = configured[member.name]
+                engine = RefereeEngine(item.initial, durations=item.durations,
+                    events=item.events, cooling_42mm_per_s=item.cooling_42mm_per_s)
+                referees.append(_Referee(item, engine))
+        plant = create_arena_plant(manifest)
         started = time.monotonic()
         run = _Run(started + startup_timeout, started + timeout, emit)
         offset = 0
         bindings = []
-        for member, uart, sockets, command in commands:
+        for member, uarts, sockets, command in commands:
             manager = running_qemu(command, sockets=sockets, startup_timeout=run.guard())
             owner = manager.__enter__()
             contexts.append((member.name, manager))
@@ -198,14 +265,18 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             resources.append((member.name + " QMP", qmp))
             peer.qmp, peer.board = qmp, QemuBoard(qmp)
             opened = {}
-            for port in ("cosim", "can1", uart):
+            for port in ("cosim", "can1", *uarts):
                 sock = connect_unix(str(owner.sockets[port]), min(2., run.guard()))
                 resources.append((member.name + " " + port, sock))
                 run.readers.append(sock)
                 opened[port] = sock
                 run.guard()
             peer.cosim, peer.can = StepFramedSocket(opened["cosim"]), CanStream(opened["can1"])
-            peer.channels = LabChannels(uarts={uart: StreamTransport(opened[uart])})
+            transports = {uart: StreamTransport(opened[uart]) for uart in uarts}
+            peer.channels = LabChannels(uarts=transports)
+            for referee in referees:
+                if referee.configuration.member == member.name:
+                    referee.endpoint = RefereeUartEndpoint(transports["uart7"])
             bus = plant.devices[offset].bus
             offset += len(member.robot.devices)
             bindings.append(BoardBinding(member.name, QemuCanEndpoint(bus, peer.can),
@@ -220,6 +291,8 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 child.prepare()
                 run.guard()
         runtime = SharedWorldRuntime(plant, tuple(bindings),
+            referees=tuple(RefereeBinding(item.configuration.member, item.engine, item.endpoint)
+                           for item in referees),
             check_running=run.guard, on_response=on_response)
         responses = runtime.start(Session(1), (1, 2), deadline=run.startup_deadline)
         for peer, response in zip(run.peers, responses):
@@ -227,7 +300,27 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             peer.last_ns = run.call(peer, peer.board.snapshot)["timestamp_ns"]
         for peer in run.peers:
             run.call(peer, peer.board.resume)
-        while not run.pump():
+        def pump():
+            ready = run.pump()
+            now = runtime.t_sim_ns
+            for item in referees:
+                peer = next(peer for peer in run.peers
+                            if peer.member.name == item.configuration.member)
+                if peer.ready_qemu_ns is None:
+                    continue
+                if item.next_due_ns is not None and now < item.next_due_ns:
+                    continue
+                runtime.publish_referee(item.configuration.member,
+                    deadline=run.startup_deadline if run.startup else run.deadline)
+                item.publications += 1
+                item.last_ns = now
+                if item.first_ns is None:
+                    item.first_ns = now
+                    item.next_due_ns = now + referee_period_ns
+                else:
+                    item.next_due_ns += referee_period_ns
+            return ready
+        while not pump():
             runtime.step(1_000_000, deadline=run.startup_deadline)
             run.wait()
         origin = runtime.t_sim_ns
@@ -235,13 +328,13 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
         target = origin + duration_ns
         while runtime.t_sim_ns < target:
             runtime.step(min(1_000_000, target - runtime.t_sim_ns), deadline=run.deadline)
-            run.pump()
+            pump()
             if runtime.t_sim_ns < target:
                 run.wait()
         for peer in run.peers:
             run.call(peer, peer.board.pause)
         runtime.service(deadline=run.deadline)
-        run.pump()
+        pump()
         run.guard()
         result = ArenaResult(manifest.name, origin, runtime.t_sim_ns, runtime.step_id,
             tuple(ArenaBoardResult(peer.member.name, peer.member.prefix,
@@ -249,7 +342,11 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 peer.ready_qemu_ns, peer.last_ns, peer.reset_qemu_ns, peer.batches)
                 for peer in run.peers),
             tuple({"label": child.label, "pid": child.process.pid, **child.diagnostics()}
-                  for child in run.children))
+                  for child in run.children),
+            referees=tuple(ArenaRefereeResult(item.configuration.member,
+                item.configuration.uart, referee_period_ns, item.publications,
+                item.first_ns, item.last_ns, item.endpoint.next_sequence)
+                for item in referees))
     except BaseException as exc:
         primary = exc
         raise
@@ -262,7 +359,17 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 errors.append((label, exc))
         if primary is None and run is not None:
             release("pre-cleanup liveness", run.guard)
-        release("world", runtime.close if runtime is not None else plant.close)
+        if runtime is not None:
+            # Successful runtime construction transferred every domain owner.
+            release("world", runtime.close)
+        else:
+            for item in reversed(referees):
+                if item.endpoint is not None:
+                    release("referee " + item.configuration.member + " endpoint", item.endpoint.close)
+            for item in reversed(referees):
+                release("referee " + item.configuration.member + " engine", item.engine.close)
+            if plant is not None:
+                release("world", plant.close)
         children = run.children if run is not None else ()
         for child in reversed(children):
             release(child.label + " stop", lambda child=child: stop(child.process))

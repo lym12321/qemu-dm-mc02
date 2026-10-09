@@ -362,6 +362,7 @@ def test_arena_runtime_options_named_uart_and_complete_report(monkeypatch, tmp_p
              "end_qemu_ns": 410_900_700, "reset_qemu_ns": 202, "observation_batches": 4},
         ],
         "children": [{"label": "east/upper:observer", "pid": 123, "stdout_tail": "literal $(pwd)"}],
+        "referees": [],
         "limits": ["Duration is shared logical time; QEMU epochs remain independent.",
                    "ACK/DONE do not establish CPU lockstep or wall pacing."],
     }}

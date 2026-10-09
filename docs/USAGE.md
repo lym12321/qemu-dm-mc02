@@ -271,8 +271,8 @@ referees:
 `events` 默认空，每项包含 `offset_ns` 及 `hit`、`shot`、`game`、`robot`、
 `power_heat`、`buff` 中恰好一种完整数据；至多 1024 项，偏移非递减，同时间保持原顺序。
 `cooling_42mm_per_s` 默认零。返回的 `arena.referees` 是按成员顺序排列的不可变记录。
-准入不创建裁判引擎或 UART endpoint；运行时接线尚未接入，`arena run` 对非空
-裁判配置会在获取资源前明确报错。省略 `referees` 继续使用原运行路径。
+准入不创建裁判引擎或 UART endpoint；运行时的 ready 条件与发布方式见下文。
+省略 `referees` 继续使用原运行路径。
 
 命令行运行同一配置：
 
@@ -310,6 +310,20 @@ print(result.origin_ns, result.end_ns, result.boards)
 ready 读取后时间上界和最后观察时间，不能将这些时间与共享世界 epoch 混用。
 `emit` 可接收带成员标签的 `ArenaEvent`，`on_response` 可观察实际 co-sim 响应；
 响应观察不构成完整 wire trace，也不保证每步样本消费。
+
+配置裁判时，对应子 Robot 必须声明实际应用 `ready` 标记；该标记应由固件在
+UART7 接收初始化后输出。每个成员匹配自己的标记后，发布裁判的最新完成状态，
+随后默认每 100 ms 共享逻辑时间发布一批四命令快照。Python 调用可用
+`referee_period_ns` 指定 1 ms–60 s 的整数周期；既有 world tick 将发布时刻向后
+量化至多 1 ms。这是快照发送策略，未实现官方各命令的独立周期。
+
+脚本仍从共同 RESET 原点计算，首次发布可能已包含 startup 期间的事件；ready
+不会重置世界或裁判。UART 观察只读，发送和后缀 flush 由 SharedWorld 独占。
+队列容量不足会终止本次 Arena 运行，保留原物理后缀；不会重步或丢弃旧快照。
+结果的 `referees` 是不可变的 `ArenaRefereeResult` 记录，包含成员、UART、
+`period_ns`、快照准入次数 `publications`、首末共享时间
+`first_logical_ns`/`last_logical_ns` 和下一个发送序号 `next_sequence`。
+这些记录不证明固件实际消费或 CPU 时间屏障。
 
 提前退出（包括退出码 0）、期限、RESET/EOF、QMP、transport、solver、输出或清理错误
 均使本次运行失败。成功只在独立清理世界、上位机、连接和两组 QEMU 后返回。
@@ -373,7 +387,7 @@ world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
 不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
 单板共享路径已通过实际 RefereeTest UART7/HAL/RTOS 消费验证，入口见下文。
-Arena YAML 可校验裁判配置，运行时尚未接入该组合；
+Arena YAML 的裁判配置使用上述 ready 与快照发布策略；
 脚本状态也不代表根据世界碰撞进行实时裁决或实现官方独立消息发送周期。
 
 裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：

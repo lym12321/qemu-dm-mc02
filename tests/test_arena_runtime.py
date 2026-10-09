@@ -22,12 +22,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim import processes
 from sim.arena import runtime
 from sim.arena.manifest import load_manifest
+from sim.core import Coordinator
 from sim.devices.dji import M3508Device, M3508JointPlant
+from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
 from sim.fabric import CanBus
 from sim.robots import shared_world
 from sim.transports import cosim
 from tools import dm_mc02_firmware_rtf as rtf
-from test_arena_manifest import ROBOT_DOCUMENT, write_arena, write_executable
+from test_arena_manifest import ROBOT_DOCUMENT, referee_configuration, write_arena, write_executable
 from test_lab_runtime import snapshot
 from test_robot_runtime import Pipe
 from test_sim_shared_world import Boards, NativeStub, can_wire
@@ -46,11 +48,25 @@ class Peer:
     def recv(self, maximum):
         assert maximum == 4096
         if self.name.startswith("uart"):
-            chunks = self.environment.uart_chunks[self.index]
+            chunks = self.environment.uart_port_chunks.get(
+                (self.index, self.name), self.environment.uart_chunks[self.index])
             if chunks:
                 self.producer.send(chunks.pop(0))
             self.environment.uart_reads[self.index] += 1
+            key = self.index, self.name
+            self.environment.uart_port_reads[key] = self.environment.uart_port_reads.get(key, 0) + 1
         return self.sock.recv(maximum)
+
+    def send(self, data):
+        key = self.index, self.name
+        budget = self.environment.uart_send_budget.get(key)
+        if budget is not None:
+            if budget == 0:
+                raise BlockingIOError
+            written = self.sock.send(data[:budget])
+            self.environment.uart_send_budget[key] -= written
+            return written
+        return self.sock.send(data)
 
     def close(self):
         label = f"peer{self.index} {self.name}"
@@ -76,6 +92,7 @@ class Environment:
         self.pause_callback = lambda index: None
         self.qmp_callback = lambda index, name: None
         self.uart_chunks, self.uart_reads = [[], []], [0, 0]
+        self.uart_port_chunks, self.uart_port_reads, self.uart_send_budget = {}, {}, {}
         self.can_commands = [None, None]
         self.snapshots = [[], []]
         self.sockets, self.producers = {}, {}
@@ -218,17 +235,18 @@ class Environment:
         self.clock += timeout
         return [], [], []
 
-    def manifest(self, *, ready=(None, None), upper=False):
+    def manifest(self, *, ready=(None, None), ready_ports=("uart7", "uart7"),
+                 upper=False, referees=None):
         documents = []
-        for marker in ready:
+        for marker, port in zip(ready, ready_ports, strict=True):
             document = ROBOT_DOCUMENT
             if marker is not None:
-                document += yaml.safe_dump({"ready": {"endpoint": "main.uart7", "text": marker}})
+                document += yaml.safe_dump({"ready": {"endpoint": "main." + port, "text": marker}})
             if upper:
                 document += yaml.safe_dump({"upper_computers": {"vision": {"command": [
                     sys.executable, "literal;$HOME", "$(touch unwanted)", "", "two words"]}}})
             documents.append(document)
-        return load_manifest(write_arena(self.directory, robot_documents=tuple(documents)))
+        return load_manifest(write_arena(self.directory, robot_documents=tuple(documents), referees=referees))
 
     def run(self, manifest=None, **options):
         arguments = {"qemu": self.binary, "duration": .0025, **options}
@@ -264,10 +282,93 @@ def environment(tmp_path, monkeypatch):
         value.release()
 
 
+def watch_referees(environment, monkeypatch):
+    """Observe real owners once per call; retain original state machines and IO."""
+    observed = SimpleNamespace(engines=[], endpoints=[], worlds=[], coordinators=[], channels=[],
+                               services=[], resets=[], steps=[], attempts=[], publications=[], closes=[],
+                               close_failures={})
+    for owner, collection in ((RefereeEngine, observed.engines),
+                              (RefereeUartEndpoint, observed.endpoints),
+                              (shared_world.SharedWorldRuntime, observed.worlds),
+                              (Coordinator, observed.coordinators)):
+        original = owner.__init__
+        def initialize(value, *args, original=original, collection=collection, **kwargs):
+            original(value, *args, **kwargs)
+            collection.append(value)
+        monkeypatch.setattr(owner, "__init__", initialize)
+    initialize_channels = runtime.LabChannels.__init__
+    def channels(value, **kwargs):
+        initialize_channels(value, **kwargs)
+        observed.channels.append(kwargs["uarts"])
+    monkeypatch.setattr(runtime.LabChannels, "__init__", channels)
+    service = runtime.LabChannels.service
+    def service_channels(value, timestamp_ns, **kwargs):
+        observed.services.append(kwargs.get("flush_uart", True))
+        return service(value, timestamp_ns, **kwargs)
+    monkeypatch.setattr(runtime.LabChannels, "service", service_channels)
+    reset, step = RefereeEngine.reset, RefereeEngine.step
+    def reset_engine(value, session):
+        observed.resets.append((value, session))
+        return reset(value, session)
+    def step_engine(value, context):
+        observed.steps.append((value, context))
+        return step(value, context)
+    monkeypatch.setattr(RefereeEngine, "reset", reset_engine)
+    monkeypatch.setattr(RefereeEngine, "step", step_engine)
+    for owner, collection, label in ((RefereeEngine, observed.engines, "engine"),
+                                     (RefereeUartEndpoint, observed.endpoints, "endpoint")):
+        original = owner.close
+        def close(value, original=original, collection=collection, label=label):
+            name = label + str(collection.index(value))
+            observed.closes.append(name)
+            environment.events.append(name + " close")
+            original(value)
+            if name in observed.close_failures:
+                raise observed.close_failures[name]
+        monkeypatch.setattr(owner, "close", close)
+    publish = shared_world.SharedWorldRuntime.publish_referee
+    def publication(value, name, **kwargs):
+        observed.attempts.append((name, value.t_sim_ns, tuple(environment.native.steps)))
+        wire = publish(value, name, **kwargs)
+        engine = next(item.engine for item in value.referees if item.name == name)
+        observed.publications.append((name, value.t_sim_ns, wire, engine.get_state()))
+        return wire
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "publish_referee", publication)
+    return observed
+
+
+# Independent 2026V1.1.0 packed layouts and pinned crccheck CRC literals, shared
+# with the existing actual RefereeTest contract; no project encoder expected.
+REFEREE_WIRES = tuple(bytes.fromhex(value) for value in (
+    "a50b000002010021010008070605040302017d07"
+    "a50d00018d010203026400c80003006400500005ef8a"
+    "a50e00028b0202000000000000000028000a001400c1da"
+    "a5080003040402050900070b0d00feec0b",
+    "a50b00046301003103000807060504030201f59e"
+    "a50d0005ec010203024600c800030064007800060a27"
+    "a50e0006ea0202000000000000000028000c001900c5f8"
+    "a508000765040208110013171d0080d577",
+))
+
+
+def short_referee_configuration():
+    configuration = referee_configuration(scripted=True)
+    # Explicit complete replacements at1ms produce the established secondbatch;
+    # this tests publication/admission, without borrowing a physics/rule constant.
+    configuration["events"] = [dict(event, offset_ns=1_000_000)
+                               for event in configuration["events"][-3:]]
+    configuration["events"].append({"offset_ns": 1_000_000,
+                                    "power_heat": {"buffer_energy_j": 40,
+                                                   "heat_17mm": 12, "heat_42mm": 25}})
+    return configuration
+
+
 @pytest.mark.parametrize("options", [
     {"duration": float("nan")}, {"duration": True}, {"duration": 1e-10},
     {"duration": 3601}, {"timeout": float("inf")},
     {"startup_timeout": 3, "timeout": 2}, {"emit": 1}, {"on_response": 1},
+    {"referee_period_ns": True}, {"referee_period_ns": 1_000_000.0},
+    {"referee_period_ns": 999_999}, {"referee_period_ns": 60_000_000_001},
 ])
 def test_invalid_options_have_no_physics_process_or_transport_effect(environment, options):
     with pytest.raises((ValueError, TypeError)):
@@ -275,14 +376,41 @@ def test_invalid_options_have_no_physics_process_or_transport_effect(environment
     assert environment.events == [] and environment.launches == []
 
 
-def test_referee_configuration_is_rejected_before_options_or_resource_admission(environment, monkeypatch):
-    manifest = replace(environment.manifest(), referees=(object(),))
+@pytest.mark.parametrize("invalid", ["missing-ready", "wrong-uart", "foreign-member", "object",
+                                    "mutable-referees", "duplicate-member", "wrong-ready-type",
+                                    "foreign-ready-board", "unsupported-ready-uart", "duplicate-alias"])
+def test_referee_association_rejects_before_resource_admission(environment, monkeypatch, invalid):
+    manifest = environment.manifest(ready=("READY", None),
+                                    referees={"east": referee_configuration()})
+    record, = manifest.referees
+    if invalid == "missing-ready":
+        member = manifest.robots[0]
+        manifest = replace(manifest, robots=(replace(member, robot=replace(member.robot, ready=None)),
+                                             manifest.robots[1]))
+    elif invalid == "wrong-uart":
+        manifest = replace(manifest, referees=(replace(record, uart="main.uart1"),))
+    elif invalid == "foreign-member":
+        manifest = replace(manifest, referees=(replace(record, member="unknown"),))
+    elif invalid == "object":
+        manifest = replace(manifest, referees=(object(),))
+    elif invalid == "mutable-referees":
+        manifest = replace(manifest, referees=[record])
+    elif invalid == "duplicate-member":
+        manifest = replace(manifest, referees=(record, record))
+    elif invalid == "duplicate-alias":
+        manifest = replace(manifest, robots=(manifest.robots[0], replace(manifest.robots[1], name="east")))
+    else:
+        member = manifest.robots[0]
+        ready = (object() if invalid == "wrong-ready-type" else replace(member.robot.ready,
+                 endpoint="other.uart7" if invalid == "foreign-ready-board" else "main.uart99"))
+        manifest = replace(manifest, robots=(replace(member, robot=replace(member.robot, ready=ready)),
+                                             manifest.robots[1]))
     def forbidden(*args, **kwargs):
-        pytest.fail("unsupported Arena referee configuration reached resource admission")
+        pytest.fail("invalid Arena referee configuration reached resource admission")
     monkeypatch.setattr(runtime, "resolve_qemu", forbidden)
     monkeypatch.setattr(runtime, "regular_file", forbidden)
-    with pytest.raises(ValueError, match="Arena referee execution is not yet supported"):
-        environment.run(manifest, duration=float("nan"), emit=object())
+    with pytest.raises((ValueError, TypeError)):
+        environment.run(manifest)
     assert environment.events == [] and environment.launches == []
 
 
@@ -340,6 +468,7 @@ def test_one_owner_canonical_aliases_literal_upper_commands_and_exact_final_tick
         assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
     assert (result.name, result.origin_ns, result.end_ns, result.steps) == (
         "two-four-wheel", 0, 2_500_000, 3)
+    assert result.referees == ()
     assert [(board.name, board.prefix, board.ready, board.ready_qemu_ns) for board in result.boards] == [
         ("east", "alpha/", "not_waited", None), ("west", "bravo/", "not_waited", None)]
     assert [name for name, _, _ in responses] == ["east", "west"] * 4
@@ -496,3 +625,207 @@ def test_harness_failure_prevents_return_after_successful_execution(environment)
     assert caught.value is error
     environment.assert_clean()
     assert environment.native.steps == [1_000_000, 1_000_000, 500_000]
+
+
+def test_ready_uart7_borrows_one_transport_and_scoped_literal_batches_from_one_coordinator(
+        environment, monkeypatch):
+    observed = watch_referees(environment, monkeypatch)
+    environment.uart_chunks = [[b"READY"], [b"READY"]]
+    configurations = {"west": short_referee_configuration(), "east": short_referee_configuration()}
+    result = environment.run(environment.manifest(ready=("READY", "READY"), referees=configurations),
+                             duration=.001, referee_period_ns=1_000_000)
+    environment.assert_clean()
+    assert len(observed.worlds) == len(observed.coordinators) == 1
+    assert observed.services and not any(observed.services)
+    assert list(observed.coordinators[0].participants) == ["can", "referee:east", "referee:west"]
+    assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
+    assert len(observed.resets) == 2 and observed.resets[0][1] is observed.resets[1][1]
+    assert [(session.session_id, session.t_sim_ns) for _, session in observed.resets] == [(1, 0), (1, 0)]
+    assert [(context.session_id, context.step_id, context.t_sim_ns, context.dt_ns)
+            for _, context in observed.steps] == [(1, 1, 1_000_000, 1_000_000)] * 2
+    assert [(name, stamp, wire) for name, stamp, wire, _ in observed.publications] == [
+        ("east", 0, REFEREE_WIRES[0]), ("west", 0, REFEREE_WIRES[0]),
+        ("east", 1_000_000, REFEREE_WIRES[1]), ("west", 1_000_000, REFEREE_WIRES[1])]
+    for index, endpoint in enumerate(observed.endpoints):
+        assert endpoint.transport is observed.channels[index]["uart7"]
+        assert environment.events.count(f"peer{index} uart7 connect") == 1
+        assert environment.owners[index][2].count("uart7") == 1
+        assert environment.producers[index, "uart7"].recv(4096) == b"".join(REFEREE_WIRES)
+        assert endpoint.next_sequence == 8 and endpoint.closed
+    assert [(record.member, record.uart, record.period_ns, record.publications,
+             record.first_logical_ns, record.last_logical_ns, record.next_sequence)
+            for record in result.referees] == [
+        ("east", "main.uart7", 1_000_000, 2, 0, 1_000_000, 8),
+        ("west", "main.uart7", 1_000_000, 2, 0, 1_000_000, 8)]
+    assert all(isinstance(record, runtime.ArenaRefereeResult) for record in result.referees)
+    with pytest.raises(FrozenInstanceError):
+        result.referees[0].publications = 0
+    assert sorted(observed.closes) == ["endpoint0", "endpoint1", "engine0", "engine1"]
+
+
+def test_independent_ready_publishes_latest_startup_state_and_absolute_quantized_periods(
+        environment, monkeypatch):
+    observed = watch_referees(environment, monkeypatch)
+    environment.uart_chunks = [[b"A\0", b"REA", b"DY"], [b"BRA", b"VO"]]
+    result = environment.run(environment.manifest(ready=("A\0READY", "BRAVO"), referees={
+        "west": short_referee_configuration(), "east": short_referee_configuration()}),
+        referee_period_ns=1_500_000)
+    environment.assert_clean()
+    assert (result.origin_ns, result.end_ns) == (2_000_000, 4_500_000)
+    assert [(name, stamp) for name, stamp, _, _ in observed.publications] == [
+        ("west", 1_000_000), ("east", 2_000_000), ("west", 3_000_000),
+        ("east", 4_000_000), ("west", 4_000_000)]
+    # Events still use RESET0, so the local first ready state includes startup
+    # changes; the later board also includes its additional1ms cooling.
+    first_west, first_east = (observed.publications[index][3] for index in (0, 1))
+    assert (first_west.robot.current_hp, first_west.power_heat.heat_17mm,
+            first_west.power_heat.heat_42mm) == (70, 12, 25)
+    assert (first_east.robot.current_hp, first_east.power_heat.heat_17mm,
+            first_east.power_heat.heat_42mm) == (70, 11, 24)
+    assert len(observed.resets) == 2 and environment.native.resets == 1
+    assert all(session.t_sim_ns == 0 for _, session in observed.resets)
+    assert environment.native.steps == [1_000_000] * 4 + [500_000]
+    assert [(record.member, record.publications, record.first_logical_ns,
+             record.last_logical_ns, record.next_sequence) for record in result.referees] == [
+        ("east", 2, 2_000_000, 4_000_000, 8), ("west", 3, 1_000_000, 4_000_000, 12)]
+    for index, board in enumerate(result.boards):
+        post_read = next(stamp for stamp, reads in environment.snapshots[index] if reads == (3, 2)[index])
+        assert board.ready_qemu_ns == post_read
+
+
+def test_wrong_uart_fragment_never_matches_or_extends_ready_tail(environment, monkeypatch):
+    observed = watch_referees(environment, monkeypatch)
+    environment.uart_port_chunks = {(0, "uart1"): [b"REA", b"", b"DY"], (0, "uart7"): [b"DY"]}
+    events = []
+    result = environment.run(environment.manifest(ready=("READY", None), ready_ports=("uart1", "uart7"),
+                                                 referees={"east": referee_configuration()}),
+                             duration=.001, emit=events.append)
+    environment.assert_clean()
+    assert result.origin_ns == 2_000_000 and result.referees[0].first_logical_ns == 2_000_000
+    assert result.referees[0].period_ns == 100_000_000
+    assert [(event.event.endpoint, event.event.data) for event in events] == [
+        ("uart1", b"REA"), ("uart7", b"DY"), ("uart1", b"DY")]
+    assert environment.events.count("peer0 uart1 connect") == environment.events.count("peer0 uart7 connect") == 1
+    assert observed.endpoints[0].transport is observed.channels[0]["uart7"]
+    assert observed.channels[0]["uart1"] is not observed.channels[0]["uart7"]
+
+
+@pytest.mark.parametrize("period,expected", [(1_000_000, [0, 1_000_000, 2_000_000, 3_000_000]),
+                                             (60_000_000_000, [0])])
+def test_period_limits_keep_exact_final_target_without_extra_publication(environment, monkeypatch, period, expected):
+    observed = watch_referees(environment, monkeypatch)
+    environment.uart_chunks[0] = [b"READY"]
+    result = environment.run(environment.manifest(ready=("READY", None),
+                                                 referees={"east": referee_configuration()}),
+                             duration=.0035, referee_period_ns=period)
+    environment.assert_clean()
+    assert [stamp for _, stamp, _, _ in observed.publications] == expected
+    assert result.end_ns == 3_500_000 and environment.native.steps == [1_000_000] * 3 + [500_000]
+    assert result.referees[0].next_sequence == 4 * len(expected)
+
+
+def test_referee_capacity_failure_retains_original_suffix_and_stops_before_another_world_tick(
+        environment, monkeypatch):
+    observed = watch_referees(environment, monkeypatch)
+    initialize = runtime.StreamTransport.__init__
+    def one_slot(value, sock, **kwargs):
+        if getattr(sock, "name", None) == "uart7":
+            kwargs["max_pending"] = 1
+        initialize(value, sock, **kwargs)
+    monkeypatch.setattr(runtime.StreamTransport, "__init__", one_slot)
+    environment.uart_send_budget[0, "uart7"] = 19
+    environment.uart_chunks[0] = [b"READY"]
+    with pytest.raises(BufferError, match="full"):
+        environment.run(environment.manifest(ready=("READY", None),
+                                             referees={"east": referee_configuration()}),
+                        referee_period_ns=1_000_000)
+    environment.assert_clean()
+    assert [stamp for _, stamp, _ in observed.attempts] == [0, 1_000_000]
+    assert len(observed.publications) == 1 and observed.publications[0][2] == REFEREE_WIRES[0]
+    assert environment.native.steps == [1_000_000]
+    endpoint, = observed.endpoints
+    assert endpoint.next_sequence == 4 and endpoint.closed
+    queued, = endpoint.transport.tx_queue
+    assert queued.obj is observed.publications[0][2] and bytes(queued) == REFEREE_WIRES[0][19:]
+    assert environment.producers[0, "uart7"].recv(4096) == REFEREE_WIRES[0][:19]
+    world, = observed.worlds
+    assert world.closed and world.t_sim_ns == 1_000_000
+    with pytest.raises(RuntimeError):
+        world.step(1_000_000, deadline=environment.clock + 1)
+    assert environment.native.steps == [1_000_000]
+
+
+@pytest.mark.parametrize("failure", ["second-engine", "plant", "second-uart", "shared-constructor"])
+def test_referee_acquisition_failures_release_every_still_caller_owned_resource(
+        environment, monkeypatch, failure):
+    observed = watch_referees(environment, monkeypatch)
+    primary = KeyboardInterrupt(failure + " acquisition interrupted")
+    if failure == "second-engine":
+        initialize = RefereeEngine.__init__
+        def fail_second(value, *args, **kwargs):
+            if len(observed.engines) == 1:
+                raise primary
+            initialize(value, *args, **kwargs)
+        monkeypatch.setattr(RefereeEngine, "__init__", fail_second)
+    elif failure == "plant":
+        environment.plant_failure = primary
+        secondary = OSError("engine1 owned cleanup failure")
+        secondary.add_note("pretransfer nested engine release diagnosis")
+        observed.close_failures["engine1"] = secondary
+    elif failure == "second-uart":
+        connect = environment.connect
+        def fail_connect(path, timeout):
+            if Path(path).parent.name == "peer1" and Path(path).name == "uart7":
+                raise primary
+            return connect(path, timeout)
+        monkeypatch.setattr(runtime, "connect_unix", fail_connect)
+    else:
+        def fail_constructor(*args, **kwargs):
+            raise primary
+        monkeypatch.setattr(shared_world.SharedWorldRuntime, "__init__", fail_constructor)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        environment.run(environment.manifest(ready=("READY", "READY"), referees={
+            "east": referee_configuration(), "west": referee_configuration()}))
+    assert caught.value is primary
+    environment.assert_clean()
+    assert environment.native.resets == 0 and environment.native.steps == []
+    assert len(observed.engines) == (1 if failure == "second-engine" else 2)
+    assert len(observed.endpoints) == {"second-engine": 0, "plant": 0,
+                                      "second-uart": 1, "shared-constructor": 2}[failure]
+    assert all(engine.closed for engine in observed.engines)
+    assert all(endpoint.closed for endpoint in observed.endpoints)
+    assert len(observed.closes) == len(observed.engines) + len(observed.endpoints)
+    assert len(set(observed.closes)) == len(observed.closes)
+    assert observed.worlds == []
+    if failure in ("second-engine", "plant"):
+        assert environment.owners == []
+    if failure == "plant":
+        assert "pretransfer nested engine release diagnosis" in "\n".join(primary.__notes__)
+
+
+def test_post_transfer_interrupt_preserves_nested_owned_cleanup_and_closes_every_resource_once(
+        environment, monkeypatch):
+    observed = watch_referees(environment, monkeypatch)
+    primary = KeyboardInterrupt("ready observation interrupted")
+    for label in ("endpoint0", "engine1"):
+        error = OSError(label + " owned close failure")
+        error.add_note(label + " nested release diagnosis")
+        observed.close_failures[label] = error
+    environment.uart_chunks = [[b"READY"], [b"READY"]]
+    def interrupt(event):
+        raise primary
+    with pytest.raises(KeyboardInterrupt) as caught:
+        environment.run(environment.manifest(ready=("READY", "READY"), upper=True, referees={
+            "east": referee_configuration(), "west": referee_configuration()}), emit=interrupt)
+    assert caught.value is primary
+    environment.assert_clean()
+    assert len(observed.worlds) == 1 and observed.worlds[0].closed
+    assert environment.native.resets == 1 and environment.native.steps == []
+    assert sorted(observed.closes) == ["endpoint0", "endpoint1", "engine0", "engine1"]
+    assert all(engine.closed for engine in observed.engines)
+    assert all(endpoint.closed for endpoint in observed.endpoints)
+    notes = "\n".join(primary.__notes__)
+    assert "endpoint0 nested release diagnosis" in notes and "engine1 nested release diagnosis" in notes
+    assert all(environment.events.index(label + " close") < environment.events.index("peer0 uart7 close")
+               for label in observed.closes)
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
