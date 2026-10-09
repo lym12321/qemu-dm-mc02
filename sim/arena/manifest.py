@@ -56,6 +56,42 @@ def _typed_record(record_type, value, label):
     return record_type(**fields(value, names, names, label))
 
 
+def parse_referee_events(value, label: str = "referee events") -> tuple[ScriptEvent, ...]:
+    """Translate a bounded event list and validate it without runtime resources.
+
+    Each entry uses reset-relative offset_ns and exactly one existing typed
+    referee value. Preserve input order, including equal offsets. File loading
+    and member/session admission belong to the caller.
+    """
+    from sim.devices.referee import (
+        Buff, GameStatus, Hit, PowerHeat, RobotStatus, ScriptEvent, Shot,
+        validate_referee_events,
+    )
+    from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
+
+    event_types = {"hit": Hit, "shot": Shot, "game": GameStatus,
+                   "robot": RobotStatus, "power_heat": PowerHeat, "buff": Buff}
+    if type(value) is not list or len(value) > MAX_SCRIPT_EVENTS:
+        raise ManifestError(f"{label} must be a list with at most {MAX_SCRIPT_EVENTS} entries")
+    events = []
+    for index, configuration in enumerate(value):
+        event_label = f"{label}[{index}]"
+        event = fields(configuration, ("offset_ns", *event_types),
+                       ("offset_ns",), event_label)
+        kinds = [kind for kind in event_types if kind in event]
+        if len(kinds) != 1:
+            raise ManifestError(f"{event_label} must contain exactly one referee event value")
+        kind = kinds[0]
+        events.append(ScriptEvent(event["offset_ns"], _typed_record(
+            event_types[kind], event[kind], event_label + "." + kind)))
+    events = tuple(events)
+    try:
+        validate_referee_events(events)
+    except (TypeError, ValueError) as error:
+        raise ManifestError(f"{label}: {error}") from error
+    return events
+
+
 def _referees(value, members) -> dict[str, ArenaReferee]:
     if type(value) is not dict or len(value) > len(members):
         raise ManifestError("referees must be a mapping with at most one entry per Arena member")
@@ -64,14 +100,12 @@ def _referees(value, members) -> dict[str, ArenaReferee]:
 
     # The old no-referee parser remains independent of optional domain imports.
     from sim.devices.referee import (
-        Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeState,
-        RobotStatus, ScriptEvent, Shot, validate_referee_configuration,
+        Buff, GameStatus, MatchDurations, PowerHeat, RefereeState,
+        RobotStatus, validate_referee_configuration,
     )
-    from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
 
     groups = {"game": GameStatus, "robot": RobotStatus,
               "power_heat": PowerHeat, "buff": Buff}
-    event_types = {"hit": Hit, "shot": Shot, **groups}
     result = {}
     for alias, configuration in value.items():
         identifier(alias, "referees label")
@@ -91,21 +125,7 @@ def _referees(value, members) -> dict[str, ArenaReferee]:
             for name, record_type in groups.items()
         })
         durations = _typed_record(MatchDurations, item["durations"], label + ".durations")
-        script = item.get("events", [])
-        if type(script) is not list or len(script) > MAX_SCRIPT_EVENTS:
-            raise ManifestError(f"{label}.events must be a list with at most {MAX_SCRIPT_EVENTS} entries")
-        events = []
-        for index, configuration in enumerate(script):
-            event_label = f"{label}.events[{index}]"
-            event = fields(configuration, ("offset_ns", *event_types),
-                           ("offset_ns",), event_label)
-            kinds = [kind for kind in event_types if kind in event]
-            if len(kinds) != 1:
-                raise ManifestError(f"{event_label} must contain exactly one referee event value")
-            kind = kinds[0]
-            events.append(ScriptEvent(event["offset_ns"], _typed_record(
-                event_types[kind], event[kind], event_label + "." + kind)))
-        events = tuple(events)
+        events = parse_referee_events(item.get("events", []), label + ".events")
         cooling = item.get("cooling_42mm_per_s", 0)
         try:
             validate_referee_configuration(initial, durations=durations, events=events,

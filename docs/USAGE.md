@@ -392,6 +392,14 @@ pending 限制。该调用不推进时间或发布 UART；名称、输入、sess
 拒绝均保留原状态，可以随后正常准入及 step。启动前、关闭后、执行失败后或
 活动回调中的调用会被拒绝。调用者负责事件来源和去重。
 
+配置消费者可调用 `sim.arena.manifest.parse_referee_events(value, label=...)`，
+将与 Arena `events` 相同的列表转换为不可变 `ScriptEvent` 元组。每项必须包含
+`offset_ns` 和一个 `hit`、`shot`、`game`、`robot`、`power_heat` 或 `buff` 值；
+最多 1024 项，偏移非递减，等时顺序保留。该函数只解析和校验，不读取文件或
+创建运行资源；成员及 session 由调用者校验。已有类型值可直接通过
+`sim.devices.referee.validate_referee_events(events)` 校验，类型、范围和顺序规则
+与引擎一致。尚未提供 Scenario 文件执行入口。
+
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，

@@ -89,10 +89,11 @@ def validate_referee_configuration(initial: RefereeState, *, durations: MatchDur
         if _uint(value, 65535, label) == 0:
             raise ValueError(f"{label} must be positive")
     _uint(cooling_42mm_per_s, 65535, "cooling_42mm_per_s")
-    _admit_events(events)
+    validate_referee_events(events)
 
 
-def _admit_events(events):
+def validate_referee_events(events: tuple[ScriptEvent, ...]) -> None:
+    """Validate immutable typed events without constructing an engine."""
     if type(events) is not tuple:
         raise TypeError("events must be an immutable tuple")
     if len(events) > MAX_SCRIPT_EVENTS:
@@ -169,7 +170,7 @@ class RefereeEngine:
             raise RuntimeError("referee requires a successful reset")
         if type(session_id) is not int or session_id != self._session.session_id:
             raise ValueError("referee events must match the active session")
-        _admit_events(events)
+        validate_referee_events(events)
         minimum = (self._pending[-1].offset_ns if self._pending
                    else self._t_sim_ns - self._session.t_sim_ns)
         if events and events[0].offset_ns < minimum:

@@ -387,6 +387,53 @@ def referee_configuration(*, uart="main.uart7", scripted=False):
     return result
 
 
+def test_public_referee_event_parser_is_pure_typed_frozen_and_preserves_input_order(monkeypatch):
+    from sim.arena.manifest import parse_referee_events
+    from sim.core import Coordinator
+    from sim.devices.referee import (
+        Buff, GameStatus, Hit, PowerHeat, RefereeEngine, RefereeUartEndpoint,
+        RobotStatus, ScriptEvent, Shot, validate_referee_events,
+    )
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("pure event admission acquired or executed a runtime owner")
+    for owner in (RefereeEngine, RefereeUartEndpoint, Coordinator):
+        monkeypatch.setattr(owner, "__init__", forbidden)
+    for method in ("reset", "step", "queue_events", "get_state", "close"):
+        monkeypatch.setattr(RefereeEngine, method, forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    robot = RobotStatus(3, 2, 100, 200, 3, 100, 80, 5)
+    expected = (
+        ScriptEvent(0, Hit(20)), ScriptEvent(0, robot), ScriptEvent(0, PowerHeat(40, 10, 20)),
+        ScriptEvent(500_000_000, Shot(5, 7)), ScriptEvent(500_000_000, Hit(30)),
+        ScriptEvent(1_000_000_000, GameStatus(1, 3, 3, 0x0102030405060708)),
+        ScriptEvent(1_000_000_000, RobotStatus(3, 2, 70, 200, 3, 100, 120, 6)),
+        ScriptEvent(1_000_000_000, Buff(8, 17, 19, 23, 29, 128)),
+    )
+    calls = []
+    def validate(events):
+        calls.append(events)
+        return validate_referee_events(events)
+    from sim.devices import referee as referee_module
+    monkeypatch.setattr(referee_module, "validate_referee_events", validate)
+    raw = referee_configuration(scripted=True)["events"]
+    result = parse_referee_events(raw)
+    assert type(result) is tuple and result == expected
+    assert calls == [result] and calls[0] is result
+    assert validate_referee_events(expected) is None
+    for event in result:
+        with pytest.raises(FrozenInstanceError):
+            event.offset_ns = 99
+        attribute = fields(event.value)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(event.value, attribute, 99)
+    raw[0]["hit"]["damage_hp"] = 99
+    raw.reverse()
+    assert result == expected
+    assert parse_referee_events([]) == ()
+
+
 def test_referee_records_are_scoped_frozen_and_canonical_without_resource_acquisition(
         tmp_path, monkeypatch):
     from sim.arena.manifest import ArenaReferee
@@ -416,11 +463,21 @@ def test_referee_records_are_scoped_frozen_and_canonical_without_resource_acquis
         return original_import(name, globals, locals, fromlist, level)
 
     monkeypatch.setattr(builtins, "__import__", pure_import)
+    from sim.arena import manifest as arena_manifest
+    translate = arena_manifest.parse_referee_events
+    translated = []
+    def parse_events(value, label="referee events"):
+        result = translate(value, label)
+        translated.append((label, result))
+        return result
+    monkeypatch.setattr(arena_manifest, "parse_referee_events", parse_events)
     path = write_arena(tmp_path, referees={"west": referee_configuration(),
                                             "east": referee_configuration(scripted=True)})
     result = load_manifest(path)
     assert type(result.referees) is tuple
     east, west = result.referees
+    assert len(translated) == 2
+    assert dict(translated) == {"referees.east.events": east.events, "referees.west.events": west.events}
     assert all(isinstance(item, ArenaReferee) for item in result.referees)
     assert [(item.member, item.uart) for item in result.referees] == [
         ("east", "main.uart7"), ("west", "main.uart7")]
@@ -442,6 +499,31 @@ def test_referee_records_are_scoped_frozen_and_canonical_without_resource_acquis
     assert load_manifest(path) == result
 
 
+EVENT_REJECTIONS = (
+    ({}, "non-list-events"),
+    ([{"offset_ns": 0}], "no-event-value"),
+    ([{"offset_ns": 0, "hit": {"damage_hp": 1},
+                         "shot": {"heat_17mm": 1, "heat_42mm": 0}}], "two-event-values"),
+    ([{"offset_ns": 0, "damage": {"damage_hp": 1}}], "unknown-event"),
+    ([{"offset_ns": True, "hit": {"damage_hp": 0}}], "bool-offset"),
+    ([{"offset_ns": 1 << 64, "hit": {"damage_hp": 0}}], "offset-overflow"),
+    ([{"offset_ns": 1, "hit": {"damage_hp": 0}},
+      {"offset_ns": 0, "hit": {"damage_hp": 0}}], "unsorted-offsets"),
+    ([{"offset_ns": 0, "hit": {"damage_hp": True}}], "bool-hit"),
+    ([{"offset_ns": 0, "shot": {"heat_17mm": 0}}], "partial-shot"),
+    ([{"offset_ns": 0, "shot": {"heat_17mm": 0, "heat_42mm": 65536}}], "shot-overflow"),
+)
+
+
+@pytest.mark.parametrize("value", [pytest.param(value, id=ident) for value, ident in EVENT_REJECTIONS
+                                  if ident in ("non-list-events", "two-event-values", "unsorted-offsets",
+                                               "partial-shot", "shot-overflow")])
+def test_public_referee_event_parser_reuses_contextual_shape_range_and_order_rejection(value):
+    from sim.arena.manifest import parse_referee_events
+    with pytest.raises(ManifestError, match=r"scenario\.script"):
+        parse_referee_events(value, "scenario.script")
+
+
 @pytest.mark.parametrize("location,replacement", [
     (("referees",), None),
     (("referees",), []),
@@ -461,25 +543,13 @@ def test_referee_records_are_scoped_frozen_and_canonical_without_resource_acquis
     (("referees", "east", "durations", "countdown_s"), 0),
     (("referees", "east", "durations", "battle_s"), True),
     (("referees", "east", "cooling_42mm_per_s"), -1),
-    (("referees", "east", "events"), {}),
-    (("referees", "east", "events"), [{"offset_ns": 0}]),
-    (("referees", "east", "events"), [{"offset_ns": 0, "hit": {"damage_hp": 1},
-                                            "shot": {"heat_17mm": 1, "heat_42mm": 0}}]),
-    (("referees", "east", "events"), [{"offset_ns": 0, "damage": {"damage_hp": 1}}]),
-    (("referees", "east", "events"), [{"offset_ns": True, "hit": {"damage_hp": 0}}]),
-    (("referees", "east", "events"), [{"offset_ns": 1 << 64, "hit": {"damage_hp": 0}}]),
-    (("referees", "east", "events"), [{"offset_ns": 1, "hit": {"damage_hp": 0}},
-                                            {"offset_ns": 0, "hit": {"damage_hp": 0}}]),
-    (("referees", "east", "events"), [{"offset_ns": 0, "hit": {"damage_hp": True}}]),
-    (("referees", "east", "events"), [{"offset_ns": 0, "shot": {"heat_17mm": 0}}]),
-    (("referees", "east", "events"), [{"offset_ns": 0, "shot": {"heat_17mm": 0,
-                                                                         "heat_42mm": 65536}}]),
-], ids=["null-table", "non-mapping-table", "unbound-alias", "non-mapping-entry", "unknown-policy",
+    *((("referees", "east", "events"), value) for value, _ in EVENT_REJECTIONS),
+], ids=[
+        "null-table", "non-mapping-table", "unbound-alias", "non-mapping-entry", "unknown-policy",
         "bool-uart", "nul-uart", "missing-initial-group", "missing-explicit-timestamp",
         "unknown-message-field", "bool-wire-field", "uint8-overflow", "timestamp-overflow",
         "hp-policy", "active-phase-zero", "zero-duration", "bool-duration", "negative-cooling",
-        "non-list-events", "no-event-value", "two-event-values", "unknown-event", "bool-offset",
-        "offset-overflow", "unsorted-offsets", "bool-hit", "partial-shot", "shot-overflow"])
+        *(ident for _, ident in EVENT_REJECTIONS)])
 def test_referee_outer_shape_and_domain_reject_before_any_child_read(
         tmp_path, monkeypatch, location, replacement):
     path = write_arena(tmp_path, referees={"west": referee_configuration(),
@@ -500,15 +570,20 @@ def test_referee_outer_shape_and_domain_reject_before_any_child_read(
 
 @pytest.mark.parametrize("count,accepted", [(1024, True), (1025, False)])
 def test_referee_script_capacity_and_maximum_offset(tmp_path, monkeypatch, count, accepted):
+    from sim.arena.manifest import parse_referee_events
     configuration = referee_configuration()
     configuration["events"] = [{"offset_ns": 0, "hit": {"damage_hp": 0}}
                                for _ in range(count - 1)]
     configuration["events"].append({"offset_ns": 0xffffffffffffffff, "hit": {"damage_hp": 1}})
     path = write_arena(tmp_path, referees={"east": configuration})
     if accepted:
+        events = parse_referee_events(configuration["events"])
+        assert len(events) == 1024 and events[-1].offset_ns == 0xffffffffffffffff
         record, = load_manifest(path).referees
         assert len(record.events) == 1024 and record.events[-1].offset_ns == 0xffffffffffffffff
     else:
+        with pytest.raises(ManifestError, match="referee events.*1024"):
+            parse_referee_events(configuration["events"])
         forbid_child_reads(tmp_path, monkeypatch)
         with pytest.raises(ManifestError, match="1024"):
             load_manifest(path)
@@ -528,14 +603,19 @@ def test_referee_uart_association_uses_its_loaded_child_board(tmp_path, uart):
         ("east", "alpha_cpu.uart7"), ("west", "bravo_cpu.uart7")]
 
 
-def test_admitted_referees_feed_real_coordinator_with_literal_wire_and_reset_origins(tmp_path):
+@pytest.mark.parametrize("public_events", [False, True], ids=["arena", "public_parser"])
+def test_admitted_referees_feed_real_coordinator_with_literal_wire_and_reset_origins(tmp_path, public_events):
+    from sim.arena.manifest import parse_referee_events
     from sim.core import Coordinator, Session, StepResult
     from sim.devices.referee import RefereeEngine, encode_message
 
     admitted = load_manifest(write_arena(tmp_path, referees={"west": referee_configuration(),
                                                               "east": referee_configuration(scripted=True)}))
+    scripts = {record.member: (parse_referee_events(
+        referee_configuration(scripted=record.member == "east").get("events", []))
+        if public_events else record.events) for record in admitted.referees}
     engines = {record.member: RefereeEngine(record.initial, durations=record.durations,
-                                           events=record.events,
+                                           events=scripts[record.member],
                                            cooling_42mm_per_s=record.cooling_42mm_per_s)
                for record in admitted.referees}
     coordinator = Coordinator(engines)
