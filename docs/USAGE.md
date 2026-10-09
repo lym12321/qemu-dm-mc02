@@ -1824,6 +1824,13 @@ EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被
 stream/datagram 队列。`sim/fabric` 在主机侧按时间戳、固定延迟和准入顺序交付 CAN 帧，
 可配置 loopback、drop predicate 和日志 sink。已有 worker 入口与默认电机协议保持兼容。
 
+Python 的 `CanBus.delay_ns` 可在该总线的交付回调之外修改，接受
+`0..2^64-1` 的普通 `int` 纳秒值（不含 `bool`）。
+新值只影响后续入队帧；已经排队的截止时间和等时 FIFO 顺序保留，减小延迟时
+新帧可以先于旧帧交付。无效值或该总线交付回调内的修改会拒绝，reset 保留当前配置。
+交付仍由现有 step 完成；这是主机侧队列策略，不建立 QEMU CPU 时间屏障。
+Scenario 的故障动作尚未接入该接口。
+
 连接已有 QEMU co-sim 和 FDCAN Unix socket 时，可使用专用 M3508 入口：
 
 ```bash

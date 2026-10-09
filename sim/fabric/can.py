@@ -73,7 +73,7 @@ class CanBus:
                             ("dispatch_budget", dispatch_budget)):
             if type(value) is not int or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        self.delay_ns = delay_ns
+        self._delay_ns = delay_ns
         self.loopback = loopback
         self.drop = drop
         self.log = log
@@ -85,6 +85,18 @@ class CanBus:
         self._sequence = 0
         self._started = False
         self._dispatching = False
+
+    @property
+    def delay_ns(self) -> int:
+        """Delay for subsequent sends; pending due times remain unchanged."""
+        return self._delay_ns
+
+    @delay_ns.setter
+    def delay_ns(self, value: int) -> None:
+        check_can_time(value)
+        if self._dispatching:
+            raise RuntimeError("CAN delay cannot be changed from a delivery callback")
+        self._delay_ns = value
 
     @property
     def pending(self) -> int:

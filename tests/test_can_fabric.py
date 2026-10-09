@@ -54,6 +54,88 @@ def test_due_order_stable_ties_and_attachment_order():
     assert not bus.has_due(10)
 
 
+def test_delay_changes_only_subsequent_due_times_and_preserves_tie_order():
+    events = []
+    bus = CanBus(delay_ns=20, log=events.append)
+    bus.delay_ns = 10
+    source, sink = Sink("source"), Sink("sink")
+    # Policy assignment alone must not freeze wiring or start delivery.
+    bus.attach(source)
+    bus.attach(sink)
+    old = CanFrame(1, timestamp_ns=5)
+    bus.send(source, old)  # due 15, sequence 0
+    assert bus.step(4) == 0
+    bus.delay_ns = 0
+    assert (bus.delay_ns, bus.pending, bus.t_sim_ns) == (0, 1, 4)
+    assert events == sink.frames == []
+    overtaking = CanFrame(2, timestamp_ns=6)
+    tied = CanFrame(3, timestamp_ns=15)
+    bus.send(source, overtaking)
+    bus.send(source, tied)
+    bus.delay_ns = 20
+    increased = CanFrame(4, timestamp_ns=0)
+    bus.send(source, increased)
+    assert not bus.has_due(5)
+    assert bus.step(6) == 1
+    assert sink.frames == [CanFrame(2, timestamp_ns=6)]
+    assert bus.step(14) == 0
+    assert bus.step(15) == 2
+    assert [frame.can_id for frame in sink.frames] == [2, 1, 3]
+    assert bus.pending == 1
+    assert not bus.has_due(19)
+    assert bus.step(20) == 1
+    assert [(event.frame.can_id, event.sequence, event.timestamp_ns,
+             event.due_ns, event.delivered_ns) for event in events] == [
+        (2, 1, 6, 6, 6), (1, 0, 5, 15, 15),
+        (3, 2, 15, 15, 15), (4, 3, 0, 20, 20)]
+    assert events[1].frame is old
+    assert bus.pending == 0
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, 1 << 64])
+def test_invalid_delay_assignment_preserves_policy_and_pending_admission(value):
+    events = []
+    bus = CanBus(delay_ns=7, log=events.append)
+    source, sink = Sink("source"), Sink("sink")
+    bus.attach(source)
+    bus.attach(sink)
+    bus.step(3)
+    original = CanFrame(1, timestamp_ns=4)
+    bus.send(source, original)
+    with pytest.raises(ValueError):
+        bus.delay_ns = value
+    assert (bus.delay_ns, bus.pending, bus.t_sim_ns) == (7, 1, 3)
+    assert events == source.frames == sink.frames == []
+    assert not bus.has_due(10)
+    bus.send(source, CanFrame(2, timestamp_ns=4))
+    assert bus.step(11) == 2
+    assert [(event.sequence, event.due_ns) for event in events] == [(0, 11), (1, 11)]
+    assert events[0].frame is original
+    assert [frame.can_id for frame in sink.frames] == [1, 2]
+
+
+def test_max_delay_is_valid_but_overflowing_send_is_atomic():
+    events = []
+    bus = CanBus(log=events.append)
+    source, sink = Sink("source"), Sink("sink")
+    bus.attach(source)
+    bus.attach(sink)
+    bus.delay_ns = (1 << 64) - 1
+    assert bus.delay_ns == 18446744073709551615
+    with pytest.raises(ValueError, match="64-bit"):
+        bus.send(source, CanFrame(1, timestamp_ns=1))
+    assert (bus.pending, bus.t_sim_ns) == (0, 0)
+    assert events == sink.frames == []
+    bus.send(source, CanFrame(2))
+    bus.delay_ns = 0
+    bus.send(source, CanFrame(3, timestamp_ns=1))
+    assert bus.step(1) == 1
+    assert bus.pending == 1
+    assert bus.step(18446744073709551615) == 1
+    assert [(event.frame.can_id, event.sequence, event.due_ns)
+            for event in events] == [(3, 1, 1), (2, 0, 18446744073709551615)]
+
+
 def test_destination_drop_log_and_late_metadata_preserve_original():
     events, decisions = [], []
     source, keep, discard = (Sink(name) for name in ("source", "keep", "discard"))
@@ -136,12 +218,13 @@ def test_capacity_rejection_preserves_existing_pending_frame():
     assert sink.frames == [first]
 
 
-def test_reset_clears_pending_clock_sequence_and_retains_fixed_wiring():
+def test_reset_clears_pending_clock_sequence_and_retains_wiring_and_delay():
     events = []
     bus = CanBus(log=events.append)
     source, sink = Sink("source"), Sink("sink")
     bus.attach(source, source.name)
     bus.attach(sink, sink.name)
+    bus.delay_ns = 3
     bus.send(source, CanFrame(1, timestamp_ns=100))
     bus.step(20)
     with pytest.raises(ValueError):
@@ -151,12 +234,15 @@ def test_reset_clears_pending_clock_sequence_and_retains_fixed_wiring():
     bus.reset(5)
     assert bus.pending == 0
     assert bus.t_sim_ns == 5
+    assert bus.delay_ns == 3
     with pytest.raises(RuntimeError, match="before the first send or step"):
         bus.attach(Sink("late"))
     bus.send(source, CanFrame(2, timestamp_ns=6))
-    assert bus.step(6) == 1
+    assert bus.step(8) == 0
+    assert bus.step(9) == 1
     assert [frame.can_id for frame in sink.frames] == [2]
     assert events[0].sequence == 0
+    assert events[0].due_ns == 9
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -214,16 +300,25 @@ def test_callback_failure_propagates_and_retains_remaining_queue(failed_callback
     assert bus.pending == 1
 
 
-@pytest.mark.parametrize("operation", ["step", "reset"])
-def test_callbacks_cannot_bypass_dispatch_budget_or_reset_mid_delivery(operation):
-    bus = CanBus(dispatch_budget=1)
+@pytest.mark.parametrize("operation", ["step", "reset", "delay"])
+def test_callbacks_cannot_step_reset_or_change_delay_mid_delivery(operation):
+    events = []
+    bus = CanBus(dispatch_budget=1, log=events.append)
     source, sink = Sink("source"), Sink("sink")
-    sink.receive = lambda frame: getattr(bus, operation)(0)
+    if operation == "delay":
+        sink.receive = lambda frame: setattr(bus, "delay_ns", 5)
+    else:
+        sink.receive = lambda frame: getattr(bus, operation)(0)
     bus.attach(source)
     bus.attach(sink)
     bus.send(source, CanFrame(1))
+    bus.send(source, CanFrame(2))
     with pytest.raises(RuntimeError, match="delivery callback"):
         bus.step(0)
+    # The current broadcast was already popped; the remaining one is retained.
+    assert (bus.delay_ns, bus.pending, bus.t_sim_ns) == (0, 1, 0)
+    assert [(event.sequence, event.due_ns) for event in events] == [(0, 0)]
+    assert sink.frames == []
 
 
 def test_tool_importlib_consumers_share_canonical_frame_and_codec_objects():

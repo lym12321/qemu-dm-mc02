@@ -218,6 +218,90 @@ def test_step_start_commands_then_devices_then_target_delivery(streams):
     runtime.close()
 
 
+def test_delay_changes_keep_pending_due_and_reset_epoch_with_one_runtime_owner(streams):
+    stream, peer = streams
+    deliveries = []
+    bus = CanBus(delay_ns=20, log=deliveries.append)
+    runtime, (device,) = runtime_for(stream, bus=bus)
+    try:
+        runtime.reset(7, 100, worker.QemuTimestampMapper(9000, 100))
+        peer.sendall(wire(0x200, 0, 3, 9000, b"old"))
+        (can_id, flags, dlc, stamp, payload), = stream.receive()
+        runtime.ingest_qemu(CanFrame(can_id, flags, dlc, payload, stamp), 100)
+        assert runtime.step(10) == StepResult("ok", 110, {
+            "delivered_start": 0, "delivered_target": 0, "pending": 2})
+        assert device.steps[0][1] == () and device.commands == []
+        with pytest.raises(BlockingIOError):
+            peer.recv(84)
+
+        bus.delay_ns = 0
+        peer.sendall(wire(0x200, 0, 3, 9010, b"new"))
+        (can_id, flags, dlc, stamp, payload), = stream.receive()
+        runtime.ingest_qemu(CanFrame(can_id, flags, dlc, payload, stamp), 110)
+        assert runtime.step(10) == StepResult("ok", 120, {
+            "delivered_start": 1, "delivered_target": 2, "pending": 1})
+        assert device.steps[1][1] == (CanFrame(0x200, data=b"new", timestamp_ns=110),)
+        assert device.commands == [CanFrame(0x200, data=b"new", timestamp_ns=110),
+                                   CanFrame(0x200, data=b"old", timestamp_ns=120)]
+        assert peer.recv(84) == wire(0x201, 0, 5, 9020, b"state")
+
+        bus.delay_ns = 30
+        assert runtime.step(10) == StepResult("ok", 130, {
+            "delivered_start": 0, "delivered_target": 1, "pending": 1})
+        assert device.steps[2][1] == tuple(device.commands)
+        assert peer.recv(84) == wire(0x201, 0, 5, 9030, b"state")
+        # Original command/feedback metadata, immutable enqueue deadlines and
+        # actual settled delivery times remain separate public observations.
+        assert [(row.frame.data, row.timestamp_ns, row.due_ns, row.delivered_ns)
+                for row in deliveries] == [
+            (b"new", 110, 110, 110), (b"old", 100, 120, 120),
+            (b"state", 120, 120, 120), (b"state", 110, 130, 130)]
+        assert [context.t_sim_ns for context, _ in device.steps] == [110, 120, 130]
+
+        runtime.reset(8, 500, worker.QemuTimestampMapper(20000, 500))
+        assert bus.delay_ns == 30 and bus.pending == 0 and device.steps == device.commands == []
+        assert runtime.step(1).diagnostics == {
+            "delivered_start": 0, "delivered_target": 0, "pending": 1}
+        assert runtime.step(30).diagnostics == {
+            "delivered_start": 0, "delivered_target": 1, "pending": 1}
+        assert peer.recv(84) == wire(0x201, 0, 5, 20031, b"state")
+        runtime.close()
+        assert device.close_calls == 1 and bus.delay_ns == 30 and bus.pending == 1
+        assert runtime.endpoint.stream is stream and stream.sock.fileno() >= 0 and peer.fileno() >= 0
+    finally:
+        runtime.close()
+
+
+@pytest.mark.parametrize("delay_ns", [True, 1.5, -1, 1 << 64])
+def test_invalid_delay_assignment_preserves_actual_pending_commands_before_step_or_io(streams, delay_ns):
+    stream, peer = streams
+    deliveries = []
+    bus = CanBus(delay_ns=5, log=deliveries.append)
+    runtime, (device,) = runtime_for(stream, bus=bus)
+    try:
+        runtime.reset(7, 100, worker.QemuTimestampMapper(9000, 100))
+        peer.sendall(wire(0x200, 0, 3, 9000, b"cmd"))
+        (can_id, flags, dlc, stamp, payload), = stream.receive()
+        runtime.ingest_qemu(CanFrame(can_id, flags, dlc, payload, stamp), 100)
+        with pytest.raises((TypeError, ValueError)):
+            bus.delay_ns = delay_ns
+        assert bus.delay_ns == 5 and bus.pending == 1
+        assert runtime.t_sim_ns == bus.t_sim_ns == 100
+        assert device.commands == device.steps == deliveries == []
+        assert not bus.has_due(104) and bus.has_due(105)
+        with pytest.raises(BlockingIOError):
+            peer.recv(84)
+        runtime.step(5)
+        assert device.steps[0][1] == ()
+        assert device.commands == [CanFrame(0x200, data=b"cmd", timestamp_ns=105)]
+        runtime.step(5)
+        assert device.steps[1][1] == tuple(device.commands)
+        assert peer.recv(84) == wire(0x201, 0, 5, 9010, b"state")
+    finally:
+        runtime.close()
+    assert device.close_calls == 1 and stream.sock.fileno() >= 0
+
+
 def test_start_due_budget_exhaustion_freezes_before_device_advance(streams):
     stream, _ = streams
     runtime, (device,) = runtime_for(stream, bus=CanBus(dispatch_budget=1))
