@@ -32,6 +32,9 @@ socket 和有界清理。socket 出现只表示 transport 可连接；固件 rea
 `FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns)`
 每个连接只读一次有界数据；CAN 观察保留原始 QEMU 时间，UART 时间只是调用者的轮询样本。
 需要截止时间判断时，应在读取后再查询 QMP 虚拟时间作为观察上界。
+已有独立 UART TX owner 时可调用 `service(timestamp_ns, flush_uart=False)`，
+继续读取并报告 UART 字节，同时保留其发送队列和后缀；TX owner 负责发送与 flush。
+该参数必须为布尔值，默认仍服务 UART 发送；CAN 和 ADC 服务保持各自原语义。
 
 ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(time)`，输入时间严格递增。
 收到 QEMU RESET 后必须重新显式 reset。逻辑 reset 保留物理流尾部，不提供 CAN/v1 历史输入隔离。

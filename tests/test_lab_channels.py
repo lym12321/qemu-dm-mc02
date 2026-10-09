@@ -82,10 +82,48 @@ def test_uart_partial_send_suffix_survives_logical_reset():
         assert bytes(stream.tx_queue[0]) == b"cde"
         lab.reset(10)
         assert bytes(stream.tx_queue[0]) == b"cde"
+        peer.sendall(b"READY\0")
+        assert lab.service(10, flush_uart=False) == [ChannelEvent("uart1", 10, b"READY\0")]
+        assert bytes(stream.tx_queue[0]) == b"cde" and peer.recv(4096) == b"ab"
         assert lab.service(10) == []
         assert bytes(stream.tx_queue[0]) == b"e"
         assert lab.service(11) == [] and not stream.tx_pending
-        assert peer.recv(4096) == b"abcde"
+        assert peer.recv(4096) == b"cde"
+
+
+@pytest.mark.parametrize("flag", [0, None, "false"])
+def test_uart_flush_option_rejects_before_read_or_time_commit(flag):
+    with pair() as (stream, peer):
+        lab = LabChannels(uarts={"uart7": stream})
+        peer.sendall(b"ready")
+        with pytest.raises(TypeError, match="flush_uart"):
+            lab.service(99, flush_uart=flag)
+        assert lab.service(1, flush_uart=False) == [ChannelEvent("uart7", 1, b"ready")]
+        no_bytes(peer)
+
+
+def test_referee_tx_owner_retains_suffix_while_lab_observes_same_uart():
+    from sim.devices.referee import RefereeUartEndpoint
+    from test_referee_endpoint import SendBudget, STATE, WIRE, received
+
+    with pair() as (original, peer):
+        budget = SendBudget(original.sock)
+        stream = StreamTransport(budget)
+        endpoint = RefereeUartEndpoint(stream, sequence=254)
+        lab = LabChannels(uarts={"uart7": stream})
+        try:
+            budget.budget = 19
+            assert endpoint.send_state(STATE) == WIRE
+            suffix = stream.tx_queue[0]
+            peer.sendall(b"READY")
+            assert lab.service(7, flush_uart=False) == [ChannelEvent("uart7", 7, b"READY")]
+            assert budget.sends == budget.reads == 1
+            assert stream.tx_queue[0] is suffix and bytes(suffix) == WIRE[19:]
+            budget.budget = None
+            assert endpoint.flush() and received(peer) == WIRE
+        finally:
+            endpoint.close()
+        assert original.sock.fileno() >= 0 and budget.closes == 0
 
 
 @pytest.mark.parametrize("flags,dlc,payload", [

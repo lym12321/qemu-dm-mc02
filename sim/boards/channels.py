@@ -216,8 +216,10 @@ class LabChannels:
         self._adc_sequence += 1
         self._adc_time_ns = timestamp_ns
 
-    def service(self, timestamp_ns: int) -> list[ChannelEvent]:
-        """Read bounded batches and deliver CAN due at the QEMU-time bound."""
+    def service(self, timestamp_ns: int, *, flush_uart: bool = True) -> list[ChannelEvent]:
+        """Read bounded batches; an external UART TX owner may disable flushing."""
+        if type(flush_uart) is not bool:
+            raise TypeError("flush_uart must be a boolean")
         check_can_time(timestamp_ns, self._time_ns)
         self._time_ns = timestamp_ns
         batch = []
@@ -230,7 +232,8 @@ class LabChannels:
                     batch.append(ChannelEvent(
                         name, timestamp_ns, bytes(stream.buffer)))
                     stream.buffer.clear()
-                methods["flush"]()
+                if flush_uart:
+                    methods["flush"]()
             for port in self._cans.values():
                 for can_id, flags, dlc, time_ns, data in port.receive():
                     port.qemu.ingest(
