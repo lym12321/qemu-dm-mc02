@@ -7,6 +7,7 @@ machine is replaced. Native QEMU and MuJoCo are separate consumer gates.
 
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
+import builtins
 import os
 from pathlib import Path
 import signal
@@ -27,6 +28,8 @@ from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
 from sim.robots import shared_world
+from sim.scenario import ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
+from sim.scenario import runtime as scenario_runtime
 from sim.transports import cosim
 from tools import dm_mc02_firmware_rtf as rtf
 from test_arena_manifest import ROBOT_DOCUMENT, referee_configuration, write_arena, write_executable
@@ -387,6 +390,83 @@ def short_referee_configuration():
     return configuration
 
 
+@pytest.mark.parametrize("invalid", ["manifest-subclass", "arena-subclass", "duration-bool",
+                                    "duration-zero", "duration-overflow", "mutable-referees",
+                                    "foreign-record", "member-subclass", "mutable-events"])
+def test_scenario_structure_rejects_before_lower_import_or_delegation(environment, monkeypatch, invalid):
+    arena = environment.manifest()
+    row = ScenarioReferee("east", ())
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1, (row,))
+    if invalid == "manifest-subclass":
+        manifest = type("ScenarioSubclass", (ScenarioManifest,), {})(
+            manifest.path, arena, 1, (row,))
+    elif invalid == "arena-subclass":
+        manifest = replace(manifest, arena=type("ArenaSubclass", (type(arena),), {})(
+            **vars(arena)))
+    elif invalid.startswith("duration-"):
+        manifest = replace(manifest, duration_ns={"duration-bool": True, "duration-zero": 0,
+                                                 "duration-overflow": 3_600_000_000_001}[invalid])
+    elif invalid == "mutable-referees":
+        manifest = replace(manifest, referees=[row])
+    elif invalid == "foreign-record":
+        manifest = replace(manifest, referees=(SimpleNamespace(member="east", events=()),))
+    else:
+        if invalid == "member-subclass":
+            row = replace(row, member=type("MemberSubclass", (str,), {})("east"))
+        else:
+            row = replace(row, events=[])
+        manifest = replace(manifest, referees=(row,))
+    original_import = builtins.__import__
+    def admit_import(name, *args, **kwargs):
+        if name == "sim.arena.runtime":
+            pytest.fail("invalid Scenario reached lower runtime import")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", admit_import)
+    with pytest.raises((TypeError, ValueError)):
+        scenario_runtime.run_manifest(manifest)
+    assert environment.events == [] and environment.owners == []
+
+
+@pytest.mark.parametrize("duration_ns,seconds", [(1, 0.000000001), (1_234_567, 0.001234567),
+                                               (3_600_000_000_000, 3600.0)])
+def test_scenario_delegates_once_with_original_order_options_and_exact_duration(
+        environment, monkeypatch, duration_ns, seconds):
+    arena = environment.manifest()
+    first, second = (ScriptEvent(0, Hit(1)),), ()
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, duration_ns,
+                                (ScenarioReferee("west", first), ScenarioReferee("east", second)))
+    calls, result = [], object()
+    def delegate(actual, **options):
+        calls.append((actual, options))
+        return result
+    monkeypatch.setattr(runtime, "run_manifest", delegate)
+    emit, on_response = lambda event: None, lambda *items: None
+    options = dict(emit=emit, on_response=on_response, qemu=environment.binary,
+                   startup_timeout=3.0, timeout=7.0, referee_period_ns=2_000_000)
+    assert scenario_runtime.run_manifest(manifest, **options) is result
+    assert len(calls) == 1 and calls[0][0] is arena
+    assert calls[0][1] == dict(options, duration=seconds,
+                             referee_events=(("west", first), ("east", second)))
+    assert calls[0][1]["referee_events"][0][1] is first
+    assert calls[0][1]["referee_events"][1][1] is second
+    assert round(calls[0][1]["duration"] * 1_000_000_000) == duration_ns
+    assert environment.events == []
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_scenario_propagates_identical_lower_error_without_retry(environment, monkeypatch, interrupt):
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 1, ())
+    calls, primary = [], KeyboardInterrupt("Arena interrupted") if interrupt else OSError("Arena rejected")
+    def delegate(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise primary
+    monkeypatch.setattr(runtime, "run_manifest", delegate)
+    with pytest.raises(type(primary)) as caught:
+        scenario_runtime.run_manifest(manifest)
+    assert caught.value is primary and len(calls) == 1
+    assert environment.events == []
+
+
 @pytest.mark.parametrize("options", [
     {"duration": float("nan")}, {"duration": True}, {"duration": 1e-10},
     {"duration": 3601}, {"timeout": float("inf")},
@@ -438,10 +518,13 @@ def test_referee_association_rejects_before_resource_admission(environment, monk
     assert environment.events == [] and environment.launches == []
 
 
-@pytest.mark.parametrize("invalid", ["outer_list", "entry_list", "entry_shape", "name_type",
-                                    "unknown", "unconfigured", "duplicate", "mutable_events",
-                                    "later_bad_event", "unordered", "after_duration", "aggregate_quota"])
-def test_queued_referee_batches_are_completely_admitted_before_resources(environment, monkeypatch, invalid):
+@pytest.mark.parametrize("invalid,via_scenario", [
+    (name, False) for name in ("outer_list", "entry_list", "entry_shape", "name_type",
+                             "unknown", "unconfigured", "duplicate", "mutable_events",
+                             "later_bad_event", "unordered", "after_duration", "aggregate_quota")
+] + [(name, True) for name in ("unknown", "duplicate", "later_bad_event", "after_duration")])
+def test_queued_referee_batches_are_completely_admitted_before_resources(
+        environment, monkeypatch, invalid, via_scenario):
     manifest = environment.manifest(ready=("READY", "READY"), referees={
         "east": referee_configuration(), "west": referee_configuration()})
     events = (ScriptEvent(0, Hit(1)),)
@@ -476,7 +559,12 @@ def test_queued_referee_batches_are_completely_admitted_before_resources(environ
     for method in ("resolve_qemu", "regular_file", "create_arena_plant"):
         monkeypatch.setattr(runtime, method, forbidden)
     with pytest.raises((ValueError, TypeError)):
-        environment.run(manifest, referee_events=batches)
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", manifest, 2_500_000,
+                                        tuple(ScenarioReferee(*batch) for batch in batches))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+        else:
+            environment.run(manifest, referee_events=batches)
     assert environment.events == [] and environment.launches == [] and environment.owners == []
     assert environment.native.resets == 0 and environment.native.steps == []
 
@@ -499,6 +587,16 @@ def test_admitted_batches_delegate_exactly_once_in_caller_order_after_shared_sta
     assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
     assert result.origin_ns == 0 and result.end_ns == 1_000_000
     assert all(engine.closed for engine in observed.engines)
+
+
+@pytest.mark.parametrize("duration_ns,steps", [(1, [1]), (1_234_567, [1_000_000, 234_567])])
+def test_scenario_exact_integer_duration_reaches_actual_arena_final_step(environment, duration_ns, steps):
+    scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), duration_ns, ())
+    result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    environment.assert_clean()
+    assert result.origin_ns == 0 and result.end_ns == duration_ns
+    assert result.steps == len(steps) and environment.native.steps == steps
+    assert environment.native.resets == 1
 
 
 def test_changed_firmware_and_native_admission_fail_before_process(environment):
@@ -714,18 +812,38 @@ def test_harness_failure_prevents_return_after_successful_execution(environment)
     assert environment.native.steps == [1_000_000, 1_000_000, 500_000]
 
 
-@pytest.mark.parametrize("queued", [False, True], ids=["script", "scoped_queue"])
+@pytest.mark.parametrize("producer", ["script", "scoped_queue", "scenario"])
 def test_ready_uart7_borrows_one_transport_and_scoped_literal_batches_from_one_coordinator(
-        environment, monkeypatch, queued):
+        environment, monkeypatch, producer):
     observed = watch_referees(environment, monkeypatch)
     environment.uart_chunks = [[b"READY"], [b"READY"]]
     configurations = {"west": short_referee_configuration(), "east": short_referee_configuration()}
     events = (ScriptEvent(1_000_000, Hit(10)),
               ScriptEvent(1_000_000, RobotStatus(3, 2, 60, 200, 3, 100, 120, 6)),
               ScriptEvent(1_000_000, Hit(5)), ScriptEvent(1_000_000, Shot(2, 3)))
-    result = environment.run(environment.manifest(ready=("READY", "READY"), referees=configurations),
-                             duration=.001, referee_period_ns=1_000_000,
-                             referee_events=(("east", events),) if queued else ())
+    arena = environment.manifest(ready=("READY", "READY"), referees=configurations)
+    queued = producer != "script"
+    if producer == "scenario":
+        path = environment.directory / "scenario.yaml"
+        path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms",
+            "referee_events": {"east": [
+                {"at": "1ms", "hit": {"damage_hp": 10}},
+                {"at": "1ms", "robot": {"robot_id": 3, "robot_level": 2, "current_hp": 60,
+                                         "maximum_hp": 200, "cooling_per_s": 3, "heat_limit": 100,
+                                         "chassis_power_limit": 120, "power_outputs": 6}},
+                {"at": "1ms", "hit": {"damage_hp": 5}},
+                {"at": "1ms", "shot": {"heat_17mm": 2, "heat_42mm": 3}},
+            ]}}, sort_keys=False), encoding="utf-8")
+        scenario = load_scenario(path)
+        assert scenario.referees[0].events == events
+        events = scenario.referees[0].events
+        path.unlink()
+        arena.path.unlink()  # Execution consumes records, without rereading either YAML file.
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary,
+                                               referee_period_ns=1_000_000)
+    else:
+        result = environment.run(arena, duration=.001, referee_period_ns=1_000_000,
+                                 referee_events=(("east", events),) if queued else ())
     environment.assert_clean()
     assert len(observed.worlds) == len(observed.coordinators) == 1
     assert observed.services and not any(observed.services)
@@ -793,8 +911,9 @@ def test_queued_zero_offset_waits_for_completed_step_and_uses_reset_origin_durin
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
 def test_later_queue_failure_preserves_primary_and_releases_every_owner_without_resume_or_step(
-        environment, monkeypatch, interrupt):
+        environment, monkeypatch, interrupt, via_scenario):
     observed = watch_referees(environment, monkeypatch)
     primary = KeyboardInterrupt("later queue interrupted") if interrupt else OSError("later queue rejected")
     secondary = OSError("endpoint0 cleanup failed")
@@ -807,10 +926,15 @@ def test_later_queue_failure_preserves_primary_and_releases_every_owner_without_
         return queue(value, events, session_id=session_id)
     monkeypatch.setattr(RefereeEngine, "queue_events", reject_later)
     first, second = (ScriptEvent(0, Hit(10)),), (ScriptEvent(0, Hit(20)),)
+    arena = environment.manifest(ready=("READY", "READY"), upper=True, referees={
+        "east": referee_configuration(), "west": referee_configuration()})
     with pytest.raises(KeyboardInterrupt if interrupt else OSError) as caught:
-        environment.run(environment.manifest(ready=("READY", "READY"), upper=True, referees={
-            "east": referee_configuration(), "west": referee_configuration()}),
-            referee_events=(("east", first), ("west", second)))
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 2_500_000,
+                                        (ScenarioReferee("east", first), ScenarioReferee("west", second)))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+        else:
+            environment.run(arena, referee_events=(("east", first), ("west", second)))
     assert caught.value is primary
     environment.assert_clean()
     assert [(name, events, session_id, stamp, steps) for name, events, session_id, stamp, steps, _ in observed.queues] == [

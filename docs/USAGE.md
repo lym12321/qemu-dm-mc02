@@ -426,8 +426,10 @@ referee_events:
 
 `at` 从 shared host Session reset 起算；`duration` 沿用 Arena 在全部请求的 ready
 之后计算的活动时长，两者的起点不同。启动期间的事件可以先改变裁判状态；
-`at: 0ns` 的动态事件在下一次成功 step 才生效。此接口只读取配置，不执行
-仿真；Scenario CLI、故障注入、assertions 和 replay 尚未支持。
+`at: 0ns` 的动态事件在下一次成功 step 才生效。加载接口只读取配置。
+通过 `sim.scenario.runtime.run_manifest(scenario)` 执行时，时长来自该配置，
+事件原样交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
+Scenario CLI、故障注入、assertions 和 replay 尚未支持。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
