@@ -429,7 +429,16 @@ referee_events:
 `at: 0ns` 的动态事件在下一次成功 step 才生效。加载接口只读取配置。
 通过 `sim.scenario.runtime.run_manifest(scenario)` 执行时，时长来自该配置，
 事件原样交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
-Scenario CLI、故障注入、assertions 和 replay 尚未支持。
+命令行使用同一执行入口，时长由 Scenario 配置决定：
+
+```bash
+uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report build/scenario.json
+```
+
+`--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
+默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
+字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
+或暂停参数。故障注入、assertions 和 replay 尚未支持。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。

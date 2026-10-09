@@ -57,7 +57,7 @@ def _runtime_options(parser, *, timeout: float, paused=True, debug=True) -> None
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sim", description="Run DM-MC02 firmware and reproducible Lab experiments.")
+        prog="sim", description="Run DM-MC02 firmware, Lab experiments, robots and scenarios.")
     groups = parser.add_subparsers(dest="group", required=True)
     board = groups.add_parser("board", help="native firmware terminal, QMP and GDB")
     boards = board.add_subparsers(dest="action", required=True)
@@ -96,6 +96,13 @@ def _parser() -> argparse.ArgumentParser:
                      help="YAML Arena manifest; robot references are relative to its directory")
     run.add_argument("--duration", type=_seconds, default=5.0, metavar="SECONDS",
                      help="shared logical world duration after all requested UART ready markers (default: 5)")
+    _runtime_options(run, timeout=30.0, debug=False)
+    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
+    scenario = groups.add_parser("scenario", help="scheduled inputs for an admitted Arena")
+    scenarios = scenario.add_subparsers(dest="action", required=True)
+    run = scenarios.add_parser("run", help="run a Scenario with its configured duration")
+    run.add_argument("manifest", type=Path, metavar="PATH",
+                     help="YAML Scenario manifest; Arena reference is relative to its directory")
     _runtime_options(run, timeout=30.0, debug=False)
     run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
     return parser
@@ -221,15 +228,24 @@ def _run_robot(args) -> int:
 
 
 def _run_arena(args) -> int:
+    scenario = args.group == "scenario"
     try:
-        from sim.arena.manifest import load_manifest
+        if scenario:
+            from sim.scenario.manifest import load_manifest
+        else:
+            from sim.arena.manifest import load_manifest
 
         manifest = load_manifest(args.manifest)
-        from sim.arena.runtime import run_manifest
+        if scenario:
+            from sim.scenario.runtime import run_manifest
+            options = {}
+        else:
+            from sim.arena.runtime import run_manifest
+            options = {"duration": args.duration}
 
         result = run_manifest(
-            manifest, emit=_emit_arena, duration=args.duration, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout)
+            manifest, emit=_emit_arena, qemu=args.qemu,
+            startup_timeout=args.startup_timeout, timeout=args.timeout, **options)
         payload = {"status": "passed", "result": asdict(result)}
         code = 0
     except (Exception, KeyboardInterrupt) as error:
@@ -245,7 +261,8 @@ def _run_arena(args) -> int:
             _diagnose(error)
             return 130 if isinstance(error, KeyboardInterrupt) else 1
     if code == 0:
-        print(f"Arena {result.name!r}: passed (shared world {result.origin_ns}..{result.end_ns} ns, "
+        label = "Scenario" if scenario else "Arena"
+        print(f"{label} {result.name!r}: passed (shared world {result.origin_ns}..{result.end_ns} ns, "
               f"{len(result.boards)} boards)", flush=True)
     return code
 
@@ -267,7 +284,7 @@ def main(argv=None) -> int:
     try:
         if args.group == "robot":
             return _run_robot(args)
-        if args.group == "arena":
+        if args.group in ("arena", "scenario"):
             return _run_arena(args)
         return _run_lab(args) if args.action == "run" else _run_interactive(args)
     finally:
