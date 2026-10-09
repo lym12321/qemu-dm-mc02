@@ -695,11 +695,17 @@ def main(argv=None):
                          help="run ArenaRefereeTest on two boards through the existing Arena owner")
     profile.add_argument("--scenario", action="store_true",
                          help="run ScenarioRefereeTest through the public Scenario wrapper and Arena owner")
+    parser.add_argument("--cli", action="store_true",
+                        help="exercise the actual sim module entry (requires --scenario)")
     args = parser.parse_args(argv)
+    if args.cli and not args.scenario:
+        parser.error("--cli requires --scenario")
     try:
         if args.arena or args.scenario:
             from tools.dm_mc02_arena_smoke import run_referee
             options = {"scenario": True} if args.scenario else {}
+            if args.cli:
+                options["cli"] = True
             return run_referee(args.elf, args.output, args.firmware_source, qemu=args.qemu, **options)
         return run(args.elf, args.output, args.firmware_source, qemu=args.qemu,
                    shared_world=args.shared_world)

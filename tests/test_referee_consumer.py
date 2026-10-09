@@ -1,12 +1,13 @@
 """Fixed wire/report and lifecycle gates; real UART firmware is tested separately."""
 
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import asdict, replace
 import hashlib
 import importlib.util
 import json
 from pathlib import Path
 import socket
+import signal
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -973,8 +974,9 @@ def test_arena_ack_gate_requires_actual_scoped_identities(corruption):
         arena_module.check_referee_responses(summary, 2, 1000, 1_000_000_000, 91_234)
 
 
-@pytest.mark.parametrize("scenario", [False, True], ids=["arena", "scenario"])
-def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monkeypatch, scenario):
+@pytest.mark.parametrize("scenario,cli", [(False, False), (True, False), (True, True)],
+                         ids=["arena", "scenario", "scenario_cli"])
+def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monkeypatch, scenario, cli):
     import builtins
     calls, imports = [], []
     original_import = builtins.__import__
@@ -992,8 +994,10 @@ def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monk
     monkeypatch.setattr(arena_module, "run_referee", admitted)
     monkeypatch.setattr(module, "run", lambda *args, **options: pytest.fail("Arena dispatch reached old runner"))
     flag = "--scenario" if scenario else "--arena"
-    assert module.main([*paths, flag, "--qemu", "/fixed/qemu"]) == 23
-    assert calls == [(*paths, dict(qemu="/fixed/qemu", **({"scenario": True} if scenario else {})))]
+    assert module.main([*paths, flag, "--qemu", "/fixed/qemu", *(["--cli"] if cli else [])]) == 23
+    options = dict(qemu="/fixed/qemu", **({"scenario": True} if scenario else {}),
+                   **({"cli": True} if cli else {}))
+    assert calls == [(*paths, options)]
     assert imports == ["tools.dm_mc02_arena_smoke"]
     with pytest.raises(SystemExit) as rejected:
         module.main([*paths, flag, "--shared-world"])
@@ -1002,6 +1006,114 @@ def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monk
         with pytest.raises(SystemExit) as rejected:
             module.main([*paths, "--scenario", "--arena"])
         assert rejected.value.code == 2 and len(calls) == 1
+
+
+@pytest.mark.parametrize("profile", [None, "--arena", "--shared-world", "direct"])
+def test_referee_cli_requires_scenario_before_output_or_admission(tmp_path, monkeypatch, profile):
+    output = tmp_path / "never-created"
+    def forbidden(*args, **options):
+        pytest.fail("invalid fixture CLI option reached input/runtime admission")
+    monkeypatch.setattr(arena_module.arena, "resolve_qemu", forbidden)
+    monkeypatch.setattr(arena_module.arena, "regular_file", forbidden)
+    if profile == "direct":
+        with pytest.raises(ValueError, match="requires.*scenario"):
+            arena_module.run_referee(tmp_path / "missing.elf", output, tmp_path, cli=True)
+    else:
+        monkeypatch.setattr(module, "run", forbidden)
+        monkeypatch.setattr(arena_module, "run_referee", forbidden)
+        with pytest.raises(SystemExit) as rejected:
+            module.main([str(tmp_path / "missing.elf"), str(output), str(tmp_path), "--cli",
+                         *([profile] if profile else [])])
+        assert rejected.value.code == 2
+    assert not output.exists()
+
+
+@pytest.mark.parametrize("referee_arena_manifest,outcome", [
+    (False, "success"), (True, "success"), (True, "error"), (True, "interrupt"),
+    (True, "report_mismatch"), (True, "error_report_mismatch")
+], indirect=["referee_arena_manifest"])
+def test_instrumented_cli_uses_actual_module_reload_single_call_and_exact_report(
+        referee_arena_manifest, outcome, tmp_path, monkeypatch, capsys):
+    from sim import cli as cli_module
+    from sim.arena import runtime as arena_runtime
+    from sim.boards.channels import ChannelEvent
+    from sim.scenario import ScenarioManifest, runtime as scenario_runtime
+
+    manifest = referee_arena_manifest
+    scenario = type(manifest) is ScenarioManifest
+    report = {"cli": {}, "uart": ["", ""],
+              "scenario_observation": {"samples": {"east": {}, "west": {}}, "stage": None}}
+    observer = (arena_module.RefereeObservation(report, manifest.arena, scenario=True, scenario_manifest=manifest)
+                if scenario else arena_module.Observation(report, manifest, "normal"))
+    observer.binary = Path(sys.executable).resolve()
+    result = arena_runtime.ArenaResult("fixed-cli-receipt", 0, 1_000_000, 1, (), ())
+    primary = (KeyboardInterrupt("completed consumer interrupted") if outcome == "interrupt"
+               else RuntimeError("completed consumer failed"))
+    primary.add_note("original cleanup detail")
+    failed = outcome in ("error", "interrupt", "error_report_mismatch")
+    calls = []
+    event = arena_runtime.ArenaEvent("east", ChannelEvent("uart1", 123, b"diagnostic\n"))
+    def completed(actual, **options):
+        calls.append((actual, options.copy()))
+        assert options["on_response"] == observer.response
+        options["emit"](event)
+        if failed:
+            raise primary
+        return result
+    observer.original_run = completed
+    monkeypatch.setattr(scenario_runtime if scenario else arena_runtime, "run_manifest", observer.run)
+    if "report_mismatch" in outcome:
+        write_report = cli_module._write_report
+        monkeypatch.setattr(cli_module, "_write_report",
+                            lambda path, payload: write_report(path, {"status": "incorrect"}))
+    saved_argv, saved_signal = sys.argv, signal.getsignal(signal.SIGTERM)
+    report_path = tmp_path / "cli-result.json"
+    if failed:
+        with pytest.raises(type(primary)) as caught:
+            arena_module.invoke_cli(observer, report_path, scenario=scenario)
+        assert caught.value is primary and observer.run_error is primary
+    elif outcome == "report_mismatch":
+        with pytest.raises(AssertionError):
+            arena_module.invoke_cli(observer, report_path, scenario=scenario)
+    else:
+        assert arena_module.invoke_cli(observer, report_path, scenario=scenario) is result
+    assert sys.argv is saved_argv and signal.getsignal(signal.SIGTERM) == saved_signal
+    assert len(calls) == 1 and calls[0][0] == manifest and calls[0][0] is not manifest
+    actual, options = calls[0]
+    expected_options = dict(qemu=str(observer.binary), startup_timeout=10.0,
+                            timeout=20.0 if scenario else 15.0)
+    if not scenario:
+        expected_options["duration"] = .05
+    evidence = report["cli"]
+    assert evidence["runtime_calls"] == 1 and evidence["runtime_options"] == expected_options
+    expected_argv = ["sim", "scenario" if scenario else "arena", "run", str(manifest.path),
+                     *([] if scenario else ["--duration", "0.05"]), "--qemu", str(observer.binary),
+                     "--startup-timeout", "10", "--timeout", "20" if scenario else "15",
+                     "--report", str(report_path)]
+    assert evidence["argv"] == expected_argv
+    entry = arena_module.ROOT / "sim/__main__.py"
+    assert evidence["module_argv"] == [str(entry), *expected_argv[1:]]
+    assert evidence["entrypoint"] == str(entry)
+    assert evidence["entrypoint_sha256"] == hashlib.sha256(entry.read_bytes()).hexdigest()
+    assert report["uart"] == ["diagnostic\n", ""]
+    assert capsys.readouterr().out.count("UART east.uart1 poll_sample_ns=123") == 1
+    if scenario:
+        assert observer.scenario_manifest is actual and observer.manifest is actual.arena
+        assert actual.arena == manifest.arena and actual.arena is not manifest.arena
+        assert actual.referees[0].events == manifest.referees[0].events
+        assert actual.referees[0].events is not manifest.referees[0].events
+        assert evidence["manifest_identity"] == id(actual) and evidence["arena_identity"] == id(actual.arena)
+    if "report_mismatch" in outcome:
+        assert "verification_error" in evidence and not evidence.get("verified")
+        if failed:
+            assert "CLI verification failed" in "\n".join(primary.__notes__)
+    else:
+        payload = ({"status": "failed", "error": str(primary), "error_type": type(primary).__name__,
+                    "notes": ["original cleanup detail"]} if failed else
+                   {"status": "passed", "result": json.loads(json.dumps(asdict(result)))})
+        assert json.loads(report_path.read_text()) == evidence["report"] == payload
+        assert evidence["exit_code"] == (130 if outcome == "interrupt" else 1 if failed else 0)
+        assert evidence["verified"]
 
 
 @pytest.mark.parametrize("corruption", ["cadence", "missing_due", "period", "ready", "admission", "sequence"])
@@ -1127,10 +1239,20 @@ def completed_arena_receipt(tmp_path, monkeypatch):
             state.events.append("published passed")
         write_json(path, report)
     monkeypatch.setattr(source_module, "write_json", observed_write)
+    invoke_cli = arena_module.invoke_cli
+    def observed_cli(observer, path, **options):
+        result = invoke_cli(observer, path, **options)
+        if state.mode == "cli_report":
+            path.write_text('{"status":"changed after verification"}\n')
+        elif state.mode == "cli_missing_verified":
+            del observer.report["cli"]["verified"]
+        return result
+    monkeypatch.setattr(arena_module, "invoke_cli", observed_cli)
 
     def completed(manifest, **options):
         state.calls.append((manifest, options.copy()))
-        observer, report = options["emit"].__self__, options["emit"].__self__.report
+        observer = options["on_response"].__self__
+        report = observer.report
         closed_socket = SimpleNamespace(fileno=lambda: -1)
         observer.sockets = [(str(tmp_path / f"removed-{index}.{name}"), closed_socket)
             for index in range(2) for name in ("uart1", "uart7", "can1", "cosim")]
@@ -1197,23 +1319,42 @@ def completed_arena_receipt(tmp_path, monkeypatch):
     return elf, state
 
 
-@pytest.mark.parametrize("mode,scenario", [
-    (mode, False) for mode in ("success", "missing_case", "missing_summary", "missing_watchdog",
-                              "cleanup", "uart_socket", "source", "primary")
-] + [(mode, True) for mode in ("success", "missing_case", "cleanup", "source", "primary",
-                              "missing_control", "late_baseline", "scenario_source")])
+@pytest.mark.parametrize("mode,scenario,cli", [
+    (mode, False, False) for mode in ("success", "missing_case", "missing_summary", "missing_watchdog",
+                                     "cleanup", "uart_socket", "source", "primary")
+] + [(mode, True, False) for mode in ("success", "missing_case", "cleanup", "source", "primary",
+                                     "missing_control", "late_baseline", "scenario_source")]
+  + [(mode, True, True) for mode in ("success", "missing_case", "source", "primary",
+                                    "cli_report", "cli_missing_verified")])
 def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
-        completed_arena_receipt, tmp_path, mode, scenario):
+        completed_arena_receipt, tmp_path, mode, scenario, cli):
     elf, state = completed_arena_receipt
     state.mode = mode
     output = tmp_path / "result"
     expected = 0 if mode == "success" else 130 if mode == "primary" else 1
-    assert arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable, scenario=scenario) == expected
+    saved_argv, saved_signal = sys.argv, signal.getsignal(signal.SIGTERM)
+    assert arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable,
+                                   scenario=scenario, cli=cli) == expected
+    assert sys.argv is saved_argv and signal.getsignal(signal.SIGTERM) == saved_signal
     report_path = output / "report.json"
     report = json.loads(report_path.read_text())
     assert len(state.calls) == 1
     options = state.calls[0][1]
     assert (options["duration"], options["startup_timeout"], options["timeout"]) == (1., 10., 20.)
+    if cli:
+        evidence = report["cli"]
+        assert evidence["runtime_calls"] == 1
+        assert bool(evidence.get("verified")) is (mode != "cli_missing_verified")
+        if mode in ("source", "primary", "cli_report", "cli_missing_verified"):
+            assert not evidence.get("source_preserved")
+        else:
+            assert evidence["source_preserved"]
+        assert evidence["manifest_equal"] and evidence["manifest_distinct"]
+        assert evidence["arena_equal"] and evidence["arena_distinct"]
+        assert evidence["exit_code"] == (130 if mode == "primary" else 0)
+        assert "--duration" not in evidence["argv"] and evidence["argv"][1:3] == ["scenario", "run"]
+        if mode != "cli_report":
+            assert json.loads(Path(evidence["report_path"]).read_text()) == evidence["report"]
     if scenario:
         assert report["scenario"] and report["scenario_input"]["duration_ns"] == 1_000_000_000
         assert [batch[0] for batch in options["referee_events"]] == ["east", "west"]
@@ -1232,7 +1373,8 @@ def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
                 "cleanup": "cleanup incomplete", "uart_socket": "cleanup incomplete",
                 "source": "source state changed", "primary": "interruption",
                 "missing_control": "observation control", "late_baseline": "baseline/sample",
-                "scenario_source": "source state changed"}[mode] in errors
+                "scenario_source": "source state changed", "cli_report": "AssertionError",
+                "cli_missing_verified": "actual CLI outcome was not verified"}[mode] in errors
         if mode == "missing_case":
             assert report["missing"]["west"] == ["control.rx"]
         if mode == "primary":
@@ -1242,5 +1384,5 @@ def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
             assert "source state changed" in "\n".join(report["notes"])
     saved = report_path.read_bytes()
     with pytest.raises(ValueError, match="refusing to overwrite"):
-        arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable, scenario=scenario)
+        arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable, scenario=scenario, cli=cli)
     assert report_path.read_bytes() == saved and len(state.calls) == 1

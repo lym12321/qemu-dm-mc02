@@ -106,26 +106,38 @@ class Observation:
 
     def run(self, manifest, **options):
         """Observe the actual CLI's single call; never execute another loop."""
-        evidence = self.report["cli"]
-        evidence["runtime_calls"] += 1
-        assert evidence["runtime_calls"] == 1
-        assert manifest == self.manifest and manifest is not self.manifest
-        entrypoint = Path(sys.modules["__main__"].__file__).resolve()
-        assert entrypoint == ROOT / "sim/__main__.py"
-        evidence.update(entrypoint=str(entrypoint), entrypoint_sha256=sha(entrypoint),
-            module_argv=list(sys.argv), actual_sources=source_origins(),
-            runtime_options={key: str(value) if key == "qemu" else value
-                for key, value in options.items() if key != "emit"})
-        assert evidence["runtime_options"] == {
-            "duration": .05, "qemu": str(self.binary), "startup_timeout": 10., "timeout": 15.}
-        emit = options.pop("emit")
-        assert callable(emit)
+        return self.record_cli_run(manifest, options, expected_manifest=self.manifest,
+            expected_options={"duration": .05, "qemu": str(self.binary),
+                              "startup_timeout": 10., "timeout": 15.})
 
-        def observed_emit(event):
-            emit(event)
-            self.emit(event)
-
+    def record_cli_run(self, manifest, options, *, expected_manifest, expected_options,
+                       scenario=False):
+        """Retain one actual module call, including admission failures."""
         try:
+            evidence = self.report["cli"]
+            evidence["runtime_calls"] += 1
+            entrypoint = Path(sys.modules["__main__"].__file__).resolve()
+            evidence.update(entrypoint=str(entrypoint), entrypoint_sha256=sha(entrypoint),
+                module_argv=list(sys.argv), actual_sources=source_origins(),
+                runtime_options={key: str(value) if key == "qemu" else value
+                    for key, value in options.items() if key != "emit"})
+            assert evidence["runtime_calls"] == 1
+            assert manifest == expected_manifest and manifest is not expected_manifest
+            assert entrypoint == ROOT / "sim/__main__.py"
+            assert evidence["runtime_options"] == expected_options
+            emit = options.pop("emit")
+            assert callable(emit)
+            if scenario:
+                assert manifest.arena == expected_manifest.arena and manifest.arena is not expected_manifest.arena
+                evidence.update(manifest_equal=True, manifest_distinct=True,
+                    arena_equal=True, arena_distinct=True, manifest_identity=id(manifest),
+                    arena_identity=id(manifest.arena))
+                self.scenario_manifest, self.manifest = manifest, manifest.arena
+
+            def observed_emit(event):
+                emit(event)
+                self.emit(event)
+
             self.run_result = self.original_run(manifest, **options,
                 emit=observed_emit, on_response=self.response)
         except BaseException as error:
@@ -409,12 +421,17 @@ class Observation:
             self.qmps[index].command("system_reset" if self.mode == "reset" else "quit")
 
 
-def invoke_cli(observer, report_path):
+def invoke_cli(observer, report_path, *, scenario=False):
     """Run the selected package's real module entry within this instrumented fixture."""
     evidence = observer.report["cli"]
-    argv = ["sim", "arena", "run", str(observer.manifest.path), "--duration", "0.05",
-        "--qemu", str(observer.binary), "--startup-timeout", "10", "--timeout", "15",
-        "--report", str(report_path)]
+    if scenario:
+        argv = ["sim", "scenario", "run", str(observer.scenario_manifest.path),
+            "--qemu", str(observer.binary), "--startup-timeout", "10", "--timeout", "20",
+            "--report", str(report_path)]
+    else:
+        argv = ["sim", "arena", "run", str(observer.manifest.path), "--duration", "0.05",
+            "--qemu", str(observer.binary), "--startup-timeout", "10", "--timeout", "15",
+            "--report", str(report_path)]
     evidence.update(argv=argv, report_path=str(report_path), runtime_calls=0)
     previous_argv = sys.argv
     try:
@@ -450,6 +467,16 @@ def invoke_cli(observer, report_path):
     if observer.run_error is not None:
         raise observer.run_error
     return observer.run_result
+
+
+def check_cli_sources(observer, current):
+    """The runpy module object is temporary; its actual entry file is retained."""
+    evidence = observer.report["cli"]
+    assert all(current[name] == value for name, value in evidence["actual_sources"].items()
+               if name != "__main__")
+    assert sha(evidence["entrypoint"]) == evidence["entrypoint_sha256"]
+    assert sha(evidence["report_path"]) == evidence["report_sha256"]
+    evidence["source_preserved"] = True
 
 
 REFEREE_IDS = {"east": 3, "west": 103}
@@ -648,6 +675,12 @@ class RefereeObservation(Observation):
         self.sockets = []
         self.buffers = {name: bytearray() for name in REFEREE_IDS}
         self.controls = {}
+
+    def run(self, manifest, **options):
+        """The actual Scenario CLI reload becomes the queue identity source."""
+        return self.record_cli_run(manifest, options, expected_manifest=self.scenario_manifest,
+            expected_options={"qemu": str(self.binary), "startup_timeout": 10., "timeout": 20.},
+            scenario=True)
 
     def channels(self, *, uarts=None, **options):
         if self.scenario and len(self.controls) >= len(self.manifest.robots):
@@ -963,8 +996,10 @@ class RefereeObservation(Observation):
             raise ValueError("watchdog event during Arena referee consumer")
 
 
-def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
+def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
     """One existing Arena execution, with passed published after cleanup checks."""
+    if cli and not scenario:
+        raise ValueError("referee --cli requires --scenario")
     from tools.dm_mc02_referee_test import source_snapshot, checkout_snapshot, write_json
     output = Path(output).resolve()
     if output.exists():
@@ -998,6 +1033,10 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
             "West UART1 a5 only releases application observation after east changed report; it does not change the world or synchronize CPUs.")
         report["limitations"].append(
             "West sample2 requires all four fresh public timestamps after the firmware's post-a5 snapshot; this does not identify an exact host publication batch.")
+    if cli:
+        report["cli"] = {}
+        report["limitations"].append(
+            "Instrumented runpy sim module entry in the existing fixture subprocess; not an unmodified external python -m sim run.")
     write_json(output / "report.json", report)
     observer = primary = binary = manifest = scenario_manifest = None
     previous_signal = signal.getsignal(signal.SIGTERM)
@@ -1024,7 +1063,9 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
         directory = output / "arena"
         directory.mkdir()
         if scenario:
-            from sim.scenario.runtime import run_manifest as run_scenario
+            from sim.scenario import runtime as scenario_runtime
+
+            run_scenario = scenario_runtime.run_manifest
 
             scenario_manifest = write_scenario_manifest(directory, (elf, elf))
             manifest = scenario_manifest.arena
@@ -1036,6 +1077,7 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
         report["inputs_before"], report["checkout_before"] = inputs(), checkout_snapshot(firmware)
         report["actual_sources_before"] = source_origins()
         observer = RefereeObservation(report, manifest, scenario=scenario, scenario_manifest=scenario_manifest)
+        observer.binary = binary
         overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
             "connect_unix": "connect", "SharedWorldRuntime": "shared",
             "RefereeEngine": "engine", "RefereeUartEndpoint": "endpoint"}
@@ -1046,7 +1088,11 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
         with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
             options = dict(qemu=binary, startup_timeout=10., timeout=20.,
                            emit=observer.emit, on_response=observer.response)
-            if scenario:
+            if cli:
+                observer.original_run = run_scenario
+                with patch.object(scenario_runtime, "run_manifest", observer.run):
+                    result = invoke_cli(observer, output / "cli-result.json", scenario=True)
+            elif scenario:
                 result = run_scenario(scenario_manifest, **options)
             else:
                 result = arena.run_manifest(manifest, duration=1., **options)
@@ -1157,6 +1203,10 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
                     or any(report["actual_sources_after"].get(name) != value
                            for name, value in report["actual_sources_before"].items())):
                 raise ValueError("Arena referee actual input/source state changed")
+            if cli:
+                if observer is None or not report["cli"].get("verified"):
+                    raise ValueError("Scenario referee actual CLI outcome was not verified")
+                check_cli_sources(observer, report["actual_sources_after"])
             report["source_preserved"] = True
         verify(sources)
         def watchdogs():
@@ -1259,11 +1309,7 @@ def main(args):
         assert all(current[name] == value for name, value in origins.items())
         assert all(sha(path) == digest for path, digest in report["inputs"].items())
         if args.cli:
-            entry_sources = report["cli"]["actual_sources"]
-            assert all(current[name] == value for name, value in entry_sources.items() if name != "__main__")
-            assert sha(report["cli"]["entrypoint"]) == report["cli"]["entrypoint_sha256"]
-            assert sha(report["cli"]["report_path"]) == report["cli"]["report_sha256"]
-            report["cli"]["source_preserved"] = True
+            check_cli_sources(observer, current)
         report.update(actual_sources=current, source_preserved=True)
     except BaseException as error:
         verification_errors.append(error)
