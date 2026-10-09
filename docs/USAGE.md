@@ -557,6 +557,25 @@ tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
 它尚不验证底盘固件闭环、双板 Arena 裁判接线、实物标定或 CPU 时间屏障；
 MuJoCo 可选依赖需要先按环境准备中的说明安装。
 
+双板周期消费者使用默认关闭的 `ArenaRefereeTestDebug` 或
+`ArenaRefereeTestRelease` 固件，以及同一 runner 的 `--arena`：
+
+```bash
+# 在 trobot 中构建
+cmake --preset ArenaRefereeTestDebug
+cmake --build --preset ArenaRefereeTestDebug
+# 在 dm-mc02-qemu 的 MuJoCo 环境中运行
+tools/run-trobot-referee-test.sh ../trobot/build/ArenaRefereeTestDebug/trobot.elf \
+  build/test-results/referee-arena-debug ../trobot --arena
+```
+
+该 profile 调用同一 Arena runtime，两个 QEMU 使用同一 ELF，分别消费 ID 3/103
+的固定状态。各板在 UART7 初始化后输出 ready，检查三次完整新样本、四组
+payload 及各组实际/前次 BSP 时间戳；报告保留缺失项和 `plant.physics` SKIP。
+共享世界运行 1 秒，快照周期为 100 ms，startup/active host 期限为 10/20 秒。
+固件的 1000 ms 等待属于各自 guest 时间，不能由此推断 CPU 与世界同步。
+`--arena` 与 `--shared-world` 互斥，原握手及 partial-frame 测试仍使用原 preset。
+
 ## Contents
 
 - [项目范围](#project-scope)

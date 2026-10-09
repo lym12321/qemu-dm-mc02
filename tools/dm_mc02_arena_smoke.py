@@ -8,6 +8,7 @@ owns the Bosch quantization oracle. This gate establishes no CPU time barrier.
 """
 
 from contextlib import contextmanager
+from collections import Counter
 from dataclasses import asdict
 import argparse
 import errno
@@ -21,6 +22,7 @@ import struct
 import sys
 import time
 from unittest.mock import patch
+from crccheck.crc import Crc8MaximDow, Crc16Mcrf4Xx
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -42,7 +44,18 @@ def append_bounded(report, key, event, maximum=2048):
     report[key].append(event)
 
 
-def write_manifests(directory, firmwares):
+def close_observation_failure(owner, label, primary):
+    """A factory still owns an acquired resource until it returns to Arena."""
+    try:
+        owner.close()
+    except BaseException as error:
+        primary.add_note(f"{label} observer setup cleanup failed: {type(error).__name__}: {error}")
+        if error is not primary:
+            for note in tuple(getattr(error, "__notes__", ())):
+                primary.add_note(note)
+
+
+def write_manifests(directory, firmwares, *, referees=False):
     """Distinct child cwd and reversed aliases exercise admitted composition."""
     for index, name in enumerate(("alpha", "bravo")):
         child = directory / name
@@ -57,9 +70,10 @@ def write_manifests(directory, firmwares):
                 "id": identifier, "joint": "wheel_" + corner}
                 for identifier, corner in enumerate(("fl", "fr", "rl", "rr"), 1)},
             "physics": {"backend": "mujoco", "model": str(ROOT / "models/four_wheel.xml")},
-            "ready": {"endpoint": "mcu.uart1", "text": f"ARENA_READY={index}\n"},
+            "ready": {"endpoint": "mcu.uart1", "text": (
+                "TTEST READY referee.arena.ready 0 0\n" if referees else f"ARENA_READY={index}\n")},
         }
-        if index == 0:
+        if index == 0 and not referees:
             script = ("import json,pathlib,sys,time; "
                 "print(json.dumps({'cwd':str(pathlib.Path.cwd()),'argv':sys.argv[1:]}),flush=True); "
                 "deadline=time.monotonic()+20\n"
@@ -74,6 +88,8 @@ def write_manifests(directory, firmwares):
         "robots": {
             "west": {"manifest": "bravo/robot.yaml", "prefix": "bravo/", "physics": "shared-world"},
             "east": {"manifest": "alpha/robot.yaml", "prefix": "alpha/", "physics": "shared-world"}}}
+    if referees:
+        document["referees"] = {name: referee_configuration(name) for name in REFEREE_IDS}
     path = directory / "arena.yaml"
     path.write_text(json.dumps(document))
     return load_manifest(path)
@@ -178,25 +194,29 @@ class Observation:
 
     def qmp(self, *args, **kwargs):
         qmp = self.original_qmp(*args, **kwargs)
-        self.qmps.append(qmp)
-        command = qmp.command
-        index = len(self.qmps) - 1
+        try:
+            self.qmps.append(qmp)
+            command = qmp.command
+            index = len(self.qmps) - 1
 
-        def observed_command(name, arguments=None):
-            try:
-                value = command(name, arguments)
-            except BaseException as error:
-                append_bounded(self.report, "qmp_events", {
-                    "peer": index, "command": name,
-                    "error": f"{type(error).__name__}: {error}"}, 16)
-                raise
-            if name in ("cont", "stop", "system_reset", "quit"):
-                append_bounded(self.report, "qmp_events", {
-                    "peer": index, "command": name, "result": value}, 16)
-            return value
+            def observed_command(name, arguments=None):
+                try:
+                    value = command(name, arguments)
+                except BaseException as error:
+                    append_bounded(self.report, "qmp_events", {
+                        "peer": index, "command": name,
+                        "error": f"{type(error).__name__}: {error}"}, 16)
+                    raise
+                if name in ("cont", "stop", "system_reset", "quit"):
+                    append_bounded(self.report, "qmp_events", {
+                        "peer": index, "command": name, "result": value}, 16)
+                return value
 
-        qmp.command = observed_command
-        return qmp
+            qmp.command = observed_command
+            return qmp
+        except BaseException as error:
+            close_observation_failure(qmp, "QMP", error)
+            raise
 
     def can(self, sock):
         stream = self.original_can(sock)
@@ -430,6 +450,532 @@ def invoke_cli(observer, report_path):
     if observer.run_error is not None:
         raise observer.run_error
     return observer.run_result
+
+
+REFEREE_IDS = {"east": 3, "west": 103}
+REFEREE_PAYLOADS = {
+    "east": ("0100000807060504030201", "03026400c80000006400500005",
+             "000000000000000028000a001400", "050900070b0d00fe"),
+    "west": ("0200000807060504030201", "67024600c80000006400780006",
+             "000000000000000029000c001900", "08110013171d0080"),
+}
+REFEREE_REQUIRED = frozenset(("control.rx", "reset.poweron", "bsp.init", "task.stack",
+    "referee.executor", "referee.uart", *(f"referee.arena.{sample}.{group}"
+        for sample in range(1, 4) for group in (
+            "fresh", "game", "robot", "power", "buff", "id",
+            "ts.game", "ts.robot", "ts.power", "ts.buff"))))
+
+
+def referee_configuration(name):
+    """Stable explicit profiles; no script or guest/world time relationship."""
+    west = name == "west"
+    return {"uart": "mcu.uart7", "durations": {"countdown_s": 1, "battle_s": 1},
+        "initial": {
+            "game": {"game_type": 2 if west else 1, "game_progress": 0,
+                     "stage_remain_time": 0, "sync_timestamp": 0x0102030405060708},
+            "robot": {"robot_id": REFEREE_IDS[name], "robot_level": 2,
+                "current_hp": 70 if west else 100, "maximum_hp": 200, "cooling_per_s": 0,
+                "heat_limit": 100, "chassis_power_limit": 120 if west else 80,
+                "power_outputs": 6 if west else 5},
+            "power_heat": {"buffer_energy_j": 41 if west else 40,
+                           "heat_17mm": 12 if west else 10, "heat_42mm": 25 if west else 20},
+            "buff": {"recovery_percent": 8 if west else 5, "cooling_per_s": 17 if west else 9,
+                "defence_percent": 19 if west else 7, "vulnerability_percent": 23 if west else 11,
+                "attack_percent": 29 if west else 13, "remaining_energy": 0x80 if west else 0xfe}}}
+
+
+def check_referee_wire(wire, name, sequence):
+    """Independent literal payloads and pinned CRC, without production encoders."""
+    if type(wire) is not bytes or len(wire) != 82:
+        raise ValueError("Arena referee requires a complete82-byte snapshot")
+    cursor = 0
+    for offset, (command, payload_hex) in enumerate(zip(
+            (0x0001, 0x0201, 0x0202, 0x0204), REFEREE_PAYLOADS[name])):
+        payload = bytes.fromhex(payload_hex)
+        raw = wire[cursor:cursor + len(payload) + 9]
+        if (raw[:4] != struct.pack("<BHB", 0xa5, len(payload), (sequence + offset) % 256)
+                or raw[4] != Crc8MaximDow.calc(raw[:4], initvalue=0xff)
+                or raw[5:7] != struct.pack("<H", command) or raw[7:-2] != payload
+                or int.from_bytes(raw[-2:], "little") != Crc16Mcrf4Xx.calc(raw[:-2])):
+            raise ValueError("Arena referee wire disagrees with member literal/sequence/CRC")
+        cursor += len(raw)
+
+
+def check_referee_case(row, name):
+    status, label = row["status"], row["name"]
+    actual, expected = row["actual"], row["expected"]
+    if any(type(value) is not int or not 0 <= value <= 0xffffffff for value in (actual, expected)):
+        raise ValueError("Arena firmware report requires uint32 fields")
+    if status == "SKIP" and label == "plant.physics" and actual == expected == 0:
+        return
+    if status != "PASS" or label not in REFEREE_REQUIRED:
+        raise ValueError("failed or unexpected Arena firmware case: " + label)
+    if label == "task.stack":
+        valid = expected == 64 and actual >= 64
+    elif label == "reset.poweron":
+        valid = actual == expected == 0x800000
+    elif label.endswith(".id"):
+        valid = actual == expected == REFEREE_IDS[name]
+    elif ".ts." in label:
+        valid = actual != 0 and actual != expected
+    else:
+        valid = actual == expected == (1 if label.endswith(".fresh") else 0)
+    if not valid:
+        raise ValueError("Arena firmware fields disagree: " + label)
+
+
+def check_referee_coverage(rows, summaries, name):
+    for row in rows:
+        check_referee_case(row, name)
+    passed = Counter(row["name"] for row in rows if row["status"] == "PASS")
+    if (passed != Counter({label: 1 for label in REFEREE_REQUIRED})
+            or [row["name"] for row in rows if row["status"] == "SKIP"] != ["plant.physics"]):
+        raise ValueError("missing/duplicate Arena firmware coverage")
+    for group in ("game", "robot", "power", "buff"):
+        previous = 0
+        for sample in range(1, 4):
+            row = next(row for row in rows if row["name"] == f"referee.arena.{sample}.ts.{group}")
+            if row["expected"] != previous:
+                raise ValueError("Arena firmware timestamp history disagrees: " + group)
+            previous = row["actual"]
+    if summaries != [{"kind": kind, "values": [36, 0, 1]} for kind in ("PHASE", "DONE")]:
+        raise ValueError("Arena firmware summaries disagree")
+
+
+def check_referee_responses(summary, wire_session, steps, end_ns, reset_qemu_ns):
+    """Check the retained actual RESET and first/last ACK identities."""
+    reset = summary["reset"]
+    if (reset is None or reset["header"]["kind"] != codec.RESET_ACK
+            or reset["header"]["flags"] != wire_session
+            or (reset["header"]["step_id"], reset["header"]["t_sim_ns"],
+                reset["header"]["dt_ns"]) != (0, 0, 0)
+            or reset["decoded"]["status"] != codec.STATUS_OK
+            or reset["decoded"]["virtual_time_ns"] != reset_qemu_ns):
+        raise ValueError("Arena referee scoped RESET_ACK identity disagrees")
+    if summary["step_ack_count"] != steps or steps <= 0:
+        raise ValueError("Arena referee STEP_ACK coverage disagrees")
+    for row, step, target in ((summary["first_step_ack"], 1, 1_000_000),
+                              (summary["last_step_ack"], steps, end_ns)):
+        if (row is None or row["header"]["kind"] != codec.STEP_ACK
+                or row["header"]["flags"] != wire_session
+                or (row["header"]["step_id"], row["header"]["t_sim_ns"],
+                    row["header"]["dt_ns"]) != (step, target, 1_000_000)
+                or row["decoded"]["status"] != codec.STATUS_OK):
+            raise ValueError("Arena referee scoped STEP_ACK identity disagrees")
+
+
+def check_referee_publications(rows, referee, end_ns, ready_logical_ns):
+    if (not rows or not all(row.get("accepted") and row.get("verified") for row in rows)
+            or referee.publications != len(rows) or referee.period_ns != 100_000_000
+            or referee.first_logical_ns != rows[0]["logical_ns"]
+            or referee.last_logical_ns != rows[-1]["logical_ns"]
+            or referee.first_logical_ns != ready_logical_ns
+            or len(rows) != 1 + (end_ns - rows[0]["logical_ns"]) // 100_000_000
+            or any(row["logical_ns"] != rows[0]["logical_ns"] + index * 100_000_000
+                   for index, row in enumerate(rows))
+            or referee.next_sequence != (4 * len(rows)) % 256):
+        raise ValueError("Arena referee scoped publication quantities/cadence disagree")
+
+
+class RefereeObservation(Observation):
+    """Borrow existing owners; observe this UART consumer with bounded evidence."""
+
+    def __init__(self, report, manifest):
+        super().__init__(report, manifest, "normal")
+        self.engines, self.endpoints = [], []
+        self.sockets = []
+        self.buffers = {name: bytearray() for name in REFEREE_IDS}
+
+    def connect(self, *args, **options):
+        sock = self.original_connect(*args, **options)
+        try:
+            self.sockets.append((str(args[0]), sock))
+            return sock
+        except BaseException as error:
+            close_observation_failure(sock, "socket", error)
+            raise
+
+    @contextmanager
+    def qemu(self, command, **options):
+        with super().qemu(command, **options) as owner:
+            primary = None
+            try:
+                yield owner
+            except BaseException as error:
+                primary = error
+                raise
+            finally:
+                try:
+                    with owner.stderr_path.open("rb") as stream:
+                        stream.seek(max(0, owner.stderr_path.stat().st_size - 12000))
+                        self.report["cleanup"][self.owners.index(owner)]["stderr_tail"] = (
+                            stream.read(12000).decode("utf-8", errors="replace"))
+                except BaseException as error:
+                    if primary is None:
+                        raise
+                    primary.add_note(f"Arena referee stderr capture failed: {type(error).__name__}: {error}")
+                    if error is not primary:
+                        for note in tuple(getattr(error, "__notes__", ())):
+                            primary.add_note(note)
+
+    def qmp(self, *args, **options):
+        qmp = super().qmp(*args, **options)
+        try:
+            index = len(self.qmps) - 1
+            name = self.manifest.robots[index].name
+            command, close = qmp.command, qmp.close
+            row = {"attempts": 0, "completed": False}
+            self.report["qmp_cleanup"].append(row)
+            def observed_command(operation, arguments=None):
+                result = command(operation, arguments)
+                if operation == "stop":
+                    self.watchdog(index, name, "paused")
+                return result
+            def observed_close():
+                row["attempts"] += 1
+                # Preserve the native atexit registration's bound method identity.
+                qmp.close = close
+                try:
+                    result = close()
+                    row["completed"] = True
+                    return result
+                finally:
+                    qmp.close = observed_close
+            qmp.command, qmp.close = observed_command, observed_close
+            return qmp
+        except BaseException as error:
+            close_observation_failure(qmp, "QMP", error)
+            raise
+
+    def world(self, manifest):
+        plant = self.original_world(manifest)
+        try:
+            self.plant = plant
+            native = plant.physics
+            self.report["world"] = {"model": str(manifest.world.model),
+                "devices": len(plant.devices), "distinct_buses": len({id(item.bus) for item in plant.devices})}
+            reset, step, close = native.reset, native.step, native.close
+            calls = self.report["native_calls"]
+            def observed_reset():
+                calls["reset"] += 1
+                return reset()
+            def observed_step(dt_ns):
+                calls["attempts"] += 1
+                result = step(dt_ns)
+                calls["steps"] += 1
+                calls["total_ns"] += dt_ns
+                calls["minimum_ns"] = dt_ns if calls["minimum_ns"] is None else min(calls["minimum_ns"], dt_ns)
+                calls["maximum_ns"] = dt_ns if calls["maximum_ns"] is None else max(calls["maximum_ns"], dt_ns)
+                return result
+            def observed_close():
+                calls["close"] += 1
+                return close()
+            native.reset, native.step, native.close = observed_reset, observed_step, observed_close
+            return plant
+        except BaseException as error:
+            close_observation_failure(plant, "world", error)
+            raise
+
+    def engine(self, *args, **options):
+        engine = self.original_engine(*args, **options)
+        try:
+            self.engines.append(engine)
+            return engine
+        except BaseException as error:
+            close_observation_failure(engine, "referee engine", error)
+            raise
+
+    def endpoint(self, *args, **options):
+        endpoint = self.original_endpoint(*args, **options)
+        try:
+            self.endpoints.append(endpoint)
+            return endpoint
+        except BaseException as error:
+            close_observation_failure(endpoint, "referee endpoint", error)
+            raise
+
+    def shared(self, *args, **options):
+        runtime = self.original_shared(*args, **options)
+        try:
+            self.runtime = runtime
+            publish = runtime.publish_referee
+            def observed_publish(name, *, deadline):
+                if name not in self.report["ready"]:
+                    raise ValueError("Arena referee publication preceded actual local ready")
+                item = next(item for item in runtime.referees if item.name == name)
+                rows = self.report["publications"][name]
+                sequence = (4 * len(rows)) % 256
+                if item.endpoint.next_sequence != sequence:
+                    raise ValueError("Arena referee outgoing sequence owner disagrees")
+                row = {"logical_ns": runtime.t_sim_ns, "sequence": sequence, "accepted": False}
+                append_bounded(self.report["publications"], name, row, 127)
+                wire = publish(name, deadline=deadline)
+                row.update(wire_hex=wire.hex(), accepted=True)
+                check_referee_wire(wire, name, sequence)
+                row["verified"] = True
+                return wire
+            runtime.publish_referee = observed_publish
+            return runtime
+        except BaseException as error:
+            close_observation_failure(runtime, "shared world", error)
+            raise
+
+    def response(self, name, frame, decoded):
+        row = {"header": asdict(frame.header), "payload_hex": frame.payload.hex(),
+               "decoded": None if decoded is None else asdict(decoded)}
+        summary = self.report["responses"][name]
+        summary["count"] += 1
+        if summary["first"] is None:
+            summary["first"] = row
+        summary["last"] = row
+        if frame.header.kind == codec.RESET_ACK:
+            if summary["reset"] is not None:
+                raise ValueError("duplicate Arena RESET_ACK observation")
+            summary["reset"] = row
+        elif frame.header.kind == codec.STEP_ACK:
+            summary["step_ack_count"] += 1
+            if summary["first_step_ack"] is None:
+                summary["first_step_ack"] = row
+            summary["last_step_ack"] = row
+        elif frame.header.kind == codec.STEP_DONE:
+            summary["done_count"] += 1
+            summary["last_done"] = row
+
+    def emit(self, event):
+        if event.event.endpoint != "uart1":
+            raise ValueError("unexpected Arena referee guest UART output")
+        index = [item.name for item in self.manifest.robots].index(event.name)
+        text = event.event.data.decode("ascii")
+        if len(self.report["uart"][index]) + len(text) > 12000:
+            raise BufferError("Arena referee UART observation exhausted")
+        self.report["uart"][index] += text
+        buffer = self.buffers[event.name]
+        if len(buffer) + len(event.event.data) > 12000:
+            raise BufferError("Arena referee line buffer exhausted")
+        buffer.extend(event.event.data)
+        while b"\n" in buffer:
+            raw, _, suffix = buffer.partition(b"\n")
+            buffer[:] = suffix
+            line = raw.decode("ascii").strip()
+            if not line.startswith("TTEST "):
+                continue
+            fields = line.split()
+            if len(fields) != 5:
+                raise ValueError("invalid Arena firmware report: " + line)
+            if fields[1] in ("PHASE", "DONE"):
+                row = {"kind": fields[1], "values": list(map(int, fields[2:]))}
+                append_bounded(self.report["summaries"], event.name, row, 2)
+                if fields[1] == "DONE":
+                    check_referee_coverage(self.report["cases"][event.name],
+                                           self.report["summaries"][event.name], event.name)
+                    self.watchdog(index, event.name, "done")
+                continue
+            row = {"status": fields[1], "name": fields[2],
+                   "actual": int(fields[3]), "expected": int(fields[4])}
+            if fields[1] == "READY":
+                if (fields[2] != "referee.arena.ready" or row["actual"] != 0 or row["expected"] != 0
+                        or event.name in self.report["ready"]):
+                    raise ValueError("unexpected Arena referee ready marker")
+                self.report["ready"][event.name] = {"poll_sample_qemu_ns": event.event.timestamp_ns,
+                                                    "logical_ns": self.runtime.t_sim_ns}
+            else:
+                append_bounded(self.report["cases"], event.name, row, 37)
+                check_referee_case(row, event.name)
+
+    def watchdog(self, index, name, stage):
+        from tools.dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
+        deadline = self.owners[0].start_ns / 1e9 + 20
+        value = deadline_qmp_call(self.qmps[index], deadline, "Arena referee watchdog",
+                                 lambda: read_iwdg_timeouts(self.qmps[index]))
+        timeouts, text = value
+        self.report["watchdogs"].setdefault(name, {})[stage] = {"timeouts": timeouts, "diagnostics": text}
+        if timeouts or "window-violations=0" not in text:
+            raise ValueError("watchdog event during Arena referee consumer")
+
+
+def run_referee(elf, output, firmware, *, qemu=None):
+    """One existing Arena execution, with passed published after cleanup checks."""
+    from tools.dm_mc02_referee_test import source_snapshot, checkout_snapshot, write_json
+    output = Path(output).resolve()
+    if output.exists():
+        raise ValueError("refusing to overwrite existing Arena referee result directory")
+    output.mkdir(parents=True)
+    report = {"result": "failed", "arena": True, "errors": [], "notes": [],
+        "cleanup": [], "qmp_events": [], "qmp_cleanup": [], "uart": ["", ""],
+        "cases": {name: [] for name in REFEREE_IDS}, "summaries": {name: [] for name in REFEREE_IDS},
+        "publications": {name: [] for name in REFEREE_IDS}, "ready": {}, "watchdogs": {},
+        "responses": {name: {"count": 0, "first": None, "last": None, "reset": None,
+            "step_ack_count": 0, "first_step_ack": None, "last_step_ack": None,
+            "done_count": 0, "last_done": None} for name in REFEREE_IDS},
+        "native_calls": {"reset": 0, "attempts": 0, "steps": 0, "total_ns": 0,
+                         "minimum_ns": None, "maximum_ns": None, "close": 0},
+        "limitations": ["Actual dual UART7/HAL/DMA/msg consumer of stable explicit profiles.",
+            "Guest1000ms waits, independent QEMU epochs and shared logical100ms periods are not a CPU barrier.",
+            "Publication counts mean transport admission; no exact host batch to firmware observation pairing.",
+            "World/ACK evidence is a constant-space summary, not a full trace; response callbacks are incomplete.",
+            "No official independent command rates, live adjudication, calibrated physics, pacing or RTF claim.",
+            "Firmware plant.physics remains an explicit SKIP."],
+        "missing": {name: sorted(REFEREE_REQUIRED) for name in REFEREE_IDS},
+        "skips": {name: [] for name in REFEREE_IDS},
+        "missing_skips": {name: ["plant.physics"] for name in REFEREE_IDS}}
+    write_json(output / "report.json", report)
+    observer = primary = binary = manifest = None
+    previous_signal = signal.getsignal(signal.SIGTERM)
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(f"Arena referee interrupted by signal {signum}")
+    signal.signal(signal.SIGTERM, interrupted)
+    def inputs():
+        result = source_snapshot(elf, binary, firmware)
+        paths = [ROOT / name for name in ("models/two_four_wheel.xml", "models/four_wheel.xml",
+            "models/mujoco-LICENSE.txt", "flake.lock", "tools/dm_mc02_arena_smoke.py",
+            "tools/dm_mc02_shared_world_smoke.py")]
+        if manifest is not None:
+            paths += [manifest.path, *(item.robot.path for item in manifest.robots)]
+        result.update({str(path): sha(path) for path in paths})
+        return result
+    try:
+        elf = arena.regular_file(elf, "ArenaRefereeTest ELF")
+        binary = arena.resolve_qemu(qemu)
+        firmware = Path(firmware).resolve()
+        if not firmware.is_dir():
+            raise ValueError("firmware source tree is not a directory")
+        directory = output / "arena"
+        directory.mkdir()
+        manifest = write_manifests(directory, (elf, elf), referees=True)
+        report["inputs_before"], report["checkout_before"] = inputs(), checkout_snapshot(firmware)
+        report["actual_sources_before"] = source_origins()
+        observer = RefereeObservation(report, manifest)
+        overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
+            "connect_unix": "connect", "SharedWorldRuntime": "shared",
+            "RefereeEngine": "engine", "RefereeUartEndpoint": "endpoint"}
+        for original, replacement in overrides.items():
+            setattr(observer, "original_" + replacement, getattr(arena, original))
+        with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
+            result = arena.run_manifest(manifest, duration=1., qemu=binary, startup_timeout=10., timeout=20.,
+                                        emit=observer.emit, on_response=observer.response)
+        report["runtime_result"] = asdict(result)
+        calls = report["native_calls"]
+        if (result.end_ns - result.origin_ns != 1_000_000_000 or calls["reset"] != 1
+                or calls["close"] != 1 or calls["steps"] != result.steps or calls["attempts"] != result.steps
+                or calls["total_ns"] != result.end_ns
+                or (calls["minimum_ns"], calls["maximum_ns"]) != (1_000_000, 1_000_000)):
+            raise ValueError("Arena referee world execution quantities disagree")
+        if len(result.boards) != 2 or len(result.referees) != 2:
+            raise ValueError("Arena referee public result scope is incomplete")
+        for wire_session, (board, referee) in enumerate(zip(result.boards, result.referees), 1):
+            name = board.name
+            rows = report["publications"][name]
+            if board.ready != "uart_marker" or board.ready_qemu_ns is None or name != referee.member:
+                raise ValueError("Arena referee scoped publication quantities disagree")
+            check_referee_publications(rows, referee, result.end_ns, report["ready"][name]["logical_ns"])
+            report["ready"][name]["post_read_qemu_ns"] = board.ready_qemu_ns
+            check_referee_responses(report["responses"][name], wire_session,
+                                    result.steps, result.end_ns, board.reset_qemu_ns)
+    except BaseException as error:
+        primary = error
+    finally:
+        def verify(callback):
+            nonlocal primary
+            try:
+                callback()
+            except BaseException as error:
+                report["errors"].append(f"{type(error).__name__}: {error}")
+                if primary is None:
+                    primary = error
+                elif error is not primary:
+                    primary.add_note(f"Arena referee post-cleanup verification failed: {type(error).__name__}: {error}")
+                    for note in tuple(getattr(error, "__notes__", ())):
+                        primary.add_note(note)
+        for name in REFEREE_IDS:
+            report["missing"][name] = sorted(REFEREE_REQUIRED - {
+                row["name"] for row in report["cases"][name] if row["status"] == "PASS"})
+            report["skips"][name] = [row["name"] for row in report["cases"][name] if row["status"] == "SKIP"]
+            report["missing_skips"][name] = [] if "plant.physics" in report["skips"][name] else ["plant.physics"]
+            verify(lambda name=name: check_referee_coverage(report["cases"][name], report["summaries"][name], name))
+        def cleanup():
+            if observer is None:
+                raise ValueError("Arena referee owner acquisition unavailable")
+            failures = []
+            def check(label, read):
+                try:
+                    value = read()
+                except BaseException as error:
+                    failures.append(f"{label}: {type(error).__name__}: {error}")
+                    return False
+                if not value:
+                    failures.append(label)
+                return value
+            for identity, owner in zip(report["cleanup"], observer.owners):
+                identity["identity_gone"] = check(f"QEMU{identity['pid']} identity", lambda:
+                    starttime(identity["pid"]) != identity["starttime"])
+                identity["reaped"] = check(f"QEMU{identity['pid']} reap", lambda: owner.process.poll() is not None)
+                identity["temporary_gone"] = check(f"QEMU{identity['pid']} temporary directory", lambda:
+                    not Path(identity["tempdir"]).exists())
+                identity["sockets_gone"] = {name: check(f"QEMU{identity['pid']} {name} path", lambda path=path:
+                    not Path(path).exists()) for name, path in identity["sockets"].items()}
+            owned = report["owned_cleanup"] = {
+                "engines": [check(f"engine{index} close", lambda item=item: item.closed)
+                            for index, item in enumerate(observer.engines)],
+                "endpoints": [check(f"endpoint{index} close", lambda item=item: item.closed)
+                              for index, item in enumerate(observer.endpoints)],
+                "plant": check("plant close", lambda: observer.plant is not None and observer.plant.closed),
+                "devices": [] if observer.plant is None else [
+                    check(f"device{index} close", lambda item=item: item.closed)
+                    for index, item in enumerate(observer.plant.devices)],
+                "runtime": check("runtime close", lambda: observer.runtime is not None and observer.runtime.closed),
+                "borrowed_sockets": {}}
+            for path, sock in observer.sockets:
+                owned["borrowed_sockets"][path] = check(path + " socket", lambda sock=sock: sock.fileno() < 0)
+            if observer.runtime is not None:
+                borrowed = {id(sock) for _, sock in observer.sockets}
+                for binding in observer.runtime.bindings:
+                    for sock in (binding.cosim.sock, binding.endpoint.stream.sock):
+                        check(binding.name + " stream socket identity", lambda sock=sock: id(sock) in borrowed)
+                for endpoint in observer.endpoints:
+                    check("referee UART socket identity", lambda endpoint=endpoint:
+                        id(endpoint.transport.sock) in borrowed)
+            for index, row in enumerate(report["qmp_cleanup"]):
+                check(f"QMP{index} close", lambda row=row: row == {"attempts": 1, "completed": True})
+            if (len(observer.owners) != 2 or len(observer.engines) != 2 or len(observer.endpoints) != 2
+                    or observer.children or len(owned["devices"]) != 8
+                    or len(report["qmp_cleanup"]) != 2 or len(owned["borrowed_sockets"]) != 8):
+                failures.append("owner acquisition scope incomplete")
+            if failures:
+                raise ValueError("Arena referee cleanup incomplete: " + "; ".join(failures))
+            report["cleanup_verified"] = True
+        verify(cleanup)
+        def sources():
+            if any(report.get(key) is None for key in ("inputs_before", "checkout_before", "actual_sources_before")):
+                raise ValueError("Arena referee pre-run input/source state unavailable")
+            report["inputs_after"], report["checkout_after"] = inputs(), checkout_snapshot(firmware)
+            report["actual_sources_after"] = source_origins()
+            if (report.get("inputs_before") != report["inputs_after"]
+                    or report.get("checkout_before") != report["checkout_after"]
+                    or any(report["actual_sources_after"].get(name) != value
+                           for name, value in report["actual_sources_before"].items())):
+                raise ValueError("Arena referee actual input/source state changed")
+            report["source_preserved"] = True
+        verify(sources)
+        def watchdogs():
+            if (set(report["watchdogs"]) != set(REFEREE_IDS)
+                    or any(set(rows) != {"done", "paused"} for rows in report["watchdogs"].values())
+                    or any(row["timeouts"] != 0 or "window-violations=0" not in row["diagnostics"]
+                           for rows in report["watchdogs"].values() for row in rows.values())):
+                raise ValueError("Arena referee watchdog observations missing")
+        verify(watchdogs)
+        signal.signal(signal.SIGTERM, previous_signal)
+        report["result"] = "passed" if primary is None else "failed"
+        if primary is not None:
+            report["errors"].insert(0, f"{type(primary).__name__}: {primary}")
+            report["error_type"] = type(primary).__name__
+            report["notes"] = list(getattr(primary, "__notes__", ()))
+        write_json(output / "report.json", report)
+    print("RESULT: dual-QEMU Arena referee consumer " + report["result"])
+    if primary is not None:
+        print(f"Arena referee consumer failed: {primary}", file=sys.stderr)
+        for note in report["notes"]:
+            print(note, file=sys.stderr)
+    return 0 if primary is None else 130 if isinstance(primary, KeyboardInterrupt) else 1
 
 
 def main(args):

@@ -22,6 +22,7 @@ REAL_CONSUME = module.consume
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.fabric import CanBus
 from test_sim_shared_world import NativeStub
+from tools import dm_mc02_arena_smoke as arena_module
 
 # Official 2026 V1.1.0 packed payloads with fixed sequences 0..7. CRC literals
 # were calculated directly with pinned crccheck, without the project encoders.
@@ -492,3 +493,458 @@ def test_shared_consumer_acquisition_cleanup_respects_runtime_transfer(
                 wrapped.sock.close()
         for peer in peers:
             peer.close()
+
+
+# Same official packed layouts as above, with stable scoped robot IDs 3/103.
+# These full-frame literals were calculated with pinned crccheck directly from
+# the payload bytes, independently of the production encoder and host oracle.
+ARENA_WIRES = {key: bytes.fromhex(value) for key, value in {
+    ("east", 0):
+        "a50b00000201000100000807060504030201d0c9"
+        "a50d00018d010203026400c800000064005000058122"
+        "a50e00028b0202000000000000000028000a001400c1da"
+        "a5080003040402050900070b0d00feec0b",
+    ("east", 4):
+        "a50b000463010001000008070605040302015379"
+        "a50d0005ec010203026400c80000006400500005ae31"
+        "a50e0006ea0202000000000000000028000a0014002703"
+        "a5080007650402050900070b0d00fe8474",
+    ("east", 252):
+        "a50b00fcd5010001000008070605040302010098"
+        "a50d00fd5a010203026400c80000006400500005b63e"
+        "a50e00fe5c0202000000000000000028000a001400e19f"
+        "a50800ffd30402050900070b0d00fe034d",
+    ("west", 0):
+        "a50b000002010002000008070605040302016337"
+        "a50d00018d010267024600c800000064007800060e5c"
+        "a50e00028b0202000000000000000029000c0019000825"
+        "a508000304040208110013171d0080bd08",
+    ("west", 4):
+        "a50b00046301000200000807060504030201e087"
+        "a50d0005ec010267024600c80000006400780006214f"
+        "a50e0006ea0202000000000000000029000c001900eefc"
+        "a508000765040208110013171d0080d577",
+    ("west", 252):
+        "a50b00fcd501000200000807060504030201b366"
+        "a50d00fd5a010267024600c800000064007800063940"
+        "a50e00fe5c0202000000000000000029000c0019002860"
+        "a50800ffd3040208110013171d0080524e",
+}.items()}
+ARENA_COMMON = ("control.rx", "reset.poweron", "bsp.init", "task.stack",
+                "referee.executor", "referee.uart")
+ARENA_GROUPS = ("fresh", "game", "robot", "power", "buff", "id",
+                "ts.game", "ts.robot", "ts.power", "ts.buff")
+ARENA_REQUIRED = set(ARENA_COMMON) | {
+    f"referee.arena.{sample}.{group}" for sample in (1, 2, 3) for group in ARENA_GROUPS}
+
+
+def arena_rows(name):
+    """A fixed valid firmware receipt, not a guest/parser state machine."""
+    rows = [dict(status="PASS", name=label, actual=value, expected=value)
+            for label, value in zip(ARENA_COMMON, (0, 0x800000, 0, 64, 0, 0))]
+    for sample in (1, 2, 3):
+        for index, group in enumerate(ARENA_GROUPS):
+            value = {"fresh": 1, "id": {"east": 3, "west": 103}[name]}.get(group, 0)
+            actual, expected = ((100 * sample + index, 0 if sample == 1 else 100 * (sample - 1) + index)
+                                if group.startswith("ts.") else (value, value))
+            rows.append(dict(status="PASS", name=f"referee.arena.{sample}.{group}",
+                             actual=actual, expected=expected))
+    return [*rows, dict(status="SKIP", name="plant.physics", actual=0, expected=0)]
+
+
+def arena_summaries():
+    return [{"kind": kind, "values": [36, 0, 1]} for kind in ("PHASE", "DONE")]
+
+
+@pytest.fixture
+def referee_arena_manifest(tmp_path):
+    elf = tmp_path / "arena.elf"
+    elf.write_bytes(b"fixed Arena firmware input")
+    directory = tmp_path / "manifests"
+    directory.mkdir()
+    return arena_module.write_manifests(directory, (elf, elf), referees=True)
+
+
+def test_arena_admission_drives_real_engines_core_and_uart_with_scoped_literals(referee_arena_manifest):
+    from sim.core import Coordinator, Session, StepResult
+    from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+    from sim.transports import StreamTransport
+
+    manifest = referee_arena_manifest
+    assert [member.name for member in manifest.robots] == ["east", "west"]
+    assert all(not member.robot.upper_computers for member in manifest.robots)
+    assert all(member.robot.ready.text == b"TTEST READY referee.arena.ready 0 0\n"
+               for member in manifest.robots)
+    engines = {row.member: RefereeEngine(row.initial, durations=row.durations,
+        events=row.events, cooling_42mm_per_s=row.cooling_42mm_per_s) for row in manifest.referees}
+    coordinator = Coordinator(engines)
+    sockets, endpoints = [], {}
+    try:
+        for name in engines:
+            sender, peer = socket.socketpair()
+            sender.setblocking(False)
+            peer.settimeout(1)
+            sockets.extend((sender, peer))
+            endpoints[name] = (RefereeUartEndpoint(StreamTransport(sender)), peer)
+        origin = 12_345_678
+        coordinator.reset(Session(7, origin))
+        for sequence in (0, 4, 252):
+            for name, (endpoint, peer) in endpoints.items():
+                endpoint.reset(sequence)
+                wire = endpoint.send_state(engines[name].get_state())
+                assert wire == ARENA_WIRES[name, sequence] == peer.recv(4096)
+                arena_module.check_referee_wire(wire, name, sequence)
+                assert endpoint.next_sequence == (sequence + 4) % 256
+            assert coordinator.step(100_000_000) == {
+                name: StepResult("ok", coordinator.t_sim_ns) for name in engines}
+        assert coordinator.step(700_000_000) == {
+            name: StepResult("ok", origin + 1_000_000_000) for name in engines}
+        assert all(engine.get_state() == record.initial
+                   for engine, record in zip(engines.values(), manifest.referees))
+    finally:
+        coordinator.close()
+        for endpoint, _ in endpoints.values():
+            endpoint.close()
+        for sock in sockets:
+            sock.close()
+
+
+@pytest.mark.parametrize("corruption", ["crc8", "crc16", "member", "sequence", "partial"])
+def test_arena_wire_rejects_wrong_member_sequence_crc_or_incomplete_batch(corruption):
+    wire, name, sequence = ARENA_WIRES["east", 0], "east", 0
+    if corruption in ("crc8", "crc16"):
+        changed = bytearray(wire)
+        changed[4 if corruption == "crc8" else -1] ^= 1
+        wire = bytes(changed)
+    elif corruption == "member":
+        name = "west"
+    elif corruption == "sequence":
+        sequence = 4
+    else:
+        wire = wire[:-1]
+    with pytest.raises(ValueError, match="wire disagrees|complete82-byte"):
+        arena_module.check_referee_wire(wire, name, sequence)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "id", "stale", "zero", "history", "summary", "uint32"])
+def test_arena_report_requires_exact_coverage_scoped_id_and_all_timestamp_histories(corruption):
+    assert arena_module.REFEREE_REQUIRED == ARENA_REQUIRED and len(ARENA_REQUIRED) == 36
+    rows, summaries = arena_rows("east"), arena_summaries()
+    arena_module.check_referee_coverage(rows, summaries, "east")
+    if corruption == "missing":
+        rows.pop(0)
+    elif corruption == "duplicate":
+        rows.append(rows[0].copy())
+    elif corruption == "summary":
+        summaries[-1]["values"] = [35, 0, 1]
+    else:
+        label = "referee.arena.2.id" if corruption == "id" else "referee.arena.2.ts.buff"
+        row = next(row for row in rows if row["name"] == label)
+        if corruption == "id":
+            row["actual"] = row["expected"] = 103
+        elif corruption == "stale":
+            row["actual"] = row["expected"]
+        elif corruption == "zero":
+            row["actual"] = 0
+        elif corruption == "history":
+            row["expected"] += 1
+        else:
+            row["actual"] = True
+    with pytest.raises(ValueError, match="coverage|fields disagree|history|summaries|uint32"):
+        arena_module.check_referee_coverage(rows, summaries, "east")
+
+
+def test_arena_uart_observer_consumes_fragmented_ready_cases_and_summaries(referee_arena_manifest):
+    from sim.boards.channels import ChannelEvent
+
+    report = {"uart": ["", ""], "ready": {}, "cases": {name: [] for name in ("east", "west")},
+              "summaries": {name: [] for name in ("east", "west")}}
+    observer = arena_module.RefereeObservation(report, referee_arena_manifest)
+    observer.runtime = SimpleNamespace(t_sim_ns=20_000_000)
+    watchdogs = []
+    observer.watchdog = lambda index, name, stage: watchdogs.append((index, name, stage))
+    for index, name in enumerate(("east", "west")):
+        rows, summaries = arena_rows(name), arena_summaries()
+        data = ("startup diagnostic\nTTEST READY referee.arena.ready 0 0\n" +
+            "".join(f"TTEST {row['status']} {row['name']} {row['actual']} {row['expected']}\n" for row in rows) +
+            "TTEST PHASE 36 0 1\nTTEST DONE 36 0 1\n").encode("ascii")
+        for chunk in (data[:19], data[19:91], data[91:]):
+            observer.emit(arena_module.arena.ArenaEvent(name, ChannelEvent("uart1", 123 + index, chunk)))
+        assert report["cases"][name] == rows and report["summaries"][name] == summaries
+        assert report["ready"][name] == {"poll_sample_qemu_ns": 123 + index, "logical_ns": 20_000_000}
+        assert not observer.buffers[name]
+    assert watchdogs == [(0, "east", "done"), (1, "west", "done")]
+    with pytest.raises(ValueError, match="ready marker"):
+        observer.emit(arena_module.arena.ArenaEvent("east", ChannelEvent(
+            "uart1", 125, b"TTEST READY referee.arena.ready 0 0\n")))
+    with pytest.raises(BufferError, match="UART observation exhausted"):
+        observer.emit(arena_module.arena.ArenaEvent("west", ChannelEvent("uart1", 125, b"x" * 12001)))
+
+
+def arena_response_summary(wire_session, reset_qemu_ns):
+    """Exact retained public ACK receipt; no transport implementation here."""
+    from sim.transports import step_codec as codec
+    def response(kind, step, target, dt, **decoded):
+        return {"header": dict(kind=kind, flags=wire_session, step_id=step,
+                               t_sim_ns=target, dt_ns=dt), "decoded": dict(status=0, **decoded)}
+    return {"reset": response(codec.RESET_ACK, 0, 0, 0, virtual_time_ns=reset_qemu_ns),
+            "step_ack_count": 1000,
+            "first_step_ack": response(codec.STEP_ACK, 1, 1_000_000, 1_000_000),
+            "last_step_ack": response(codec.STEP_ACK, 1000, 1_000_000_000, 1_000_000)}
+
+
+@pytest.mark.parametrize("corruption", ["session", "reset_epoch", "count", "last_step", "status"])
+def test_arena_ack_gate_requires_actual_scoped_identities(corruption):
+    summary = arena_response_summary(2, 91_234)
+    arena_module.check_referee_responses(summary, 2, 1000, 1_000_000_000, 91_234)
+    if corruption == "session":
+        summary["first_step_ack"]["header"]["flags"] = 1
+    elif corruption == "reset_epoch":
+        summary["reset"]["decoded"]["virtual_time_ns"] += 1
+    elif corruption == "count":
+        summary["step_ack_count"] -= 1
+    elif corruption == "last_step":
+        summary["last_step_ack"]["header"]["step_id"] -= 1
+    else:
+        summary["last_step_ack"]["decoded"]["status"] = 1
+    with pytest.raises(ValueError, match="ACK .*disagrees"):
+        arena_module.check_referee_responses(summary, 2, 1000, 1_000_000_000, 91_234)
+
+
+def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monkeypatch):
+    import builtins
+    calls, imports = [], []
+    original_import = builtins.__import__
+    def observed_import(name, *args, **options):
+        if name == "tools.dm_mc02_arena_smoke":
+            imports.append(name)
+        return original_import(name, *args, **options)
+    monkeypatch.setattr(builtins, "__import__", observed_import)
+    def admitted(elf, output, firmware, **options):
+        calls.append((elf, output, firmware, options))
+        return 23
+    paths = tuple(str(tmp_path / name) for name in ("arena.elf", "report", "trobot"))
+    monkeypatch.setattr(module, "run", lambda *args, **options: 17)
+    assert module.main(list(paths)) == 17 and imports == [] and calls == []
+    monkeypatch.setattr(arena_module, "run_referee", admitted)
+    monkeypatch.setattr(module, "run", lambda *args, **options: pytest.fail("Arena dispatch reached old runner"))
+    assert module.main([*paths, "--arena", "--qemu", "/fixed/qemu"]) == 23
+    assert calls == [(*paths, dict(qemu="/fixed/qemu"))]
+    assert imports == ["tools.dm_mc02_arena_smoke"]
+    with pytest.raises(SystemExit) as rejected:
+        module.main([*paths, "--arena", "--shared-world"])
+    assert rejected.value.code == 2 and len(calls) == 1
+
+
+@pytest.mark.parametrize("corruption", ["cadence", "missing_due", "period", "ready", "admission", "sequence"])
+def test_arena_publication_gate_checks_actual_period_and_complete_due_coverage(corruption):
+    from dataclasses import replace
+    ready, end = 25_000_000, 275_000_000
+    rows = [dict(logical_ns=ready + index * 100_000_000, accepted=True, verified=True)
+            for index in range(3)]
+    referee = arena_module.arena.ArenaRefereeResult("east", "uart7", 100_000_000,
+        3, ready, 225_000_000, 12)
+    arena_module.check_referee_publications(rows, referee, end, ready)
+    if corruption == "cadence":
+        for index, row in enumerate(rows):
+            row["logical_ns"] = ready + index * 50_000_000
+        referee = replace(referee, last_logical_ns=rows[-1]["logical_ns"])
+    elif corruption == "missing_due":
+        rows.pop()
+        referee = replace(referee, publications=2, last_logical_ns=rows[-1]["logical_ns"], next_sequence=8)
+    elif corruption == "period":
+        referee = replace(referee, period_ns=50_000_000)
+    elif corruption == "ready":
+        ready += 1_000_000
+    elif corruption == "admission":
+        rows[1]["verified"] = False
+    else:
+        referee = replace(referee, next_sequence=13)
+    with pytest.raises(ValueError, match="quantities/cadence disagree"):
+        arena_module.check_referee_publications(rows, referee, end, ready)
+
+
+@pytest.mark.parametrize("resource", ["world", "qmp"])
+@pytest.mark.parametrize("cleanup_failure", [False, True])
+def test_arena_observer_setup_failure_closes_acquired_owner_and_preserves_primary(
+        referee_arena_manifest, resource, cleanup_failure):
+    primary = ValueError("observer setup failed")
+    cleanup = OSError("native owner cleanup failed")
+    cleanup.add_note("native release detail")
+    report = {"qmp_events": [], "qmp_cleanup": [], "native_calls": dict(reset=0, attempts=0,
+        steps=0, total_ns=0, minimum_ns=None, maximum_ns=None, close=0)}
+    observer = arena_module.RefereeObservation(report, referee_arena_manifest)
+    if resource == "world":
+        class SetupRejectingNative(NativeStub):
+            def __setattr__(self, name, value):
+                if name == "step" and getattr(self, "reject_setup", False):
+                    raise primary
+                super().__setattr__(name, value)
+            def close(self):
+                super().close()
+                if cleanup_failure:
+                    raise cleanup
+        native = SetupRejectingNative()
+        device = M3508Device(CanBus(), 1)
+        acquired = M3508JointPlant(native, {device: "wheel_fl"})
+        native.reject_setup = True
+        observer.original_world = lambda manifest: acquired
+        with pytest.raises(ValueError) as rejected:
+            observer.world(referee_arena_manifest)
+        assert acquired.closed and device.closed and native.closed == 1
+        assert native.resets == 0 and native.steps == []
+    else:
+        class SetupRejectingQmp:
+            def __init__(self):
+                self.closes = 0
+            @property
+            def command(self):
+                raise primary
+            def close(self):
+                self.closes += 1
+                if cleanup_failure:
+                    raise cleanup
+        acquired = SetupRejectingQmp()
+        observer.original_qmp = lambda *args, **options: acquired
+        with pytest.raises(ValueError) as rejected:
+            observer.qmp("unused-qmp-path")
+        assert acquired.closes == 1
+    assert rejected.value is primary
+    notes = "\n".join(getattr(primary, "__notes__", ()))
+    if cleanup_failure:
+        assert "native owner cleanup failed" in notes and "native release detail" in notes
+
+
+def test_arena_connect_observer_retains_actual_borrowed_socket_once(referee_arena_manifest):
+    observer = arena_module.RefereeObservation({}, referee_arena_manifest)
+    sender, peer = socket.socketpair()
+    calls = []
+    def connect(path, timeout):
+        calls.append((path, timeout))
+        return sender
+    observer.original_connect = connect
+    try:
+        assert observer.connect("actual-uart1-path", .5) is sender
+        assert calls == [("actual-uart1-path", .5)]
+        assert observer.sockets == [("actual-uart1-path", sender)]
+        assert sender.fileno() >= 0
+    finally:
+        sender.close()
+        peer.close()
+
+
+@pytest.fixture
+def completed_arena_receipt(tmp_path, monkeypatch):
+    """Isolate post-consumer verification using one completed Arena result.
+
+    Lower runtime ownership and transport state machines have separate direct
+    tests. This fixture never constructs or runs a second runtime/guest loop.
+    """
+    from tools import dm_mc02_referee_test as source_module
+
+    elf = tmp_path / "fixture.elf"
+    elf.write_bytes(b"fixed input")
+    state = SimpleNamespace(mode="success", calls=[], events=[], snapshots=0)
+    def snapshot(*args):
+        state.snapshots += 1
+        value = hashlib.sha256(elf.read_bytes()).hexdigest()
+        return {str(elf): value + ("changed" if state.mode in ("source", "primary") and state.snapshots > 1 else "")}
+    monkeypatch.setattr(source_module, "source_snapshot", snapshot)
+    monkeypatch.setattr(source_module, "checkout_snapshot", lambda firmware: {})
+    monkeypatch.setattr(arena_module, "source_origins", lambda: {})
+    monkeypatch.setattr(arena_module, "starttime", lambda pid: None)
+    write_json = source_module.write_json
+    def observed_write(path, report):
+        if report["result"] == "passed":
+            state.events.append("published passed")
+        write_json(path, report)
+    monkeypatch.setattr(source_module, "write_json", observed_write)
+
+    def completed(manifest, **options):
+        state.calls.append((manifest, options.copy()))
+        observer, report = options["emit"].__self__, options["emit"].__self__.report
+        closed_socket = SimpleNamespace(fileno=lambda: -1)
+        observer.sockets = [(str(tmp_path / f"removed-{index}.{name}"), closed_socket)
+            for index in range(2) for name in ("uart1", "uart7", "can1", "cosim")]
+        observer.engines = [SimpleNamespace(closed=True) for _ in range(2)]
+        observer.endpoints = [SimpleNamespace(closed=True, transport=SimpleNamespace(sock=closed_socket))
+                              for _ in range(2)]
+        observer.plant = SimpleNamespace(closed=True, devices=[SimpleNamespace(closed=True) for _ in range(8)])
+        observer.runtime = SimpleNamespace(closed=True, bindings=[SimpleNamespace(name=name,
+            cosim=SimpleNamespace(sock=closed_socket), endpoint=SimpleNamespace(
+                stream=SimpleNamespace(sock=closed_socket))) for name in ("east", "west")])
+        observer.owners = [SimpleNamespace(process=SimpleNamespace(poll=lambda: 0)) for _ in range(2)]
+        report["cleanup"] = [dict(pid=123456 + index, starttime=1,
+            tempdir=str(tmp_path / f"removed-{index}"), sockets={"qmp": str(tmp_path / f"removed-{index}.qmp")})
+            for index in range(2)]
+        report["qmp_cleanup"] = [dict(attempts=1, completed=True) for _ in range(2)]
+        report["native_calls"] = dict(reset=1, attempts=1000, steps=1000, total_ns=1_000_000_000,
+            minimum_ns=1_000_000, maximum_ns=1_000_000, close=1)
+        boards, referees = [], []
+        for index, name in enumerate(("east", "west"), 1):
+            report["cases"][name], report["summaries"][name] = arena_rows(name), arena_summaries()
+            report["ready"][name] = dict(poll_sample_qemu_ns=100 * index, logical_ns=0)
+            report["publications"][name] = [dict(logical_ns=period * 100_000_000, sequence=period * 4,
+                accepted=True, verified=True) for period in range(11)]
+            report["responses"][name].update(arena_response_summary(index, 90 * index))
+            report["watchdogs"][name] = {stage: dict(timeouts=0, diagnostics="window-violations=0")
+                                         for stage in ("done", "paused")}
+            boards.append(arena_module.arena.ArenaBoardResult(name, "alpha/" if index == 1 else "bravo/",
+                "uart_marker", 110 * index, 1_000_000_000 + index, 90 * index, 1000))
+            referees.append(arena_module.arena.ArenaRefereeResult(name, "uart7", 100_000_000,
+                11, 0, 1_000_000_000, 44))
+        state.events.append("runtime cleanup completed")
+        if state.mode == "missing_case":
+            report["cases"]["west"].pop(0)
+        elif state.mode == "missing_summary":
+            report["summaries"]["west"].pop()
+        elif state.mode == "missing_watchdog":
+            del report["watchdogs"]["west"]["paused"]
+        elif state.mode in ("cleanup", "primary"):
+            report["qmp_cleanup"][1]["completed"] = False
+        elif state.mode == "uart_socket":
+            path, _ = observer.sockets[0]
+            observer.sockets[0] = (path, SimpleNamespace(fileno=lambda: 3))
+        if state.mode == "primary":
+            raise KeyboardInterrupt("original Arena interruption")
+        return arena_module.arena.ArenaResult(manifest.name, 0, 1_000_000_000, 1000,
+            tuple(boards), (), referees=tuple(referees))
+    monkeypatch.setattr(arena_module.arena, "run_manifest", completed)
+    return elf, state
+
+
+@pytest.mark.parametrize("mode", ["success", "missing_case", "missing_summary", "missing_watchdog",
+                                  "cleanup", "uart_socket", "source", "primary"])
+def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
+        completed_arena_receipt, tmp_path, mode):
+    elf, state = completed_arena_receipt
+    state.mode = mode
+    output = tmp_path / "result"
+    expected = 0 if mode == "success" else 130 if mode == "primary" else 1
+    assert arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable) == expected
+    report_path = output / "report.json"
+    report = json.loads(report_path.read_text())
+    assert len(state.calls) == 1
+    options = state.calls[0][1]
+    assert (options["duration"], options["startup_timeout"], options["timeout"]) == (1., 10., 20.)
+    if mode == "success":
+        assert report["result"] == "passed" and report["cleanup_verified"] and report["source_preserved"]
+        assert report["missing"] == {"east": [], "west": []}
+        assert state.events == ["runtime cleanup completed", "published passed"]
+    else:
+        assert report["result"] == "failed" and "published passed" not in state.events
+        errors = "\n".join(report["errors"])
+        assert {"missing_case": "coverage", "missing_summary": "summaries", "missing_watchdog": "watchdog",
+                "cleanup": "cleanup incomplete", "uart_socket": "cleanup incomplete",
+                "source": "source state changed", "primary": "interruption"}[mode] in errors
+        if mode == "missing_case":
+            assert report["missing"]["west"] == ["control.rx"]
+        if mode == "primary":
+            assert report["error_type"] == "KeyboardInterrupt"
+            assert report["errors"][0] == "KeyboardInterrupt: original Arena interruption"
+            assert "cleanup incomplete" in "\n".join(report["notes"])
+            assert "source state changed" in "\n".join(report["notes"])
+    saved = report_path.read_bytes()
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable)
+    assert report_path.read_bytes() == saved and len(state.calls) == 1

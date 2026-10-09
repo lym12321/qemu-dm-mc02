@@ -688,10 +688,16 @@ def main(argv=None):
     parser.add_argument("output", nargs="?", default=ROOT / "build/test-results/trobot-referee")
     parser.add_argument("firmware_source", nargs="?", default=ROOT.parent / "trobot")
     parser.add_argument("--qemu")
-    parser.add_argument("--shared-world", action="store_true",
-                        help="run this fixed fixture through the existing shared world owner")
+    profile = parser.add_mutually_exclusive_group()
+    profile.add_argument("--shared-world", action="store_true",
+                         help="run this fixed fixture through the existing shared world owner")
+    profile.add_argument("--arena", action="store_true",
+                         help="run ArenaRefereeTest on two boards through the existing Arena owner")
     args = parser.parse_args(argv)
     try:
+        if args.arena:
+            from tools.dm_mc02_arena_smoke import run_referee
+            return run_referee(args.elf, args.output, args.firmware_source, qemu=args.qemu)
         return run(args.elf, args.output, args.firmware_source, qemu=args.qemu,
                    shared_world=args.shared_world)
     except (OSError, ValueError) as exc:
