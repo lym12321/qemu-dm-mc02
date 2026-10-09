@@ -14,7 +14,8 @@ from sim.boards import QemuBoard
 from sim.boards.channels import ChannelEvent, LabChannels
 from sim.boards.launch import UARTS, positive_seconds, qemu_command, regular_file, resolve_qemu
 from sim.core import Session
-from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, validate_referee_events
+from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready
@@ -177,13 +178,17 @@ class _Run:
 
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                  on_response=None, qemu=None, startup_timeout=10.0,
-                 timeout=30.0, referee_period_ns=100_000_000) -> ArenaResult:
+                 timeout=30.0, referee_period_ns=100_000_000,
+                 referee_events=()) -> ArenaResult:
     """Consume admitted records and return only after all owners are released.
 
     Referees publish the latest completed snapshot when their local UART marker
     is observed, then at absolute logical deadlines in the existing tick loop.
     The whole-snapshot cadence is a fixture, not official command periods.
     Capacity refusal terminates the complete Arena without replaying a tick.
+    Optional named typed event batches use the shared reset origin and are
+    queued once after start, before resume or the first world step. All batches
+    are admitted before resources; a runtime refusal terminates the whole run.
     """
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
@@ -220,6 +225,25 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     if not 1e-9 <= duration <= 3600:
         raise ValueError("Arena duration must be in 1ns..3600s")
     duration_ns = round(duration * 1_000_000_000)
+    if type(referee_events) is not tuple:
+        raise TypeError("Arena referee_events must be a plain immutable tuple")
+    seen = set()
+    count = 0
+    for item in referee_events:
+        if type(item) is not tuple or len(item) != 2:
+            raise TypeError("Arena referee_events entries require (member, events) tuples")
+        member, events = item
+        if type(member) is not str or member not in configured:
+            raise ValueError("Arena queued events must name a configured referee member")
+        if member in seen:
+            raise ValueError("Arena queued referee members must be unique")
+        seen.add(member)
+        validate_referee_events(events)
+        count += len(events)
+        if count > MAX_SCRIPT_EVENTS:
+            raise ValueError(f"Arena queued referee events total must not exceed {MAX_SCRIPT_EVENTS}")
+        if events and events[-1].offset_ns > duration_ns:
+            raise ValueError("Arena queued referee event offset must not exceed duration")
     startup_timeout, timeout = positive_seconds(startup_timeout), positive_seconds(timeout)
     if startup_timeout > timeout:
         raise ValueError("startup timeout must not exceed active host timeout")
@@ -294,7 +318,12 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             referees=tuple(RefereeBinding(item.configuration.member, item.engine, item.endpoint)
                            for item in referees),
             check_running=run.guard, on_response=on_response)
-        responses = runtime.start(Session(1), (1, 2), deadline=run.startup_deadline)
+        session = Session(1)
+        responses = runtime.start(session, (1, 2), deadline=run.startup_deadline)
+        for member, events in referee_events:
+            run.guard()
+            runtime.queue_referee_events(member, events, session_id=session.session_id)
+            run.guard()
         for peer, response in zip(run.peers, responses):
             peer.reset_qemu_ns = codec.decode_reset_ack_payload(response.payload).virtual_time_ns
             peer.last_ns = run.call(peer, peer.board.snapshot)["timestamp_ns"]

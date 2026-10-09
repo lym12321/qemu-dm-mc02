@@ -429,6 +429,12 @@ referee_events:
 `at: 0ns` 的动态事件在下一次成功 step 才生效。此接口只读取配置，不执行
 仿真；Scenario CLI、故障注入、assertions 和 replay 尚未支持。
 
+Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
+整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
+事件元组在共享世界 start 成功后、恢复 QEMU 或首次 step 前原样交付一次，
+使用实际 host Session ID；任一运行时拒绝均终止整个 Arena 并清理资源。
+队列与规则执行仍由既有裁判引擎拥有，发布继续遵循每个成员的实际 ready 和原周期。
+
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
