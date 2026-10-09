@@ -657,6 +657,27 @@ payload 及各组实际/前次 BSP 时间戳；报告保留缺失项和 `plant.p
 固件的 1000 ms 等待属于各自 guest 时间，不能由此推断 CPU 与世界同步。
 `--arena` 与 `--shared-world` 互斥，原握手及 partial-frame 测试仍使用原 preset。
 
+定时输入的固件消费者使用默认关闭的 `ScenarioRefereeTestDebug` 或
+`ScenarioRefereeTestRelease`，并选择 `--scenario`：
+
+```bash
+# 在 trobot 中构建
+cmake --preset ScenarioRefereeTestDebug
+cmake --build --preset ScenarioRefereeTestDebug
+# 在 dm-mc02-qemu 的 MuJoCo 环境中运行
+tools/run-trobot-referee-test.sh ../trobot/build/ScenarioRefereeTestDebug/trobot.elf \
+  build/test-results/referee-scenario-debug ../trobot --scenario
+```
+
+夹具生成 Scenario 配置，通过同一 Scenario/Arena 入口运行。共同 reset 后
+200 ms 对 east 注入伤害 30 HP、热量 5/7 和 Buff 替换；west 保持原状态。
+两板首先验证完整初始状态，east 随后验证改变及刷新，west 在 host 已观察到
+east 的完整改变报告后，通过既有应用握手验证两次原状态刷新；第二次观察要求
+四组时间戳相对握手返回后读取的状态均已更新。握手只控制应用
+观察，不改变世界、事件时间或发布周期。初始报告迟于事件、缺失或清理失败均失败。
+该门沿用 100 ms 发布、1 秒活动时长和原 guest 等待；报告保留实际时间戳、
+缺失项和物理 SKIP，不建立 CPU 时间屏障。三个 runner profile 互斥。
+
 ## Contents
 
 - [项目范围](#project-scope)

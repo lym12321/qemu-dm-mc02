@@ -459,6 +459,11 @@ REFEREE_PAYLOADS = {
     "west": ("0200000807060504030201", "67024600c80000006400780006",
              "000000000000000029000c001900", "08110013171d0080"),
 }
+SCENARIO_EVENT_NS = 200_000_000
+SCENARIO_EAST_PAYLOADS = (
+    "0100000807060504030201", "03024600c80000006400500005",
+    "000000000000000028000f001b00", "08110013171d0080",
+)
 REFEREE_REQUIRED = frozenset(("control.rx", "reset.poweron", "bsp.init", "task.stack",
     "referee.executor", "referee.uart", *(f"referee.arena.{sample}.{group}"
         for sample in range(1, 4) for group in (
@@ -484,13 +489,36 @@ def referee_configuration(name):
                 "attack_percent": 29 if west else 13, "remaining_energy": 0x80 if west else 0xfe}}}
 
 
-def check_referee_wire(wire, name, sequence):
+def write_scenario_manifest(directory, firmwares):
+    """Load the fixed Scenario through its public producer, without execution."""
+    from sim.scenario.manifest import load_manifest as load_scenario
+
+    manifest = write_manifests(directory, firmwares, referees=True)
+    document = {"schema": 1, "arena": manifest.path.name, "duration": "1s",
+        "referee_events": {"east": [
+            {"at": "200ms", "hit": {"damage_hp": 30}},
+            {"at": "200ms", "shot": {"heat_17mm": 5, "heat_42mm": 7}},
+            {"at": "200ms", "buff": {"recovery_percent": 8, "cooling_per_s": 17,
+                "defence_percent": 19, "vulnerability_percent": 23,
+                "attack_percent": 29, "remaining_energy": 0x80}}], "west": []}}
+    path = directory / "scenario.yaml"
+    path.write_text(json.dumps(document))
+    return load_scenario(path)
+
+
+def check_referee_wire(wire, name, sequence, *, logical_ns=None, scenario=False):
     """Independent literal payloads and pinned CRC, without production encoders."""
     if type(wire) is not bytes or len(wire) != 82:
         raise ValueError("Arena referee requires a complete82-byte snapshot")
+    payloads = REFEREE_PAYLOADS[name]
+    if scenario:
+        if type(logical_ns) is not int or logical_ns < 0:
+            raise ValueError("Scenario referee wire requires a nonnegative logical timestamp")
+        if name == "east" and logical_ns >= SCENARIO_EVENT_NS:
+            payloads = SCENARIO_EAST_PAYLOADS
     cursor = 0
     for offset, (command, payload_hex) in enumerate(zip(
-            (0x0001, 0x0201, 0x0202, 0x0204), REFEREE_PAYLOADS[name])):
+            (0x0001, 0x0201, 0x0202, 0x0204), payloads)):
         payload = bytes.fromhex(payload_hex)
         raw = wire[cursor:cursor + len(payload) + 9]
         if (raw[:4] != struct.pack("<BHB", 0xa5, len(payload), (sequence + offset) % 256)
@@ -577,14 +605,60 @@ def check_referee_publications(rows, referee, end_ns, ready_logical_ns):
         raise ValueError("Arena referee scoped publication quantities/cadence disagree")
 
 
+def check_scenario_observations(report):
+    """Check causal guest observations and the retained original queue calls."""
+    evidence = report["scenario_observation"]
+    samples = evidence["samples"]
+    if evidence["event_ns"] != SCENARIO_EVENT_NS:
+        raise ValueError("Scenario referee event boundary disagrees")
+    for name in REFEREE_IDS:
+        rows = samples[name]
+        if (set(rows) != {"1", "2", "3"}
+                or not 0 <= rows["1"]["logical_ns"] < SCENARIO_EVENT_NS
+                or any(rows[str(index)]["logical_ns"] > rows[str(index + 1)]["logical_ns"]
+                       for index in (1, 2))):
+            raise ValueError("Scenario referee complete baseline/sample observations disagree")
+    if any(samples["east"][sample]["logical_ns"] < SCENARIO_EVENT_NS for sample in ("2", "3")):
+        raise ValueError("Scenario referee changed observation preceded its event")
+    stage, control = evidence["stage"], evidence["control"]
+    if (stage is None or control is None or control.get("send_attempts") != 1
+            or control.get("wire_hex") != "a5" or not control.get("accepted")
+            or not control.get("completed") or control.get("flush_attempts", 0) < 1
+            or control["logical_ns"] < max(stage["logical_ns"], samples["east"]["2"]["logical_ns"])
+            or control["completed_logical_ns"] < control["logical_ns"]
+            or samples["west"]["2"]["logical_ns"] < control["completed_logical_ns"]):
+        raise ValueError("Scenario referee single borrowed UART observation control disagrees")
+    start, calls = evidence["shared_start"], evidence["queue_calls"]
+    if (start != {"session_id": 1, "origin_ns": 0, "accepted": True}
+            or len(calls) != 2 or [row["member"] for row in calls] != list(REFEREE_IDS)
+            or any(not row["accepted"] or not row["exact_batch"] or not row["before_cont"]
+                   or row["session_id"] != start["session_id"] or row["logical_ns"] != 0
+                   or row["offsets_ns"] != ([SCENARIO_EVENT_NS] * 3 if row["member"] == "east" else [])
+                   for row in calls)):
+        raise ValueError("Scenario referee original queue/session/before-cont evidence disagrees")
+
+
 class RefereeObservation(Observation):
     """Borrow existing owners; observe this UART consumer with bounded evidence."""
 
-    def __init__(self, report, manifest):
+    def __init__(self, report, manifest, *, scenario=False, scenario_manifest=None):
         super().__init__(report, manifest, "normal")
+        self.scenario, self.scenario_manifest = scenario, scenario_manifest
         self.engines, self.endpoints = [], []
         self.sockets = []
         self.buffers = {name: bytearray() for name in REFEREE_IDS}
+        self.controls = {}
+
+    def channels(self, *, uarts=None, **options):
+        if self.scenario and len(self.controls) >= len(self.manifest.robots):
+            raise ValueError("duplicate Scenario referee UART channel construction")
+        channels = self.original_channels(uarts=uarts, **options)
+        if self.scenario:
+            name = self.manifest.robots[len(self.controls)].name
+            if "uart1" not in uarts or name in self.controls:
+                raise ValueError("Scenario referee requires its existing member UART1")
+            self.controls[name] = uarts["uart1"]
+        return channels
 
     def connect(self, *args, **options):
         sock = self.original_connect(*args, **options)
@@ -627,6 +701,13 @@ class RefereeObservation(Observation):
             row = {"attempts": 0, "completed": False}
             self.report["qmp_cleanup"].append(row)
             def observed_command(operation, arguments=None):
+                if self.scenario and operation == "cont":
+                    evidence = self.report["scenario_observation"]
+                    if (evidence["shared_start"] is None or not evidence["shared_start"]["accepted"]
+                            or len(evidence["queue_calls"]) != 2
+                            or any(not item["accepted"] or not item["exact_batch"]
+                                   or not item["before_cont"] for item in evidence["queue_calls"])):
+                        raise ValueError("Scenario referee resume preceded original batch queueing")
                 result = command(operation, arguments)
                 if operation == "stop":
                     self.watchdog(index, name, "paused")
@@ -698,6 +779,31 @@ class RefereeObservation(Observation):
         runtime = self.original_shared(*args, **options)
         try:
             self.runtime = runtime
+            if self.scenario:
+                start, queue = runtime.start, runtime.queue_referee_events
+                evidence = self.report["scenario_observation"]
+                def observed_start(session, wire_sessions, *, deadline):
+                    if evidence["shared_start"] is not None:
+                        raise ValueError("duplicate Scenario referee shared start")
+                    evidence["shared_start"] = {"session_id": session.session_id,
+                        "origin_ns": session.t_sim_ns, "accepted": False}
+                    result = start(session, wire_sessions, deadline=deadline)
+                    evidence["shared_start"]["accepted"] = True
+                    return result
+                def observed_queue(name, events, *, session_id):
+                    expected = next((item.events for item in self.scenario_manifest.referees
+                                     if item.member == name), None)
+                    row = {"member": name, "session_id": session_id,
+                        "logical_ns": runtime.t_sim_ns, "batch_identity": id(events),
+                        "exact_batch": events is expected,
+                        "offsets_ns": [event.offset_ns for event in events],
+                        "before_cont": not any(item["command"] == "cont"
+                                               for item in self.report["qmp_events"]), "accepted": False}
+                    append_bounded(evidence, "queue_calls", row, 2)
+                    result = queue(name, events, session_id=session_id)
+                    row["accepted"] = True
+                    return result
+                runtime.start, runtime.queue_referee_events = observed_start, observed_queue
             publish = runtime.publish_referee
             def observed_publish(name, *, deadline):
                 if name not in self.report["ready"]:
@@ -711,7 +817,7 @@ class RefereeObservation(Observation):
                 append_bounded(self.report["publications"], name, row, 127)
                 wire = publish(name, deadline=deadline)
                 row.update(wire_hex=wire.hex(), accepted=True)
-                check_referee_wire(wire, name, sequence)
+                check_referee_wire(wire, name, sequence, logical_ns=row["logical_ns"], scenario=self.scenario)
                 row["verified"] = True
                 return wire
             runtime.publish_referee = observed_publish
@@ -740,6 +846,60 @@ class RefereeObservation(Observation):
         elif frame.header.kind == codec.STEP_DONE:
             summary["done_count"] += 1
             summary["last_done"] = row
+        self.service_control()
+
+    def service_control(self):
+        """At most one flush per callback; the existing loop owns all waiting."""
+        if not self.scenario:
+            return
+        evidence = self.report["scenario_observation"]
+        east = evidence["samples"]["east"].get("2")
+        if evidence["stage"] is None or east is None:
+            return
+        stream = self.controls["west"]
+        control = evidence["control"]
+        if control is None:
+            if any("1" not in rows or rows["1"]["logical_ns"] >= SCENARIO_EVENT_NS
+                   for rows in evidence["samples"].values()):
+                raise ValueError("Scenario referee requires both complete baselines before its event")
+            if stream.tx_pending:
+                raise ValueError("Scenario referee control UART has prior pending output")
+            control = evidence["control"] = {"logical_ns": self.runtime.t_sim_ns,
+                "wire_hex": "a5", "send_attempts": 1, "accepted": False,
+                "flush_attempts": 1, "completed": False,
+                "borrowed_stream_identity": id(stream)}
+            # StreamTransport.send owns the first real flush attempt.
+            stream.send(b"\xa5")
+            control["accepted"] = True
+        elif stream.tx_pending:
+            control["flush_attempts"] += 1
+            stream.flush()
+        if not stream.tx_pending and not control["completed"]:
+            control.update(completed=True, completed_logical_ns=self.runtime.t_sim_ns)
+
+    def scenario_case(self, name, row, poll_sample_qemu_ns):
+        prefix = "referee.arena."
+        if not self.scenario or not row["name"].startswith(prefix):
+            return
+        sample = row["name"].split(".")[2]
+        evidence = self.report["scenario_observation"]
+        now = self.runtime.t_sim_ns
+        if sample == "1" and now >= SCENARIO_EVENT_NS:
+            raise ValueError("Scenario referee complete baseline report missed the event boundary")
+        if name == "east" and sample in ("2", "3") and now < SCENARIO_EVENT_NS:
+            raise ValueError("Scenario referee changed report preceded its event boundary")
+        if name == "west" and sample in ("2", "3"):
+            control = evidence["control"]
+            if control is None or not control["completed"]:
+                raise ValueError("Scenario referee west sample preceded observation control")
+        labels = {label for label in REFEREE_REQUIRED if label.startswith(prefix + sample + ".")}
+        observed = [item["name"] for item in self.report["cases"][name]
+                    if item["name"].startswith(prefix + sample + ".")]
+        if len(observed) > len(labels) or len(observed) != len(set(observed)):
+            raise ValueError("duplicate Scenario referee sample report")
+        if set(observed) == labels:
+            evidence["samples"][name][sample] = {"logical_ns": now,
+                "poll_sample_qemu_ns": poll_sample_qemu_ns}
 
     def emit(self, event):
         if event.event.endpoint != "uart1":
@@ -773,6 +933,14 @@ class RefereeObservation(Observation):
             row = {"status": fields[1], "name": fields[2],
                    "actual": int(fields[3]), "expected": int(fields[4])}
             if fields[1] == "READY":
+                if self.scenario and fields[2] == "referee.scenario.observe":
+                    evidence = self.report["scenario_observation"]
+                    if (event.name != "west" or row["actual"] != 0 or row["expected"] != 0
+                            or evidence["stage"] is not None or "1" not in evidence["samples"]["west"]):
+                        raise ValueError("unexpected Scenario referee observation stage marker")
+                    evidence["stage"] = {"logical_ns": self.runtime.t_sim_ns,
+                        "poll_sample_qemu_ns": event.event.timestamp_ns}
+                    continue
                 if (fields[2] != "referee.arena.ready" or row["actual"] != 0 or row["expected"] != 0
                         or event.name in self.report["ready"]):
                     raise ValueError("unexpected Arena referee ready marker")
@@ -781,6 +949,8 @@ class RefereeObservation(Observation):
             else:
                 append_bounded(self.report["cases"], event.name, row, 37)
                 check_referee_case(row, event.name)
+                self.scenario_case(event.name, row, event.event.timestamp_ns)
+        self.service_control()
 
     def watchdog(self, index, name, stage):
         from tools.dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
@@ -793,7 +963,7 @@ class RefereeObservation(Observation):
             raise ValueError("watchdog event during Arena referee consumer")
 
 
-def run_referee(elf, output, firmware, *, qemu=None):
+def run_referee(elf, output, firmware, *, qemu=None, scenario=False):
     """One existing Arena execution, with passed published after cleanup checks."""
     from tools.dm_mc02_referee_test import source_snapshot, checkout_snapshot, write_json
     output = Path(output).resolve()
@@ -818,8 +988,18 @@ def run_referee(elf, output, firmware, *, qemu=None):
         "missing": {name: sorted(REFEREE_REQUIRED) for name in REFEREE_IDS},
         "skips": {name: [] for name in REFEREE_IDS},
         "missing_skips": {name: ["plant.physics"] for name in REFEREE_IDS}}
+    if scenario:
+        report["scenario"] = True
+        report["scenario_observation"] = {"event_ns": SCENARIO_EVENT_NS,
+            "samples": {name: {} for name in REFEREE_IDS}, "stage": None, "control": None,
+            "shared_start": None, "queue_calls": []}
+        report["limitations"][0] = "Actual dual UART7/HAL/DMA/msg consumer of explicit Scenario events."
+        report["limitations"].append(
+            "West UART1 a5 only releases application observation after east changed report; it does not change the world or synchronize CPUs.")
+        report["limitations"].append(
+            "West sample2 requires all four fresh public timestamps after the firmware's post-a5 snapshot; this does not identify an exact host publication batch.")
     write_json(output / "report.json", report)
-    observer = primary = binary = manifest = None
+    observer = primary = binary = manifest = scenario_manifest = None
     previous_signal = signal.getsignal(signal.SIGTERM)
     def interrupted(signum, _frame):
         raise KeyboardInterrupt(f"Arena referee interrupted by signal {signum}")
@@ -831,28 +1011,45 @@ def run_referee(elf, output, firmware, *, qemu=None):
             "tools/dm_mc02_shared_world_smoke.py")]
         if manifest is not None:
             paths += [manifest.path, *(item.robot.path for item in manifest.robots)]
+        if scenario_manifest is not None:
+            paths.append(scenario_manifest.path)
         result.update({str(path): sha(path) for path in paths})
         return result
     try:
-        elf = arena.regular_file(elf, "ArenaRefereeTest ELF")
+        elf = arena.regular_file(elf, "ScenarioRefereeTest ELF" if scenario else "ArenaRefereeTest ELF")
         binary = arena.resolve_qemu(qemu)
         firmware = Path(firmware).resolve()
         if not firmware.is_dir():
             raise ValueError("firmware source tree is not a directory")
         directory = output / "arena"
         directory.mkdir()
-        manifest = write_manifests(directory, (elf, elf), referees=True)
+        if scenario:
+            from sim.scenario.runtime import run_manifest as run_scenario
+
+            scenario_manifest = write_scenario_manifest(directory, (elf, elf))
+            manifest = scenario_manifest.arena
+            report["scenario_input"] = {"path": str(scenario_manifest.path),
+                "duration_ns": scenario_manifest.duration_ns,
+                "referees": [asdict(item) for item in scenario_manifest.referees]}
+        else:
+            manifest = write_manifests(directory, (elf, elf), referees=True)
         report["inputs_before"], report["checkout_before"] = inputs(), checkout_snapshot(firmware)
         report["actual_sources_before"] = source_origins()
-        observer = RefereeObservation(report, manifest)
+        observer = RefereeObservation(report, manifest, scenario=scenario, scenario_manifest=scenario_manifest)
         overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
             "connect_unix": "connect", "SharedWorldRuntime": "shared",
             "RefereeEngine": "engine", "RefereeUartEndpoint": "endpoint"}
+        if scenario:
+            overrides["LabChannels"] = "channels"
         for original, replacement in overrides.items():
             setattr(observer, "original_" + replacement, getattr(arena, original))
         with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
-            result = arena.run_manifest(manifest, duration=1., qemu=binary, startup_timeout=10., timeout=20.,
-                                        emit=observer.emit, on_response=observer.response)
+            options = dict(qemu=binary, startup_timeout=10., timeout=20.,
+                           emit=observer.emit, on_response=observer.response)
+            if scenario:
+                result = run_scenario(scenario_manifest, **options)
+            else:
+                result = arena.run_manifest(manifest, duration=1., **options)
         report["runtime_result"] = asdict(result)
         calls = report["native_calls"]
         if (result.end_ns - result.origin_ns != 1_000_000_000 or calls["reset"] != 1
@@ -892,6 +1089,8 @@ def run_referee(elf, output, firmware, *, qemu=None):
             report["skips"][name] = [row["name"] for row in report["cases"][name] if row["status"] == "SKIP"]
             report["missing_skips"][name] = [] if "plant.physics" in report["skips"][name] else ["plant.physics"]
             verify(lambda name=name: check_referee_coverage(report["cases"][name], report["summaries"][name], name))
+        if scenario:
+            verify(lambda: check_scenario_observations(report))
         def cleanup():
             if observer is None:
                 raise ValueError("Arena referee owner acquisition unavailable")
@@ -934,6 +1133,10 @@ def run_referee(elf, output, firmware, *, qemu=None):
                 for endpoint in observer.endpoints:
                     check("referee UART socket identity", lambda endpoint=endpoint:
                         id(endpoint.transport.sock) in borrowed)
+                if scenario:
+                    check("Scenario existing UART1 borrow scope", lambda: set(observer.controls) == set(REFEREE_IDS))
+                    for name, stream in observer.controls.items():
+                        check(name + " existing control socket identity", lambda stream=stream: id(stream.sock) in borrowed)
             for index, row in enumerate(report["qmp_cleanup"]):
                 check(f"QMP{index} close", lambda row=row: row == {"attempts": 1, "completed": True})
             if (len(observer.owners) != 2 or len(observer.engines) != 2 or len(observer.endpoints) != 2
@@ -970,7 +1173,8 @@ def run_referee(elf, output, firmware, *, qemu=None):
             report["error_type"] = type(primary).__name__
             report["notes"] = list(getattr(primary, "__notes__", ()))
         write_json(output / "report.json", report)
-    print("RESULT: dual-QEMU Arena referee consumer " + report["result"])
+    label = "Scenario" if scenario else "Arena"
+    print("RESULT: dual-QEMU " + label + " referee consumer " + report["result"])
     if primary is not None:
         print(f"Arena referee consumer failed: {primary}", file=sys.stderr)
         for note in report["notes"]:

@@ -1,6 +1,7 @@
 """Fixed wire/report and lifecycle gates; real UART firmware is tested separately."""
 
 from contextlib import contextmanager
+from dataclasses import replace
 import hashlib
 import importlib.util
 import json
@@ -21,7 +22,7 @@ REAL_CONSUME = module.consume
 
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.fabric import CanBus
-from test_sim_shared_world import NativeStub
+from test_sim_shared_world import NativeStub, UartBudget, world_resources
 from tools import dm_mc02_arena_smoke as arena_module
 
 # Official 2026 V1.1.0 packed payloads with fixed sequences 0..7. CRC literals
@@ -530,6 +531,16 @@ ARENA_WIRES = {key: bytes.fromhex(value) for key, value in {
         "a50e00fe5c0202000000000000000029000c0019002860"
         "a50800ffd3040208110013171d0080524e",
 }.items()}
+SCENARIO_WIRES = {sequence: bytes.fromhex(value) for sequence, value in {
+    0: "a50b00000201000100000807060504030201d0c9"
+       "a50d00018d010203024600c80000006400500005296b"
+       "a50e00028b0202000000000000000028000f001b005e37"
+       "a508000304040208110013171d0080bd08",
+    4: "a50b000463010001000008070605040302015379"
+       "a50d0005ec010203024600c800000064005000050678"
+       "a50e0006ea0202000000000000000028000f001b00b8ee"
+       "a508000765040208110013171d0080d577",
+}.items()}
 ARENA_COMMON = ("control.rx", "reset.poweron", "bsp.init", "task.stack",
                 "referee.executor", "referee.uart")
 ARENA_GROUPS = ("fresh", "game", "robot", "power", "buff", "id",
@@ -556,13 +567,147 @@ def arena_summaries():
     return [{"kind": kind, "values": [36, 0, 1]} for kind in ("PHASE", "DONE")]
 
 
+def scenario_observations():
+    """One fixed completed observer receipt, without executing an owner."""
+    return {"event_ns": 200_000_000,
+        "samples": {name: {str(sample): dict(logical_ns=stamp, poll_sample_qemu_ns=10 + sample)
+            for sample, stamp in enumerate(stamps, 1)} for name, stamps in (
+                ("east", (50_000_000, 200_000_000, 300_000_000)),
+                ("west", (50_000_000, 300_000_000, 400_000_000)))},
+        "stage": dict(logical_ns=50_000_000, poll_sample_qemu_ns=19),
+        "control": dict(logical_ns=200_000_000, completed_logical_ns=200_000_000,
+            send_attempts=1, flush_attempts=1, wire_hex="a5", accepted=True, completed=True),
+        "shared_start": dict(session_id=1, origin_ns=0, accepted=True),
+        "queue_calls": [dict(member=name, session_id=1, logical_ns=0, exact_batch=True,
+            offsets_ns=[200_000_000] * 3 if name == "east" else [], before_cont=True, accepted=True)
+            for name in ("east", "west")]}
+
+
+@pytest.mark.parametrize("corruption", ["missing_sample", "late_baseline", "early_changed", "missing_control",
+                                       "duplicate_control", "west_before_flush", "queue_session", "queue_after_cont"])
+def test_scenario_observation_gate_requires_scoped_causal_and_original_queue_evidence(corruption):
+    evidence = scenario_observations()
+    arena_module.check_scenario_observations({"scenario_observation": evidence})
+    if corruption == "missing_sample":
+        del evidence["samples"]["west"]["3"]
+    elif corruption == "late_baseline":
+        evidence["samples"]["west"]["1"]["logical_ns"] = 200_000_000
+    elif corruption == "early_changed":
+        evidence["samples"]["east"]["2"]["logical_ns"] = 199_999_999
+    elif corruption == "missing_control":
+        evidence["control"] = None
+    elif corruption == "duplicate_control":
+        evidence["control"]["send_attempts"] = 2
+    elif corruption == "west_before_flush":
+        evidence["samples"]["west"]["2"]["logical_ns"] = 199_999_999
+    elif corruption == "queue_session":
+        evidence["queue_calls"][1]["session_id"] = 2
+    else:
+        evidence["queue_calls"][1]["before_cont"] = False
+    with pytest.raises(ValueError, match="Scenario referee"):
+        arena_module.check_scenario_observations({"scenario_observation": evidence})
+
+
 @pytest.fixture
-def referee_arena_manifest(tmp_path):
+def referee_arena_manifest(tmp_path, request):
     elf = tmp_path / "arena.elf"
     elf.write_bytes(b"fixed Arena firmware input")
     directory = tmp_path / "manifests"
     directory.mkdir()
+    if getattr(request, "param", False):
+        return arena_module.write_scenario_manifest(directory, (elf, elf))
     return arena_module.write_manifests(directory, (elf, elf), referees=True)
+
+
+@pytest.mark.parametrize("referee_arena_manifest", [True], indirect=True)
+def test_scenario_fixture_admits_fixed_typed_inputs_and_exact_wire_time_boundary(referee_arena_manifest):
+    from sim.devices.referee import Buff, Hit, ScriptEvent, Shot
+    from sim.scenario import load_manifest
+
+    scenario = referee_arena_manifest
+    assert load_manifest(scenario.path) == scenario
+    assert scenario.duration_ns == 1_000_000_000
+    assert [row.member for row in scenario.referees] == ["east", "west"]
+    assert scenario.referees[0].events == (
+        ScriptEvent(200_000_000, Hit(30)), ScriptEvent(200_000_000, Shot(5, 7)),
+        ScriptEvent(200_000_000, Buff(8, 17, 19, 23, 29, 128)))
+    assert scenario.referees[1].events == ()
+    assert all(row.events == () and row.cooling_42mm_per_s == 0 for row in scenario.arena.referees)
+    assert all(not row.robot.upper_computers and row.robot.ready.text ==
+               b"TTEST READY referee.arena.ready 0 0\n" for row in scenario.arena.robots)
+    for sequence in (0, 4):
+        arena_module.check_referee_wire(ARENA_WIRES["east", sequence], "east", sequence,
+                                       scenario=True, logical_ns=199_999_999)
+        arena_module.check_referee_wire(SCENARIO_WIRES[sequence], "east", sequence,
+                                       scenario=True, logical_ns=200_000_000)
+        arena_module.check_referee_wire(ARENA_WIRES["west", sequence], "west", sequence,
+                                       scenario=True, logical_ns=200_000_000)
+        for wrong, stamp in ((SCENARIO_WIRES[sequence], 199_999_999),
+                             (ARENA_WIRES["east", sequence], 200_000_000)):
+            with pytest.raises(ValueError, match="wire disagrees"):
+                arena_module.check_referee_wire(wrong, "east", sequence, scenario=True, logical_ns=stamp)
+
+
+@pytest.mark.parametrize("logical_ns", [None, True, -1, 200_000_000.0])
+def test_scenario_wire_requires_plain_nonnegative_logical_time(logical_ns):
+    with pytest.raises((TypeError, ValueError), match="logical"):
+        arena_module.check_referee_wire(SCENARIO_WIRES[0], "east", 0,
+                                       scenario=True, logical_ns=logical_ns)
+
+
+@pytest.mark.parametrize("referee_arena_manifest", [True], indirect=True)
+def test_scenario_public_queue_drives_real_shared_engines_and_complete_scoped_wires(
+        referee_arena_manifest, world_resources, monkeypatch):
+    import time
+    from sim.core import Session
+    from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+    from sim.robots.shared_world import RefereeBinding, SharedWorldRuntime
+    from sim.transports import StreamTransport
+
+    scenario = referee_arena_manifest
+    plant, boards, native, bindings, _, _, stack = world_resources
+    bindings = tuple(replace(row, name=name) for row, name in zip(bindings, ("east", "west")))
+    referees, peers, admissions = [], {}, []
+    for record in scenario.arena.referees:
+        engine = RefereeEngine(record.initial, durations=record.durations,
+                               events=record.events, cooling_42mm_per_s=record.cooling_42mm_per_s)
+        sender, peer = socket.socketpair()
+        sender.setblocking(False)
+        peer.settimeout(1)
+        stack.callback(sender.close)
+        stack.callback(peer.close)
+        endpoint = RefereeUartEndpoint(StreamTransport(sender))
+        referees.append(RefereeBinding(record.member, engine, endpoint))
+        peers[record.member] = peer
+        original = engine.queue_events
+        def queue(events, *, session_id, original=original, name=record.member):
+            admissions.append((name, events, session_id))
+            return original(events, session_id=session_id)
+        monkeypatch.setattr(engine, "queue_events", queue)
+    runtime = SharedWorldRuntime(plant, bindings, referees=tuple(referees), check_running=boards)
+    stack.callback(runtime.close)
+    origin = 12_345_678
+    runtime.start(Session(7, origin), (71, 72), deadline=time.monotonic() + 1)
+    for row in scenario.referees:
+        runtime.queue_referee_events(row.member, row.events, session_id=7)
+    assert len(admissions) == 2 and all(actual[1] is row.events and actual[2] == 7
+                                      for actual, row in zip(admissions, scenario.referees))
+    assert native.resets == 1 and native.steps == []
+    for dt, logical_ns, sequence in ((199_999_999, 199_999_999, 0), (1, 200_000_000, 4)):
+        runtime.step(dt, deadline=time.monotonic() + 1)
+        for row in referees:
+            wire = runtime.publish_referee(row.name, deadline=time.monotonic() + 1)
+            expected = (SCENARIO_WIRES[sequence] if logical_ns == 200_000_000 and row.name == "east"
+                        else ARENA_WIRES[row.name, sequence])
+            assert wire == peers[row.name].recv(4096) == expected
+            arena_module.check_referee_wire(wire, row.name, sequence, scenario=True, logical_ns=logical_ns)
+    assert runtime.t_sim_ns == origin + 200_000_000 and native.steps == [199_999_999, 1]
+    assert referees[0].engine.get_state().robot.current_hp == 70
+    assert (referees[0].engine.get_state().power_heat.heat_17mm,
+            referees[0].engine.get_state().power_heat.heat_42mm) == (15, 27)
+    assert referees[1].engine.get_state() == scenario.arena.referees[1].initial
+    runtime.close()
+    assert native.closed == 1 and all(row.engine.closed and row.endpoint.closed for row in referees)
 
 
 def test_arena_admission_drives_real_engines_core_and_uart_with_scoped_literals(referee_arena_manifest):
@@ -681,6 +826,123 @@ def test_arena_uart_observer_consumes_fragmented_ready_cases_and_summaries(refer
         observer.emit(arena_module.arena.ArenaEvent("west", ChannelEvent("uart1", 125, b"x" * 12001)))
 
 
+@pytest.mark.parametrize("stage_first", [False, True], ids=["east_changed_first", "west_stage_first"])
+def test_scenario_fragmented_stage_borrows_one_control_and_flushes_original_stream(
+        referee_arena_manifest, stage_first):
+    from sim.boards.channels import ChannelEvent, LabChannels
+    from sim.transports import StreamTransport
+
+    report = {"uart": ["", ""], "ready": {}, "cases": {name: [] for name in ("east", "west")},
+              "summaries": {name: [] for name in ("east", "west")},
+              "scenario_observation": {"event_ns": 200_000_000, "samples": {"east": {}, "west": {}},
+                  "stage": None, "control": None, "shared_start": None, "queue_calls": []}}
+    observer = arena_module.RefereeObservation(report, referee_arena_manifest, scenario=True)
+    observer.runtime = SimpleNamespace(t_sim_ns=50_000_000)
+    watchdogs, channel_calls, sockets, budgets, peers = [], [], [], {}, {}
+    observer.watchdog = lambda index, name, stage: watchdogs.append((name, stage))
+    def channels(**options):
+        channel_calls.append(options)
+        return LabChannels(**options)
+    observer.original_channels = channels
+    def emit(name, data):
+        observer.emit(arena_module.arena.ArenaEvent(name, ChannelEvent("uart1", 123, data)))
+    def emit_rows(name, sample):
+        rows = [row for row in arena_rows(name) if row["name"].startswith(f"referee.arena.{sample}.")]
+        emit(name, "".join(f"TTEST {row['status']} {row['name']} {row['actual']} {row['expected']}\n"
+                           for row in rows).encode("ascii"))
+    def stage():
+        emit("west", b"TTEST READY referee.scenario.")
+        assert report["scenario_observation"]["stage"] is None
+        emit("west", b"observe 0 0\n")
+    try:
+        for name in ("east", "west"):
+            sender, peer = socket.socketpair()
+            sender.setblocking(False)
+            peer.setblocking(False)
+            sockets.extend((sender, peer))
+            budgets[name], peers[name] = UartBudget(sender), peer
+            stream = StreamTransport(budgets[name], max_pending=1)
+            actual = observer.channels(uarts={"uart1": stream})
+            assert actual is not None and observer.controls[name] is stream
+            rows = [row for row in arena_rows(name) if row["name"] in ARENA_COMMON]
+            emit(name, b"TTEST READY referee.arena.ready 0 0\n" +
+                 "".join(f"TTEST {row['status']} {row['name']} {row['actual']} {row['expected']}\n"
+                         for row in rows).encode("ascii"))
+            emit_rows(name, 1)
+        assert len(channel_calls) == 2
+        budgets["west"].budget = 0
+        if stage_first:
+            stage()
+        observer.runtime.t_sim_ns = 200_000_000
+        emit_rows("east", 2)
+        if not stage_first:
+            assert report["scenario_observation"]["control"] is None
+            stage()
+        control = report["scenario_observation"]["control"]
+        assert control["accepted"] and not control["completed"] and control["send_attempts"] == 1
+        assert control["borrowed_stream_identity"] == id(observer.controls["west"])
+        assert control["flush_attempts"] == budgets["west"].sends == 1
+        emit("east", b"diagnostic\n")
+        assert control["flush_attempts"] == budgets["west"].sends == 2
+        budgets["west"].budget = None
+        observer.runtime.t_sim_ns = 250_000_000
+        emit("east", b"diagnostic\n")
+        assert control["completed"] and control["completed_logical_ns"] == 250_000_000
+        assert peers["west"].recv(4096) == b"\xa5"
+        assert control["flush_attempts"] == budgets["west"].sends == 3
+        for name, sample, stamp in (("east", 3, 300_000_000), ("west", 2, 300_000_000),
+                                    ("west", 3, 400_000_000)):
+            observer.runtime.t_sim_ns = stamp
+            emit_rows(name, sample)
+        for name in ("east", "west"):
+            emit(name, b"TTEST SKIP plant.physics 0 0\nTTEST PHASE 36 0 1\nTTEST DONE 36 0 1\n")
+            assert report["cases"][name] == arena_rows(name)
+            assert report["summaries"][name] == arena_summaries()
+        assert watchdogs == [("east", "done"), ("west", "done")]
+        assert budgets["west"].sends == 3 and budgets["east"].sends == 0
+        assert all(value.reads == value.closes == 0 for value in budgets.values())
+        with pytest.raises(ValueError, match="duplicate.*channel"):
+            observer.channels(uarts={"uart1": observer.controls["west"]})
+        assert len(channel_calls) == 2
+    finally:
+        for sock in sockets:
+            sock.close()
+
+
+@pytest.mark.parametrize("violation", ["late_baseline", "early_changed", "west_before_control",
+                                      "foreign_stage", "stage_before_baseline", "bad_stage_values",
+                                      "duplicate_stage", "duplicate_sample"])
+def test_scenario_observer_rejects_bad_stage_early_or_duplicate_reports(referee_arena_manifest, violation):
+    from sim.boards.channels import ChannelEvent
+
+    report = {"uart": ["", ""], "ready": {}, "cases": {name: [] for name in ("east", "west")},
+              "summaries": {name: [] for name in ("east", "west")},
+              "scenario_observation": {"event_ns": 200_000_000, "samples": {"east": {}, "west": {}},
+                  "stage": None, "control": None, "shared_start": None, "queue_calls": []}}
+    observer = arena_module.RefereeObservation(report, referee_arena_manifest, scenario=True)
+    observer.runtime = SimpleNamespace(t_sim_ns=50_000_000)
+    def emit(name, data):
+        observer.emit(arena_module.arena.ArenaEvent(name, ChannelEvent("uart1", 123, data)))
+    if violation not in ("stage_before_baseline", "late_baseline"):
+        rows = [row for row in arena_rows("west") if row["name"].startswith("referee.arena.1.")]
+        emit("west", "".join(f"TTEST {row['status']} {row['name']} {row['actual']} {row['expected']}\n"
+                              for row in rows).encode("ascii"))
+    name, data = "west", b"TTEST READY referee.scenario.observe 0 0\n"
+    if violation in ("late_baseline", "early_changed", "west_before_control", "duplicate_sample"):
+        observer.runtime.t_sim_ns = 200_000_000 if violation == "late_baseline" else 50_000_000
+        sample = 1 if violation in ("late_baseline", "duplicate_sample") else 2
+        name = "east" if violation == "early_changed" else "west"
+        data = f"TTEST PASS referee.arena.{sample}.fresh 1 1\n".encode("ascii")
+    elif violation == "foreign_stage":
+        name = "east"
+    elif violation == "bad_stage_values":
+        data = b"TTEST READY referee.scenario.observe 1 0\n"
+    elif violation == "duplicate_stage":
+        emit(name, data)
+    with pytest.raises(ValueError, match="Scenario referee"):
+        emit(name, data)
+
+
 def arena_response_summary(wire_session, reset_qemu_ns):
     """Exact retained public ACK receipt; no transport implementation here."""
     from sim.transports import step_codec as codec
@@ -711,7 +973,8 @@ def test_arena_ack_gate_requires_actual_scoped_identities(corruption):
         arena_module.check_referee_responses(summary, 2, 1000, 1_000_000_000, 91_234)
 
 
-def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monkeypatch):
+@pytest.mark.parametrize("scenario", [False, True], ids=["arena", "scenario"])
+def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monkeypatch, scenario):
     import builtins
     calls, imports = [], []
     original_import = builtins.__import__
@@ -728,12 +991,17 @@ def test_arena_cli_delegates_once_and_profile_flags_are_exclusive(tmp_path, monk
     assert module.main(list(paths)) == 17 and imports == [] and calls == []
     monkeypatch.setattr(arena_module, "run_referee", admitted)
     monkeypatch.setattr(module, "run", lambda *args, **options: pytest.fail("Arena dispatch reached old runner"))
-    assert module.main([*paths, "--arena", "--qemu", "/fixed/qemu"]) == 23
-    assert calls == [(*paths, dict(qemu="/fixed/qemu"))]
+    flag = "--scenario" if scenario else "--arena"
+    assert module.main([*paths, flag, "--qemu", "/fixed/qemu"]) == 23
+    assert calls == [(*paths, dict(qemu="/fixed/qemu", **({"scenario": True} if scenario else {})))]
     assert imports == ["tools.dm_mc02_arena_smoke"]
     with pytest.raises(SystemExit) as rejected:
-        module.main([*paths, "--arena", "--shared-world"])
+        module.main([*paths, flag, "--shared-world"])
     assert rejected.value.code == 2 and len(calls) == 1
+    if scenario:
+        with pytest.raises(SystemExit) as rejected:
+            module.main([*paths, "--scenario", "--arena"])
+        assert rejected.value.code == 2 and len(calls) == 1
 
 
 @pytest.mark.parametrize("corruption", ["cadence", "missing_due", "period", "ready", "admission", "sequence"])
@@ -880,6 +1148,22 @@ def completed_arena_receipt(tmp_path, monkeypatch):
         report["qmp_cleanup"] = [dict(attempts=1, completed=True) for _ in range(2)]
         report["native_calls"] = dict(reset=1, attempts=1000, steps=1000, total_ns=1_000_000_000,
             minimum_ns=1_000_000, maximum_ns=1_000_000, close=1)
+        if report.get("scenario"):
+            assert observer.scenario_manifest.arena is manifest
+            observer.controls = {name: SimpleNamespace(sock=closed_socket) for name in ("east", "west")}
+            batches = options["referee_events"]
+            assert len(batches) == 2
+            assert all(batch[0] == row.member and batch[1] is row.events
+                       for batch, row in zip(batches, observer.scenario_manifest.referees))
+            report["scenario_observation"] = scenario_observations()
+            for row, batch in zip(report["scenario_observation"]["queue_calls"], batches):
+                row["batch_identity"] = id(batch[1])
+            if state.mode == "missing_control":
+                report["scenario_observation"]["control"] = None
+            elif state.mode == "late_baseline":
+                report["scenario_observation"]["samples"]["west"]["1"]["logical_ns"] = 200_000_000
+            elif state.mode == "scenario_source":
+                observer.scenario_manifest.path.write_text("changed after admission\n")
         boards, referees = [], []
         for index, name in enumerate(("east", "west"), 1):
             report["cases"][name], report["summaries"][name] = arena_rows(name), arena_summaries()
@@ -913,20 +1197,30 @@ def completed_arena_receipt(tmp_path, monkeypatch):
     return elf, state
 
 
-@pytest.mark.parametrize("mode", ["success", "missing_case", "missing_summary", "missing_watchdog",
-                                  "cleanup", "uart_socket", "source", "primary"])
+@pytest.mark.parametrize("mode,scenario", [
+    (mode, False) for mode in ("success", "missing_case", "missing_summary", "missing_watchdog",
+                              "cleanup", "uart_socket", "source", "primary")
+] + [(mode, True) for mode in ("success", "missing_case", "cleanup", "source", "primary",
+                              "missing_control", "late_baseline", "scenario_source")])
 def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
-        completed_arena_receipt, tmp_path, mode):
+        completed_arena_receipt, tmp_path, mode, scenario):
     elf, state = completed_arena_receipt
     state.mode = mode
     output = tmp_path / "result"
     expected = 0 if mode == "success" else 130 if mode == "primary" else 1
-    assert arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable) == expected
+    assert arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable, scenario=scenario) == expected
     report_path = output / "report.json"
     report = json.loads(report_path.read_text())
     assert len(state.calls) == 1
     options = state.calls[0][1]
     assert (options["duration"], options["startup_timeout"], options["timeout"]) == (1., 10., 20.)
+    if scenario:
+        assert report["scenario"] and report["scenario_input"]["duration_ns"] == 1_000_000_000
+        assert [batch[0] for batch in options["referee_events"]] == ["east", "west"]
+        path = report["scenario_input"]["path"]
+        assert path in report["inputs_before"]
+        if mode != "scenario_source":
+            assert report["inputs_before"][path] == hashlib.sha256(Path(path).read_bytes()).hexdigest()
     if mode == "success":
         assert report["result"] == "passed" and report["cleanup_verified"] and report["source_preserved"]
         assert report["missing"] == {"east": [], "west": []}
@@ -936,7 +1230,9 @@ def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
         errors = "\n".join(report["errors"])
         assert {"missing_case": "coverage", "missing_summary": "summaries", "missing_watchdog": "watchdog",
                 "cleanup": "cleanup incomplete", "uart_socket": "cleanup incomplete",
-                "source": "source state changed", "primary": "interruption"}[mode] in errors
+                "source": "source state changed", "primary": "interruption",
+                "missing_control": "observation control", "late_baseline": "baseline/sample",
+                "scenario_source": "source state changed"}[mode] in errors
         if mode == "missing_case":
             assert report["missing"]["west"] == ["control.rx"]
         if mode == "primary":
@@ -946,5 +1242,5 @@ def test_arena_pass_requires_consumer_evidence_cleanup_and_preserved_sources(
             assert "source state changed" in "\n".join(report["notes"])
     saved = report_path.read_bytes()
     with pytest.raises(ValueError, match="refusing to overwrite"):
-        arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable)
+        arena_module.run_referee(elf, output, tmp_path, qemu=sys.executable, scenario=scenario)
     assert report_path.read_bytes() == saved and len(state.calls) == 1
