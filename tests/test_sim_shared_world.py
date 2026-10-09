@@ -638,9 +638,10 @@ def referee_setup(referee_resources):
     yield runtime, boards, native, bindings, peers, observations, referees, pairs
 
 
-@pytest.mark.parametrize("queued", [False, True], ids=["script", "scoped_queue"])
-def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, monkeypatch, queued):
+@pytest.mark.parametrize("source", ["script", "scoped_queue", "scenario"])
+def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, monkeypatch, tmp_path, source):
     runtime, boards, native, _, _, _, referees, pairs = referee_setup
+    queued = source != "script"
     assert runtime.referees is referees
     sessions, contexts, reset_observations, endpoint_resets, admissions = [], [], [], [], []
     for item in referees:
@@ -691,6 +692,31 @@ def test_referee_shared_session_context_and_literal_scoped_uart(referee_setup, m
     assert all(sock.sends == 0 and uart_received(peer) == b"" for sock, peer in pairs)
     if queued:
         events = (ScriptEvent(500_000_000, Hit(10)), ScriptEvent(500_000_000, Shot(2, 3)))
+        if source == "scenario":
+            from sim.scenario.manifest import load_manifest
+            from test_arena_manifest import referee_configuration, write_arena
+
+            write_arena(tmp_path / "inputs", members={
+                "right": {"manifest": "robots/bravo/robot.yaml", "prefix": "bravo/",
+                          "physics": "shared-world"},
+                "left": {"manifest": "robots/alpha/robot.yaml", "prefix": "alpha/",
+                         "physics": "shared-world"}},
+                referees={name: referee_configuration() for name in ("right", "left")})
+            path = tmp_path / "scenario.yaml"
+            path.write_text("""schema: 1
+arena: inputs/arena.yaml
+duration: 1s
+referee_events:
+  left:
+    - {at: 500ms, hit: {damage_hp: 10}}
+    - {at: 500ms, shot: {heat_17mm: 2, heat_42mm: 3}}
+""", encoding="utf-8")
+            scenario = load_manifest(path)
+            assert scenario.duration_ns == 1_000_000_000
+            assert tuple(item.member for item in scenario.arena.referees) == ("left", "right")
+            assert tuple(item.member for item in scenario.referees) == ("left",)
+            assert scenario.referees[0].events == events
+            events = scenario.referees[0].events
         before = tuple(item.engine.get_state() for item in referees)
         before_reads = list(native.reads)
         with monkeypatch.context() as admission:

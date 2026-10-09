@@ -77,14 +77,16 @@ def load_manifest(path):
     return load(path)
 
 
-def forbid_child_reads(directory, monkeypatch):
+def forbid_child_reads(directory, monkeypatch, *, include_arena=False):
     child_paths = {(directory / "robots" / prefix / "robot.yaml").resolve()
                    for prefix in ("alpha", "bravo")}
+    if include_arena:
+        child_paths.add((directory / "arena.yaml").resolve())
     original_open = Path.open
 
     def open_file(self, *args, **kwargs):
         if self.resolve() in child_paths:
-            pytest.fail("outer rejection read a child before complete admission")
+            pytest.fail("outer rejection read referenced configuration before complete admission")
         return original_open(self, *args, **kwargs)
 
     monkeypatch.setattr(Path, "open", open_file)
@@ -653,3 +655,173 @@ def test_admitted_referees_feed_real_coordinator_with_literal_wire_and_reset_ori
     finally:
         coordinator.close()
     assert coordinator.closed and all(engine.closed for engine in engines.values())
+
+
+def test_scenario_admission_is_pure_relative_scoped_canonical_and_frozen(tmp_path, monkeypatch):
+    from sim.core import Coordinator
+    from sim.devices.referee import RefereeEngine, RefereeUartEndpoint
+
+    arena_path = write_arena(tmp_path, referees={"west": referee_configuration(),
+                                                "east": referee_configuration()})
+    directory = tmp_path / "scenarios"
+    directory.mkdir()
+    path = directory / "trial.yaml"
+    raw_events = referee_configuration(scripted=True)["events"]
+    times = ("0s", "0ns", "0us", "500ms", "500ms", "1s", "1000ms", "1000000us")
+    events = [{"at": at, **{key: value for key, value in row.items() if key != "offset_ns"}}
+              for at, row in zip(times, raw_events)]
+    document = {"schema": 1, "arena": "../arena.yaml", "duration": "2s",
+                "referee_events": {"west": [], "east": events}}
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Scenario admission constructed or executed a runtime owner")
+    for owner in (RefereeEngine, RefereeUartEndpoint, Coordinator):
+        monkeypatch.setattr(owner, "__init__", forbidden)
+    for method in ("reset", "step", "queue_events", "get_state", "close"):
+        monkeypatch.setattr(RefereeEngine, method, forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    original_import = builtins.__import__
+    def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
+        resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
+                    if level else name)
+        candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
+        for candidate in candidates:
+            if any(candidate == prefix or candidate.startswith(prefix + ".") for prefix in (
+                    "mujoco", "numpy", "sim.physics", "sim.arena.runtime", "sim.robots.runtime",
+                    "sim.robots.shared_world", "sim.lab.runtime", "sim.boards", "tools")):
+                pytest.fail(f"Scenario admission imported a runtime dependency: {candidate}")
+        return original_import(name, globals, locals, fromlist, level)
+    monkeypatch.setattr(builtins, "__import__", pure_import)
+    from sim.scenario import ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
+
+    result = load_scenario(path)
+    assert isinstance(result, ScenarioManifest)
+    assert (result.path, result.duration_ns, result.arena.path) == (path.resolve(), 2_000_000_000, arena_path.resolve())
+    assert result.arena == load_manifest(arena_path)
+    assert type(result.referees) is tuple
+    assert all(isinstance(item, ScenarioReferee) for item in result.referees)
+    east, west = result.referees
+    assert [item.member for item in result.referees] == ["east", "west"] and west.events == ()
+    assert type(east.events) is tuple
+    assert [event.offset_ns for event in east.events] == [0, 0, 0, 500_000_000, 500_000_000,
+                                                          1_000_000_000, 1_000_000_000, 1_000_000_000]
+    assert [type(event.value).__name__ for event in east.events] == [
+        "Hit", "RobotStatus", "PowerHeat", "Shot", "Hit", "GameStatus", "RobotStatus", "Buff"]
+    assert east.events[0].value.damage_hp == 20 and east.events[3].value.heat_42mm == 7
+    for record in (result, *result.referees, *east.events, *(event.value for event in east.events)):
+        attribute = fields(record)[0].name
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, attribute, getattr(record, attribute))
+    document["referee_events"] = dict(reversed(tuple(document["referee_events"].items())))
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    assert load_scenario(path) == result
+
+
+@pytest.mark.parametrize("referees", [None, {}, {"east": []}])
+def test_scenario_absent_events_and_valid_empty_target_have_explicit_defaults(tmp_path, referees):
+    from sim.scenario import load_manifest as load_scenario
+    write_arena(tmp_path, referees={"east": referee_configuration()})
+    document = {"schema": 1, "arena": "arena.yaml", "duration": "1ns"}
+    if referees is not None:
+        document["referee_events"] = referees
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    result = load_scenario(path)
+    assert result.duration_ns == 1
+    assert [(item.member, item.events) for item in result.referees] == ([] if not referees else [("east", ())])
+
+
+@pytest.mark.parametrize("location,replacement", [
+    (("schema",), True),
+    (("arena",), DELETE),
+    (("arena",), "arena\0.yaml"),
+    (("duration",), "0s"),
+    (("duration",), 1),
+    (("duration",), "3601s"),
+    (("actions",), []),
+    (("assertions",), []),
+    (("step",), "1ms"),
+    (("referee_events",), []),
+    (("referee_events",), {"bad\0name": []}),
+    (("referee_events", "east"), [{"hit": {"damage_hp": 1}}]),
+    (("referee_events", "east"), [{"at": "1s", "offset_ns": 0, "hit": {"damage_hp": 1}}]),
+    (("referee_events", "east"), [{"at": "2s", "hit": {"damage_hp": 1}}]),
+    (("referee_events", "east"), [{"at": "1s", "hit": {"damage_hp": 0}},
+                                     {"at": "0s", "hit": {"damage_hp": 0}}]),
+    (("referee_events", "east"), [{"at": "0s", "hit": {"damage_hp": True}}]),
+], ids=["schema-type", "required-arena", "nul-path", "zero-duration", "duration-type", "duration-limit",
+        "unsupported-actions", "unsupported-assertions", "unsupported-step", "events-mapping", "nul-target",
+        "required-at", "unknown-offset", "after-duration", "unordered-events", "wire-range"])
+def test_scenario_complete_outer_admission_rejects_before_referenced_arena_read(
+        tmp_path, monkeypatch, location, replacement):
+    from sim.scenario import load_manifest as load_scenario
+    write_arena(tmp_path, referees={"east": referee_configuration()})
+    document = {"schema": 1, "arena": "arena.yaml", "duration": "1s", "referee_events": {"east": []}}
+    item = document
+    for key in location[:-1]:
+        item = item[key]
+    if replacement is DELETE:
+        del item[location[-1]]
+    else:
+        item[location[-1]] = replacement
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError):
+        load_scenario(path)
+
+
+@pytest.mark.parametrize("change", ["duplicate", "anchor"])
+def test_scenario_uses_existing_bounded_yaml_loader_before_arena_read(tmp_path, monkeypatch, change):
+    from sim.scenario import load_manifest as load_scenario
+    write_arena(tmp_path)
+    text = "schema: 1\narena: arena.yaml\nduration: 1s\n"
+    text += "duration: 2s\n" if change == "duplicate" else "referee_events: {east: &events [], west: *events}\n"
+    path = tmp_path / "scenario.yaml"
+    path.write_text(text, encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError):
+        load_scenario(path)
+
+
+@pytest.mark.parametrize("count", [1024, 1025])
+def test_scenario_event_capacity_is_aggregate_and_duration_endpoint_is_inclusive(tmp_path, monkeypatch, count):
+    from sim.scenario import load_manifest as load_scenario
+    write_arena(tmp_path, referees={"east": referee_configuration(), "west": referee_configuration()})
+    document = {"schema": 1, "arena": "arena.yaml", "duration": "1s", "referee_events": {
+        name: [{"at": "1s", "hit": {"damage_hp": 0}} for _ in range(size)]
+        for name, size in (("west", count - 512), ("east", 512))}}
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    if count == 1024:
+        result = load_scenario(path)
+        assert [(item.member, len(item.events)) for item in result.referees] == [("east", 512), ("west", 512)]
+        assert all(event.offset_ns == 1_000_000_000 for item in result.referees for event in item.events)
+    else:
+        forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+        with pytest.raises(ManifestError, match="1024"):
+            load_scenario(path)
+
+
+@pytest.mark.parametrize("target", ["missing", "west"])
+def test_scenario_targets_require_existing_referee_even_for_empty_input(tmp_path, target):
+    from sim.scenario import load_manifest as load_scenario
+    write_arena(tmp_path, referees={"east": referee_configuration()})
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1s",
+                                    "referee_events": {target: []}}), encoding="utf-8")
+    with pytest.raises(ManifestError, match=target):
+        load_scenario(path)
+
+
+def test_scenario_preserves_context_for_referenced_arena_rejection(tmp_path):
+    from sim.scenario import load_manifest as load_scenario
+    arena_path = write_arena(tmp_path)
+    arena_path.write_text("schema: 0\n", encoding="utf-8")
+    path = tmp_path / "scenario.yaml"
+    path.write_text("schema: 1\narena: arena.yaml\nduration: 1s\n", encoding="utf-8")
+    with pytest.raises(ManifestError) as caught:
+        load_scenario(path)
+    assert "'arena.yaml'" in str(caught.value) and isinstance(caught.value.__cause__, ManifestError)

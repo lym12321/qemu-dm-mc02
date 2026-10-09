@@ -404,6 +404,31 @@ pending 限制。该调用不推进时间或发布 UART；名称、输入、sess
 整数 `ns/us/ms/s` 字符串，最多 13 位十进制数字，结果不超过 3600 秒。
 `zero=False` 拒绝零值；不接受浮点、负数或其它单位，不推进任何时钟。
 
+Scenario 的首版文件准入接口为 `sim.scenario.load_manifest(path)`：
+
+```yaml
+schema: 1
+arena: arena.yaml
+duration: 1s
+referee_events:
+  east:
+    - at: 100ms
+      hit: {damage_hp: 10}
+  west:
+    - at: 100ms
+      shot: {heat_17mm: 5, heat_42mm: 7}
+```
+
+`arena` 相对 Scenario 文件解析，目标必须是该 Arena 中已配置 referee 的成员。
+`referee_events` 可省略；事件复用上面的六种 typed 值，合计最多 1024 项。
+每个成员的 `at` 必须非递减且不超过 `duration`，等时顺序保留。完整文件校验后
+返回不可变记录，可将各 `record.events` 交给共享世界的 `queue_referee_events`。
+
+`at` 从 shared host Session reset 起算；`duration` 沿用 Arena 在全部请求的 ready
+之后计算的活动时长，两者的起点不同。启动期间的事件可以先改变裁判状态；
+`at: 0ns` 的动态事件在下一次成功 step 才生效。此接口只读取配置，不执行
+仿真；Scenario CLI、故障注入、assertions 和 replay 尚未支持。
+
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
