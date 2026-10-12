@@ -3,8 +3,9 @@
 The runtime borrows board endpoints and all nonblocking streams. One Coordinator
 owns the existing CAN/plant participant and optional referee engines; referee
 endpoints have a separate sequence lifecycle. This is a synchronous host
-composition, not a CPU target barrier. Operation failure is terminal except
+composition, not a CPU target barrier. Execution failure is terminal except
 snapshot capacity refusal: recreate the owner and boards, never replay a tick.
+Pure admission refusal preserves runtime readiness.
 Callbacks may observe state but must not reenter execution or cleanup.
 """
 
@@ -372,6 +373,22 @@ class SharedWorldRuntime:
         if item is None:
             raise ValueError(f"unknown referee: {name!r}")
         item.engine.queue_events(events, session_id=session_id)
+
+    def set_can_delay(self, name: str, delay_ns: int) -> None:
+        """Change one board bus's subsequent-enqueue policy without IO or ticks.
+
+        Pending due times remain unchanged. Admission refusal preserves runtime
+        readiness; the borrowed bus owns value validation and the current policy.
+        Calls during active execution or cleanup are rejected.
+        """
+        if self.closed or self._busy or self.failed:
+            raise RuntimeError("shared world requires a successful start and fresh runtime")
+        if type(name) is not str:
+            raise TypeError("board name must be a string")
+        item = next((item for item in self.bindings if item.name == name), None)
+        if item is None:
+            raise ValueError(f"unknown board: {name!r}")
+        item.endpoint.bus.delay_ns = delay_ns
 
     def step(self, dt_ns: int, *, deadline):
         """Advance the sole world once; return actual per-board STEP_ACKs."""

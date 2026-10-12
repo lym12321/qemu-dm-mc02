@@ -2000,6 +2000,7 @@ runtime = SharedWorldRuntime(plant, (
 try:
     reset_acks = runtime.start(Session(1, 7), (101, 102),
                                deadline=time.monotonic() + 2)
+    runtime.set_can_delay("a", 5_000_000)
     step_acks = runtime.step(1_000_000, deadline=time.monotonic() + 2)
     runtime.service(deadline=time.monotonic() + 2, timeout=0)
 finally:
@@ -2012,6 +2013,13 @@ finally:
 输入，不提前消费。每个 `step()` 先有界服务连接，再调用一次 Coordinator；
 plant 沿用既有命令超时分段。全部终点 IMU 编码成功后才发送各板 STEP，返回
 实际 ACK tuple；重试复用编码 bytes。`service()` 只收发和入队，不推进世界。
+
+`set_can_delay(name, delay_ns)` 在 start 成功后修改指定成员总线的后续入队延迟。
+值遵守 `CanBus.delay_ns` 的整数范围；命令和反馈共用该策略，已排队帧保留原截止时间。
+尚未读取的物理输入在后续入队时使用新值。调用本身不收发、推进世界或发布裁判数据；
+无效名称或数值保留原策略及运行状态，执行和清理回调内的调用拒绝。
+关闭 owner 保留借用总线的配置。最大合法延迟可能使后续 step 的时间范围检查失败，
+该执行失败仍冻结 owner。此接口不提供 Scenario 动作调度或 QEMU CPU 时间屏障。
 
 可传入 `check_running()` 检查调用方拥有的进程；
 `on_response(name, frame, decoded_payload)` 观察返回的 ACK 和闲置连接的回复，

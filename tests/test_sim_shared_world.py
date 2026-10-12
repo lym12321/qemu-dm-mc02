@@ -451,6 +451,104 @@ def test_future_can_timestamp_cannot_control_earlier_interval(setup):
     assert native.steps == [10, 10]
 
 
+def test_scoped_can_delay_keeps_pending_command_and_feedback_due_with_independent_epochs(setup):
+    runtime, boards, native, bindings, peers, _ = setup
+    buses = tuple(item.endpoint.bus for item in bindings)
+    deliveries = ([], [])
+    for bus, rows in zip(buses, deliveries):
+        bus.log = rows.append
+    start(runtime)  # Shared logical 500ns, independent QEMU 1000/2000ns.
+    runtime.set_can_delay("left", 2_000_000)
+    for peer, origin, command in zip(peers, boards.origins,
+                                     ("1000 0000 0000 0000", "f000 0000 0000 0000")):
+        peer.send(can_wire(origin, command))
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [bus.pending for bus in buses] == [2, 0]
+    assert [device.current_raw for device in runtime.plant.devices] == [0, -4096]
+    with pytest.raises(BlockingIOError):
+        peers[0].recv(84)
+
+    # This command is still physical input when policy changes. Ingress later
+    # uses zero delay; the older command's 2ms and feedback's 3ms due stay fixed.
+    peers[0].send(can_wire(1_001_000, "2000 0000 0000 0000"))
+    runtime.set_can_delay("left", 0)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [bus.pending for bus in buses] == [1, 0]
+    assert [device.current_raw for device in runtime.plant.devices] == [4096, -4096]
+    runtime.set_can_delay("left", 3_000_000)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [bus.pending for bus in buses] == [1, 0]
+    runtime.set_can_delay("left", 0)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [bus.pending for bus in buses] == [1, 0]
+    runtime.step(2_000_000, deadline=time.monotonic() + 1)
+    assert [bus.pending for bus in buses] == [0, 0]
+    assert native.resets == 1 and native.steps == [1_000_000] * 4 + [2_000_000]
+    assert native.efforts == [("j1", 0), ("j2", -.2), ("j1", .4), ("j2", -.2),
+                              ("j1", .2), ("j2", -.2), ("j1", .2), ("j2", -.2),
+                              ("j1", .2), ("j2", -.2)]
+    assert runtime.t_sim_ns == 6_000_500 and runtime.step_id == 5 and not runtime.failed
+    assert [bus.delay_ns for bus in buses] == [0, 0]
+
+    # Fixed official C620 payloads, zero rotor observation and literal epochs;
+    # these do not invoke any production wire, time or feedback helper.
+    zero, old, new, right = (bytes.fromhex(value) for value in (
+        "0000 0000 0000 19 00", "0000 0000 1000 19 00",
+        "0000 0000 2000 19 00", "0000 0000 f000 19 00"))
+    for peer, expected in zip(peers, (
+            ((2_001_000, new), (3_001_000, zero), (4_001_000, old),
+             (6_001_000, old), (6_001_000, old)),
+            ((1_002_000, right), (2_002_000, right), (3_002_000, right),
+             (4_002_000, right), (6_002_000, right)))):
+        assert uart_received(peer) == b"".join(
+            struct.pack("<IIB3xQ64s", 0x201, 0, 8, stamp, data.ljust(64, b"\0"))
+            for stamp, data in expected)
+    assert [(row.frame.data, row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns)
+            for row in deliveries[0]] == [
+        (bytes.fromhex("2000 0000 0000 0000"), 2, 1_000_500, 1_000_500, 1_000_500),
+        (bytes.fromhex("1000 0000 0000 0000"), 0, 500, 2_000_500, 2_000_500),
+        (new, 3, 2_000_500, 2_000_500, 2_000_500),
+        (zero, 1, 1_000_500, 3_000_500, 3_000_500),
+        (old, 5, 4_000_500, 4_000_500, 4_000_500),
+        (old, 4, 3_000_500, 6_000_500, 6_000_500),
+        (old, 6, 6_000_500, 6_000_500, 6_000_500)]
+    assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns)
+            for row in deliveries[1]] == [
+        (0, 500, 500, 500), (1, 1_000_500, 1_000_500, 1_000_500),
+        (2, 2_000_500, 2_000_500, 2_000_500), (3, 3_000_500, 3_000_500, 3_000_500),
+        (4, 4_000_500, 4_000_500, 4_000_500), (5, 6_000_500, 6_000_500, 6_000_500)]
+    runtime.set_can_delay("left", 17)
+    runtime.close()
+    assert [bus.delay_ns for bus in buses] == [17, 0] and native.closed == 1
+    assert all(item.endpoint.stream.sock.fileno() >= 0 and item.cosim.sock.fileno() >= 0
+               for item in bindings)
+
+
+def test_can_delay_maximum_is_admitted_then_existing_step_overflow_is_terminal(setup, monkeypatch):
+    runtime, boards, native, bindings, peers, _ = setup
+    start(runtime)
+    original = CanBus.delay_ns
+    calls = []
+
+    def setter(bus, value):
+        calls.append((bus, value))
+        original.fset(bus, value)
+
+    monkeypatch.setattr(CanBus, "delay_ns", property(original.fget, setter))
+    assert runtime.set_can_delay("left", (1 << 64) - 1) is None
+    assert not runtime.failed and runtime.t_sim_ns == 500 and runtime.step_id == 0
+    peers[0].send(can_wire(1000, "1000 0000 0000 0000"))
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        runtime.step(1, deadline=time.monotonic() + 1)
+    assert runtime.failed and native.steps == [] and native.resets == 1
+    assert all(item.endpoint.stream.reads == [] for item in bindings)
+    assert [len(frames) for frames in boards.frames] == [1, 1]
+    with pytest.raises(RuntimeError, match="fresh runtime"):
+        runtime.set_can_delay("left", 0)
+    assert calls == [(bindings[0].endpoint.bus, (1 << 64) - 1)]
+    assert [item.endpoint.bus.delay_ns for item in bindings] == [(1 << 64) - 1, 0]
+
+
 @pytest.mark.parametrize("callback", ["liveness", "idle_response"])
 def test_callback_timeout_is_terminal_and_never_replayed(setup, monkeypatch, callback):
     runtime, boards, native, _, _, _ = setup
@@ -636,6 +734,107 @@ def referee_setup(referee_resources):
         on_response=lambda *response: observations.append(response))
     stack.callback(runtime.close)
     yield runtime, boards, native, bindings, peers, observations, referees, pairs
+
+
+def test_can_delay_scoped_admission_and_refusal_delegate_once_without_io(referee_setup, monkeypatch):
+    runtime, boards, native, bindings, peers, _, referees, pairs = referee_setup
+    start(runtime)
+    runtime.set_can_delay("left", 20)
+    peers[0].send(can_wire(1000, "1000 0000 0000 0000"))
+    runtime.service(deadline=time.monotonic() + 1)
+    pairs[0][0].budget = 0
+    queued = runtime.publish_referee("left", deadline=time.monotonic() + 1)
+    states = tuple(item.engine.get_state() for item in referees)
+    world = (runtime.t_sim_ns, runtime.step_id, native.resets,
+             list(native.steps), list(native.reads), list(native.efforts))
+    reads = [list(item.endpoint.stream.reads) for item in bindings]
+    frames = [list(items) for items in boards.frames]
+    uart_counts = [(sock.sends, sock.reads, sock.closes) for sock, _ in pairs]
+    original = CanBus.delay_ns
+    calls = []
+
+    def setter(bus, value):
+        calls.append((bus, value))
+        original.fset(bus, value)
+
+    def forbidden(*args, **options):
+        pytest.fail("pure CAN delay admission observed or serviced a runtime resource")
+
+    class Alias(str):
+        pass
+
+    with monkeypatch.context() as admission:
+        admission.setattr(CanBus, "delay_ns", property(original.fget, setter))
+        admission.setattr(runtime, "_check_running", forbidden)
+        admission.setattr(time, "monotonic", forbidden)
+        for owner, methods in (
+                (native, ("reset", "step", "set_joint_effort", "get_joint_state", "get_imu",
+                          "validate_step", "validate_steps", "validate_joint_effort")),
+                (CanBus, ("send", "step", "reset")),
+                (QemuCanEndpoint, ("ingest", "receive", "bind_mapper")),
+                (RefereeEngine, ("reset", "step", "get_state", "queue_events")),
+                (RefereeUartEndpoint, ("reset", "send_state", "flush")),
+                (CanStream, ("receive", "send", "flush")),
+                (StepFramedSocket, ("receive", "send", "flush"))):
+            for method in methods:
+                admission.setattr(owner, method, forbidden)
+        assert runtime.set_can_delay("left", 30) is None
+        assert calls == [(bindings[0].endpoint.bus, 30)]
+        for name, value, error, delegates in (
+                ("missing", 7, ValueError, False), (None, 7, TypeError, False),
+                (Alias("left"), 7, TypeError, False),
+                ("left", True, ValueError, True), ("left", 1.5, ValueError, True),
+                ("left", -1, ValueError, True), ("left", 1 << 64, ValueError, True)):
+            count = len(calls)
+            with pytest.raises(error):
+                runtime.set_can_delay(name, value)
+            assert len(calls) == count + int(delegates)
+            if delegates:
+                assert calls[-1] == (bindings[0].endpoint.bus, value)
+            assert [item.endpoint.bus.delay_ns for item in bindings] == [30, 0]
+            assert [item.endpoint.bus.pending for item in bindings] == [1, 0]
+            assert not runtime.failed and not runtime.closed
+        assert runtime.set_can_delay("left", 0) is None
+        assert calls[-1] == (bindings[0].endpoint.bus, 0)
+        assert len(calls) == 6  # Two successes and the four value refusals.
+    assert (runtime.t_sim_ns, runtime.step_id, native.resets,
+            native.steps, native.reads, native.efforts) == world
+    assert [item.endpoint.bus.t_sim_ns for item in bindings] == [500, 500]
+    assert [item.endpoint.stream.reads for item in bindings] == reads
+    assert boards.frames == frames
+    assert all(item.engine.get_state() is state for item, state in zip(referees, states))
+    assert [item.endpoint.next_sequence for item in referees] == [2, 10]
+    assert [(sock.sends, sock.reads, sock.closes) for sock, _ in pairs] == uart_counts
+    assert [bytes(view) for view in referees[0].endpoint.transport.tx_queue] == [queued]
+    assert all(uart_received(peer) == b"" for _, peer in pairs)
+    # A valid subsequent operation still settles the old command and uses it
+    # only for the next interval; refusal did not freeze or discard admission.
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.efforts == [("j1", 0), ("j2", 0), ("j1", .2), ("j2", 0)]
+    assert not runtime.failed and runtime.step_id == 2
+
+
+def test_can_delay_active_uart_callback_reentry_refuses_other_bus_before_delegation(
+        referee_setup, monkeypatch):
+    runtime, _, native, bindings, _, _, _, pairs = referee_setup
+    start(runtime)
+    calls = []
+
+    def forbidden(bus, value):
+        pytest.fail("active callback invoked lower CAN delay setter")
+
+    def reenter():
+        with pytest.raises(RuntimeError, match="fresh runtime"):
+            runtime.set_can_delay("right", 1)
+        calls.append("refused")
+
+    monkeypatch.setattr(CanBus, "delay_ns", property(CanBus.delay_ns.fget, forbidden))
+    pairs[0][0].on_send = reenter
+    assert runtime.publish_referee("left", deadline=time.monotonic() + 1) == REFEREE_INITIAL_WIRE
+    assert uart_received(pairs[0][1]) == REFEREE_INITIAL_WIRE and calls == ["refused"]
+    assert [item.endpoint.bus.delay_ns for item in bindings] == [0, 0]
+    assert not runtime.failed and native.steps == [] and runtime.step_id == 0
 
 
 @pytest.mark.parametrize("source", ["script", "scoped_queue", "scenario"])
@@ -965,8 +1164,11 @@ def test_scoped_queue_lifecycle_guard_rejects_before_lower_delegation(referee_se
         pytest.fail("lifecycle refusal invoked lower queue")
     for item in referees:
         monkeypatch.setattr(item.engine, "queue_events", forbidden)
+    monkeypatch.setattr(CanBus, "delay_ns", property(CanBus.delay_ns.fget, forbidden))
     with pytest.raises(RuntimeError):
         runtime.queue_referee_events("left", (), session_id=7)
+    with pytest.raises(RuntimeError):
+        runtime.set_can_delay("left", 1)
     assert native.steps == [] and runtime.step_id == 0
     assert all(sock.sends == sock.reads == 0 for sock, _ in pairs)
 
@@ -1105,6 +1307,11 @@ def test_referee_close_reentry_and_errors_release_all_owners_once(
     later = (OSError("left endpoint close"), OSError("right engine close"),
              OSError("left engine close"), OSError("native close"))
     later[3].add_note("physics borrowed-storage release failed")
+
+    def forbidden_delay(bus, value):
+        pytest.fail("close reentry invoked lower CAN delay setter")
+
+    monkeypatch.setattr(CanBus, "delay_ns", property(CanBus.delay_ns.fget, forbidden_delay))
     for index, item in enumerate(referees):
         original_endpoint, original_engine = item.endpoint.close, item.engine.close
 
@@ -1117,7 +1324,8 @@ def test_referee_close_reentry_and_errors_release_all_owners_once(
             for action in (runtime.close,
                            lambda: runtime.publish_referee("left", deadline=time.monotonic() + 1),
                            lambda: runtime.service(deadline=time.monotonic() + 1),
-                           lambda: runtime.queue_referee_events("left", (), session_id=7)):
+                           lambda: runtime.queue_referee_events("left", (), session_id=7),
+                           lambda: runtime.set_can_delay("right", 1)):
                 with pytest.raises(RuntimeError):
                     action()
             original()
