@@ -2,8 +2,8 @@
 
 Event times are relative to the shared host reset. Duration is the Arena active
 duration after requested ready markers; startup events may precede that origin.
-The referee engine owns domain execution; CAN policy execution is not yet
-wired into the Scenario runner. This module reads configuration only.
+The runner delegates referee and CAN policy execution to the existing Arena
+owner. This module reads configuration only.
 """
 
 from __future__ import annotations

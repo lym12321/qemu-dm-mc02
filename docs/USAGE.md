@@ -449,14 +449,14 @@ events:
 CAN 动作独立限制为 1024 项，不占用 referee 的 1024 项额度。
 完整动作形状和值在读取引用的 Arena 前校验，实际成员与总线关联在配置加载后校验。
 加载结果的 `can_delays` 是不可变 `ScenarioCanDelay(offset_ns, member, delay_ns)` 元组。
-当前执行入口明确拒绝非空 CAN 动作列表；这些记录可显式转换为下面 Arena Python
-入口的动作元组，Scenario 执行接线留待后续验证。
+执行入口将这些记录按原顺序转换为下面 Arena Python 入口的动作元组，
+由同一 Arena 调度器完成准入和执行；空列表保持原有调用方式。
 
 `at` 从 shared host Session reset 起算；`duration` 沿用 Arena 在全部请求的 ready
 之后计算的活动时长，两者的起点不同。启动期间的事件可以先改变裁判状态；
 `at: 0ns` 的裁判动态事件在下一次成功 step 才生效。加载接口只读取配置。
 通过 `sim.scenario.runtime.run_manifest(scenario)` 执行时，时长来自该配置，
-裁判事件原样交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
+裁判事件与 CAN 动作交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
 命令行使用同一执行入口，时长由 Scenario 配置决定：
 
 ```bash
@@ -466,7 +466,7 @@ uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report
 `--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
 默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
 字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
-或暂停参数。CAN 动作目前支持加载；其执行、其它故障注入、assertions 和 replay 尚未支持。
+或暂停参数。CAN 延迟动作支持加载和执行；其它故障注入、assertions 和 replay 尚未支持。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
@@ -489,8 +489,8 @@ Arena 的 Python 入口也接受 `can_delays=((offset_ns, member, delay_ns), ...
 随后才读到的输入使用新策略。帧自带时间戳不选择延迟策略，另一成员的总线不受影响。
 拆分会改变 native 积分区间及 STEP 观察次数，不能保证轨迹与未拆分时相同。
 动作、存活检查或步进失败沿用整个 Arena 的终止及清理规则，保留先前效果。
-此 Python 控制入口不建立 QEMU CPU 时间屏障、wall-clock pacing 或物理 CAN 时序保证；
-Scenario 和 CLI 尚不执行 CAN 延迟动作。
+Python、Scenario 和 CLI 共用上述调度与失败规则，均不建立 QEMU CPU 时间屏障、
+wall-clock pacing 或物理 CAN 时序保证。
 
 配置消费者可调用 `sim.arena.manifest.validate_can_delays(actions, duration_ns=...)`，
 复用上述普通元组、成员字符串、无符号 64 位时间、顺序、额度和截止时间校验。
@@ -1880,7 +1880,7 @@ Python 的 `CanBus.delay_ns` 可在该总线的交付回调之外修改，接受
 新值只影响后续入队帧；已经排队的截止时间和等时 FIFO 顺序保留，减小延迟时
 新帧可以先于旧帧交付。无效值或该总线交付回调内的修改会拒绝，reset 保留当前配置。
 交付仍由现有 step 完成；这是主机侧队列策略，不建立 QEMU CPU 时间屏障。
-Scenario 的故障动作尚未接入该接口。
+Scenario 的 `can_delay` 动作通过既有 Arena 和共享世界接口修改此策略。
 
 连接已有 QEMU co-sim 和 FDCAN Unix socket 时，可使用专用 M3508 入口：
 

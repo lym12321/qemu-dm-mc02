@@ -8,6 +8,7 @@ machine is replaced. Native QEMU and MuJoCo are separate consumer gates.
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError, replace
 import builtins
+import json
 import os
 from pathlib import Path
 import signal
@@ -30,7 +31,7 @@ from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotSt
 from sim.fabric import CanBus
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.robots import shared_world
-from sim.scenario import ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
+from sim.scenario import ScenarioCanDelay, ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
 from sim.scenario import runtime as scenario_runtime
 from sim.transports import cosim
 from tools import dm_mc02_firmware_rtf as rtf
@@ -415,7 +416,11 @@ def short_referee_configuration():
 
 @pytest.mark.parametrize("invalid", ["manifest-subclass", "arena-subclass", "duration-bool",
                                     "duration-zero", "duration-overflow", "mutable-referees",
-                                    "foreign-record", "member-subclass", "mutable-events"])
+                                    "foreign-record", "member-subclass", "mutable-events",
+                                    "can-list", "can-tuple-subclass", "can-foreign-record",
+                                    "can-record-subclass", "can-offset-bool", "can-offset-subclass",
+                                    "can-delay-bool", "can-delay-subclass", "can-member-type",
+                                    "can-member-subclass"])
 def test_scenario_structure_rejects_before_lower_import_or_delegation(environment, monkeypatch, invalid):
     arena = environment.manifest()
     row = ScenarioReferee("east", ())
@@ -433,6 +438,33 @@ def test_scenario_structure_rejects_before_lower_import_or_delegation(environmen
         manifest = replace(manifest, referees=[row])
     elif invalid == "foreign-record":
         manifest = replace(manifest, referees=(SimpleNamespace(member="east", events=()),))
+    elif invalid.startswith("can-"):
+        first = ScenarioCanDelay(0, "west", 7)
+        last = ScenarioCanDelay(1, "east", 0)
+        actions = (first, last)
+        if invalid == "can-list":
+            actions = []
+        elif invalid == "can-tuple-subclass":
+            actions = type("Actions", (tuple,), {})(())
+        elif invalid == "can-foreign-record":
+            class Foreign:
+                def __getattr__(self, name):
+                    pytest.fail("foreign CAN record fields were read before identity admission")
+            actions = (first, Foreign())
+        elif invalid == "can-record-subclass":
+            actions = (first, type("CanDelaySubclass", (ScenarioCanDelay,), {})(1, "east", 0))
+        else:
+            if invalid.startswith("can-offset"):
+                last = replace(last, offset_ns=True if invalid.endswith("bool")
+                               else type("Time", (int,), {})(1))
+            elif invalid.startswith("can-delay"):
+                last = replace(last, delay_ns=True if invalid.endswith("bool")
+                               else type("Time", (int,), {})(0))
+            else:
+                last = replace(last, member=None if invalid.endswith("type")
+                               else type("Member", (str,), {})("east"))
+            actions = (first, last)
+        manifest = replace(manifest, can_delays=actions)
     else:
         if invalid == "member-subclass":
             row = replace(row, member=type("MemberSubclass", (str,), {})("east"))
@@ -446,13 +478,14 @@ def test_scenario_structure_rejects_before_lower_import_or_delegation(environmen
         return original_import(name, *args, **kwargs)
     monkeypatch.setattr(builtins, "__import__", admit_import)
     with pytest.raises((TypeError, ValueError)):
-        scenario_runtime.run_manifest(manifest)
-    assert environment.events == [] and environment.owners == []
+        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
+    assert environment.events == [] and environment.owners == [] and environment.launches == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
 @pytest.fixture
 def admitted_can_delay_scenario(environment):
-    """Real no-referee YAML input; execution remains a separate consumer."""
+    """Real no-referee YAML input for the original Scenario execution consumer."""
     arena = environment.manifest()
     path = environment.directory / "can-delay.yaml"
     path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms",
@@ -463,37 +496,12 @@ def admitted_can_delay_scenario(environment):
     return load_scenario(path)
 
 
-@pytest.mark.parametrize("invalid", ["nonempty", "empty-list", "tuple-subclass", "manifest-subclass"])
-def test_scenario_can_delay_temporary_guard_precedes_lower_import_options_and_resources(
-        environment, monkeypatch, admitted_can_delay_scenario, invalid):
-    manifest = admitted_can_delay_scenario
-    if invalid == "empty-list":
-        manifest = replace(manifest, can_delays=[])
-    elif invalid == "tuple-subclass":
-        manifest = replace(manifest, can_delays=type("Actions", (tuple,), {})(()))
-    elif invalid == "manifest-subclass":
-        manifest = type("ScenarioSubclass", (ScenarioManifest,), {})(
-            manifest.path, manifest.arena, manifest.duration_ns, manifest.referees, manifest.can_delays)
-    original_import = builtins.__import__
-    def admit_import(name, *args, **kwargs):
-        if name == "sim.arena.runtime":
-            pytest.fail("unsupported Scenario CAN actions reached the lower runtime import")
-        return original_import(name, *args, **kwargs)
-    monkeypatch.setattr(builtins, "__import__", admit_import)
-    error = ValueError if invalid == "nonempty" else TypeError
-    message = {"nonempty": "CAN delay", "manifest-subclass": "ScenarioManifest"}.get(invalid, "can_delays")
-    with pytest.raises(error, match=message):
-        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
-    assert environment.events == [] and environment.owners == [] and environment.launches == []
-    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
-
-
-def test_loaded_scenario_can_delays_manual_projection_consumes_actual_arena_bus(
-        environment, monkeypatch, admitted_can_delay_scenario):
-    """Explicit lower consumer; the guarded Scenario wrapper is not executed."""
+@pytest.mark.parametrize("via_cli", [False, True], ids=["scenario", "scenario-cli"])
+def test_loaded_scenario_can_delays_consumes_actual_arena_bus_without_rereading(
+        environment, monkeypatch, admitted_can_delay_scenario, via_cli, capsys):
     scenario = admitted_can_delay_scenario
-    actions = tuple((item.offset_ns, item.member, item.delay_ns) for item in scenario.can_delays)
-    assert actions == ((0, "east", 2_000_000), (500_000, "east", 0))
+    assert scenario.can_delays == (ScenarioCanDelay(0, "east", 2_000_000),
+                                   ScenarioCanDelay(500_000, "east", 0))
     assert scenario.referees == scenario.arena.referees == ()
     observed = watch_can_delays(environment, monkeypatch)
     environment.can_commands[0] = "1000 0000 0000 0000"
@@ -501,10 +509,47 @@ def test_loaded_scenario_can_delays_manual_projection_consumes_actual_arena_bus(
         if value.t_sim_ns == 500_000:
             environment.producers[0, "can1"].send(can_wire(1000, "0800 0000 0000 0000"))
     observed.after_set = after_set
-    result = environment.run(scenario.arena, duration=scenario.duration_ns / 1_000_000_000,
-                             can_delays=actions)
+    if via_cli:
+        from sim import cli
+        calls, results = [], []
+        run_scenario = scenario_runtime.run_manifest
+        def execute(actual, **options):
+            calls.append(actual)
+            assert actual == scenario
+            actual.path.unlink()
+            actual.arena.path.unlink()
+            result = run_scenario(actual, **options)
+            results.append(result)
+            return result
+        monkeypatch.setattr(scenario_runtime, "run_manifest", execute)
+        report = environment.directory / "report.json"
+        write_text = Path.write_text
+        def write_after_cleanup(path, *args, **kwargs):
+            if path == report:
+                environment.assert_clean()
+                environment.events.append("report write")
+            return write_text(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "write_text", write_after_cleanup)
+        assert cli.main(["scenario", "run", str(scenario.path), "--qemu", str(environment.binary),
+                         "--report", str(report)]) == 0
+        result, = results
+        assert len(calls) == 1 and calls[0] is not scenario
+        payload = json.loads(report.read_text(encoding="utf-8"))
+        assert payload["status"] == "passed"
+        assert (payload["result"]["origin_ns"], payload["result"]["end_ns"],
+                payload["result"]["steps"], payload["result"]["referees"]) == (0, 1_000_000, 2, [])
+        output = capsys.readouterr()
+        assert f"Scenario {result.name!r}: passed" in output.out and output.err == ""
+        assert environment.events[-1] == "report write"
+        assert all(environment.events.index(f"owner{i} cleanup") < environment.events.index("report write")
+                   for i in range(2))
+    else:
+        scenario.path.unlink()
+        scenario.arena.path.unlink()
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
     environment.assert_clean()
-    assert [(stamp, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
+    assert [(stamp, member, delay) for member, delay, stamp, *_ in observed.calls] == [
+        (0, "east", 2_000_000), (500_000, "east", 0)]
     assert environment.native.resets == 1 and environment.native.steps == [500_000, 500_000]
     assert (result.origin_ns, result.end_ns, result.steps, result.referees) == (0, 1_000_000, 2, ())
     world, = observed.worlds
@@ -521,14 +566,19 @@ def test_loaded_scenario_can_delays_manual_projection_consumes_actual_arena_bus(
         assert environment.producers[index, "can1"].recv(4096) == expected
 
 
-@pytest.mark.parametrize("duration_ns,seconds", [(1, 0.000000001), (1_234_567, 0.001234567),
-                                               (3_600_000_000_000, 3600.0)])
+@pytest.mark.parametrize("duration_ns,seconds,scheduled", [
+    (1, 0.000000001, False), (1_234_567, 0.001234567, False),
+    (3_600_000_000_000, 3600.0, False), (1_234_567, 0.001234567, True)])
 def test_scenario_delegates_once_with_original_order_options_and_exact_duration(
-        environment, monkeypatch, duration_ns, seconds):
+        environment, monkeypatch, duration_ns, seconds, scheduled):
     arena = environment.manifest()
     first, second = (ScriptEvent(0, Hit(1)),), ()
     manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, duration_ns,
                                 (ScenarioReferee("west", first), ScenarioReferee("east", second)))
+    if scheduled:
+        manifest = replace(manifest, can_delays=(ScenarioCanDelay(0, "west", 11),
+            ScenarioCanDelay(0, "east", 7), ScenarioCanDelay(1_234_567, "east", 0),
+            ScenarioCanDelay(1_234_567, "east", 23)))
     calls, result = [], object()
     def delegate(actual, **options):
         calls.append((actual, options))
@@ -539,8 +589,12 @@ def test_scenario_delegates_once_with_original_order_options_and_exact_duration(
                    startup_timeout=3.0, timeout=7.0, referee_period_ns=2_000_000)
     assert scenario_runtime.run_manifest(manifest, **options) is result
     assert len(calls) == 1 and calls[0][0] is arena
-    assert calls[0][1] == dict(options, duration=seconds,
-                             referee_events=(("west", first), ("east", second)))
+    expected = dict(options, duration=seconds, referee_events=(("west", first), ("east", second)))
+    if scheduled:
+        expected["can_delays"] = ((0, "west", 11), (0, "east", 7),
+                                  (1_234_567, "east", 0), (1_234_567, "east", 23))
+    assert calls[0][1] == expected
+    assert calls[0][1]["emit"] is emit and calls[0][1]["on_response"] is on_response
     assert calls[0][1]["referee_events"][0][1] is first
     assert calls[0][1]["referee_events"][1][1] is second
     assert round(calls[0][1]["duration"] * 1_000_000_000) == duration_ns
@@ -549,7 +603,8 @@ def test_scenario_delegates_once_with_original_order_options_and_exact_duration(
 
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_scenario_propagates_identical_lower_error_without_retry(environment, monkeypatch, interrupt):
-    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 1, ())
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 1, (),
+                                (ScenarioCanDelay(0, "east", 7),))
     calls, primary = [], KeyboardInterrupt("Arena interrupted") if interrupt else OSError("Arena rejected")
     def delegate(*args, **kwargs):
         calls.append((args, kwargs))
@@ -558,7 +613,46 @@ def test_scenario_propagates_identical_lower_error_without_retry(environment, mo
     with pytest.raises(type(primary)) as caught:
         scenario_runtime.run_manifest(manifest)
     assert caught.value is primary and len(calls) == 1
+    assert calls[0][1]["can_delays"] == ((0, "east", 7),)
     assert environment.events == []
+
+
+@pytest.mark.parametrize("invalid", ["delay-overflow", "unknown-member", "unordered",
+                                    "after-duration", "quota", "duplicate-topology"])
+def test_scenario_typed_can_values_reach_arena_preflight_before_resources(
+        environment, monkeypatch, invalid):
+    arena = environment.manifest()
+    first, last = ScenarioCanDelay(0, "east", 7), ScenarioCanDelay(1_000_000, "west", 11)
+    actions = (first, last)
+    if invalid == "delay-overflow":
+        actions = (first, replace(last, delay_ns=1 << 64))
+    elif invalid == "unknown-member":
+        actions = (first, replace(last, member="missing"))
+    elif invalid == "unordered":
+        actions = (last, first)
+    elif invalid == "after-duration":
+        actions = (first, replace(last, offset_ns=1_000_001))
+    elif invalid == "quota":
+        actions = (first,) * 1025
+    else:
+        arena = replace(arena, robots=(arena.robots[0], replace(arena.robots[1], name="east")))
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (), actions)
+    calls = []
+    lower = runtime.run_manifest
+    def delegate(actual, **options):
+        calls.append(actual)
+        return lower(actual, **options)
+    monkeypatch.setattr(runtime, "run_manifest", delegate)
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid typed Scenario schedule reached resources or policy effects")
+    for method in ("resolve_qemu", "regular_file", "create_arena_plant"):
+        monkeypatch.setattr(runtime, method, forbidden)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_can_delay", forbidden)
+    with pytest.raises(ValueError):
+        scenario_runtime.run_manifest(manifest, qemu=environment.binary)
+    assert len(calls) == 1 and calls[0] is arena
+    assert environment.events == [] and environment.launches == [] and environment.owners == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
 @pytest.mark.parametrize("options", [
@@ -741,7 +835,9 @@ def test_can_delay_full_quota_preserves_equal_time_caller_order(environment, mon
 
 
 @pytest.mark.parametrize("delayed_ready", [False, True], ids=["ready_at_reset", "startup_steps"])
-def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(environment, monkeypatch, delayed_ready):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(
+        environment, monkeypatch, delayed_ready, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     reset_origin = 500 if delayed_ready else 0
     if delayed_ready:
@@ -750,7 +846,13 @@ def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(environment
     actions = ((0, "west", 41), (0, "east", 9), (500_000, "east", 0),
                (500_000, "east", 23), (1_500_000, "west", 0),
                (2_500_000, "east", (1 << 64) - 1 if not delayed_ready else 0))
-    result = environment.run(environment.manifest(ready=("READY", "READY")), can_delays=actions)
+    arena = environment.manifest(ready=("READY", "READY"))
+    if via_scenario:
+        scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 2_500_000, (),
+                                    tuple(ScenarioCanDelay(*action) for action in actions))
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    else:
+        result = environment.run(arena, can_delays=actions)
     environment.assert_clean()
     assert [(stamp - reset_origin, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
     assert [steps for _, _, _, steps, _, _ in observed.calls] == [
@@ -768,7 +870,9 @@ def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(environment
     assert [board.reset_qemu_ns for board in result.boards] == [1000, 2000]
 
 
-def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_state(environment, monkeypatch):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "loaded-scenario"])
+def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_state(
+        environment, monkeypatch, via_scenario):
     referees = watch_referees(environment, monkeypatch)
     observed = watch_can_delays(environment, monkeypatch)
     states = []
@@ -780,10 +884,33 @@ def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_st
     events = (ScriptEvent(0, Hit(10)), ScriptEvent(1_000_000, Shot(2, 3)))
     configuration = referee_configuration()
     configuration["cooling_42mm_per_s"] = 2
-    result = environment.run(environment.manifest(ready=("READY", "READY"), referees={
-        "east": configuration}), duration=.001, referee_period_ns=1_000_000,
-        referee_events=(("east", events),), can_delays=((0, "east", 17), (1_000_000, "east", 0)))
+    arena = environment.manifest(ready=("READY", "READY"), referees={"east": configuration})
+    if via_scenario:
+        path = environment.directory / "combined-scenario.yaml"
+        path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms",
+            "referee_events": {"east": [
+                {"at": "0ns", "hit": {"damage_hp": 10}},
+                {"at": "1ms", "shot": {"heat_17mm": 2, "heat_42mm": 3}},
+            ]}, "events": [
+                {"at": "0ns", "action": "can_delay", "target": "east.chassis_can", "value": "17ns"},
+                {"at": "1ms", "action": "can_delay", "target": "east.chassis_can", "value": "0ns"},
+            ]}), encoding="utf-8")
+        scenario = load_scenario(path)
+        assert scenario.referees == (ScenarioReferee("east", events),)
+        assert scenario.can_delays == (ScenarioCanDelay(0, "east", 17), ScenarioCanDelay(1_000_000, "east", 0))
+        events = scenario.referees[0].events
+        path.unlink()
+        arena.path.unlink()
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary,
+                                               referee_period_ns=1_000_000)
+    else:
+        result = environment.run(arena, duration=.001, referee_period_ns=1_000_000,
+            referee_events=(("east", events),), can_delays=((0, "east", 17), (1_000_000, "east", 0)))
     environment.assert_clean()
+    assert len(referees.worlds) == len(referees.coordinators) == 1
+    assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
+    assert len(referees.queues) == 1 and referees.queues[0][1] is events
+    assert not any(event.endswith(" cont") for event in observed.calls[0][4])
     assert [(stamp, queues, reads, state.robot.current_hp) for stamp, queues, reads, state in states] == [
         (0, 1, (0, 0), 100), (1_000_000, 1, (1, 1), 90)]
     assert (states[1][3].power_heat.heat_17mm, states[1][3].power_heat.heat_42mm) == (11, 22)
@@ -793,7 +920,9 @@ def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_st
     assert result.origin_ns == 0 and result.end_ns == 1_000_000
 
 
-def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admission(environment, monkeypatch):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admission(
+        environment, monkeypatch, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     deliveries, ingresses, boundaries = ([], []), [], []
     factory = environment.create_plant
@@ -823,8 +952,13 @@ def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admi
             environment.producers[0, "can1"].send(can_wire(1_201_000, "2000 0000 0000 0000"))
     observed.after_set = after_set
     environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
-    result = environment.run(duration=.004,
-        can_delays=((0, "east", 2_000_000), (1_000_000, "east", 3_000_000), (1_500_000, "east", 0)))
+    actions = ((0, "east", 2_000_000), (1_000_000, "east", 3_000_000), (1_500_000, "east", 0))
+    if via_scenario:
+        scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+                                    4_000_000, (), tuple(ScenarioCanDelay(*action) for action in actions))
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    else:
+        result = environment.run(duration=.004, can_delays=actions)
     environment.assert_clean()
     assert environment.native.steps == [1_000_000, 500_000, 1_000_000, 1_000_000, 500_000]
     assert (result.origin_ns, result.end_ns, result.steps) == (0, 4_000_000, 5)
@@ -865,7 +999,9 @@ def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admi
 
 
 @pytest.mark.parametrize("interrupt", [False, True])
-def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent_cleanup(environment, monkeypatch, interrupt):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent_cleanup(
+        environment, monkeypatch, interrupt, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     primary = KeyboardInterrupt("CAN policy interrupted") if interrupt else OSError("CAN policy rejected")
     environment.world_close_failure = OSError("native cleanup failed")
@@ -876,9 +1012,15 @@ def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent
             raise primary
         return property_.fset(value, delay)
     monkeypatch.setattr(CanBus, "delay_ns", property(property_.fget, reject))
+    arena = environment.manifest(upper=True)
+    actions = ((0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17))
     with pytest.raises(type(primary)) as caught:
-        environment.run(environment.manifest(upper=True), can_delays=(
-            (0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17)))
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 2_500_000, (),
+                                        tuple(ScenarioCanDelay(*action) for action in actions))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+        else:
+            environment.run(arena, can_delays=actions)
     assert caught.value is primary
     environment.assert_clean()
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [
@@ -889,8 +1031,11 @@ def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent
     assert "CAN policy nested cleanup diagnosis" in "\n".join(primary.__notes__)
 
 
-@pytest.mark.parametrize("violation", ["deadline", "child_exit", "pre_child_exit"])
-def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(environment, monkeypatch, violation):
+@pytest.mark.parametrize("violation,via_scenario", [("deadline", False), ("child_exit", False),
+    ("pre_child_exit", False), ("deadline", True), ("pre_child_exit", True)],
+    ids=["arena-deadline", "arena-child-exit", "arena-pre-exit", "scenario-deadline", "scenario-pre-exit"])
+def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(
+        environment, monkeypatch, violation, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     def violate(value, name, delay):
         if value.t_sim_ns == 1_500_000 and violation != "pre_child_exit":
@@ -906,9 +1051,15 @@ def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(envir
             environment.children[0].returncode = 0
         return result
     monkeypatch.setattr(shared_world.SharedWorldRuntime, "step", exit_after_step)
+    arena = environment.manifest(upper=True)
+    actions = ((0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17))
     with pytest.raises((RuntimeError, TimeoutError), match="host deadline|exited early.*0"):
-        environment.run(environment.manifest(upper=True), startup_timeout=1, timeout=3,
-            can_delays=((0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17)))
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 2_500_000, (),
+                                        tuple(ScenarioCanDelay(*action) for action in actions))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary, startup_timeout=1, timeout=3)
+        else:
+            environment.run(arena, startup_timeout=1, timeout=3, can_delays=actions)
     environment.assert_clean()
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == (
         [("east", 7, 0)] if violation == "pre_child_exit" else [("east", 7, 0), ("west", 13, 1_500_000)])
@@ -918,7 +1069,9 @@ def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(envir
     assert all(process.returncode == -signal.SIGTERM for process in environment.children)
 
 
-def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target_action(environment, monkeypatch):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target_action(
+        environment, monkeypatch, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     primary, admissions, closing = ValueError("native interval500000 refused"), [], []
     def validate(intervals):
@@ -932,7 +1085,12 @@ def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target
         return close(value)
     monkeypatch.setattr(shared_world.SharedWorldRuntime, "close", inspect)
     with pytest.raises(ValueError) as caught:
-        environment.run(can_delays=((0, "east", 7), (1_500_000, "east", 0)))
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+                2_500_000, (), (ScenarioCanDelay(0, "east", 7), ScenarioCanDelay(1_500_000, "east", 0)))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+        else:
+            environment.run(can_delays=((0, "east", 7), (1_500_000, "east", 0)))
     assert caught.value is primary
     environment.assert_clean()
     assert admissions == [(1_000_000,), (500_000,)]
@@ -941,10 +1099,17 @@ def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [("east", 7, 0)]
 
 
-def test_can_delay_maximum_is_admitted_then_existing_execution_overflow_is_terminal(environment, monkeypatch):
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_can_delay_maximum_is_admitted_then_existing_execution_overflow_is_terminal(
+        environment, monkeypatch, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     with pytest.raises(ValueError, match="unsigned 64-bit"):
-        environment.run(can_delays=((0, "east", (1 << 64) - 1), (1, "east", 0)))
+        if via_scenario:
+            scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+                2_500_000, (), (ScenarioCanDelay(0, "east", (1 << 64) - 1), ScenarioCanDelay(1, "east", 0)))
+            scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+        else:
+            environment.run(can_delays=((0, "east", (1 << 64) - 1), (1, "east", 0)))
     environment.assert_clean()
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [("east", (1 << 64) - 1, 0)]
     assert environment.native.resets == 1 and environment.native.steps == []

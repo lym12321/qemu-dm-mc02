@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 
 from sim.arena.manifest import ArenaManifest
 from sim.manifest import MAX_TIME_NS
-from sim.scenario.manifest import ScenarioManifest, ScenarioReferee
+from sim.scenario.manifest import ScenarioCanDelay, ScenarioManifest, ScenarioReferee
 
 if TYPE_CHECKING:
     from sim.arena.runtime import ArenaResult
@@ -19,15 +19,17 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
 
     Events use the shared reset origin. Duration is active world time after all
     requested ready markers, exactly as in the referenced Arena.
-    CAN delay records currently require explicit use of the lower Arena API;
-    nonempty schedules are refused before runtime imports or resources.
+    Typed records are projected in caller order; Arena owns their numeric and
+    topology admission, scheduling, and all resource effects.
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
-    if type(manifest.can_delays) is not tuple:
-        raise TypeError("Scenario can_delays must be a plain immutable tuple")
-    if manifest.can_delays:
-        raise ValueError("Scenario CAN delay execution is not yet integrated")
+    if (type(manifest.can_delays) is not tuple
+            or any(type(item) is not ScenarioCanDelay for item in manifest.can_delays)):
+        raise TypeError("Scenario can_delays require a plain ScenarioCanDelay tuple")
+    if any(type(item.offset_ns) is not int or type(item.member) is not str
+           or type(item.delay_ns) is not int for item in manifest.can_delays):
+        raise TypeError("Scenario can_delays require plain integer times and member strings")
     if type(manifest.arena) is not ArenaManifest:
         raise TypeError("Scenario requires an ArenaManifest")
     if type(manifest.duration_ns) is not int:
@@ -41,6 +43,9 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
            for item in manifest.referees):
         raise TypeError("Scenario referees require plain member strings and event tuples")
     batches = tuple((item.member, item.events) for item in manifest.referees)
+    actions = tuple((item.offset_ns, item.member, item.delay_ns)
+                    for item in manifest.can_delays)
+    can_options = {"can_delays": actions} if actions else {}
 
     from sim.arena.runtime import run_manifest as run_arena
 
@@ -49,4 +54,4 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     return run_arena(manifest.arena, duration=manifest.duration_ns / 1_000_000_000,
         referee_events=batches, emit=emit, on_response=on_response, qemu=qemu,
         startup_timeout=startup_timeout, timeout=timeout,
-        referee_period_ns=referee_period_ns)
+        referee_period_ns=referee_period_ns, **can_options)
