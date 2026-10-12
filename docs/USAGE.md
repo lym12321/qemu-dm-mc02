@@ -2177,3 +2177,32 @@ runner 通过 ID1/ID5 覆盖两个电流命令组，独立 literal 反馈检查�
 一次；tick 内到达的命令在下一边界交付，最多量化 1 ms。它不建立 CPU/plant 全局锁步。
 观测与追赶有界，FAIL、缺失项、清理失败或输入哈希变化均返回非零并保留报告；实物
 plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续性能门分别执行。
+
+Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
+
+当前 Debug/Release 原生场景门尚未通过：QEMU CPU 虚拟时钟推进快于共享世界的
+1ms 步，带未来时间戳的周期命令积压后触发 CAN 容量拒绝。该入口保留诊断报告；
+CPU 与共享世界时间边界落实前，不能把这个夹具视为已验证的原生消费者。
+
+```bash
+cd ../trobot
+cmake --preset DjiScenarioTestRelease
+cmake --build --preset DjiScenarioTestRelease --clean-first
+cd ../dm-mc02-qemu
+.venv/bin/python tools/dm_mc02_dji_test.py --scenario \
+  ../trobot/build/DjiScenarioTestRelease/trobot.elf \
+  build/test-results/dji-scenario-release ../trobot \
+  --qemu build/qemu/qemu-system-arm
+```
+
+夹具生成固定双机器人 Scenario，并通过同一 Scenario/Arena 入口运行。两个 MCU
+使用相同 ELF，真实驱动 ID1/2 输出 `64/-64`；另外两个命令槽保持零。east 总线在
+RESET 相对 0ms 设置 5ms 入队延迟，在 250ms 恢复零延迟，west 保持零延迟。
+已排队帧保留原截止时间；报告分别记录来源、交付时间、原始 CAN 字节和固件复制的
+反馈字段及 BSP 时间戳。相同反馈字节只能证明来源匹配，不能识别唯一一次固件回调。
+两边第一次完整反馈报告必须早于 250ms，否则测试失败。
+
+恢复延迟后，既有 UART1 握手释放第二次应用观察；握手不改变事件时间或推进世界。
+结果目录必须不存在。缺失样本、FAIL、发送或清理失败、输入变化均保留失败报告。
+该门不证明动态延迟下的 50ms 超时、物理 CAN 时序、CPU/plant 全局锁步或实时性能；
+物理校准保持显式 SKIP。旧 ID1/ID5 独立掉线测试沿用上述入口。

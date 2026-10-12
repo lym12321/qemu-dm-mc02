@@ -19,6 +19,7 @@ from pathlib import Path
 import runpy
 import signal
 import struct
+import subprocess
 import sys
 import time
 from unittest.mock import patch
@@ -55,7 +56,7 @@ def close_observation_failure(owner, label, primary):
                 primary.add_note(note)
 
 
-def write_manifests(directory, firmwares, *, referees=False):
+def write_manifests(directory, firmwares, *, referees=False, dji_scenario=False):
     """Distinct child cwd and reversed aliases exercise admitted composition."""
     for index, name in enumerate(("alpha", "bravo")):
         child = directory / name
@@ -71,9 +72,10 @@ def write_manifests(directory, firmwares, *, referees=False):
                 for identifier, corner in enumerate(("fl", "fr", "rl", "rr"), 1)},
             "physics": {"backend": "mujoco", "model": str(ROOT / "models/four_wheel.xml")},
             "ready": {"endpoint": "mcu.uart1", "text": (
+                "TTEST READY dji.scenario.ready 0 0\n" if dji_scenario else
                 "TTEST READY referee.arena.ready 0 0\n" if referees else f"ARENA_READY={index}\n")},
         }
-        if index == 0 and not referees:
+        if index == 0 and not referees and not dji_scenario:
             script = ("import json,pathlib,sys,time; "
                 "print(json.dumps({'cwd':str(pathlib.Path.cwd()),'argv':sys.argv[1:]}),flush=True); "
                 "deadline=time.monotonic()+20\n"
@@ -96,6 +98,9 @@ def write_manifests(directory, firmwares, *, referees=False):
 
 
 class Observation:
+    feedback_bound = 2048
+    step_bound = 512
+
     def __init__(self, report, manifest, mode):
         self.report, self.manifest, self.mode = report, manifest, mode
         self.owners, self.qmps, self.children = [], [], []
@@ -161,7 +166,7 @@ class Observation:
             return reset()
 
         def observed_step(dt_ns):
-            append_bounded(self.report["native_calls"], "step_ns", dt_ns, 512)
+            append_bounded(self.report["native_calls"], "step_ns", dt_ns, self.step_bound)
             return step(dt_ns)
 
         def observed_close():
@@ -285,7 +290,7 @@ class Observation:
                      "send_live_current_raw": device.current_raw,
                      "sequence": delivery.sequence, "due_ns": delivery.due_ns,
                      "delivered_ns": delivery.delivered_ns}
-            append_bounded(self.report, "feedback", event)
+            append_bounded(self.report, "feedback", event, self.feedback_bound)
             # An extremely small negative angle can project to exact tau in
             # double modulo. On the documented cyclic8192 encoder this exact
             # boundary is zero; accept only that equality, not a wider bin.
@@ -309,14 +314,17 @@ class Observation:
                     "error": str(error)}, 8)
                 raise
             for can_id, flags, dlc, stamp, data in frames:
-                append_bounded(self.report, "commands", {"peer": index,
-                    "can_id": can_id, "flags": flags, "dlc": dlc,
-                    "qemu_ns": stamp, "data_hex": data.hex()}, 8)
-                assert (can_id, flags, dlc, data.hex()) == (0x200, 0, 8, COMMANDS[index])
+                self.command(index, can_id, flags, dlc, stamp, data)
             return frames
 
         stream.send, stream.receive = observed_send, observed_receive
         return stream
+
+    def command(self, index, can_id, flags, dlc, stamp, data):
+        append_bounded(self.report, "commands", {"peer": index,
+            "can_id": can_id, "flags": flags, "dlc": dlc,
+            "qemu_ns": stamp, "data_hex": data.hex()}, 8)
+        assert (can_id, flags, dlc, data.hex()) == (0x200, 0, 8, COMMANDS[index])
 
     def cosim(self, sock):
         stream = self.original_cosim(sock)
@@ -705,33 +713,17 @@ def check_scenario_observations(report):
         raise ValueError("Scenario referee original queue/session/before-cont evidence disagrees")
 
 
-class RefereeObservation(Observation):
-    """Borrow existing owners; observe this UART consumer with bounded evidence."""
+class FirmwareObservation(Observation):
+    """Shared acquisition and watchdog receipts for actual UART firmware gates."""
 
-    def __init__(self, report, manifest, *, scenario=False, scenario_manifest=None):
+    consumer_label = "Arena referee"
+
+    def __init__(self, report, manifest):
         super().__init__(report, manifest, "normal")
-        self.scenario, self.scenario_manifest = scenario, scenario_manifest
-        self.engines, self.endpoints = [], []
         self.sockets = []
-        self.buffers = {name: bytearray() for name in REFEREE_IDS}
-        self.controls = {}
 
-    def run(self, manifest, **options):
-        """The actual Scenario CLI reload becomes the queue identity source."""
-        return self.record_cli_run(manifest, options, expected_manifest=self.scenario_manifest,
-            expected_options={"qemu": str(self.binary), "startup_timeout": 10., "timeout": 20.},
-            scenario=True)
-
-    def channels(self, *, uarts=None, **options):
-        if self.scenario and len(self.controls) >= len(self.manifest.robots):
-            raise ValueError("duplicate Scenario referee UART channel construction")
-        channels = self.original_channels(uarts=uarts, **options)
-        if self.scenario:
-            name = self.manifest.robots[len(self.controls)].name
-            if "uart1" not in uarts or name in self.controls:
-                raise ValueError("Scenario referee requires its existing member UART1")
-            self.controls[name] = uarts["uart1"]
-        return channels
+    def check_cont(self):
+        pass
 
     def connect(self, *args, **options):
         sock = self.original_connect(*args, **options)
@@ -760,7 +752,7 @@ class RefereeObservation(Observation):
                 except BaseException as error:
                     if primary is None:
                         raise
-                    primary.add_note(f"Arena referee stderr capture failed: {type(error).__name__}: {error}")
+                    primary.add_note(f"{self.consumer_label} stderr capture failed: {type(error).__name__}: {error}")
                     if error is not primary:
                         for note in tuple(getattr(error, "__notes__", ())):
                             primary.add_note(note)
@@ -774,13 +766,8 @@ class RefereeObservation(Observation):
             row = {"attempts": 0, "completed": False}
             self.report["qmp_cleanup"].append(row)
             def observed_command(operation, arguments=None):
-                if self.scenario and operation == "cont":
-                    evidence = self.report["scenario_observation"]
-                    if (evidence["shared_start"] is None or not evidence["shared_start"]["accepted"]
-                            or len(evidence["queue_calls"]) != 2
-                            or any(not item["accepted"] or not item["exact_batch"]
-                                   or not item["before_cont"] for item in evidence["queue_calls"])):
-                        raise ValueError("Scenario referee resume preceded original batch queueing")
+                if operation == "cont":
+                    self.check_cont()
                 result = command(operation, arguments)
                 if operation == "stop":
                     self.watchdog(index, name, "paused")
@@ -800,6 +787,80 @@ class RefereeObservation(Observation):
         except BaseException as error:
             close_observation_failure(qmp, "QMP", error)
             raise
+
+    def watchdog(self, index, name, stage):
+        from tools.dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
+        deadline = self.owners[0].start_ns / 1e9 + 20
+        value = deadline_qmp_call(self.qmps[index], deadline, self.consumer_label + " watchdog",
+                                 lambda: read_iwdg_timeouts(self.qmps[index]))
+        timeouts, text = value
+        self.report["watchdogs"].setdefault(name, {})[stage] = {"timeouts": timeouts, "diagnostics": text}
+        if timeouts or "window-violations=0" not in text:
+            raise ValueError("watchdog event during " + self.consumer_label + " consumer")
+
+
+    def channels(self, *, uarts=None, **options):
+        if self.scenario and len(self.controls) >= len(self.manifest.robots):
+            raise ValueError("duplicate Scenario referee UART channel construction")
+        channels = self.original_channels(uarts=uarts, **options)
+        if self.scenario:
+            name = self.manifest.robots[len(self.controls)].name
+            if "uart1" not in uarts or name in self.controls:
+                raise ValueError("Scenario referee requires its existing member UART1")
+            self.controls[name] = uarts["uart1"]
+        return channels
+
+
+    def response(self, name, frame, decoded):
+        row = {"header": asdict(frame.header), "payload_hex": frame.payload.hex(),
+               "decoded": None if decoded is None else asdict(decoded)}
+        summary = self.report["responses"][name]
+        summary["count"] += 1
+        if summary["first"] is None:
+            summary["first"] = row
+        summary["last"] = row
+        if frame.header.kind == codec.RESET_ACK:
+            if summary["reset"] is not None:
+                raise ValueError("duplicate Arena RESET_ACK observation")
+            summary["reset"] = row
+        elif frame.header.kind == codec.STEP_ACK:
+            summary["step_ack_count"] += 1
+            if summary["first_step_ack"] is None:
+                summary["first_step_ack"] = row
+            summary["last_step_ack"] = row
+        elif frame.header.kind == codec.STEP_DONE:
+            summary["done_count"] += 1
+            summary["last_done"] = row
+        self.service_control()
+
+    def service_control(self):
+        pass
+
+
+class RefereeObservation(FirmwareObservation):
+    """Borrow existing owners; observe this UART consumer with bounded evidence."""
+
+    def __init__(self, report, manifest, *, scenario=False, scenario_manifest=None):
+        super().__init__(report, manifest)
+        self.scenario, self.scenario_manifest = scenario, scenario_manifest
+        self.engines, self.endpoints = [], []
+        self.buffers = {name: bytearray() for name in REFEREE_IDS}
+        self.controls = {}
+
+    def run(self, manifest, **options):
+        """The actual Scenario CLI reload becomes the queue identity source."""
+        return self.record_cli_run(manifest, options, expected_manifest=self.scenario_manifest,
+            expected_options={"qemu": str(self.binary), "startup_timeout": 10., "timeout": 20.},
+            scenario=True)
+
+    def check_cont(self):
+        if self.scenario:
+            evidence = self.report["scenario_observation"]
+            if (evidence["shared_start"] is None or not evidence["shared_start"]["accepted"]
+                    or len(evidence["queue_calls"]) != 2
+                    or any(not item["accepted"] or not item["exact_batch"]
+                           or not item["before_cont"] for item in evidence["queue_calls"])):
+                raise ValueError("Scenario referee resume preceded original batch queueing")
 
     def world(self, manifest):
         plant = self.original_world(manifest)
@@ -898,28 +959,6 @@ class RefereeObservation(Observation):
         except BaseException as error:
             close_observation_failure(runtime, "shared world", error)
             raise
-
-    def response(self, name, frame, decoded):
-        row = {"header": asdict(frame.header), "payload_hex": frame.payload.hex(),
-               "decoded": None if decoded is None else asdict(decoded)}
-        summary = self.report["responses"][name]
-        summary["count"] += 1
-        if summary["first"] is None:
-            summary["first"] = row
-        summary["last"] = row
-        if frame.header.kind == codec.RESET_ACK:
-            if summary["reset"] is not None:
-                raise ValueError("duplicate Arena RESET_ACK observation")
-            summary["reset"] = row
-        elif frame.header.kind == codec.STEP_ACK:
-            summary["step_ack_count"] += 1
-            if summary["first_step_ack"] is None:
-                summary["first_step_ack"] = row
-            summary["last_step_ack"] = row
-        elif frame.header.kind == codec.STEP_DONE:
-            summary["done_count"] += 1
-            summary["last_done"] = row
-        self.service_control()
 
     def service_control(self):
         """At most one flush per callback; the existing loop owns all waiting."""
@@ -1025,15 +1064,648 @@ class RefereeObservation(Observation):
                 self.scenario_case(event.name, row, event.event.timestamp_ns)
         self.service_control()
 
-    def watchdog(self, index, name, stage):
-        from tools.dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
-        deadline = self.owners[0].start_ns / 1e9 + 20
-        value = deadline_qmp_call(self.qmps[index], deadline, "Arena referee watchdog",
-                                 lambda: read_iwdg_timeouts(self.qmps[index]))
-        timeouts, text = value
-        self.report["watchdogs"].setdefault(name, {})[stage] = {"timeouts": timeouts, "diagnostics": text}
-        if timeouts or "window-violations=0" not in text:
-            raise ValueError("watchdog event during Arena referee consumer")
+
+def verify_firmware_cleanup(report, observer, *, label, referees=False, controls=False):
+    if observer is None:
+        raise ValueError(label + " owner acquisition unavailable")
+    failures = []
+    def check(label, read):
+        try:
+            value = read()
+        except BaseException as error:
+            failures.append(f"{label}: {type(error).__name__}: {error}")
+            return False
+        if not value:
+            failures.append(label)
+        return value
+    for identity, owner in zip(report["cleanup"], observer.owners):
+        identity["identity_gone"] = check(f"QEMU{identity['pid']} identity", lambda:
+            starttime(identity["pid"]) != identity["starttime"])
+        identity["reaped"] = check(f"QEMU{identity['pid']} reap", lambda: owner.process.poll() is not None)
+        identity["temporary_gone"] = check(f"QEMU{identity['pid']} temporary directory", lambda:
+            not Path(identity["tempdir"]).exists())
+        identity["sockets_gone"] = {name: check(f"QEMU{identity['pid']} {name} path", lambda path=path:
+            not Path(path).exists()) for name, path in identity["sockets"].items()}
+    owned = report["owned_cleanup"] = {
+        "engines": [check(f"engine{index} close", lambda item=item: item.closed)
+                    for index, item in enumerate(getattr(observer, "engines", ()))],
+        "endpoints": [check(f"endpoint{index} close", lambda item=item: item.closed)
+                      for index, item in enumerate(getattr(observer, "endpoints", ()))],
+        "plant": check("plant close", lambda: observer.plant is not None and observer.plant.closed),
+        "devices": [] if observer.plant is None else [
+            check(f"device{index} close", lambda item=item: item.closed)
+            for index, item in enumerate(observer.plant.devices)],
+        "runtime": check("runtime close", lambda: observer.runtime is not None and observer.runtime.closed),
+        "borrowed_sockets": {}}
+    for path, sock in observer.sockets:
+        owned["borrowed_sockets"][path] = check(path + " socket", lambda sock=sock: sock.fileno() < 0)
+    if observer.runtime is not None:
+        borrowed = {id(sock) for _, sock in observer.sockets}
+        for binding in observer.runtime.bindings:
+            for sock in (binding.cosim.sock, binding.endpoint.stream.sock):
+                check(binding.name + " stream socket identity", lambda sock=sock: id(getattr(sock, "borrowed_socket", sock)) in borrowed)
+        for endpoint in getattr(observer, "endpoints", ()):
+            check("referee UART socket identity", lambda endpoint=endpoint:
+                id(endpoint.transport.sock) in borrowed)
+        if controls:
+            check("Scenario existing UART1 borrow scope", lambda: set(observer.controls) == {item.name for item in observer.manifest.robots})
+            for name, stream in observer.controls.items():
+                check(name + " existing control socket identity", lambda stream=stream: id(stream.sock) in borrowed)
+    for index, row in enumerate(report["qmp_cleanup"]):
+        check(f"QMP{index} close", lambda row=row: row == {"attempts": 1, "completed": True})
+    if (len(observer.owners) != 2 or len(report["cleanup"]) != 2
+            or len(getattr(observer, "engines", ())) != (2 if referees else 0)
+            or len(getattr(observer, "endpoints", ())) != (2 if referees else 0)
+            or observer.children or len(owned["devices"]) != 8
+            or len(report["qmp_cleanup"]) != 2 or len(owned["borrowed_sockets"]) != (8 if referees else 6)):
+        failures.append("owner acquisition scope incomplete")
+    if failures:
+        raise ValueError(label + " cleanup incomplete: " + "; ".join(failures))
+    report["cleanup_verified"] = True
+
+
+def verify_firmware_sources(report, inputs, firmware, *, observer=None, cli=False,
+                            label="Arena referee"):
+    from tools.dm_mc02_referee_test import checkout_snapshot
+    if any(report.get(key) is None for key in ("inputs_before", "checkout_before", "actual_sources_before")):
+        raise ValueError(label + " pre-run input/source state unavailable")
+    report["inputs_after"], report["checkout_after"] = inputs(), checkout_snapshot(firmware)
+    report["actual_sources_after"] = source_origins()
+    if (report.get("inputs_before") != report["inputs_after"]
+            or report.get("checkout_before") != report["checkout_after"]
+            or any(report["actual_sources_after"].get(name) != value
+                   for name, value in report["actual_sources_before"].items())):
+        raise ValueError(label + " actual input/source state changed")
+    if cli:
+        if observer is None or not report["cli"].get("verified"):
+            raise ValueError("Scenario referee actual CLI outcome was not verified")
+        check_cli_sources(observer, report["actual_sources_after"])
+    report["source_preserved"] = True
+
+
+def verify_firmware_watchdogs(report, *, label="Arena referee"):
+    if (set(report["watchdogs"]) != set(REFEREE_IDS)
+            or any(set(rows) != {"done", "paused"} for rows in report["watchdogs"].values())
+            or any(row["timeouts"] != 0 or "window-violations=0" not in row["diagnostics"]
+                   for rows in report["watchdogs"].values() for row in rows.values())):
+        raise ValueError(label + " watchdog observations missing")
+
+
+DJI_SCENARIO_EVENT_NS = 250_000_000
+DJI_SCENARIO_MEMBERS = ("east", "west")
+DJI_SCENARIO_FIELDS = ("angle", "speed", "current", "temp", "ts", "output",
+                       "enabled", "update_age", "feedback_age")
+DJI_SCENARIO_REQUIRED = frozenset(("control.rx", "reset.poweron", "bsp.init", "task.stack",
+    "dji.scenario.stop", "dji.can", *(f"dji.scenario.{phase}.id{identifier}.{field}"
+        for phase in (1, 2) for identifier in (1, 2) for field in DJI_SCENARIO_FIELDS)))
+
+
+def write_dji_scenario_manifest(directory, firmwares):
+    from sim.scenario.manifest import load_manifest as load_scenario
+    manifest = write_manifests(directory, firmwares, dji_scenario=True)
+    document = {"schema": 1, "arena": manifest.path.name, "duration": "1s", "events": [
+        {"at": "0ms", "action": "can_delay", "target": "east.drive", "value": "5ms"},
+        {"at": "250ms", "action": "can_delay", "target": "east.drive", "value": "0ms"}]}
+    path = directory / "scenario.yaml"
+    path.write_text(json.dumps(document))
+    return load_scenario(path)
+
+
+def check_dji_scenario_case(row):
+    if type(row) is not dict or set(row) != {"status", "name", "actual", "expected"}:
+        raise ValueError("DJI Scenario firmware case requires exact fields")
+    status, name, actual, expected = (row[key] for key in ("status", "name", "actual", "expected"))
+    if any(type(value) is not int or not 0 <= value <= 0xffffffff for value in (actual, expected)):
+        raise ValueError("DJI Scenario firmware report requires uint32 fields")
+    if status == "SKIP" and name == "plant.physics" and actual == expected == 0:
+        return
+    if status != "PASS" or name not in DJI_SCENARIO_REQUIRED:
+        raise ValueError("failed or unexpected DJI Scenario firmware case: " + name)
+    if name == "task.stack":
+        valid = actual >= 64 and expected == 64
+    elif name == "reset.poweron":
+        valid = actual == expected == 0x800000
+    elif name.endswith(".angle"):
+        valid = actual < 8192 and expected == 8192
+    elif name.endswith(".speed"):
+        # Sentinel expected0 does not claim zero speed; copied signed int16 is
+        # sign-extended through the firmware's uint32 report field.
+        valid = expected == 0 and (actual <= 0x7fff or actual >= 0xffff8000)
+    elif name.endswith(".ts"):
+        valid = actual != 0 and actual != expected
+    elif name.endswith((".update_age", ".feedback_age")):
+        valid = actual < 50 and expected == 50
+    elif name.endswith((".current", ".output")):
+        valid = actual == expected == (64 if ".id1." in name else 0xffffffc0)
+    elif name.endswith(".temp"):
+        valid = actual == expected == 25
+    elif name.endswith(".enabled"):
+        valid = actual == expected == 1
+    else:
+        valid = actual == expected == 0
+    if not valid:
+        raise ValueError("DJI Scenario firmware fields disagree: " + name)
+
+
+def check_dji_scenario_coverage(rows, summaries):
+    for row in rows:
+        check_dji_scenario_case(row)
+    if (Counter(row["name"] for row in rows if row["status"] == "PASS") !=
+            Counter({name: 1 for name in DJI_SCENARIO_REQUIRED})
+            or [row["name"] for row in rows if row["status"] == "SKIP"] != ["plant.physics"]
+            or summaries != [{"kind": kind, "values": [42, 0, 1]} for kind in ("PHASE", "DONE")]):
+        raise ValueError("missing/duplicate DJI Scenario firmware coverage or summaries")
+    for identifier in (1, 2):
+        stamps = [next(row for row in rows if row["name"] == f"dji.scenario.{phase}.id{identifier}.ts")
+                  for phase in (1, 2)]
+        if stamps[0]["actual"] == stamps[1]["actual"]:
+            raise ValueError("DJI Scenario second timestamp repeats first observation")
+
+
+def check_dji_scenario_observations(report):
+    if any(row["suffix_hex"] for row in report.get("physical_can_suffixes", ())):
+        raise ValueError("DJI Scenario physical CAN suffix remains incomplete")
+    evidence = report["scenario_observation"]
+    start = evidence["shared_start"]
+    if (start is None or not start["accepted"] or start["origin_ns"] != 0
+            or start["session_id"] != 1 or start["wire_sessions"] != [1, 2]):
+        raise ValueError("DJI Scenario shared reset/session observation disagrees")
+    actions = evidence["actions"]
+    if (len(actions) != 2 or any(not row["accepted"] for row in actions)
+            or [(row["logical_ns"], row["member"], row["delay_ns"]) for row in actions] !=
+            [(0, "east", 5_000_000), (DJI_SCENARIO_EVENT_NS, "east", 0)]
+            or not actions[0]["before_cont"] or actions[1]["before_cont"]):
+        raise ValueError("DJI Scenario original CAN delay actions disagree")
+    if not actions[1]["pending_sources"]:
+        raise ValueError("DJI Scenario restore has no retained delayed producer sources")
+    for name in DJI_SCENARIO_MEMBERS:
+        samples = evidence["samples"][name]
+        stage, control = evidence["stages"].get(name), evidence["controls"].get(name)
+        if (set(samples) != {"1", "2"} or samples["1"]["logical_ns"] >= DJI_SCENARIO_EVENT_NS
+                or stage is None or stage["logical_ns"] < samples["1"]["logical_ns"]
+                or control is None or not control["accepted"] or not control["completed"]
+                or control["send_attempts"] != 1 or control["wire_hex"] != "a5"
+                or control["logical_ns"] < max(DJI_SCENARIO_EVENT_NS,
+                    *(row["logical_ns"] for row in evidence["stages"].values()))
+                or samples["2"]["logical_ns"] < control["completed_logical_ns"]):
+            raise ValueError("DJI Scenario firmware observation/control order disagrees: " + name)
+        peer = DJI_SCENARIO_MEMBERS.index(name)
+        for phase in ("1", "2"):
+            rows = {row["name"]: row["actual"] for row in report["cases"][name]}
+            matches = samples[phase]["source_matches"]
+            for identifier in (1, 2):
+                prefix = f"dji.scenario.{phase}.id{identifier}."
+                values = tuple(rows[prefix + field] for field in ("angle", "speed", "current", "temp"))
+                match = matches.get("id" + str(identifier))
+                if match is None:
+                    raise ValueError("DJI Scenario copied raw feedback has no admitted source")
+                encoder, rpm, current, temp, _ = struct.unpack(">HhhBB", bytes.fromhex(match["data_hex"]))
+                if values != (encoder, rpm & 0xffffffff, current & 0xffffffff, temp):
+                    raise ValueError("DJI Scenario copied raw feedback differs from admitted source")
+                if not any(row["peer"] == peer and row["can_id"] == 0x200 + identifier
+                           and row["accepted"] and row["data_hex"] == match["data_hex"]
+                           and row["world_ns"] == match["source_world_ns"]
+                           and row["delivered_ns"] == match["delivery_ns"]
+                           and row["qemu_ns"] == match["qemu_ns"] for row in report["feedback"]):
+                    raise ValueError("DJI Scenario copied raw source receipt was not admitted")
+        for key in ("commands", "command_wire", "command_deliveries"):
+            commands = report[key][name]
+            if (commands["count"] <= 0 or commands["active_count"] <= 0 or commands["zero_count"] <= 0
+                    or commands["count"] > 10000 or len(commands["transitions"]) > 8):
+                raise ValueError("DJI Scenario active/disabled command evidence incomplete")
+    east = [row for row in report["feedback"] if row["peer"] == 0 and row["accepted"]]
+    west = [row for row in report["feedback"] if row["peer"] == 1 and row["accepted"]]
+    if (not east or not west or not any(row["due_ns"] - row["world_ns"] == 5_000_000 for row in east)
+            or not any(row["world_ns"] > DJI_SCENARIO_EVENT_NS and row["due_ns"] == row["world_ns"] for row in east)
+            or not any(later["world_ns"] < earlier["world_ns"] for earlier, later in zip(east, east[1:]))
+            or any(row["due_ns"] != row["world_ns"] for row in west)):
+        raise ValueError("DJI Scenario delayed/pending/overtaken/zero delivery evidence incomplete")
+    for row in (*east, *west):
+        reset = report["responses"][DJI_SCENARIO_MEMBERS[row["peer"]]]["reset"]
+        epoch = reset["decoded"]["virtual_time_ns"]
+        if (row["qemu_ns"] != epoch + row["delivered_ns"]
+                or not row.get("physical_complete") or not row.get("physical_wire_hex")):
+            raise ValueError("DJI Scenario feedback epoch/physical wire evidence disagrees")
+
+
+class _CanWrittenBytes:
+    """Forward each real socket write once, retaining only one physical suffix."""
+
+    def __init__(self, sock, observer, peer):
+        self.borrowed_socket, self.observer, self.peer = sock, observer, peer
+        self.suffix = bytearray()
+        self.cursor = 0
+
+    def __getattr__(self, name):
+        return getattr(self.borrowed_socket, name)
+
+    def send(self, data):
+        written = self.borrowed_socket.send(data)
+        self.suffix.extend(data[:written])
+        while len(self.suffix) >= 84:
+            raw = bytes(self.suffix[:84])
+            del self.suffix[:84]
+            rows = self.observer.report["feedback"]
+            while self.cursor < len(rows) and rows[self.cursor]["peer"] != self.peer:
+                self.cursor += 1
+            if self.cursor >= len(rows):
+                raise ValueError("DJI Scenario physical CAN write has no original send observation")
+            row = rows[self.cursor]
+            row.update(physical_wire_hex=raw.hex(), physical_complete=True)
+            expected = struct.pack("<IIB3xQ", row["can_id"], 0, 8, row["qemu_ns"])
+            if raw[:20] != expected or raw[20:28].hex() != row["data_hex"] or raw[28:] != bytes(56):
+                raise ValueError("DJI Scenario physical CAN bytes differ from original source send")
+            self.cursor += 1
+        return written
+
+
+def _dji_command_summary():
+    return {"count": 0, "active_count": 0, "zero_count": 0,
+            "first": None, "last": None, "transitions": []}
+
+
+def _record_dji_command(summary, row):
+    data = row["data_hex"]
+    if (row["can_id"] not in (0x200, 0x1ff) or row["flags"] != 0 or row["dlc"] != 8
+            or data not in ("0040ffc000000000", "0000000000000000")
+            or row["can_id"] == 0x1ff and data != "0000000000000000"):
+        raise ValueError("DJI Scenario command differs from literal CURRENT profile: " + repr(row))
+    if summary["count"] >= 10000:
+        raise BufferError("DJI Scenario command observation exhausted")
+    summary["count"] += 1
+    if row["can_id"] == 0x200:
+        summary["active_count" if data == "0040ffc000000000" else "zero_count"] += 1
+    if summary["first"] is None:
+        summary["first"] = row
+    previous = summary["last"]
+    if previous is None or (previous["can_id"], previous["data_hex"]) != (row["can_id"], data):
+        append_bounded(summary, "transitions", row, 8)
+    summary["last"] = row
+
+
+class DjiScenarioObservation(FirmwareObservation):
+    """Observe the existing Scenario and release only later guest observations."""
+
+    consumer_label = "DJI Scenario"
+    feedback_bound, step_bound = 10000, 1250
+
+    def __init__(self, report, manifest):
+        super().__init__(report, manifest)
+        self.scenario = True
+        self.controls = {}
+        self.buffers = {name: bytearray() for name in DJI_SCENARIO_MEMBERS}
+        self.written = []
+
+    def world(self, manifest):
+        try:
+            plant = super().world(manifest)
+            for peer, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
+                log = bus.log
+                name = self.manifest.robots[peer].name
+                def observed_log(delivery, log=log, peer=peer, name=name):
+                    log(delivery)
+                    if delivery.source != "qemu" or delivery.dropped:
+                        return
+                    frame = delivery.frame
+                    reset = self.report["responses"][name]["reset"]
+                    if reset is None:
+                        raise ValueError("DJI Scenario command delivery preceded actual RESET epoch")
+                    epoch = reset["decoded"]["virtual_time_ns"]
+                    _record_dji_command(self.report["command_deliveries"][name], {
+                        "peer": peer, "can_id": frame.can_id, "flags": frame.flags,
+                        "dlc": frame.dlc, "data_hex": frame.data.hex(),
+                        "mapped_qemu_ns": epoch + delivery.timestamp_ns,
+                        "source_world_ns": delivery.timestamp_ns, "due_ns": delivery.due_ns,
+                        "delivered_ns": delivery.delivered_ns, "sequence": delivery.sequence,
+                        "destination": delivery.destination})
+                bus.log = observed_log
+            return plant
+        except BaseException as error:
+            if self.plant is not None:
+                close_observation_failure(self.plant, "world", error)
+            raise
+
+    def can(self, sock):
+        stream = super().can(sock)
+        peer = self.can_count - 1
+        name = self.manifest.robots[peer].name
+        records = stream.receive_records
+        def observed_records():
+            for raw in records():
+                # Retain original bytes before the original receive consumes them.
+                # The production codec still owns decoding and validation.
+                if len(raw) != 84:
+                    raise ValueError("DJI Scenario command wire is not84 bytes")
+                row = {"peer": peer, "can_id": int.from_bytes(raw[:4], "little"),
+                    "flags": int.from_bytes(raw[4:8], "little"), "dlc": raw[8],
+                    "qemu_ns": int.from_bytes(raw[12:20], "little"),
+                    "data_hex": raw[20:28].hex(), "wire_hex": raw.hex()}
+                if raw[9:12] != bytes(3) or raw[28:] != bytes(56):
+                    raise ValueError("DJI Scenario command wire reserved bytes disagree")
+                _record_dji_command(self.report["command_wire"][name], row)
+                yield raw
+        stream.receive_records = observed_records
+        written = _CanWrittenBytes(sock, self, peer)
+        self.written.append(written)
+        stream.sock = written
+        return stream
+
+    def command(self, index, can_id, flags, dlc, stamp, data):
+        name = self.manifest.robots[index].name
+        _record_dji_command(self.report["commands"][name], {"peer": index,
+            "can_id": can_id, "flags": flags, "dlc": dlc, "qemu_ns": stamp, "data_hex": data.hex()})
+
+    def shared(self, *args, **options):
+        runtime = super().shared(*args, **options)
+        try:
+            start, setter = runtime.start, runtime.set_can_delay
+            evidence = self.report["scenario_observation"]
+            def observed_start(session, wire_sessions, *, deadline):
+                if evidence["shared_start"] is not None:
+                    raise ValueError("duplicate DJI Scenario shared start")
+                row = evidence["shared_start"] = {"session_id": session.session_id,
+                    "origin_ns": session.t_sim_ns, "wire_sessions": list(wire_sessions), "accepted": False}
+                result = start(session, wire_sessions, deadline=deadline)
+                row["accepted"] = True
+                return result
+            def observed_setter(name, delay_ns):
+                peer = [item.name for item in self.manifest.robots].index(name)
+                row = {"member": name, "delay_ns": delay_ns, "logical_ns": runtime.t_sim_ns,
+                    "before_cont": not any(item["command"] == "cont" for item in self.report["qmp_events"]),
+                    "accepted": False, "pending_sources": [dict(device=index, **source)
+                        for index in range(peer * 4, peer * 4 + 4)
+                        for source in self.feedback_sources[index].values()],
+                    "bus_pending": runtime.bindings[peer].endpoint.bus.pending}
+                append_bounded(evidence, "actions", row, 2)
+                result = setter(name, delay_ns)
+                row["accepted"] = True
+                self.service_control()
+                return result
+            runtime.start, runtime.set_can_delay = observed_start, observed_setter
+            return runtime
+        except BaseException as error:
+            close_observation_failure(runtime, "shared world", error)
+            raise
+
+    def check_cont(self):
+        evidence = self.report["scenario_observation"]
+        if (evidence["shared_start"] is None or not evidence["shared_start"]["accepted"]
+                or len(evidence["actions"]) != 1 or not evidence["actions"][0]["accepted"]
+                or not evidence["actions"][0]["before_cont"]):
+            raise ValueError("DJI Scenario resume preceded original reset/offset0 delay")
+
+    def service_control(self):
+        evidence = self.report["scenario_observation"]
+        if (len(evidence["actions"]) != 2 or not evidence["actions"][-1]["accepted"]
+                or set(evidence["stages"]) != set(DJI_SCENARIO_MEMBERS)
+                or any("1" not in samples for samples in evidence["samples"].values())):
+            return
+        for name in DJI_SCENARIO_MEMBERS:
+            stream = self.controls[name]
+            control = evidence["controls"].get(name)
+            if control is None:
+                if stream.tx_pending:
+                    raise ValueError("DJI Scenario borrowed control UART has prior pending output")
+                control = evidence["controls"][name] = {"logical_ns": self.runtime.t_sim_ns,
+                    "wire_hex": "a5", "send_attempts": 1, "accepted": False,
+                    "flush_attempts": 1, "completed": False, "borrowed_stream_identity": id(stream)}
+                stream.send(b"\xa5")
+                control["accepted"] = True
+            elif stream.tx_pending:
+                control["flush_attempts"] += 1
+                stream.flush()
+            if not stream.tx_pending and not control["completed"]:
+                control.update(completed=True, completed_logical_ns=self.runtime.t_sim_ns)
+
+    def scenario_case(self, name, row, poll_sample_qemu_ns):
+        if not row["name"].startswith("dji.scenario.") or row["name"] == "dji.scenario.stop":
+            return
+        phase = row["name"].split(".")[2]
+        evidence, now = self.report["scenario_observation"], self.runtime.t_sim_ns
+        if name not in self.report["ready"]:
+            raise ValueError("DJI Scenario sample report preceded actual UART ready")
+        if phase == "1" and now >= DJI_SCENARIO_EVENT_NS:
+            raise ValueError("DJI Scenario first firmware report missed250ms boundary")
+        if phase == "2":
+            control = evidence["controls"].get(name)
+            if control is None or not control["completed"]:
+                raise ValueError("DJI Scenario second firmware report preceded observation control")
+        prefix = f"dji.scenario.{phase}."
+        required = {label for label in DJI_SCENARIO_REQUIRED if label.startswith(prefix)}
+        rows = [item for item in self.report["cases"][name] if item["name"].startswith(prefix)]
+        if len(rows) != len({item["name"] for item in rows}):
+            raise ValueError("duplicate DJI Scenario sample report")
+        if {item["name"] for item in rows} == required:
+            values = {item["name"]: item["actual"] for item in rows}
+            sample = {"logical_ns": now, "poll_sample_qemu_ns": poll_sample_qemu_ns, "source_matches": {}}
+            evidence["samples"][name][phase] = sample
+            peer = [item.name for item in self.manifest.robots].index(name)
+            for identifier in (1, 2):
+                observed = tuple(values[prefix + f"id{identifier}." + field]
+                    for field in ("angle", "speed", "current", "temp"))
+                for source in reversed(self.report["feedback"]):
+                    if (source["peer"] != peer or source["can_id"] != 0x200 + identifier
+                            or not source["accepted"] or not source.get("physical_complete")
+                            or source["delivered_ns"] > now):
+                        continue
+                    angle, speed, current, temp, _ = struct.unpack(">HhhBB", bytes.fromhex(source["data_hex"]))
+                    if observed == (angle, speed & 0xffffffff, current & 0xffffffff, temp):
+                        sample["source_matches"][f"id{identifier}"] = {"data_hex": source["data_hex"],
+                            "source_world_ns": source["world_ns"], "delivery_ns": source["delivered_ns"],
+                            "qemu_ns": source["qemu_ns"]}
+                        break
+                else:
+                    raise ValueError("DJI Scenario actual copied raw has no admitted same-peer feedback")
+
+    def emit(self, event):
+        if event.event.endpoint != "uart1":
+            raise ValueError("unexpected DJI Scenario guest UART output")
+        index = [item.name for item in self.manifest.robots].index(event.name)
+        text = event.event.data.decode("ascii")
+        if len(self.report["uart"][index]) + len(text) > 12000:
+            raise BufferError("DJI Scenario UART observation exhausted")
+        self.report["uart"][index] += text
+        buffer = self.buffers[event.name]
+        if len(buffer) + len(event.event.data) > 12000:
+            raise BufferError("DJI Scenario UART line buffer exhausted")
+        buffer.extend(event.event.data)
+        while b"\n" in buffer:
+            raw, _, suffix = buffer.partition(b"\n")
+            buffer[:] = suffix
+            line = raw.decode("ascii").strip()
+            if not line.startswith("TTEST "):
+                continue
+            fields = line.split()
+            if len(fields) != 5:
+                raise ValueError("invalid DJI Scenario firmware report")
+            if fields[1] in ("PHASE", "DONE"):
+                append_bounded(self.report["summaries"], event.name,
+                    {"kind": fields[1], "values": list(map(int, fields[2:]))}, 2)
+                if fields[1] == "DONE":
+                    check_dji_scenario_coverage(self.report["cases"][event.name], self.report["summaries"][event.name])
+                    self.watchdog(index, event.name, "done")
+                continue
+            row = {"status": fields[1], "name": fields[2], "actual": int(fields[3]), "expected": int(fields[4])}
+            if row["status"] == "READY":
+                if row["actual"] != 0 or row["expected"] != 0:
+                    raise ValueError("DJI Scenario ready/stage values disagree")
+                marker = {"logical_ns": self.runtime.t_sim_ns, "poll_sample_qemu_ns": event.event.timestamp_ns}
+                if row["name"] == "dji.scenario.ready" and event.name not in self.report["ready"]:
+                    self.report["ready"][event.name] = marker
+                elif (row["name"] == "dji.scenario.observe" and event.name not in self.report["scenario_observation"]["stages"]
+                        and "1" in self.report["scenario_observation"]["samples"][event.name]):
+                    self.report["scenario_observation"]["stages"][event.name] = marker
+                else:
+                    raise ValueError("unexpected DJI Scenario ready/stage marker")
+            else:
+                append_bounded(self.report["cases"], event.name, row, 43)
+                check_dji_scenario_case(row)
+                self.scenario_case(event.name, row, event.event.timestamp_ns)
+        self.service_control()
+
+
+def run_dji_scenario(elf, output, firmware, *, qemu=None):
+    """One real Scenario wrapper/Arena call; publish success after final receipts."""
+    from tools.dm_mc02_dji_test import source_snapshot as dji_sources
+    from tools.dm_mc02_referee_test import source_snapshot, checkout_snapshot, write_json
+    from sim.scenario import runtime as scenario_runtime
+    output = Path(output).resolve()
+    if output.exists():
+        raise ValueError("refusing to overwrite existing DJI Scenario result directory")
+    output.mkdir(parents=True)
+    report = {"result": "failed", "arena": True, "scenario": True, "errors": [], "notes": [],
+        "cleanup": [], "qmp_events": [], "qmp_cleanup": [], "uart": ["", ""],
+        "cases": {name: [] for name in DJI_SCENARIO_MEMBERS},
+        "summaries": {name: [] for name in DJI_SCENARIO_MEMBERS}, "ready": {}, "watchdogs": {},
+        "responses": {name: {"count": 0, "first": None, "last": None, "reset": None,
+            "step_ack_count": 0, "first_step_ack": None, "last_step_ack": None,
+            "done_count": 0, "last_done": None} for name in DJI_SCENARIO_MEMBERS},
+        "native_calls": {"reset": 0, "step_ns": [], "close": 0}, "feedback": [],
+        "commands": {name: _dji_command_summary() for name in DJI_SCENARIO_MEMBERS},
+        "command_wire": {name: _dji_command_summary() for name in DJI_SCENARIO_MEMBERS},
+        "command_deliveries": {name: _dji_command_summary() for name in DJI_SCENARIO_MEMBERS},
+        "can_receive_errors": [], "scenario_observation": {"shared_start": None, "actions": [],
+            "samples": {name: {} for name in DJI_SCENARIO_MEMBERS}, "stages": {}, "controls": {}},
+        "missing": {name: sorted(DJI_SCENARIO_REQUIRED) for name in DJI_SCENARIO_MEMBERS},
+        "skips": {name: [] for name in DJI_SCENARIO_MEMBERS},
+        "missing_skips": {name: ["plant.physics"] for name in DJI_SCENARIO_MEMBERS},
+        "observation_bounds": {"feedback": 10000, "steps": 1250, "pending_per_device": 256,
+            "commands_per_peer": 10000, "command_transitions_per_peer": 8},
+        "limitations": ["Actual motor::dji/BSP/HAL/FDCAN consumer of one eight-device native world.",
+            "Both first complete reports must precede the reset-relative250ms event; no ready reanchor.",
+            "UART1 a5 releases application observation only, without world events or CPU synchronization.",
+            "Copied raw tuple has a completed admitted same-peer witness; repeated raw bytes do not identify a unique firmware source or exact host pairing.",
+            "Host logical/source/due/delivery/wire epochs and BSP milliseconds are distinct.",
+            "No50ms dynamic-delay timeout, calibrated physicalCAN, CPU barrier, pacing or RTF claim.",
+            "Firmware plant.physics remains an explicit SKIP."]}
+    write_json(output / "report.json", report)
+    observer = primary = binary = manifest = scenario_manifest = None
+    previous_signal = signal.getsignal(signal.SIGTERM)
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(f"DJI Scenario interrupted by signal {signum}")
+    signal.signal(signal.SIGTERM, interrupted)
+    def inputs():
+        result = source_snapshot(elf, binary, firmware)
+        result["dji_consumer"] = dji_sources(elf, binary, firmware)
+        motor = firmware / "components/motor"
+        motor_state = {}
+        for key, command in (("head", ["rev-parse", "--verify", "HEAD"]),
+                             ("status", ["status", "--short"])):
+            text = subprocess.check_output(["git", *command], cwd=motor, text=True, timeout=2)
+            if len(text.encode()) > 12000:
+                raise BufferError("DJI Scenario motor checkout observation exhausted")
+            motor_state[key] = text.strip() if key == "head" else text
+        result["actual_motor_checkout"] = motor_state
+        paths = [ROOT / name for name in ("models/two_four_wheel.xml", "models/four_wheel.xml",
+            "models/mujoco-LICENSE.txt", "flake.lock", "tools/dm_mc02_arena_smoke.py",
+            "tools/dm_mc02_shared_world_smoke.py")]
+        paths += [firmware / name for name in ("Core/Src/fdcan.c",
+            "Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_fdcan.c",
+            "Middlewares/Third_Party/FreeRTOS/Source/tasks.c",
+            "Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c")]
+        if manifest is not None:
+            paths += [manifest.path, *(item.robot.path for item in manifest.robots)]
+        if scenario_manifest is not None:
+            paths.append(scenario_manifest.path)
+        result.update({str(path): sha(path) for path in paths})
+        return result
+    try:
+        elf = arena.regular_file(elf, "DjiScenarioTest ELF")
+        binary = arena.resolve_qemu(qemu)
+        firmware = Path(firmware).resolve()
+        if not firmware.is_dir():
+            raise ValueError("firmware source tree is not a directory")
+        directory = output / "arena"
+        directory.mkdir()
+        scenario_manifest = write_dji_scenario_manifest(directory, (elf, elf))
+        manifest = scenario_manifest.arena
+        report["scenario_input"] = {"path": str(scenario_manifest.path),
+            "duration_ns": scenario_manifest.duration_ns,
+            "can_delays": [asdict(item) for item in scenario_manifest.can_delays]}
+        report["inputs_before"], report["checkout_before"] = inputs(), checkout_snapshot(firmware)
+        report["actual_sources_before"] = source_origins()
+        observer = DjiScenarioObservation(report, manifest)
+        overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
+            "connect_unix": "connect", "SharedWorldRuntime": "shared", "LabChannels": "channels",
+            "CanStream": "can"}
+        for original, replacement in overrides.items():
+            setattr(observer, "original_" + replacement, getattr(arena, original))
+        with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
+            result = scenario_runtime.run_manifest(scenario_manifest, qemu=binary,
+                startup_timeout=10., timeout=20., emit=observer.emit, on_response=observer.response)
+        report["runtime_result"] = asdict(result)
+        calls = report["native_calls"]
+        if (result.end_ns - result.origin_ns != 1_000_000_000 or result.origin_ns >= DJI_SCENARIO_EVENT_NS
+                or calls["reset"] != 1 or calls["close"] != 1 or len(calls["step_ns"]) != result.steps
+                or sum(calls["step_ns"]) != result.end_ns or set(calls["step_ns"]) != {1_000_000}
+                or len(result.boards) != 2 or result.referees or result.children):
+            raise ValueError("DJI Scenario world/result scope disagrees")
+        for wire_session, board in enumerate(result.boards, 1):
+            if board.ready != "uart_marker" or board.ready_qemu_ns is None:
+                raise ValueError("DJI Scenario actual UART ready observation missing")
+            report["ready"][board.name]["post_read_qemu_ns"] = board.ready_qemu_ns
+            check_referee_responses(report["responses"][board.name], wire_session,
+                result.steps, result.end_ns, board.reset_qemu_ns)
+    except BaseException as error:
+        primary = error
+    finally:
+        def verify(callback):
+            nonlocal primary
+            try:
+                callback()
+            except BaseException as error:
+                report["errors"].append(f"{type(error).__name__}: {error}")
+                if primary is None:
+                    primary = error
+                elif error is not primary:
+                    primary.add_note(f"DJI Scenario post-cleanup verification failed: {type(error).__name__}: {error}")
+                    for note in tuple(getattr(error, "__notes__", ())):
+                        primary.add_note(note)
+        for name in DJI_SCENARIO_MEMBERS:
+            rows = report["cases"][name]
+            report["missing"][name] = sorted(DJI_SCENARIO_REQUIRED -
+                {row["name"] for row in rows if row["status"] == "PASS"})
+            report["skips"][name] = [row["name"] for row in rows if row["status"] == "SKIP"]
+            report["missing_skips"][name] = [] if "plant.physics" in report["skips"][name] else ["plant.physics"]
+            verify(lambda name=name: check_dji_scenario_coverage(report["cases"][name], report["summaries"][name]))
+        report["physical_can_suffixes"] = [] if observer is None else [
+            {"peer": item.peer, "suffix_hex": item.suffix.hex()} for item in observer.written]
+        verify(lambda: check_dji_scenario_observations(report))
+        verify(lambda: verify_firmware_cleanup(report, observer, label="DJI Scenario", controls=True))
+        verify(lambda: verify_firmware_sources(report, inputs, firmware, observer=observer, label="DJI Scenario"))
+        verify(lambda: verify_firmware_watchdogs(report, label="DJI Scenario"))
+        signal.signal(signal.SIGTERM, previous_signal)
+        report["result"] = "passed" if primary is None else "failed"
+        if primary is not None:
+            report["errors"].insert(0, f"{type(primary).__name__}: {primary}")
+            report["error_type"], report["notes"] = type(primary).__name__, list(getattr(primary, "__notes__", ()))
+        write_json(output / "report.json", report)
+    print("RESULT: dual-QEMU DJI Scenario consumer " + report["result"])
+    if primary is not None:
+        print(f"DJI Scenario consumer failed: {primary}", file=sys.stderr)
+        for note in report["notes"]:
+            print(note, file=sys.stderr)
+    return 0 if primary is None else 130 if isinstance(primary, KeyboardInterrupt) else 1
 
 
 def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
@@ -1177,85 +1849,11 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
             verify(lambda name=name: check_referee_coverage(report["cases"][name], report["summaries"][name], name))
         if scenario:
             verify(lambda: check_scenario_observations(report))
-        def cleanup():
-            if observer is None:
-                raise ValueError("Arena referee owner acquisition unavailable")
-            failures = []
-            def check(label, read):
-                try:
-                    value = read()
-                except BaseException as error:
-                    failures.append(f"{label}: {type(error).__name__}: {error}")
-                    return False
-                if not value:
-                    failures.append(label)
-                return value
-            for identity, owner in zip(report["cleanup"], observer.owners):
-                identity["identity_gone"] = check(f"QEMU{identity['pid']} identity", lambda:
-                    starttime(identity["pid"]) != identity["starttime"])
-                identity["reaped"] = check(f"QEMU{identity['pid']} reap", lambda: owner.process.poll() is not None)
-                identity["temporary_gone"] = check(f"QEMU{identity['pid']} temporary directory", lambda:
-                    not Path(identity["tempdir"]).exists())
-                identity["sockets_gone"] = {name: check(f"QEMU{identity['pid']} {name} path", lambda path=path:
-                    not Path(path).exists()) for name, path in identity["sockets"].items()}
-            owned = report["owned_cleanup"] = {
-                "engines": [check(f"engine{index} close", lambda item=item: item.closed)
-                            for index, item in enumerate(observer.engines)],
-                "endpoints": [check(f"endpoint{index} close", lambda item=item: item.closed)
-                              for index, item in enumerate(observer.endpoints)],
-                "plant": check("plant close", lambda: observer.plant is not None and observer.plant.closed),
-                "devices": [] if observer.plant is None else [
-                    check(f"device{index} close", lambda item=item: item.closed)
-                    for index, item in enumerate(observer.plant.devices)],
-                "runtime": check("runtime close", lambda: observer.runtime is not None and observer.runtime.closed),
-                "borrowed_sockets": {}}
-            for path, sock in observer.sockets:
-                owned["borrowed_sockets"][path] = check(path + " socket", lambda sock=sock: sock.fileno() < 0)
-            if observer.runtime is not None:
-                borrowed = {id(sock) for _, sock in observer.sockets}
-                for binding in observer.runtime.bindings:
-                    for sock in (binding.cosim.sock, binding.endpoint.stream.sock):
-                        check(binding.name + " stream socket identity", lambda sock=sock: id(sock) in borrowed)
-                for endpoint in observer.endpoints:
-                    check("referee UART socket identity", lambda endpoint=endpoint:
-                        id(endpoint.transport.sock) in borrowed)
-                if scenario:
-                    check("Scenario existing UART1 borrow scope", lambda: set(observer.controls) == set(REFEREE_IDS))
-                    for name, stream in observer.controls.items():
-                        check(name + " existing control socket identity", lambda stream=stream: id(stream.sock) in borrowed)
-            for index, row in enumerate(report["qmp_cleanup"]):
-                check(f"QMP{index} close", lambda row=row: row == {"attempts": 1, "completed": True})
-            if (len(observer.owners) != 2 or len(observer.engines) != 2 or len(observer.endpoints) != 2
-                    or observer.children or len(owned["devices"]) != 8
-                    or len(report["qmp_cleanup"]) != 2 or len(owned["borrowed_sockets"]) != 8):
-                failures.append("owner acquisition scope incomplete")
-            if failures:
-                raise ValueError("Arena referee cleanup incomplete: " + "; ".join(failures))
-            report["cleanup_verified"] = True
-        verify(cleanup)
-        def sources():
-            if any(report.get(key) is None for key in ("inputs_before", "checkout_before", "actual_sources_before")):
-                raise ValueError("Arena referee pre-run input/source state unavailable")
-            report["inputs_after"], report["checkout_after"] = inputs(), checkout_snapshot(firmware)
-            report["actual_sources_after"] = source_origins()
-            if (report.get("inputs_before") != report["inputs_after"]
-                    or report.get("checkout_before") != report["checkout_after"]
-                    or any(report["actual_sources_after"].get(name) != value
-                           for name, value in report["actual_sources_before"].items())):
-                raise ValueError("Arena referee actual input/source state changed")
-            if cli:
-                if observer is None or not report["cli"].get("verified"):
-                    raise ValueError("Scenario referee actual CLI outcome was not verified")
-                check_cli_sources(observer, report["actual_sources_after"])
-            report["source_preserved"] = True
-        verify(sources)
-        def watchdogs():
-            if (set(report["watchdogs"]) != set(REFEREE_IDS)
-                    or any(set(rows) != {"done", "paused"} for rows in report["watchdogs"].values())
-                    or any(row["timeouts"] != 0 or "window-violations=0" not in row["diagnostics"]
-                           for rows in report["watchdogs"].values() for row in rows.values())):
-                raise ValueError("Arena referee watchdog observations missing")
-        verify(watchdogs)
+        verify(lambda: verify_firmware_cleanup(report, observer, label="Arena referee",
+            referees=True, controls=scenario))
+        verify(lambda: verify_firmware_sources(report, inputs, firmware,
+            observer=observer, cli=cli))
+        verify(lambda: verify_firmware_watchdogs(report))
         signal.signal(signal.SIGTERM, previous_signal)
         report["result"] = "passed" if primary is None else "failed"
         if primary is not None:
