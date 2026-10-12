@@ -1,8 +1,9 @@
-"""Pure Scenario admission for explicit scoped referee events.
+"""Pure Scenario admission for explicit scoped referee and CAN policy events.
 
 Event times are relative to the shared host reset. Duration is the Arena active
 duration after requested ready markers; startup events may precede that origin.
-The existing engine owns event execution. This module reads configuration only.
+The referee engine owns domain execution; CAN policy execution is not yet
+wired into the Scenario runner. This module reads configuration only.
 """
 
 from __future__ import annotations
@@ -12,7 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sim.arena.manifest import (
-    ArenaManifest, load_manifest as load_arena, parse_referee_events,
+    MAX_CAN_DELAY_EVENTS, ArenaManifest, load_manifest as load_arena,
+    parse_referee_events, validate_can_delays,
 )
 from sim.manifest import (
     ManifestError, fields, file_path, identifier, load_document, parse_time,
@@ -29,11 +31,49 @@ class ScenarioReferee:
 
 
 @dataclass(frozen=True)
+class ScenarioCanDelay:
+    offset_ns: int
+    member: str
+    delay_ns: int
+
+
+@dataclass(frozen=True)
 class ScenarioManifest:
     path: Path
     arena: ArenaManifest
     duration_ns: int
     referees: tuple[ScenarioReferee, ...]
+    can_delays: tuple[ScenarioCanDelay, ...] = ()
+
+
+def _can_delays(value, duration_ns):
+    if type(value) is not list or len(value) > MAX_CAN_DELAY_EVENTS:
+        raise ManifestError(f"events must be a list with at most {MAX_CAN_DELAY_EVENTS} entries")
+    if not value:
+        return (), ()
+    records, targets = [], []
+    for index, configuration in enumerate(value):
+        label = f"events[{index}]"
+        required = ("at", "action", "target", "value")
+        event = fields(configuration, required, required, label)
+        if type(event["action"]) is not str or event["action"] != "can_delay":
+            raise ManifestError(f"{label}.action unsupported: {event['action']!r}")
+        target = event["target"]
+        if type(target) is not str or target.count(".") != 1:
+            raise ManifestError(f"{label}.target must be a scoped member.bus name")
+        member, bus = target.split(".")
+        identifier(member, label + ".target.member")
+        identifier(bus, label + ".target.bus")
+        records.append(ScenarioCanDelay(parse_time(event["at"], label + ".at"), member,
+                                        parse_time(event["value"], label + ".value")))
+        targets.append(target)
+    records = tuple(records)
+    try:
+        validate_can_delays(tuple((item.offset_ns, item.member, item.delay_ns)
+                                 for item in records), duration_ns=duration_ns)
+    except (TypeError, ValueError) as error:
+        raise ManifestError(f"events: {error}") from error
+    return records, tuple(targets)
 
 
 def _referee_events(value, duration_ns):
@@ -71,11 +111,12 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     """Return immutable inputs without acquiring or executing simulation owners."""
     manifest_path, document = load_document(path)
     required = ("schema", "arena", "duration")
-    item = fields(document, (*required, "referee_events"), required, "scenario manifest")
+    item = fields(document, (*required, "referee_events", "events"), required, "scenario manifest")
     if type(item["schema"]) is not int or item["schema"] != 1:
         raise ManifestError("unsupported Scenario schema; schema must be integer 1")
     duration_ns = parse_time(item["duration"], "duration", zero=False)
     events = _referee_events(item.get("referee_events", {}), duration_ns)
+    can_delays, targets = _can_delays(item.get("events", []), duration_ns)
     try:
         reference = file_path(item["arena"], manifest_path.parent, "scenario.arena")
         arena = load_arena(reference)
@@ -87,4 +128,9 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
             raise ManifestError(f"referee_events.{member} must name an Arena member with a referee")
     referees = tuple(ScenarioReferee(item.member, events[item.member])
                      for item in arena.referees if item.member in events)
-    return ScenarioManifest(manifest_path, arena, duration_ns, referees)
+    robots = {item.name: item for item in arena.robots}
+    for index, (action, target) in enumerate(zip(can_delays, targets)):
+        if (action.member not in robots
+                or target != action.member + "." + robots[action.member].robot.bus.name):
+            raise ManifestError(f"events[{index}].target {target!r} must name its Arena member's bus")
+    return ScenarioManifest(manifest_path, arena, duration_ns, referees, can_delays)

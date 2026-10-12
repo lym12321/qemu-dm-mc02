@@ -19,9 +19,15 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
 
     Events use the shared reset origin. Duration is active world time after all
     requested ready markers, exactly as in the referenced Arena.
+    CAN delay records currently require explicit use of the lower Arena API;
+    nonempty schedules are refused before runtime imports or resources.
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
+    if type(manifest.can_delays) is not tuple:
+        raise TypeError("Scenario can_delays must be a plain immutable tuple")
+    if manifest.can_delays:
+        raise ValueError("Scenario CAN delay execution is not yet integrated")
     if type(manifest.arena) is not ArenaManifest:
         raise TypeError("Scenario requires an ArenaManifest")
     if type(manifest.duration_ns) is not int:

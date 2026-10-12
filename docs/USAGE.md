@@ -398,7 +398,7 @@ pending 限制。该调用不推进时间或发布 UART；名称、输入、sess
 最多 1024 项，偏移非递减，等时顺序保留。该函数只解析和校验，不读取文件或
 创建运行资源；成员及 session 由调用者校验。已有类型值可直接通过
 `sim.devices.referee.validate_referee_events(events)` 校验，类型、范围和顺序规则
-与引擎一致。尚未提供 Scenario 文件执行入口。
+与引擎一致。
 
 `sim.manifest.parse_time(value, label, zero=True)` 供配置消费者复用 Lab 的时间语法：
 整数 `ns/us/ms/s` 字符串，最多 13 位十进制数字，结果不超过 3600 秒。
@@ -424,11 +424,39 @@ referee_events:
 每个成员的 `at` 必须非递减且不超过 `duration`，等时顺序保留。完整文件校验后
 返回不可变记录，可将各 `record.events` 交给共享世界的 `queue_referee_events`。
 
+Scenario 也可声明 CAN 延迟动作，无需配置 referee：
+
+```yaml
+schema: 1
+arena: arena.yaml
+duration: 1s
+events:
+  - at: 500us
+    action: can_delay
+    target: east.chassis_can
+    value: 5ms
+  - at: 1s
+    action: can_delay
+    target: east.chassis_can
+    value: 0ns
+```
+
+每项必须且只能包含 `at/action/target/value`，当前只接受 `can_delay`。
+`target` 精确匹配 Arena 成员名与其 Robot 配置中的总线名，格式为 `成员.总线`；
+不接受未限定的总线名、板卡 FDCAN endpoint 或其它成员的总线名称。
+`at/value` 沿用整数 `ns/us/ms/s` 字符串，范围 0..3600 秒；
+`at` 不超过 `duration`，整个列表非递减，同刻跨成员和重复动作保留输入顺序。
+CAN 动作独立限制为 1024 项，不占用 referee 的 1024 项额度。
+完整动作形状和值在读取引用的 Arena 前校验，实际成员与总线关联在配置加载后校验。
+加载结果的 `can_delays` 是不可变 `ScenarioCanDelay(offset_ns, member, delay_ns)` 元组。
+当前执行入口明确拒绝非空 CAN 动作列表；这些记录可显式转换为下面 Arena Python
+入口的动作元组，Scenario 执行接线留待后续验证。
+
 `at` 从 shared host Session reset 起算；`duration` 沿用 Arena 在全部请求的 ready
 之后计算的活动时长，两者的起点不同。启动期间的事件可以先改变裁判状态；
-`at: 0ns` 的动态事件在下一次成功 step 才生效。加载接口只读取配置。
+`at: 0ns` 的裁判动态事件在下一次成功 step 才生效。加载接口只读取配置。
 通过 `sim.scenario.runtime.run_manifest(scenario)` 执行时，时长来自该配置，
-事件原样交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
+裁判事件原样交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
 命令行使用同一执行入口，时长由 Scenario 配置决定：
 
 ```bash
@@ -438,7 +466,7 @@ uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report
 `--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
 默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
 字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
-或暂停参数。故障注入、assertions 和 replay 尚未支持。
+或暂停参数。CAN 动作目前支持加载；其执行、其它故障注入、assertions 和 replay 尚未支持。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
@@ -462,7 +490,12 @@ Arena 的 Python 入口也接受 `can_delays=((offset_ns, member, delay_ns), ...
 拆分会改变 native 积分区间及 STEP 观察次数，不能保证轨迹与未拆分时相同。
 动作、存活检查或步进失败沿用整个 Arena 的终止及清理规则，保留先前效果。
 此 Python 控制入口不建立 QEMU CPU 时间屏障、wall-clock pacing 或物理 CAN 时序保证；
-Scenario YAML 和 CLI 的 CAN 延迟动作尚未接入。
+Scenario 和 CLI 尚不执行 CAN 延迟动作。
+
+配置消费者可调用 `sim.arena.manifest.validate_can_delays(actions, duration_ns=...)`，
+复用上述普通元组、成员字符串、无符号 64 位时间、顺序、额度和截止时间校验。
+该纯函数不创建资源或查询拓扑，允许零时长校验范围；实际运行仍要求 1 ns..3600 秒，
+成员与总线关联由调用者检查。Python 延迟值保持完整 64 位范围，YAML 值遵循 3600 秒配置上限。
 
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。

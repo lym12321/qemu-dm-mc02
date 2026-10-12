@@ -16,7 +16,6 @@ from sim.boards.launch import UARTS, positive_seconds, qemu_command, regular_fil
 from sim.core import Session
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, validate_referee_events
 from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
-from sim.fabric.can import check_can_time
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready
@@ -29,11 +28,9 @@ from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_test_harness import running_qemu, stop
 
-from .manifest import ArenaManifest, ArenaReferee, ArenaRobot
+from .manifest import (MAX_CAN_DELAY_EVENTS, ArenaManifest, ArenaReferee, ArenaRobot,
+                       validate_can_delays)
 from .world import create_arena_plant
-
-
-MAX_CAN_DELAY_EVENTS = 1024
 
 
 @dataclass(frozen=True)
@@ -252,24 +249,12 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             raise ValueError(f"Arena queued referee events total must not exceed {MAX_SCRIPT_EVENTS}")
         if events and events[-1].offset_ns > duration_ns:
             raise ValueError("Arena queued referee event offset must not exceed duration")
-    if type(can_delays) is not tuple:
-        raise TypeError("Arena can_delays must be a plain immutable tuple")
-    if len(can_delays) > MAX_CAN_DELAY_EVENTS:
-        raise ValueError(f"Arena CAN delay actions must not exceed {MAX_CAN_DELAY_EVENTS}")
+    validate_can_delays(can_delays, duration_ns=duration_ns)
     if can_delays and len(members) != len(manifest.robots):
         raise ValueError("Arena CAN delay members must be unique")
-    previous_offset = None
-    for item in can_delays:
-        if type(item) is not tuple or len(item) != 3:
-            raise TypeError("Arena can_delays entries require (offset_ns, member, delay_ns) tuples")
-        offset_ns, member, delay_ns = item
-        check_can_time(offset_ns, previous_offset)
-        if offset_ns > duration_ns:
-            raise ValueError("Arena CAN delay action offset must not exceed duration")
-        if type(member) is not str or member not in members:
+    for _, member, _ in can_delays:
+        if member not in members:
             raise ValueError("Arena CAN delay action must name a declared member")
-        check_can_time(delay_ns)
-        previous_offset = offset_ns
     startup_timeout, timeout = positive_seconds(startup_timeout), positive_seconds(timeout)
     if startup_timeout > timeout:
         raise ValueError("startup timeout must not exceed active host timeout")

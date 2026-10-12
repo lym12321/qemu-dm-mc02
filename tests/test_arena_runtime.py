@@ -450,6 +450,77 @@ def test_scenario_structure_rejects_before_lower_import_or_delegation(environmen
     assert environment.events == [] and environment.owners == []
 
 
+@pytest.fixture
+def admitted_can_delay_scenario(environment):
+    """Real no-referee YAML input; execution remains a separate consumer."""
+    arena = environment.manifest()
+    path = environment.directory / "can-delay.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms",
+        "events": [
+            {"at": "0ns", "action": "can_delay", "target": "east.chassis_can", "value": "2ms"},
+            {"at": "500us", "action": "can_delay", "target": "east.chassis_can", "value": "0s"},
+        ]}), encoding="utf-8")
+    return load_scenario(path)
+
+
+@pytest.mark.parametrize("invalid", ["nonempty", "empty-list", "tuple-subclass", "manifest-subclass"])
+def test_scenario_can_delay_temporary_guard_precedes_lower_import_options_and_resources(
+        environment, monkeypatch, admitted_can_delay_scenario, invalid):
+    manifest = admitted_can_delay_scenario
+    if invalid == "empty-list":
+        manifest = replace(manifest, can_delays=[])
+    elif invalid == "tuple-subclass":
+        manifest = replace(manifest, can_delays=type("Actions", (tuple,), {})(()))
+    elif invalid == "manifest-subclass":
+        manifest = type("ScenarioSubclass", (ScenarioManifest,), {})(
+            manifest.path, manifest.arena, manifest.duration_ns, manifest.referees, manifest.can_delays)
+    original_import = builtins.__import__
+    def admit_import(name, *args, **kwargs):
+        if name == "sim.arena.runtime":
+            pytest.fail("unsupported Scenario CAN actions reached the lower runtime import")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", admit_import)
+    error = ValueError if invalid == "nonempty" else TypeError
+    message = {"nonempty": "CAN delay", "manifest-subclass": "ScenarioManifest"}.get(invalid, "can_delays")
+    with pytest.raises(error, match=message):
+        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
+    assert environment.events == [] and environment.owners == [] and environment.launches == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_loaded_scenario_can_delays_manual_projection_consumes_actual_arena_bus(
+        environment, monkeypatch, admitted_can_delay_scenario):
+    """Explicit lower consumer; the guarded Scenario wrapper is not executed."""
+    scenario = admitted_can_delay_scenario
+    actions = tuple((item.offset_ns, item.member, item.delay_ns) for item in scenario.can_delays)
+    assert actions == ((0, "east", 2_000_000), (500_000, "east", 0))
+    assert scenario.referees == scenario.arena.referees == ()
+    observed = watch_can_delays(environment, monkeypatch)
+    environment.can_commands[0] = "1000 0000 0000 0000"
+    def after_set(value, member, delay):
+        if value.t_sim_ns == 500_000:
+            environment.producers[0, "can1"].send(can_wire(1000, "0800 0000 0000 0000"))
+    observed.after_set = after_set
+    result = environment.run(scenario.arena, duration=scenario.duration_ns / 1_000_000_000,
+                             can_delays=actions)
+    environment.assert_clean()
+    assert [(stamp, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
+    assert environment.native.resets == 1 and environment.native.steps == [500_000, 500_000]
+    assert (result.origin_ns, result.end_ns, result.steps, result.referees) == (0, 1_000_000, 2, ())
+    world, = observed.worlds
+    assert world.closed and world.referees == ()
+    assert [(item.endpoint.bus.delay_ns, item.endpoint.bus.pending) for item in world.bindings] == [(0, 1), (0, 0)]
+    # Independent fixed C620 bytes: the new command is admitted after the policy
+    # change, while the old delayed command remains pending beyond this run.
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    current = bytes.fromhex("0000 0000 0800 19 00")
+    for index, stamp in enumerate((1_001_000, 1_002_000)):
+        expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+            (current if index == 0 and motor_id == 1 else zero).ljust(64, b"\0"))
+            for motor_id in range(1, 5))
+        assert environment.producers[index, "can1"].recv(4096) == expected
+
+
 @pytest.mark.parametrize("duration_ns,seconds", [(1, 0.000000001), (1_234_567, 0.001234567),
                                                (3_600_000_000_000, 3600.0)])
 def test_scenario_delegates_once_with_original_order_options_and_exact_duration(

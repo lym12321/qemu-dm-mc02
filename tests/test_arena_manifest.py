@@ -730,7 +730,185 @@ def test_scenario_absent_events_and_valid_empty_target_have_explicit_defaults(tm
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     result = load_scenario(path)
     assert result.duration_ns == 1
+    assert result.can_delays == ()
     assert [(item.member, item.events) for item in result.referees] == ([] if not referees else [("east", ())])
+    document["events"] = []
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    assert load_scenario(path) == result
+
+
+def test_scenario_can_delay_admission_is_pure_uses_actual_bus_and_frozen_fifo(tmp_path, monkeypatch):
+    from sim.core import Coordinator
+    from sim.fabric import CanBus
+    from sim.scenario import ScenarioCanDelay, ScenarioManifest
+
+    documents = tuple(ROBOT_DOCUMENT.replace("chassis_can", label)
+                      for label in ("drive_left", "drive-right"))
+    arena_path = write_arena(tmp_path, robot_documents=documents)
+    directory = tmp_path / "scenarios"
+    directory.mkdir()
+    path = directory / "can.yaml"
+    actions = [
+        {"at": "0ns", "action": "can_delay", "target": "west.drive-right", "value": "0us"},
+        {"at": "0us", "action": "can_delay", "target": "east.drive_left", "value": "1ns"},
+        {"at": "500us", "action": "can_delay", "target": "east.drive_left", "value": "2ms"},
+        {"at": "500000ns", "action": "can_delay", "target": "west.drive-right", "value": "3us"},
+        {"at": "2ms", "action": "can_delay", "target": "east.drive_left", "value": "3600s"},
+    ]
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "../arena.yaml", "duration": "2ms",
+                                    "events": actions}, sort_keys=False), encoding="utf-8")
+    def forbidden(*args, **kwargs):
+        pytest.fail("pure CAN-delay admission constructed or executed a runtime owner")
+    for owner in (CanBus, Coordinator):
+        monkeypatch.setattr(owner, "__init__", forbidden)
+    for method in ("send", "reset", "step"):
+        monkeypatch.setattr(CanBus, method, forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    original_import = builtins.__import__
+    def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
+        resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
+                    if level else name)
+        candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
+        for candidate in candidates:
+            if any(candidate == prefix or candidate.startswith(prefix + ".") for prefix in (
+                    "mujoco", "numpy", "sim.physics", "sim.devices", "sim.arena.runtime", "sim.robots.runtime",
+                    "sim.robots.shared_world", "sim.lab.runtime", "sim.boards", "tools")):
+                pytest.fail(f"CAN-delay admission imported a runtime dependency: {candidate}")
+        return original_import(name, globals, locals, fromlist, level)
+    monkeypatch.setattr(builtins, "__import__", pure_import)
+    spec = importlib.util.spec_from_file_location("scenario_manifest_can_purity", ROOT / "sim/scenario/manifest.py")
+    scenario = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, scenario)
+    spec.loader.exec_module(scenario)
+    original_open, reads, calls = Path.open, [], []
+    def open_file(value, *args, **kwargs):
+        if value.resolve() == arena_path.resolve() or value.name == "robot.yaml":
+            reads.append(value.resolve())
+        return original_open(value, *args, **kwargs)
+    monkeypatch.setattr(Path, "open", open_file)
+    validate = scenario.validate_can_delays
+    def admission(value, *, duration_ns):
+        calls.append((value, duration_ns, tuple(reads)))
+        return validate(value, duration_ns=duration_ns)
+    monkeypatch.setattr(scenario, "validate_can_delays", admission)
+    result = scenario.load_manifest(path)
+    expected = ((0, "west", 0), (0, "east", 1), (500_000, "east", 2_000_000),
+                (500_000, "west", 3000), (2_000_000, "east", 3_600_000_000_000))
+    assert calls == [(expected, 2_000_000, ())]
+    assert reads and result.referees == () and result.arena.referees == ()
+    assert (result.path, result.arena.path, result.duration_ns) == (path.resolve(), arena_path.resolve(), 2_000_000)
+    assert type(result.can_delays) is tuple
+    assert result.can_delays == tuple(scenario.ScenarioCanDelay(*row) for row in expected)
+    for record in (result, *result.can_delays):
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, fields(record)[0].name, None)
+    # Public exported records and the old four-position constructor remain valid.
+    assert ScenarioCanDelay(0, "west", 0).member == "west"
+    assert ScenarioManifest(path, result.arena, 1, ()).can_delays == ()
+
+
+@pytest.mark.parametrize("invalid", ["outer_mapping", "entry_scalar", "missing", "extra", "action_type",
+                                    "unsupported", "target_type", "target_unscoped", "target_three_parts",
+                                    "target_non_ascii", "target_nul", "at_type", "at_fraction",
+                                    "value_type", "value_negative", "value_limit", "unordered", "horizon", "quota"])
+def test_scenario_can_delay_complete_outer_admission_precedes_referenced_reads(tmp_path, monkeypatch, invalid):
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path)
+    first = {"at": "0ns", "action": "can_delay", "target": "east.chassis_can", "value": "0ns"}
+    last = {"at": "1ms", "action": "can_delay", "target": "west.chassis_can", "value": "7ns"}
+    actions = [first, last]
+    if invalid == "outer_mapping":
+        actions = {"east": last}
+    elif invalid == "entry_scalar":
+        actions[1] = 7
+    elif invalid == "missing":
+        del last["value"]
+    elif invalid == "extra":
+        last["delay_ns"] = 7
+    elif invalid in ("action_type", "unsupported"):
+        last["action"] = True if invalid == "action_type" else "device_offline"
+    elif invalid.startswith("target_"):
+        last["target"] = {"target_type": False, "target_unscoped": "chassis_can",
+                          "target_three_parts": "east.main.fdcan1", "target_non_ascii": "east.底盘",
+                          "target_nul": "west.chassis_can\0"}[invalid]
+    elif invalid.startswith("at_"):
+        last["at"] = 1 if invalid == "at_type" else "0.5ms"
+    elif invalid.startswith("value_"):
+        last["value"] = {"value_type": True, "value_negative": "-1ns", "value_limit": "3601s"}[invalid]
+    elif invalid == "unordered":
+        actions = [last, first]
+    elif invalid == "horizon":
+        last["at"] = "1000001ns"
+    else:
+        actions = [dict(first) for _ in range(1025)]
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms",
+                                    "events": actions}, sort_keys=False), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError, match="events"):
+        load_scenario(path)
+
+
+@pytest.mark.parametrize("target", ["missing.chassis_can", "east.chassis_can", "east.main", "west.drive_left"])
+def test_scenario_can_delay_concrete_target_is_exact_loaded_member_bus(tmp_path, target):
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path, robot_documents=tuple(ROBOT_DOCUMENT.replace("chassis_can", name)
+                                               for name in ("drive_left", "drive-right")))
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": [
+        {"at": "0ns", "action": "can_delay", "target": target, "value": "0ns"}]}), encoding="utf-8")
+    with pytest.raises(ManifestError) as caught:
+        load_scenario(path)
+    assert "events[0].target" in str(caught.value) and target in str(caught.value)
+
+
+def test_scenario_can_delay_quota_is_independent_of_referee_quota(tmp_path):
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path, referees={"west": referee_configuration(), "east": referee_configuration()})
+    path = tmp_path / "scenario.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms",
+        "referee_events": {"west": [{"at": "1ms", "hit": {"damage_hp": 0}} for _ in range(512)],
+                           "east": [{"at": "1ms", "hit": {"damage_hp": 0}} for _ in range(512)]},
+        "events": [{"at": "1ms", "action": "can_delay", "target": "west.chassis_can", "value": "0ns"}
+                   for _ in range(1024)]}, sort_keys=False), encoding="utf-8")
+    result = load_scenario(path)
+    assert [(item.member, len(item.events)) for item in result.referees] == [("east", 512), ("west", 512)]
+    assert len(result.can_delays) == 1024
+    assert all((item.offset_ns, item.member, item.delay_ns) == (1_000_000, "west", 0)
+               for item in result.can_delays)
+
+
+def test_public_can_delay_validator_is_pure_neutral_and_accepts_unsigned_horizon(monkeypatch):
+    from sim.arena.manifest import MAX_CAN_DELAY_EVENTS, validate_can_delays
+    from sim.fabric import CanBus
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("pure value validator acquired a bus or runtime resource")
+    monkeypatch.setattr(CanBus, "__init__", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    maximum = (1 << 64) - 1
+    assert MAX_CAN_DELAY_EVENTS == 1024
+    assert validate_can_delays((), duration_ns=0) is None
+    assert validate_can_delays(((0, "undeclared", maximum),), duration_ns=0) is None
+    assert validate_can_delays(((maximum, "undeclared", 0),), duration_ns=maximum) is None
+
+
+@pytest.mark.parametrize("actions,horizon", [
+    ([(0, "east", 0)], 0), (((0, "east"),), 0),
+    (((0, type("Alias", (str,), {})("east"), 0),), 0),
+    (((1, "east", 0), (0, "west", 0)), 1), (((1, "east", 0),), 0),
+    (((0, "east", 1 << 64),), 0), ((), True), (((0, "east", 0),) * 1025, 0),
+])
+def test_public_can_delay_validator_refuses_invalid_neutral_input(actions, horizon):
+    from sim.arena.manifest import validate_can_delays
+
+    with pytest.raises((TypeError, ValueError)):
+        validate_can_delays(actions, duration_ns=horizon)
 
 
 @pytest.mark.parametrize("location,replacement", [

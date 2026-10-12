@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
 _MODELS = Path(__file__).resolve().parents[2] / "models"
 _PREFIXES = ("alpha/", "bravo/")
+MAX_CAN_DELAY_EVENTS = 1024
 
 
 @dataclass(frozen=True)
@@ -49,6 +50,34 @@ class ArenaManifest:
     world: Physics
     robots: tuple[ArenaRobot, ...]
     referees: tuple[ArenaReferee, ...] = ()
+
+
+def validate_can_delays(can_delays, *, duration_ns: int) -> None:
+    """Admit immutable CAN policy values without topology or runtime effects.
+
+    Entries are plain (offset_ns, member, delay_ns) tuples in caller order.
+    The unsigned64 horizon may be zero; run-duration and member/bus association
+    belong to the caller. Equal offsets and repeated member writes are legal.
+    """
+    from sim.fabric.can import check_can_time
+
+    check_can_time(duration_ns)
+    if type(can_delays) is not tuple:
+        raise TypeError("Arena can_delays must be a plain immutable tuple")
+    if len(can_delays) > MAX_CAN_DELAY_EVENTS:
+        raise ValueError(f"Arena CAN delay actions must not exceed {MAX_CAN_DELAY_EVENTS}")
+    previous_offset = None
+    for item in can_delays:
+        if type(item) is not tuple or len(item) != 3:
+            raise TypeError("Arena can_delays entries require (offset_ns, member, delay_ns) tuples")
+        offset_ns, member, delay_ns = item
+        check_can_time(offset_ns, previous_offset)
+        if offset_ns > duration_ns:
+            raise ValueError("Arena CAN delay action offset must not exceed duration")
+        if type(member) is not str:
+            raise ValueError("Arena CAN delay action requires a plain member string")
+        check_can_time(delay_ns)
+        previous_offset = offset_ns
 
 
 def _typed_record(record_type, value, label):
