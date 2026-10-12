@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim import processes
 from sim.arena import runtime
 from sim.arena.manifest import load_manifest
-from sim.core import Coordinator, Session
+from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
@@ -368,6 +368,317 @@ def watch_can_delays(environment, monkeypatch):
         return result
     monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_can_delay", set_delay)
     return observed
+
+
+@pytest.fixture
+def arena_tool_observation(environment, monkeypatch):
+    """Borrow the actual smoke observer over the existing eight-device fixture."""
+    from tools import dm_mc02_arena_smoke as tool
+    manifest = environment.manifest()
+    report = {"native_calls": {"reset": 0, "step_ns": [], "close": 0},
+              "feedback": [], "commands": [], "can_receive_errors": []}
+    observer = tool.Observation(report, manifest, "normal")
+    decisions, writes, streams = [], [], []
+    def acquire(actual):
+        plant = environment.create_plant(actual)
+        for bus in dict.fromkeys(device.bus for device in plant.devices):
+            bus.log = decisions.append
+        return plant
+    observer.original_world, observer.original_can = acquire, runtime.CanStream
+    monkeypatch.setattr(runtime, "create_arena_plant", observer.world)
+    monkeypatch.setattr(runtime, "CanStream", observer.can)
+    # Select only the tool's input assertion profile. Actual current still
+    # comes from literal socket commands consumed by the unchanged bus/driver.
+    monkeypatch.setattr(tool, "COMMANDS", ("1000000000000000", "f000000000000000"))
+    send = Peer.send
+    def physical_write(peer, data):
+        if peer.name == "can1":
+            event = report["feedback"][-1]
+            decision = next(row for row in reversed(decisions) if row.destination == "qemu")
+            writes.append((peer.index, decision, event["accepted"],
+                           observer.feedback_deliveries[peer.index]))
+        return send(peer, data)
+    monkeypatch.setattr(Peer, "send", physical_write)
+    def direct():
+        plant = observer.world(manifest)
+        plant.reset(Session(7, 500))
+        for index, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
+            bus.reset(500)
+            peer = environment.connect(environment.directory / f"peer{index}" / "can1", 1)
+            stream = observer.can(peer)
+            streams.append(stream)
+            endpoint = QemuCanEndpoint(bus, stream)
+            endpoint.bind_mapper(cosim.QemuTimestampMapper((1000, 2000)[index], 500))
+        return plant.devices[0], streams[0]
+    return SimpleNamespace(tool=tool, observer=observer, report=report, manifest=manifest,
+                           decisions=decisions, writes=writes, streams=streams, direct=direct)
+
+
+@pytest.mark.parametrize("invalid", ["missing-source", "source-time", "payload", "can-id"])
+def test_arena_tool_observation_refuses_bad_public_delivery_before_endpoint_send(
+        environment, arena_tool_observation, invalid):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    frame = device.feedback()
+    sources = observed.observer.feedback_sources[0]
+    if invalid == "missing-source":
+        sources.pop(500)
+    elif invalid == "source-time":
+        sources[500]["world_ns"] = 501
+    elif invalid == "payload":
+        frame = replace(frame, data=bytes.fromhex("0000 0000 0001 19 00"))
+    else:
+        frame = replace(frame, can_id=0x205)
+    device.bus.send(device, frame)
+    with pytest.raises((AssertionError, KeyError)):
+        device.bus.step(500)
+    assert len(observed.decisions) == 4  # One previous log call per actual destination.
+    assert observed.decisions[-1].destination == "qemu"
+    assert observed.observer.feedback_deliveries == {0: None, 1: None}
+    assert observed.report["feedback"] == [] and observed.writes == [] and not stream.tx_pending
+    with pytest.raises(BlockingIOError):
+        environment.producers[0, "can1"].recv(4096)
+
+
+def test_arena_tool_observation_duplicate_source_and_drop_keep_original_missing_evidence(
+        environment, arena_tool_observation):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    frame = device.feedback()
+    source = observed.observer.feedback_sources[0][500]
+    with pytest.raises(ValueError, match="duplicate feedback source"):
+        device.feedback()
+    assert observed.observer.feedback_sources[0] == {500: source}
+    device.bus.drop = lambda origin, destination, incoming: isinstance(destination, QemuCanEndpoint)
+    device.bus.send(device, frame)
+    assert device.bus.step(500) == 1
+    assert observed.decisions[-1].dropped and observed.decisions[-1].frame is frame
+    assert observed.observer.feedback_sources[0][500] is source
+    assert observed.observer.feedback_deliveries == {0: None, 1: None}
+    assert observed.report["feedback"] == [] and observed.writes == [] and not stream.tx_pending
+    with pytest.raises(BlockingIOError):
+        environment.producers[0, "can1"].recv(4096)
+
+
+def test_arena_tool_observation_source_capacity_uses_actual_completed_producer_times(arena_tool_observation):
+    observed = arena_tool_observation
+    device, _ = observed.direct()
+    for index in range(1, 257):
+        observed.observer.plant.step(StepContext(7, index, 500 + index, 1))
+        device.feedback()
+    sources = observed.observer.feedback_sources[0]
+    assert tuple(sources) == tuple(range(501, 757))
+    observed.observer.plant.step(StepContext(7, 257, 757, 1))
+    with pytest.raises(BufferError, match="pending feedback source exhausted"):
+        device.feedback()
+    assert tuple(sources) == tuple(range(501, 757))
+    assert observed.report["feedback"] == [] and observed.decisions == []
+
+
+@pytest.mark.parametrize("invalid", ["flags", "dlc", "data"])
+def test_arena_tool_observation_duplicate_attribution_and_wrong_send_consume_one_attempt(
+        environment, arena_tool_observation, invalid):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    frame = device.feedback()
+    device.bus.drop = lambda origin, destination, incoming: isinstance(destination, QemuCanEndpoint)
+    device.bus.send(device, frame)
+    device.bus.step(500)
+    # Isolate the observer hook with the real frame and decision metadata;
+    # changing the dropped flag here does not dispatch another bus frame.
+    decision = replace(observed.decisions[-1], dropped=False)
+    device.bus.log(decision)
+    assert observed.observer.feedback_deliveries[0] is decision
+    with pytest.raises(AssertionError, match="unconsumed Arena feedback delivery"):
+        device.bus.log(decision)
+    arguments = [0x201, 0, 8, 1000, bytes.fromhex("0000 0000 0000 19 00")]
+    if invalid == "flags":
+        arguments[1] = 1
+    elif invalid == "dlc":
+        arguments[2] = 7
+    else:
+        arguments[4] = bytes.fromhex("0000 0000 0001 19 00")
+    with pytest.raises(AssertionError):
+        stream.send(*arguments)
+    assert observed.observer.feedback_deliveries[0] is None
+    assert tuple(observed.observer.feedback_sources[0]) == (500,)
+    with pytest.raises(AssertionError, match="no delivery attribution"):
+        stream.send(0x201, 0, 8, 1000, frame.data)
+    assert observed.report["feedback"] == [] and observed.writes == [] and not stream.tx_pending
+    with pytest.raises(BlockingIOError):
+        environment.producers[0, "can1"].recv(4096)
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["io-error", "interrupt"])
+def test_arena_tool_observation_io_failure_keeps_source_without_replaying_send(
+        environment, monkeypatch, arena_tool_observation, interrupt):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    frame = device.feedback()
+    source = observed.observer.feedback_sources[0][500]
+    primary = KeyboardInterrupt("observer send interrupted") if interrupt else OSError("observer send failed")
+    attempts = []
+    def reject(peer, data):
+        attempts.append(bytes(data))
+        raise primary
+    monkeypatch.setattr(Peer, "send", reject)
+    device.bus.send(device, frame)
+    with pytest.raises(type(primary)) as caught:
+        device.bus.step(500)
+    assert caught.value is primary and len(attempts) == 1
+    assert observed.observer.feedback_sources[0][500] is source
+    assert observed.observer.feedback_deliveries[0] is None and stream.tx_pending
+    assert len(observed.report["feedback"]) == 1 and not observed.report["feedback"][0]["accepted"]
+    with pytest.raises(AssertionError, match="no delivery attribution"):
+        stream.send(0x201, 0, 8, 1000, frame.data)
+    assert len(attempts) == 1 and len(observed.report["feedback"]) == 1
+
+
+def test_arena_tool_observation_partial_socket_prefix_accepts_one_record_then_flushes_suffix(
+        environment, arena_tool_observation):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    frame = device.feedback()
+    environment.uart_send_budget[0, "can1"] = 17
+    device.bus.send(device, frame)
+    assert device.bus.step(500) == 1
+    expected = struct.pack("<IIB3xQ64s", 0x201, 0, 8, 1000,
+                           bytes.fromhex("0000 0000 0000 19 00").ljust(64, b"\0"))
+    assert environment.producers[0, "can1"].recv(4096) == expected[:17]
+    assert stream.tx_pending and observed.report["feedback"][0]["accepted"]
+    assert not observed.observer.feedback_sources[0] and observed.observer.feedback_deliveries[0] is None
+    with pytest.raises(AssertionError, match="no delivery attribution"):
+        stream.send(0x201, 0, 8, 1000, frame.data)
+    environment.uart_send_budget[0, "can1"] = 67
+    assert stream.flush() and not stream.tx_pending
+    assert environment.producers[0, "can1"].recv(4096) == expected[17:]
+    assert len(observed.report["feedback"]) == 1
+    assert [row[2:] for row in observed.writes] == [(False, None), (True, None)]
+
+
+def test_arena_tool_observation_tx_capacity_keeps_unaccepted_source_and_consumes_token(
+        environment, arena_tool_observation):
+    observed = arena_tool_observation
+    device, stream = observed.direct()
+    stream.max_pending = 1
+    environment.uart_send_budget[0, "can1"] = 0
+    first = device.feedback()
+    device.bus.send(device, first)
+    device.bus.step(500)
+    other = observed.observer.plant.devices[1]
+    second = other.feedback()
+    source = observed.observer.feedback_sources[1][500]
+    other.bus.send(other, second)
+    with pytest.raises(BufferError, match="TX queue is full"):
+        other.bus.step(500)
+    assert [row["accepted"] for row in observed.report["feedback"]] == [True, False]
+    assert not observed.observer.feedback_sources[0]
+    assert observed.observer.feedback_sources[1][500] is source
+    assert observed.observer.feedback_deliveries[0] is None and stream.tx_pending
+    with pytest.raises(AssertionError, match="no delivery attribution"):
+        stream.send(0x202, 0, 8, 1000, second.data)
+    assert len(observed.report["feedback"]) == 2
+
+
+@pytest.mark.parametrize("delayed,via_scenario", [(False, False), (True, False), (True, True)],
+                         ids=["arena-zero-delay", "arena-delay-reduction", "scenario-delay-reduction"])
+def test_arena_tool_observation_actual_socket_sources_follow_overtaking_and_equal_due_fifo(
+        environment, monkeypatch, arena_tool_observation, delayed, via_scenario):
+    fixture = arena_tool_observation
+    observed = watch_can_delays(environment, monkeypatch)
+    monkeypatch.setattr(runtime, "Session", lambda identifier: Session(identifier, 500))
+    environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
+    def restore(value, member, delay):
+        if value.t_sim_ns == 2_000_500:
+            monkeypatch.setattr(fixture.tool, "COMMANDS", ("2000000000000000", "f000000000000000"))
+            environment.producers[0, "can1"].send(can_wire(1000, "2000 0000 0000 0000"))
+    observed.after_set = restore
+    actions = ((0, "east", 2_000_000), (2_000_000, "east", 0)) if delayed else ()
+    if via_scenario:
+        scenario = ScenarioManifest(environment.directory / "unread.yaml", fixture.manifest, 4_000_000, (),
+                                    (ScenarioCanDelay(0, "east", 2_000_000), ScenarioCanDelay(2_000_000, "east", 0)))
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    else:
+        result = environment.run(fixture.manifest, duration=.004, can_delays=actions)
+    environment.assert_clean()
+    assert (result.origin_ns, result.end_ns, result.steps) == (500, 4_000_500, 4)
+    assert [row.reset_qemu_ns for row in result.boards] == [1000, 2000]
+    assert fixture.report["native_calls"] == {"reset": 1, "step_ns": [1_000_000] * 4, "close": 1}
+    assert all(not sources for sources in fixture.observer.feedback_sources.values())
+    assert fixture.observer.feedback_deliveries == {0: None, 1: None}
+    world, = observed.worlds
+    assert all(not item.endpoint.stream.tx_pending for item in world.bindings)
+    assert [item.endpoint.bus.delay_ns for item in world.bindings] == [0, 0]
+    rows = fixture.report["feedback"]
+    assert len(rows) == 32 and all(row["accepted"] for row in rows)
+    qemu_decisions = [row for row in fixture.decisions if row.destination == "qemu"]
+    assert len(qemu_decisions) == 32 and len(fixture.writes) == 32
+    assert all(not accepted and token is None for _, _, accepted, token in fixture.writes)
+    assert [decision for _, decision, _, _ in fixture.writes] == qemu_decisions
+    east = [row for row in rows if row["peer"] == 0 and row["can_id"] == 0x201]
+    if delayed:
+        assert [(row["world_ns"], row["sequence"], row["due_ns"], row["delivered_ns"],
+                 row["qemu_ns"], row["producer_current_raw"], row["send_live_current_raw"])
+                for row in east] == [
+            (1_000_500, 1, 3_000_500, 3_000_500, 3_001_000, 0, 8192),
+            (3_000_500, 10, 3_000_500, 3_000_500, 3_001_000, 8192, 8192),
+            (2_000_500, 5, 4_000_500, 4_000_500, 4_001_000, 0, 8192),
+            (4_000_500, 14, 4_000_500, 4_000_500, 4_001_000, 8192, 8192),
+        ]
+        groups = ((3_001_000, "0000"), (3_001_000, "2000"),
+                  (4_001_000, "0000"), (4_001_000, "2000"))
+    else:
+        assert [(row["world_ns"], row["due_ns"], row["delivered_ns"], row["qemu_ns"],
+                 row["producer_current_raw"], row["send_live_current_raw"]) for row in east] == [
+            (1_000_500, 1_000_500, 1_000_500, 1_001_000, 4096, 4096),
+            (2_000_500, 2_000_500, 2_000_500, 2_001_000, 4096, 4096),
+            (3_000_500, 3_000_500, 3_000_500, 3_001_000, 4096, 4096),
+            (4_000_500, 4_000_500, 4_000_500, 4_001_000, 4096, 4096),
+        ]
+        groups = ((1_001_000, "1000"), (2_001_000, "1000"),
+                  (3_001_000, "1000"), (4_001_000, "1000"))
+    west = [row for row in rows if row["peer"] == 1 and row["can_id"] == 0x201]
+    assert [(row["world_ns"], row["due_ns"], row["delivered_ns"], row["qemu_ns"],
+             row["producer_current_raw"]) for row in west] == [
+        (1_000_500, 1_000_500, 1_000_500, 1_002_000, -4096),
+        (2_000_500, 2_000_500, 2_000_500, 2_002_000, -4096),
+        (3_000_500, 3_000_500, 3_000_500, 3_002_000, -4096),
+        (4_000_500, 4_000_500, 4_000_500, 4_002_000, -4096),
+    ]
+    for index, group in enumerate((groups, ((1_002_000, "f000"), (2_002_000, "f000"),
+                                          (3_002_000, "f000"), (4_002_000, "f000")))):
+        expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+            bytes.fromhex("0000 0000 " + (current if motor_id == 1 else "0000") + " 19 00").ljust(64, b"\0"))
+            for stamp, current in group for motor_id in range(1, 5))
+        assert environment.producers[index, "can1"].recv(4096) == expected
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["io-error", "interrupt"])
+def test_arena_tool_observation_send_failure_retains_source_and_original_runtime_cleanup(
+        environment, monkeypatch, arena_tool_observation, interrupt):
+    fixture = arena_tool_observation
+    primary = KeyboardInterrupt("observer callback interrupted") if interrupt else OSError("observer callback failed")
+    environment.world_close_failure = OSError("observer cleanup failed")
+    environment.world_close_failure.add_note("observer nested cleanup evidence")
+    calls = []
+    send = Peer.send
+    def reject(peer, data):
+        if peer.name == "can1":
+            calls.append((peer.index, bytes(data)))
+            raise primary
+        return send(peer, data)
+    monkeypatch.setattr(Peer, "send", reject)
+    with pytest.raises(type(primary)) as caught:
+        environment.run(environment.manifest(upper=True), duration=.001)
+    assert caught.value is primary
+    environment.assert_clean()
+    assert len(calls) == 1 and fixture.report["native_calls"] == {
+        "reset": 1, "step_ns": [1_000_000], "close": 1}
+    assert len(fixture.report["feedback"]) == 1 and not fixture.report["feedback"][0]["accepted"]
+    assert tuple(fixture.observer.feedback_sources[0]) == (1_000_000,)
+    assert fixture.observer.feedback_deliveries == {0: None, 1: None}
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+    assert "observer nested cleanup evidence" in "\n".join(primary.__notes__)
 
 
 # Independent 2026V1.1.0 packed layouts and pinned crccheck CRC literals, shared

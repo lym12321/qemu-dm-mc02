@@ -102,6 +102,7 @@ class Observation:
         self.plant = self.runtime = None
         self.can_count = self.cosim_count = 0
         self.feedback_sources = {}
+        self.feedback_deliveries = {}
         self.run_result = self.run_error = None
 
     def run(self, manifest, **options):
@@ -171,7 +172,7 @@ class Observation:
         for index, device in enumerate(plant.devices):
             member = manifest.robots[index // 4]
             motor = member.robot.devices[index % 4]
-            self.feedback_sources[index] = []
+            self.feedback_sources[index] = {}
             feedback = device.feedback
 
             def observed_feedback(device=device, feedback=feedback, index=index,
@@ -184,12 +185,37 @@ class Observation:
                 frame = feedback()
                 assert frame.timestamp_ns == source["world_ns"]
                 source["data_hex"] = frame.data.hex()
+                if frame.timestamp_ns in self.feedback_sources[index]:
+                    raise ValueError("Arena fixture duplicate feedback source timestamp")
                 if len(self.feedback_sources[index]) >= 256:
                     raise BufferError("Arena fixture pending feedback source exhausted")
-                self.feedback_sources[index].append(source)
+                self.feedback_sources[index][frame.timestamp_ns] = source
                 return frame
 
             device.feedback = observed_feedback
+        for peer, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
+            self.feedback_deliveries[peer] = None
+            log = bus.log
+
+            def observed_delivery(delivery, peer=peer, log=log):
+                if log is not None:
+                    log(delivery)
+                if delivery.destination != "qemu" or delivery.dropped:
+                    return
+                frame = delivery.frame
+                assert 0x201 <= frame.can_id <= 0x204, repr(delivery)
+                sources = self.feedback_sources[peer * 4 + frame.can_id - 0x201]
+                assert delivery.timestamp_ns in sources, "Arena feedback delivery has no producer source"
+                source = sources[delivery.timestamp_ns]
+                assert source["world_ns"] == delivery.timestamp_ns == frame.timestamp_ns, repr(delivery)
+                assert source["data_hex"] == frame.data.hex(), repr(delivery)
+                assert self.feedback_deliveries[peer] is None, "unconsumed Arena feedback delivery"
+                # Public CanBus.log runs immediately before this destination's
+                # receive. One attribution follows actual delivery order;
+                # producer order may differ after a delay reduction.
+                self.feedback_deliveries[peer] = delivery
+
+            bus.log = observed_delivery
         return plant
 
     @contextmanager
@@ -236,8 +262,17 @@ class Observation:
         self.can_count += 1
         send, receive = stream.send, stream.receive
         def observed_send(can_id, flags, dlc, timestamp_ns, data):
-            device = self.plant.devices[index * 4 + can_id - 0x201]
-            source = self.feedback_sources[index * 4 + can_id - 0x201].pop(0)
+            delivery = self.feedback_deliveries[index]
+            assert delivery is not None, "Arena feedback send has no delivery attribution"
+            # An attempt consumes the attribution even if validation or the
+            # original send fails. Keep its source until transport admission.
+            self.feedback_deliveries[index] = None
+            original = delivery.frame
+            assert (can_id, flags, dlc, data) == (
+                original.can_id, original.flags, original.dlc, original.data), repr(delivery)
+            device_index = index * 4 + can_id - 0x201
+            device = self.plant.devices[device_index]
+            source = self.feedback_sources[device_index][delivery.timestamp_ns]
             assert source["data_hex"] == data.hex()
             state = source["joint"]
             encoder, rpm, current, temperature, reserved = struct.unpack(">HhhBB", data)
@@ -247,7 +282,9 @@ class Observation:
                      "world_ns": source["world_ns"], "data_hex": data.hex(), "accepted": False,
                      "joint": state, "rotor_position_mod_tau": position,
                      "producer_current_raw": source["current_raw"],
-                     "send_live_current_raw": device.current_raw}
+                     "send_live_current_raw": device.current_raw,
+                     "sequence": delivery.sequence, "due_ns": delivery.due_ns,
+                     "delivered_ns": delivery.delivered_ns}
             append_bounded(self.report, "feedback", event)
             # An extremely small negative angle can project to exact tau in
             # double modulo. On the documented cyclic8192 encoder this exact
@@ -257,7 +294,10 @@ class Observation:
             assert abs(state["velocity_rad_s"] * (3591 / 187) - rpm * math.pi / 30) <= math.pi / 60, repr(event)
             assert (flags, dlc, current, temperature, reserved) == (0, 8, source["current_raw"], 25, 0), repr(event)
             result = send(can_id, flags, dlc, timestamp_ns, data)
+            # Accepted means the original bounded stream admitted this record;
+            # physical suffix completion and guest consumption are separate.
             event["accepted"] = True
+            del self.feedback_sources[device_index][delivery.timestamp_ns]
             return result
 
         def observed_receive():
@@ -1321,13 +1361,15 @@ def main(args):
         assert all(device.closed for device in observer.plant.devices)
         assert len(observer.owners) == 2 and len(observer.children) == 1
         assert all(not pending for pending in observer.feedback_sources.values())
+        assert all(delivery is None for delivery in observer.feedback_deliveries.values())
+        assert all(not item.endpoint.stream.tx_pending for item in observer.runtime.bindings)
         report["device_cleanup"] = [device.closed for device in observer.plant.devices]
         assert {event["peer"] for event in report["commands"]} == {0, 1}
         resets = {event["name"]: event["decoded"]["virtual_time_ns"]
             for event in report["responses"] if event["header"]["kind"] == codec.RESET_ACK}
         assert set(resets) == {member.name for member in manifest.robots}
         for event in report["feedback"]:
-            assert event["qemu_ns"] == resets[manifest.robots[event["peer"]].name] + event["world_ns"]
+            assert event["qemu_ns"] == resets[manifest.robots[event["peer"]].name] + event["delivered_ns"]
         assert observer.completed_names() == {member.name for member in manifest.robots}
         for index, text in enumerate(report["uart"]):
             lines = [line for line in text.splitlines() if line.startswith("WORLD_RESULT=")]
