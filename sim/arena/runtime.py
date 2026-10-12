@@ -16,6 +16,7 @@ from sim.boards.launch import UARTS, positive_seconds, qemu_command, regular_fil
 from sim.core import Session
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, validate_referee_events
 from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
+from sim.fabric.can import check_can_time
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready
@@ -30,6 +31,9 @@ from tools.dm_mc02_test_harness import running_qemu, stop
 
 from .manifest import ArenaManifest, ArenaReferee, ArenaRobot
 from .world import create_arena_plant
+
+
+MAX_CAN_DELAY_EVENTS = 1024
 
 
 @dataclass(frozen=True)
@@ -179,7 +183,7 @@ class _Run:
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                  on_response=None, qemu=None, startup_timeout=10.0,
                  timeout=30.0, referee_period_ns=100_000_000,
-                 referee_events=()) -> ArenaResult:
+                 referee_events=(), can_delays=()) -> ArenaResult:
     """Consume admitted records and return only after all owners are released.
 
     Referees publish the latest completed snapshot when their local UART marker
@@ -189,6 +193,10 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     Optional named typed event batches use the shared reset origin and are
     queued once after start, before resume or the first world step. All batches
     are admitted before resources; a runtime refusal terminates the whole run.
+    CAN delay actions are (reset-relative offset_ns, member, delay_ns) tuples.
+    They split ticks at their exact deadlines and change subsequent admissions
+    only, in caller order, after the completed step and before publication.
+    Splitting changes native integration intervals and STEP observations.
     """
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
@@ -244,6 +252,24 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             raise ValueError(f"Arena queued referee events total must not exceed {MAX_SCRIPT_EVENTS}")
         if events and events[-1].offset_ns > duration_ns:
             raise ValueError("Arena queued referee event offset must not exceed duration")
+    if type(can_delays) is not tuple:
+        raise TypeError("Arena can_delays must be a plain immutable tuple")
+    if len(can_delays) > MAX_CAN_DELAY_EVENTS:
+        raise ValueError(f"Arena CAN delay actions must not exceed {MAX_CAN_DELAY_EVENTS}")
+    if can_delays and len(members) != len(manifest.robots):
+        raise ValueError("Arena CAN delay members must be unique")
+    previous_offset = None
+    for item in can_delays:
+        if type(item) is not tuple or len(item) != 3:
+            raise TypeError("Arena can_delays entries require (offset_ns, member, delay_ns) tuples")
+        offset_ns, member, delay_ns = item
+        check_can_time(offset_ns, previous_offset)
+        if offset_ns > duration_ns:
+            raise ValueError("Arena CAN delay action offset must not exceed duration")
+        if type(member) is not str or member not in members:
+            raise ValueError("Arena CAN delay action must name a declared member")
+        check_can_time(delay_ns)
+        previous_offset = offset_ns
     startup_timeout, timeout = positive_seconds(startup_timeout), positive_seconds(timeout)
     if startup_timeout > timeout:
         raise ValueError("startup timeout must not exceed active host timeout")
@@ -324,6 +350,24 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             run.guard()
             runtime.queue_referee_events(member, events, session_id=session.session_id)
             run.guard()
+        can_delay_index = 0
+        def apply_can_delays():
+            nonlocal can_delay_index
+            while (can_delay_index < len(can_delays)
+                   and session.t_sim_ns + can_delays[can_delay_index][0] <= runtime.t_sim_ns):
+                _, member, delay_ns = can_delays[can_delay_index]
+                run.guard()
+                runtime.set_can_delay(member, delay_ns)
+                run.guard()
+                can_delay_index += 1
+        def advance(dt_ns, *, deadline):
+            apply_can_delays()
+            if can_delay_index < len(can_delays):
+                dt_ns = min(dt_ns, session.t_sim_ns + can_delays[can_delay_index][0]
+                            - runtime.t_sim_ns)
+            runtime.step(dt_ns, deadline=deadline)
+            apply_can_delays()
+        apply_can_delays()
         for peer, response in zip(run.peers, responses):
             peer.reset_qemu_ns = codec.decode_reset_ack_payload(response.payload).virtual_time_ns
             peer.last_ns = run.call(peer, peer.board.snapshot)["timestamp_ns"]
@@ -350,13 +394,13 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                     item.next_due_ns += referee_period_ns
             return ready
         while not pump():
-            runtime.step(1_000_000, deadline=run.startup_deadline)
+            advance(1_000_000, deadline=run.startup_deadline)
             run.wait()
         origin = runtime.t_sim_ns
         run.startup = False
         target = origin + duration_ns
         while runtime.t_sim_ns < target:
-            runtime.step(min(1_000_000, target - runtime.t_sim_ns), deadline=run.deadline)
+            advance(min(1_000_000, target - runtime.t_sim_ns), deadline=run.deadline)
             pump()
             if runtime.t_sim_ns < target:
                 run.wait()

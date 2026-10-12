@@ -446,6 +446,24 @@ Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 使用实际 host Session ID；任一运行时拒绝均终止整个 Arena 并清理资源。
 队列与规则执行仍由既有裁判引擎拥有，发布继续遵循每个成员的实际 ready 和原周期。
 
+Arena 的 Python 入口也接受 `can_delays=((offset_ns, member, delay_ns), ...)`，例如
+`can_delays=((0, "east", 2_000_000), (1_500_000, "east", 0))`。
+列表及各项必须为普通元组，最多 1024 项；成员必须准确匹配 Arena 名称。
+偏移和延迟为普通无符号 64 位整数，偏移非递减且不超过运行时长，同刻按输入顺序执行。
+完整列表在创建资源前校验；最大延迟可以配置，但后续帧时间相加溢出会终止运行。
+
+偏移从实际 host Session RESET 原点计算，ready 等待期间也执行；
+`ArenaResult.origin_ns` 仍是所有请求的 ready 达成后的活动时长起点。
+零偏移动作在 referee 批次入队后、恢复 QEMU 前执行。
+其余动作将原有最多 1 ms 的步进拆到准确截止时间，在成功 step 后、UART 发布或等待前执行。
+同刻裁判事件已在该 step 内处理；偏移恰等于时长的动作也执行一次。
+已入队命令和该 step 的反馈保留原截止时间，ACK 等待期间准入的输入也使用旧策略；
+随后才读到的输入使用新策略。帧自带时间戳不选择延迟策略，另一成员的总线不受影响。
+拆分会改变 native 积分区间及 STEP 观察次数，不能保证轨迹与未拆分时相同。
+动作、存活检查或步进失败沿用整个 Arena 的终止及清理规则，保留先前效果。
+此 Python 控制入口不建立 QEMU CPU 时间屏障、wall-clock pacing 或物理 CAN 时序保证；
+Scenario YAML 和 CLI 的 CAN 延迟动作尚未接入。
+
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
 `close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，

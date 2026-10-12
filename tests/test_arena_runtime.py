@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import signal
 import socket
+import struct
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -23,10 +24,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim import processes
 from sim.arena import runtime
 from sim.arena.manifest import load_manifest
-from sim.core import Coordinator
+from sim.core import Coordinator, Session
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
+from sim.fabric.endpoints import QemuCanEndpoint
 from sim.robots import shared_world
 from sim.scenario import ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
 from sim.scenario import runtime as scenario_runtime
@@ -346,6 +348,27 @@ def watch_referees(environment, monkeypatch):
     return observed
 
 
+def watch_can_delays(environment, monkeypatch):
+    """Observe public calls once; the real runtime and bus remain the owners."""
+    observed = SimpleNamespace(worlds=[], calls=[], after_set=None)
+    initialize = shared_world.SharedWorldRuntime.__init__
+    def world(value, *args, **kwargs):
+        initialize(value, *args, **kwargs)
+        observed.worlds.append(value)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "__init__", world)
+    setter = shared_world.SharedWorldRuntime.set_can_delay
+    def set_delay(value, member, delay_ns):
+        observed.calls.append((member, delay_ns, value.t_sim_ns,
+                               tuple(environment.native.steps), tuple(environment.events),
+                               tuple(environment.uart_reads)))
+        result = setter(value, member, delay_ns)
+        if observed.after_set is not None:
+            observed.after_set(value, member, delay_ns)
+        return result
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_can_delay", set_delay)
+    return observed
+
+
 # Independent 2026V1.1.0 packed layouts and pinned crccheck CRC literals, shared
 # with the existing actual RefereeTest contract; no project encoder expected.
 REFEREE_WIRES = tuple(bytes.fromhex(value) for value in (
@@ -587,6 +610,274 @@ def test_admitted_batches_delegate_exactly_once_in_caller_order_after_shared_sta
     assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
     assert result.origin_ns == 0 and result.end_ns == 1_000_000
     assert all(engine.closed for engine in observed.engines)
+
+
+@pytest.mark.parametrize("invalid", ["outer_list", "outer_subclass", "entry_list", "entry_subclass",
+                                    "entry_shape", "offset_bool", "offset_overflow", "delay_bool",
+                                    "delay_overflow", "member_type", "member_subclass", "unknown",
+                                    "unordered", "after_duration", "quota", "duplicate_member"])
+def test_can_delay_schedule_is_completely_admitted_before_resources(environment, monkeypatch, invalid):
+    manifest = environment.manifest()
+    first, last = (0, "east", 7), (1_000_000, "west", 11)
+    actions = (first, last)
+    if invalid == "outer_list":
+        actions = list(actions)
+    elif invalid == "outer_subclass":
+        actions = type("Actions", (tuple,), {})(actions)
+    elif invalid == "entry_list":
+        actions = (first, list(last))
+    elif invalid == "entry_subclass":
+        actions = (first, type("Action", (tuple,), {})(last))
+    elif invalid == "entry_shape":
+        actions = (first, (1_000_000, "west"))
+    elif invalid in ("offset_bool", "offset_overflow"):
+        actions = (first, (True if invalid == "offset_bool" else 1 << 64, "west", 11))
+    elif invalid in ("delay_bool", "delay_overflow"):
+        actions = (first, (1_000_000, "west", True if invalid == "delay_bool" else 1 << 64))
+    elif invalid in ("member_type", "member_subclass", "unknown"):
+        member = {"member_type": None, "member_subclass": type("Member", (str,), {})("west"),
+                  "unknown": "missing"}[invalid]
+        actions = (first, (1_000_000, member, 11))
+    elif invalid == "unordered":
+        actions = (last, first)
+    elif invalid == "after_duration":
+        actions = (first, (2_500_001, "west", 11))
+    elif invalid == "quota":
+        actions = (first,) * 1025
+    else:
+        manifest = replace(manifest, robots=(manifest.robots[0], replace(manifest.robots[1], name="east")))
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid CAN delay schedule reached resource admission or policy control")
+    for method in ("resolve_qemu", "regular_file", "create_arena_plant"):
+        monkeypatch.setattr(runtime, method, forbidden)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_can_delay", forbidden)
+    with pytest.raises((TypeError, ValueError)):
+        environment.run(manifest, can_delays=actions)
+    assert environment.events == [] and environment.launches == [] and environment.owners == []
+    assert environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_can_delay_full_quota_preserves_equal_time_caller_order(environment, monkeypatch):
+    observed = watch_can_delays(environment, monkeypatch)
+    actions = tuple((0, "west" if index % 2 else "east", index) for index in range(1024))
+    result = environment.run(duration=.001, can_delays=actions)
+    environment.assert_clean()
+    assert runtime.MAX_CAN_DELAY_EVENTS == 1024
+    assert [(stamp, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
+    assert all(steps == () and reads == (0, 0) for _, _, _, steps, _, reads in observed.calls)
+    assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [1022, 1023]
+    assert result.steps == 1 and environment.native.steps == [1_000_000]
+
+
+@pytest.mark.parametrize("delayed_ready", [False, True], ids=["ready_at_reset", "startup_steps"])
+def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(environment, monkeypatch, delayed_ready):
+    observed = watch_can_delays(environment, monkeypatch)
+    reset_origin = 500 if delayed_ready else 0
+    if delayed_ready:
+        monkeypatch.setattr(runtime, "Session", lambda session_id: Session(session_id, reset_origin))
+    environment.uart_chunks = [[b"", b"", b"", b"READY"] if delayed_ready else [b"READY"], [b"READY"]]
+    actions = ((0, "west", 41), (0, "east", 9), (500_000, "east", 0),
+               (500_000, "east", 23), (1_500_000, "west", 0),
+               (2_500_000, "east", (1 << 64) - 1 if not delayed_ready else 0))
+    result = environment.run(environment.manifest(ready=("READY", "READY")), can_delays=actions)
+    environment.assert_clean()
+    assert [(stamp - reset_origin, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
+    assert [steps for _, _, _, steps, _, _ in observed.calls] == [
+        (), (), (500_000,), (500_000,), (500_000, 1_000_000),
+        (500_000, 1_000_000, 1_000_000)]
+    assert all(not any(event.endswith(" cont") for event in row[4]) for row in observed.calls[:2])
+    assert all(row[5] == (0, 0) for row in observed.calls[:2])
+    assert observed.calls[2][5] == observed.calls[3][5] == (1, 1)
+    expected_steps = [500_000, 1_000_000, 1_000_000]
+    if delayed_ready:
+        expected_steps += [1_000_000, 1_000_000, 500_000]
+    assert environment.native.steps == expected_steps and result.steps == len(expected_steps)
+    assert (result.origin_ns, result.end_ns) == ((2_500_500, 5_000_500) if delayed_ready else (0, 2_500_000))
+    assert environment.native.resets == 1
+    assert [board.reset_qemu_ns for board in result.boards] == [1000, 2000]
+
+
+def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_state(environment, monkeypatch):
+    referees = watch_referees(environment, monkeypatch)
+    observed = watch_can_delays(environment, monkeypatch)
+    states = []
+    def inspect(value, member, delay):
+        states.append((value.t_sim_ns, len(referees.queues), tuple(environment.uart_reads),
+                       referees.engines[0].get_state()))
+    observed.after_set = inspect
+    environment.uart_chunks = [[b"READY"], [b"READY"]]
+    events = (ScriptEvent(0, Hit(10)), ScriptEvent(1_000_000, Shot(2, 3)))
+    configuration = referee_configuration()
+    configuration["cooling_42mm_per_s"] = 2
+    result = environment.run(environment.manifest(ready=("READY", "READY"), referees={
+        "east": configuration}), duration=.001, referee_period_ns=1_000_000,
+        referee_events=(("east", events),), can_delays=((0, "east", 17), (1_000_000, "east", 0)))
+    environment.assert_clean()
+    assert [(stamp, queues, reads, state.robot.current_hp) for stamp, queues, reads, state in states] == [
+        (0, 1, (0, 0), 100), (1_000_000, 1, (1, 1), 90)]
+    assert (states[1][3].power_heat.heat_17mm, states[1][3].power_heat.heat_42mm) == (11, 22)
+    assert [(name, stamp, wire) for name, stamp, wire, _ in referees.publications] == [
+        ("east", 0, REFEREE_WIRES[0]), ("east", 1_000_000, REFEREE_ZERO_EVENT_WIRES[1])]
+    assert environment.producers[0, "uart7"].recv(4096) == REFEREE_WIRES[0] + REFEREE_ZERO_EVENT_WIRES[1]
+    assert result.origin_ns == 0 and result.end_ns == 1_000_000
+
+
+def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admission(environment, monkeypatch):
+    observed = watch_can_delays(environment, monkeypatch)
+    deliveries, ingresses, boundaries = ([], []), [], []
+    factory = environment.create_plant
+    def plant(manifest):
+        value = factory(manifest)
+        for bus, log in zip(dict.fromkeys(device.bus for device in value.devices), deliveries):
+            bus.log = log.append
+        return value
+    monkeypatch.setattr(runtime, "create_arena_plant", plant)
+    ingest = QemuCanEndpoint.ingest
+    def admission(value, frame, current_time_ns):
+        ingresses.append((frame.timestamp_ns, frame.data, current_time_ns, value.bus.delay_ns))
+        return ingest(value, frame, current_time_ns)
+    monkeypatch.setattr(QemuCanEndpoint, "ingest", admission)
+    def observe_step(index, frame):
+        if index == 0 and frame.header.kind == 2 and frame.header.step_id == 1:
+            # Physical input during the completed interval's ACK wait. Its
+            # future source time must not select the later zero-delay policy.
+            environment.producers[0, "can1"].send(can_wire(1_701_000, "3000 0000 0000 0000"))
+        return False
+    def after_set(value, member, delay):
+        boundaries.append((value.t_sim_ns, tuple(item.endpoint.bus.pending for item in value.bindings)))
+        if value.t_sim_ns == 0:
+            environment.boards.on_frame = observe_step
+        elif value.t_sim_ns == 1_500_000:
+            # This older-stamped command remains unread until after control.
+            environment.producers[0, "can1"].send(can_wire(1_201_000, "2000 0000 0000 0000"))
+    observed.after_set = after_set
+    environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
+    result = environment.run(duration=.004,
+        can_delays=((0, "east", 2_000_000), (1_000_000, "east", 3_000_000), (1_500_000, "east", 0)))
+    environment.assert_clean()
+    assert environment.native.steps == [1_000_000, 500_000, 1_000_000, 1_000_000, 500_000]
+    assert (result.origin_ns, result.end_ns, result.steps) == (0, 4_000_000, 5)
+    assert boundaries == [(0, (0, 0)), (1_000_000, (6, 0)), (1_500_000, (6, 0))]
+    assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [0, 0]
+    old, future, newer = (bytes.fromhex(value) for value in (
+        "1000 0000 0000 0000", "3000 0000 0000 0000", "2000 0000 0000 0000"))
+    assert [row for row in ingresses if row[1] in (future, newer)] == [
+        (1_701_000, future, 1_000_000, 2_000_000), (1_201_000, newer, 1_500_000, 0)]
+    assert [(row.frame.data, row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.late)
+            for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
+        (newer, 6, 1_200_000, 1_200_000, 1_500_000, True),
+        (old, 0, 0, 2_000_000, 2_500_000, True),
+        (future, 5, 1_700_000, 3_700_000, 4_000_000, True)]
+    # Independent C620 layouts, fixed stationary rotor and separate QEMU epochs.
+    # New feedback overtakes the completed1ms batch, whose old2ms due remains.
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    feedbacks = (
+        ((2_501_000, "2000"), (3_501_000, "0000"), (3_501_000, "1000"), (4_001_000, "1000")),
+        ((1_002_000, "f000"), (2_502_000, "f000"), (3_502_000, "f000"), (4_002_000, "f000")),
+    )
+    for index, groups in enumerate(feedbacks):
+        expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+            (bytes.fromhex("0000 0000 " + current + " 19 00") if motor_id == 1 else zero).ljust(64, b"\0"))
+            for stamp, current in groups for motor_id in range(1, 5))
+        assert environment.producers[index, "can1"].recv(4096) == expected
+    assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns)
+            for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
+        (7, 2_500_000, 2_500_000, 2_500_000), (1, 1_000_000, 3_000_000, 3_500_000),
+        (11, 3_500_000, 3_500_000, 3_500_000), (15, 4_000_000, 4_000_000, 4_000_000)]
+    ratio = 3591 / 187  # Pinned DJI M3508 specification, no production converter.
+    expected_currents = ((0, -4096), (0, -4096), (8192, -4096), (4096, -4096), (4096, -4096))
+    for offset, currents in zip(range(0, 40, 8), expected_currents):
+        group = environment.native.efforts[offset:offset + 8]
+        assert group[0][1] == pytest.approx(currents[0] * 20 / 16384 * .02 * ratio)
+        assert group[4][1] == pytest.approx(currents[1] * 20 / 16384 * .02 * ratio)
+        assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent_cleanup(environment, monkeypatch, interrupt):
+    observed = watch_can_delays(environment, monkeypatch)
+    primary = KeyboardInterrupt("CAN policy interrupted") if interrupt else OSError("CAN policy rejected")
+    environment.world_close_failure = OSError("native cleanup failed")
+    environment.world_close_failure.add_note("CAN policy nested cleanup diagnosis")
+    property_ = CanBus.delay_ns
+    def reject(value, delay):
+        if delay == 13:
+            raise primary
+        return property_.fset(value, delay)
+    monkeypatch.setattr(CanBus, "delay_ns", property(property_.fget, reject))
+    with pytest.raises(type(primary)) as caught:
+        environment.run(environment.manifest(upper=True), can_delays=(
+            (0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17)))
+    assert caught.value is primary
+    environment.assert_clean()
+    assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [
+        ("east", 7, 0), ("west", 13, 1_500_000)]
+    assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [7, 0]
+    assert environment.native.steps == [1_000_000, 500_000]
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+    assert "CAN policy nested cleanup diagnosis" in "\n".join(primary.__notes__)
+
+
+@pytest.mark.parametrize("violation", ["deadline", "child_exit", "pre_child_exit"])
+def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(environment, monkeypatch, violation):
+    observed = watch_can_delays(environment, monkeypatch)
+    def violate(value, name, delay):
+        if value.t_sim_ns == 1_500_000 and violation != "pre_child_exit":
+            if violation == "deadline":
+                environment.clock += 4
+            else:
+                environment.children[0].returncode = 0
+    observed.after_set = violate
+    step = shared_world.SharedWorldRuntime.step
+    def exit_after_step(value, dt_ns, **kwargs):
+        result = step(value, dt_ns, **kwargs)
+        if violation == "pre_child_exit" and value.t_sim_ns == 1_500_000:
+            environment.children[0].returncode = 0
+        return result
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "step", exit_after_step)
+    with pytest.raises((RuntimeError, TimeoutError), match="host deadline|exited early.*0"):
+        environment.run(environment.manifest(upper=True), startup_timeout=1, timeout=3,
+            can_delays=((0, "east", 7), (1_500_000, "west", 13), (1_500_000, "east", 17)))
+    environment.assert_clean()
+    assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == (
+        [("east", 7, 0)] if violation == "pre_child_exit" else [("east", 7, 0), ("west", 13, 1_500_000)])
+    assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == (
+        [7, 0] if violation == "pre_child_exit" else [7, 13])
+    assert environment.native.steps == [1_000_000, 500_000]
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+
+
+def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target_action(environment, monkeypatch):
+    observed = watch_can_delays(environment, monkeypatch)
+    primary, admissions, closing = ValueError("native interval500000 refused"), [], []
+    def validate(intervals):
+        admissions.append(intervals)
+        if intervals == (500_000,):
+            raise primary
+    environment.native.validate_steps = validate
+    close = shared_world.SharedWorldRuntime.close
+    def inspect(value):
+        closing.append((value.failed, value.t_sim_ns, value.step_id))
+        return close(value)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "close", inspect)
+    with pytest.raises(ValueError) as caught:
+        environment.run(can_delays=((0, "east", 7), (1_500_000, "east", 0)))
+    assert caught.value is primary
+    environment.assert_clean()
+    assert admissions == [(1_000_000,), (500_000,)]
+    assert environment.native.steps == [1_000_000] and len(environment.native.efforts) == 8
+    assert closing == [(True, 1_000_000, 1)]
+    assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [("east", 7, 0)]
+
+
+def test_can_delay_maximum_is_admitted_then_existing_execution_overflow_is_terminal(environment, monkeypatch):
+    observed = watch_can_delays(environment, monkeypatch)
+    with pytest.raises(ValueError, match="unsigned 64-bit"):
+        environment.run(can_delays=((0, "east", (1 << 64) - 1), (1, "east", 0)))
+    environment.assert_clean()
+    assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [("east", (1 << 64) - 1, 0)]
+    assert environment.native.resets == 1 and environment.native.steps == []
+    assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [(1 << 64) - 1, 0]
 
 
 @pytest.mark.parametrize("duration_ns,steps", [(1, [1]), (1_234_567, [1_000_000, 234_567])])
