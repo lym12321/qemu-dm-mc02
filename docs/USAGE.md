@@ -1025,6 +1025,32 @@ rmdir -- "$dm_run_dir"
 
 项目 Python 工具通过 `tools/dm_mc02_qmp.py` 复用固定版本的 QEMU Python client。不要另开第二个 reader 读取同一 QMP 连接。深层临时目录可能超过 `sockaddr_un` 路径限制；Linux smoke 应使用脚本管理的 `/tmp/dm-qemu.*.XXXXXX` 私有临时目录。
 
+实验性原生 QMP 执行接口可让一个 CPU 在指定的绝对虚拟时间暂停。直接启动 QEMU 时使用
+`-accel tcg,thread=single -S -icount shift=0,align=off,sleep=off`，保留原生 QMP 连接。
+该接口要求一个 CPU、固定 icount、paused/prelaunch，且没有 replay、block node/backend、
+用户 IOThread、活动 migration 或后台 dump。默认 launcher 和 Arena 暂未接入此接口。
+
+```json
+{"execute":"x-run-to-virtual-time","arguments":{"target-ns":1000000}}
+{"execute":"x-query-virtual-execution"}
+{"execute":"query-status"}
+```
+
+`target-ns` 是严格晚于当前时间的有符号 64 位纳秒值。执行请求的返回只表示准入成功；
+轮询查询，直到 `state` 为 `reached`，`current-ns` 等于 `target-ns`，且原生
+`query-status` 为 `paused`。状态还可能为 `idle`、`running` 或 `cancelled`；
+后续普通执行会改变 `current-ns`，历史 `reached` 不能当作当前暂停状态。
+请求期间调用方须串行控制执行并保持配置不变，不能发送 `cont`、通过 GDB resume/step，
+或热插拔／重配 CPU、时钟、器件、block 和 IOThread。提前停止或其它原因停止会取消请求；
+复位总会使结果失效，并保留 QEMU 正常复位运行状态，调用方负责停止和清理。
+请求属于进程，发起 monitor 断连后有限目标继续执行并暂停，前提是其它控制方不干预。
+
+固定 shift=0 表示每条指令计一纳秒，不表示 H723 的真实周期。完成只保证 CPU 虚拟时间
+到达目标且没有执行超出目标的指令；同时间 IRQ handler、所有器件 timer、CAN/UART
+socket 输出完成、plant 同步和实时性能需要分别验证。原生 SysTick 的分数时钟首次 reload
+存在逐段纳秒取整，例如 64 MHz、reload 63 的首次中断可在 999 ns；当前执行测试使用
+正常 RCC 配置的 8 MHz 整数周期，不能据此声明分数时钟或实板时序已验证。
+
 ## External simulation worker
 
 先运行仓库提供的 co-sim 和 motor fixtures，再连接自己的 plant：
