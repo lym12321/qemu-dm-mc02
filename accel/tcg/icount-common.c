@@ -38,6 +38,7 @@
 #include "sysemu/cpu-timers.h"
 #include "sysemu/cpu-throttle.h"
 #include "sysemu/cpu-timers-internal.h"
+#include "sysemu/virtual-execution.h"
 
 /*
  * ICOUNT: Instruction Counter
@@ -55,6 +56,13 @@ static bool icount_sleep = true;
  * 2 = Runtime adaptive algorithm to compute shift
  */
 int use_icount;
+
+bool icount_has_exact_ns_deadlines(void)
+{
+    return icount_enabled() == 1 && !qemu_tcg_mttcg_enabled() &&
+        timers_state.icount_time_shift == 0 && !icount_sleep &&
+        !icount_align_option;
+}
 
 static void icount_enable_precise(void)
 {
@@ -337,6 +345,8 @@ void icount_start_warp_timer(void)
     clock = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL_RT);
     deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
                                           ~QEMU_TIMER_ATTR_EXTERNAL);
+    deadline = qemu_soonest_timeout(deadline, virtual_execution_deadline_ns(
+                                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
     if (deadline < 0) {
         static bool notified;
         if (!icount_sleep && !notified) {

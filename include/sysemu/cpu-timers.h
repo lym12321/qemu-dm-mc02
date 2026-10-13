@@ -53,6 +53,9 @@ int64_t icount_to_ns(int64_t icount);
 /* configure the icount options, including "shift" */
 void icount_configure(QemuOpts *opts, Error **errp);
 
+/* Fixed single-threaded 1 ns instructions and deterministic idle warp. */
+bool icount_has_exact_ns_deadlines(void);
+
 /* used by tcg vcpu thread to calc icount budget */
 int64_t icount_round(int64_t count);
 

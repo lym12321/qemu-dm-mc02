@@ -25,6 +25,7 @@ system_ss.add(files(
   'runstate.c',
   'tpm-hmp-cmds.c',
   'vl.c',
+  'virtual-execution.c',
 ), sdl, libpmem, libdaxctl)
 
 if have_tpm

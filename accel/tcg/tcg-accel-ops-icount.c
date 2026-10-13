@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include "sysemu/replay.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/virtual-execution.h"
 #include "qemu/main-loop.h"
 #include "qemu/guest-random.h"
 #include "exec/exec-all.h"
@@ -45,6 +46,9 @@ static int64_t icount_get_limit(void)
          */
         deadline = qemu_clock_deadline_ns_all(QEMU_CLOCK_VIRTUAL,
                                               QEMU_TIMER_ATTR_ALL);
+        deadline = qemu_soonest_timeout(
+            deadline, virtual_execution_deadline_ns(
+                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)));
         /* Check realtime timers, because they help with input processing */
         deadline = qemu_soonest_timeout(deadline,
                 qemu_clock_deadline_ns_all(QEMU_CLOCK_REALTIME,

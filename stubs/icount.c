@@ -6,6 +6,11 @@
 
 int use_icount;
 
+bool icount_has_exact_ns_deadlines(void)
+{
+    return false;
+}
+
 void icount_update(CPUState *cpu)
 {
     abort();

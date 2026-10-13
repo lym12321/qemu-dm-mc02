@@ -147,6 +147,64 @@
   'allow-preconfig': true }
 
 ##
+# @VirtualExecutionState:
+#
+# @idle: No target has been accepted.
+# @running: A target is outstanding; this is not a completion receipt.
+# @reached: The target fired and native pause committed at that exact time.
+# @cancelled: Another stop or reset invalidated the latest target.
+#
+# Since: 8.2
+##
+{ 'enum': 'VirtualExecutionState',
+  'data': [ 'idle', 'running', 'reached', 'cancelled' ] }
+
+##
+# @VirtualExecutionInfo:
+#
+# @current-ns: Current QEMU virtual time, including later native execution.
+# @state: Status of the latest accepted request.
+# @target-ns: Latest absolute target, absent before the first request.
+#
+# Since: 8.2
+##
+{ 'struct': 'VirtualExecutionInfo',
+  'data': { 'current-ns': 'int', 'state': 'VirtualExecutionState',
+            '*target-ns': 'int' } }
+
+##
+# @x-query-virtual-execution:
+#
+# Read the latest execution request without changing timers or run state.
+# This experimental project extension is not a transport or sensor barrier.
+#
+# Since: 8.2
+##
+{ 'command': 'x-query-virtual-execution', 'returns': 'VirtualExecutionInfo' }
+
+##
+# @x-run-to-virtual-time:
+#
+# Resume a paused/prelaunch VM until an absolute future virtual target,
+# then request native pause.  The return acknowledges admission only;
+# poll x-query-virtual-execution and query-status for committed completion.
+# Requires one CPU, single-threaded TCG, fixed icount shift=0, align=off,
+# sleep=off, no replay, block nodes/backends, user IOThreads, dump or migration.
+# Premature or other-reason stops cancel the target; reset always invalidates
+# it and retains normal native run-state behavior.  Disconnect leaves the
+# process-scoped target intact.
+# The caller must serialize run control and keep the configuration unchanged
+# while a target is outstanding: no cont, GDB resume/step or resource hotplug.
+# Completion means no instructions beyond the target; target-time IRQ
+# handlers, device timer closure and physical output drain are separate.
+#
+# @target-ns: Absolute signed 64-bit QEMU virtual time strictly after now.
+#
+# Since: 8.2
+##
+{ 'command': 'x-run-to-virtual-time', 'data': { 'target-ns': 'int' } }
+
+##
 # @SHUTDOWN:
 #
 # Emitted when the virtual machine has shut down, indicating that qemu
