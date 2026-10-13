@@ -1701,6 +1701,12 @@ buffer、混合 buffer/FIFO 和按优先级排序的 TX queue 尚未支持。地
 旧 FDCAN v1/v2 组件快照及共享 Message RAM link v1 快照会被拒绝；这不影响普通 ELF
 启动。完整 machine migration 仍未支持。
 
+FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发送记录并取消重试；
+已发送的前缀不会在新连接重放。关闭后新提交的完整帧
+仍使用现有有界队列，重连后按顺序发送。`fdcan-host-ack` 和 TXBTO 沿用模型的准入及完成近似，
+不能证明主机已收到完整帧。该规则不保证同一连接上的 reset/断电保留 partial frame，
+也不提供 CPU 暂停时的任意输出排空。
+
 ### trobot motor/MuJoCo test
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
