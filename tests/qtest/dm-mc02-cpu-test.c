@@ -50,6 +50,27 @@
 #define EXECUTION_SENTINEL    0xa55a5aa5u
 #define EXECUTION_ICOUNT      "shift=0,align=off,sleep=off"
 
+static QTestState *execution_start_image(const char *machine,
+                                         const uint8_t *image, size_t size,
+                                         const char *extra_args)
+{
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    QTestState *qts;
+    int fd;
+
+    fd = g_file_open_tmp("dm-qemu.vtime-XXXXXX", &path, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(write(fd, image, size), ==, size);
+    g_assert_cmpint(close(fd), ==, 0);
+    quoted_path = g_shell_quote(path);
+    qts = qtest_initf("-machine %s -nodefaults -accel tcg,thread=single "
+                      "-S -icount " EXECUTION_ICOUNT " -kernel %s %s",
+                      machine, quoted_path, extra_args ?: "");
+    g_assert_cmpint(g_unlink(path), ==, 0);
+    return qts;
+}
+
 /*
  * These native TCG cases use the qtest memory channel, never its dummy CPU or
  * clock_step. Upstream libqtest appends -accel qtest as a fallback; the
@@ -68,10 +89,6 @@ static QTestState *execution_guest(const char *machine, uint32_t flash_base,
                                    bool idle, const char *extra_args)
 {
     uint8_t image[0x58] = { 0 };
-    g_autofree char *path = NULL;
-    g_autofree char *quoted_path = NULL;
-    QTestState *qts;
-    int fd;
 
     stl_le_p(image, 0x20002000); /* Initial MSP. */
     stl_le_p(image + 4, flash_base + 0x41);
@@ -95,16 +112,7 @@ static QTestState *execution_guest(const char *machine, uint32_t flash_base,
         stw_le_p(image + 0x4c, 0xe7fb); /* b 0x46 */
         stl_le_p(image + 0x50, EXECUTION_COUNTER);
     }
-    fd = g_file_open_tmp("dm-qemu.vtime-XXXXXX", &path, NULL);
-    g_assert_cmpint(fd, >=, 0);
-    g_assert_cmpint(write(fd, image, sizeof(image)), ==, sizeof(image));
-    g_assert_cmpint(close(fd), ==, 0);
-    quoted_path = g_shell_quote(path);
-    qts = qtest_initf("-machine %s -nodefaults -accel tcg,thread=single "
-                      "-S -icount " EXECUTION_ICOUNT " -kernel %s %s",
-                      machine, quoted_path, extra_args ?: "");
-    g_assert_cmpint(g_unlink(path), ==, 0);
-    return qts;
+    return execution_start_image(machine, image, sizeof(image), extra_args);
 }
 
 static QDict *execution_query(QTestState *qts)
@@ -479,6 +487,197 @@ static void test_execution_requester_disconnect(void)
 }
 #endif
 
+#ifdef CONFIG_LINUX
+typedef struct ExecutionCanCleanup {
+    int fd;
+    const char *path;
+    const char *directory;
+} ExecutionCanCleanup;
+
+static void execution_can_abort_cleanup(void *opaque)
+{
+    ExecutionCanCleanup *cleanup = opaque;
+
+    if (cleanup->fd >= 0) {
+        close(cleanup->fd);
+    }
+    g_unlink(cleanup->path);
+    g_rmdir(cleanup->directory);
+}
+
+static void execution_can_recv(int fd, uint8_t *buffer, size_t size,
+                               int64_t deadline)
+{
+    int64_t remaining = deadline - g_get_monotonic_time();
+    struct timeval timeout;
+
+    g_assert_cmpint(remaining, >, 0);
+    timeout.tv_sec = remaining / G_TIME_SPAN_SECOND;
+    timeout.tv_usec = remaining % G_TIME_SPAN_SECOND;
+    g_assert_cmpint(setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO,
+                              &timeout, sizeof(timeout)), ==, 0);
+    g_assert_cmpint(recv(fd, buffer, size, MSG_WAITALL), ==, size);
+    g_assert_cmpint(g_get_monotonic_time(), <=, deadline);
+}
+
+static void test_execution_periodic_can(void)
+{
+    /*
+     * Independent classic CAN RAM layout: ST HAL FDCAN_CopyMessageToRAM,
+     * standard ID << 18, DLC << 16, then eight literal payload bytes.
+     * The wire contract is <IIB3xQ64s; no production encoder supplies expected.
+     */
+    static const uint8_t tx_ram[2][16] = {
+        { 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
+          0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 },
+        { 0x00, 0x00, 0xfc, 0x07, 0x00, 0x00, 0x08, 0x00,
+          0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 },
+    };
+    static const uint8_t expected_wire[2][84] = {
+        { [1] = 0x02, [8] = 0x08,
+          [20] = 0x11, [21] = 0x22, [22] = 0x33, [23] = 0x44,
+          [24] = 0x55, [25] = 0x66, [26] = 0x77, [27] = 0x88 },
+        { [0] = 0xff, [1] = 0x01, [8] = 0x08,
+          [20] = 0x88, [21] = 0x77, [22] = 0x66, [23] = 0x55,
+          [24] = 0x44, [25] = 0x33, [26] = 0x22, [27] = 0x11 },
+    };
+    static const int64_t targets[] = {
+        1000000, 2000000, 3000000, 3000200,
+    };
+    uint8_t image[0x74] = { 0 };
+    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *extra_args = NULL;
+    ExecutionCanCleanup cleanup = { .fd = -1 };
+    QTestState *qts;
+    int64_t connect_deadline;
+    int64_t receive_deadline = 0;
+    uint64_t previous_timestamp = 0;
+
+    /*
+     * Thumb handler submits the two frames, then increments the pair ledger.
+     * Third invocation disables SysTick. The finite paths take 12/15 guest
+     * instructions, plus at most b/WFI after return: <= 17 icount ns.
+     * CMSIS exception 15 and register encodings, not Cortex-M cycle timing.
+     */
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    stl_le_p(image + 15 * 4, 0x08000049);
+    stw_le_p(image + 0x40, 0xbf30); /* wfi */
+    stw_le_p(image + 0x42, 0xe7fd); /* b 0x40 */
+    stw_le_p(image + 0x48, 0x4807); /* ldr r0, [pc, #28] */
+    stw_le_p(image + 0x4a, 0x2101); /* movs r1, #1 */
+    stw_le_p(image + 0x4c, 0x6001); /* str r1, [r0]: TXBAR slot 0 */
+    stw_le_p(image + 0x4e, 0x2102); /* movs r1, #2 */
+    stw_le_p(image + 0x50, 0x6001); /* str r1, [r0]: TXBAR slot 1 */
+    stw_le_p(image + 0x52, 0x4806); /* ldr r0, [pc, #24] */
+    stw_le_p(image + 0x54, 0x6801); /* ldr r1, [r0] */
+    stw_le_p(image + 0x56, 0x3101); /* adds r1, #1 */
+    stw_le_p(image + 0x58, 0x6001); /* str r1, [r0]: completed pair */
+    stw_le_p(image + 0x5a, 0x2903); /* cmp r1, #3 */
+    stw_le_p(image + 0x5c, 0xd102); /* bne 0x64 */
+    stw_le_p(image + 0x5e, 0x4804); /* ldr r0, [pc, #16] */
+    stw_le_p(image + 0x60, 0x2100); /* movs r1, #0 */
+    stw_le_p(image + 0x62, 0x6001); /* str r1, [r0]: disable SysTick */
+    stw_le_p(image + 0x64, 0x4770); /* bx lr */
+    stw_le_p(image + 0x66, 0xbf00); /* unexecuted alignment nop */
+    stl_le_p(image + 0x68, 0x4000a0d0);
+    stl_le_p(image + 0x6c, EXECUTION_COUNTER);
+    stl_le_p(image + 0x70, SYST_CSR);
+
+    g_assert_nonnull(g_mkdtemp(directory));
+    path = g_build_filename(directory, "can.sock", NULL);
+    quoted_path = g_shell_quote(path);
+    extra_args = g_strdup_printf(
+        "-chardev socket,id=can1,path=%s,server=on,wait=off "
+        "-serial none -serial none -serial none -serial none "
+        "-serial none -serial none -serial none -serial chardev:can1",
+        quoted_path);
+    cleanup.path = path;
+    cleanup.directory = directory;
+    /* Native kill hook is prepended during launch, before this path cleanup. */
+    qtest_add_abrt_handler(execution_can_abort_cleanup, &cleanup);
+    /* host ACK is model admission only, not physical CAN acknowledgement. */
+    qts = execution_start_image(
+        "dm-mc02,fdcan-host-ack=on,electrical-power=on",
+        image, sizeof(image), extra_args);
+    cleanup.fd = unix_connect(path, NULL);
+    g_assert_cmpint(cleanup.fd, >=, 0);
+    connect_deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    while (!qtest_qom_get_bool(qts, "/chardevs/can1", "connected")) {
+        g_assert_cmpint(g_get_monotonic_time(), <, connect_deadline);
+    }
+    g_assert_cmpint(g_get_monotonic_time(), <=, connect_deadline);
+
+    qtest_writel(qts, EXECUTION_COUNTER, 0);
+    /* CMSIS GPIOCEN bit 2 and real PC15 output feed the board's 5 V rail. */
+    qtest_writel(qts, RCC_BASE + 0xe0,
+                 qtest_readl(qts, RCC_BASE + 0xe0) | (1u << 2));
+    qtest_writel(qts, 0x58020800,
+                 (qtest_readl(qts, 0x58020800) & ~(3u << 30)) | (1u << 30));
+    qtest_writel(qts, 0x58020818, 1u << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x58020814) & (1u << 15), ==, 1u << 15);
+    g_assert_true(qtest_qom_get_bool(qts, "/machine", "system-5v-good"));
+
+    /* CMSIS TFQS=2, NDTB=0, TFQM=0, byte offset 0; classic 8-byte slots. */
+    qtest_writel(qts, 0x4000a018, 1);
+    qtest_writel(qts, 0x4000a0c0, 0x02000000);
+    qtest_writel(qts, 0x4000a0c8, 0);
+    qtest_memwrite(qts, 0x4000ac00, tx_ram, sizeof(tx_ram));
+    qtest_writel(qts, 0x4000a018, 0);
+    /* CMSIS D1CPRE /8: 64 MHz -> 8 MHz, integer 125 ns, exactly 1 ms. */
+    qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8);
+    qtest_writel(qts, SYST_RVR, 7999);
+    qtest_writel(qts, SYST_CVR, 0);
+    qtest_writel(qts, SYST_CSR,
+                 SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE);
+
+    for (unsigned pair = 0; pair < G_N_ELEMENTS(targets); pair++) {
+        execution_run_to(qts, targets[pair]);
+        execution_assert_stable(qts, targets[pair], pair);
+        if (!pair) {
+            continue; /* Handler at exactly 1 ms has not submitted a pair. */
+        }
+        if (pair == 1) {
+            receive_deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+        }
+        for (unsigned frame = 0; frame < 2; frame++) {
+            uint8_t wire[84];
+            uint64_t timestamp;
+
+            /* Client read fragmentation does not force short writes. */
+            execution_can_recv(cleanup.fd, wire, 17, receive_deadline);
+            execution_can_recv(cleanup.fd, wire + 17, 67, receive_deadline);
+            timestamp = ldq_le_p(wire + 12);
+            g_test_message("CAN pair %u record %u timestamp %" PRIu64 " ns",
+                           pair, 2 * (pair - 1) + frame, timestamp);
+            g_assert_cmpuint(timestamp, >, previous_timestamp);
+            g_assert_cmpuint(timestamp, >=, pair * 1000000);
+            g_assert_cmpuint(timestamp, <=, pair * 1000000 + 17);
+            g_assert_cmpuint(timestamp, <=, targets[pair]);
+            previous_timestamp = timestamp;
+            memset(wire + 12, 0, 8);
+            g_assert_cmpmem(wire, sizeof(wire), expected_wire[frame],
+                            sizeof(expected_wire[frame]));
+        }
+    }
+    g_assert_cmphex(qtest_readl(qts, SYST_CSR) &
+                    (SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SCB_ICSR) &
+                    (0x1ffu | SCB_ICSR_PENDSTSET), ==, 0);
+    execution_assert_stable(qts, 3000200, 3);
+
+    g_assert_cmpint(close(cleanup.fd), ==, 0);
+    cleanup.fd = -1;
+    qtest_quit(qts);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    qtest_remove_abrt_handler(&cleanup);
+}
+#endif
+
 static bool qom_list_has_child(QTestState *qts, const char *name,
                                const char *type)
 {
@@ -826,6 +1025,10 @@ int main(int argc, char **argv)
 #ifndef _WIN32
     g_test_add_func("/dm-mc02/virtual-execution/requester-disconnect",
                     test_execution_requester_disconnect);
+#endif
+#ifdef CONFIG_LINUX
+    g_test_add_func("/dm-mc02/virtual-execution/periodic-can",
+                    test_execution_periodic_can);
 #endif
     g_test_add_func("/dm-mc02/armv7m/qom-children-and-irq-width",
                     test_armv7m_children_and_irq_width);
