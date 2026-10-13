@@ -1,5 +1,6 @@
-/* Focused VMState contract test for the reusable FDCAN component. */
+/* Focused VMState and TX transport tests for the reusable FDCAN component. */
 #include "qemu/osdep.h"
+#include "chardev/char.h"
 #include "hw/arm/dm_mc02_fdcan.h"
 #include "migration/migration.h"
 #include "migration/qemu-file-types.h"
@@ -7,6 +8,7 @@
 #include "migration/savevm.h"
 #include "qemu/module.h"
 #include "io/channel-file.h"
+#include "sysemu/cpu-timers.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -19,8 +21,250 @@
 #define FDCAN_RXF1C 0x0b0
 #define FDCAN_TXBC  0x0c0
 #define FDCAN_PSR   0x044
+#define FDCAN_CCCR  0x018
+#define FDCAN_TXESC 0x0c8
+#define FDCAN_TXBAR 0x0d0
+#define FDCAN_TXBTO 0x0d8
 
 static int temp_fd;
+static int64_t test_clock_ns;
+
+int64_t cpu_get_clock(void)
+{
+    return test_clock_ns;
+}
+
+#define TYPE_TX_CAPTURE_CHARDEV "dm-fdcan-test-write-capture"
+
+typedef struct WriteAttempt {
+    int length;
+    uint8_t bytes[84];
+} WriteAttempt;
+
+typedef struct TxCaptureChardev {
+    Chardev parent_obj;
+    int results[4];
+    unsigned result_count;
+    bool writable;
+    unsigned calls;
+    WriteAttempt attempts[32];
+    unsigned accepted_length;
+    uint8_t accepted[16 * 84];
+} TxCaptureChardev;
+
+/* The mock controls only backend write outcomes and records actual bytes. */
+static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
+{
+    TxCaptureChardev *capture = (TxCaptureChardev *)chr;
+    WriteAttempt *attempt;
+    int result;
+
+    g_assert_cmpint(length, >, 0);
+    g_assert_cmpint(length, <=, sizeof(capture->attempts[0].bytes));
+    g_assert_cmpuint(capture->calls, <, G_N_ELEMENTS(capture->attempts));
+    attempt = &capture->attempts[capture->calls];
+    attempt->length = length;
+    memcpy(attempt->bytes, bytes, length);
+    result = capture->calls < capture->result_count ?
+             capture->results[capture->calls] :
+             (capture->writable ? length : -1);
+    capture->calls++;
+    if (result < 0) {
+        errno = EAGAIN;
+    } else {
+        g_assert_cmpint(result, <=, length);
+        g_assert_cmpuint(capture->accepted_length + result, <=,
+                         sizeof(capture->accepted));
+        memcpy(capture->accepted + capture->accepted_length, bytes, result);
+        capture->accepted_length += result;
+    }
+    return result;
+}
+
+static void capture_class_init(ObjectClass *klass, void *data)
+{
+    CHARDEV_CLASS(klass)->chr_write = capture_write;
+}
+
+static const TypeInfo capture_type = {
+    .name = TYPE_TX_CAPTURE_CHARDEV,
+    .parent = TYPE_CHARDEV,
+    .instance_size = sizeof(TxCaptureChardev),
+    .class_init = capture_class_init,
+};
+
+/*
+ * Fixed sim/transports/can_codec.py <IIB3xQ64s wire at 1000 ns,
+ * independent of the FDCAN serializer, not a silicon/physical ACK oracle.
+ * All unspecified bytes are zero, including padding and the payload tail.
+ */
+static const uint8_t expected_wire[84] = {
+    [1] = 0x02, [8] = 0x08, [12] = 0xe8, [13] = 0x03,
+    [21] = 0x40, [22] = 0xff, [23] = 0xc0,
+};
+
+/*
+ * RM0468 TX element / ST HAL: standard ID 0x200 at bits 28:18,
+ * DLC 8 at bits 19:16, followed by eight literal data bytes.
+ */
+static const uint8_t tx_element[16] = {
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
+    0x00, 0x40, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00,
+};
+
+static TxCaptureChardev *init_tx_fixture(DmMc02Fdcan *fdcan, uint8_t *ram,
+                                        const int *results, unsigned count)
+{
+    TxCaptureChardev *capture =
+        (TxCaptureChardev *)object_new(TYPE_TX_CAPTURE_CHARDEV);
+
+    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(count, <=, G_N_ELEMENTS(capture->results));
+    memcpy(capture->results, results, count * sizeof(*results));
+    capture->result_count = count;
+    test_clock_ns = 1000;
+    memcpy(ram, tx_element, sizeof(tx_element));
+    qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_OPENED);
+    g_assert_true(dm_mc02_fdcan_init(fdcan, NULL, "test-fdcan-tx",
+                                     DM_MC02_FDCAN_REGION_SIZE, ram,
+                                     sizeof(tx_element), CHARDEV(capture),
+                                     &error_abort));
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_CCCR, 0, 4);
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_TXBC, 0x01000000, 4);
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_TXESC, 0, 4);
+    /*
+     * This model policy acknowledges queue admission, not suffix delivery
+     * or a physical CAN ACK.  Keep unrelated no-ACK errors out of this gate.
+     */
+    dm_mc02_fdcan_set_host_ack(fdcan, true);
+    return capture;
+}
+
+static void cleanup_tx_fixture(DmMc02Fdcan *fdcan,
+                               TxCaptureChardev *capture)
+{
+    dm_mc02_fdcan_cleanup(fdcan);
+    g_assert_null(fdcan->tx_timer);
+    g_assert_cmpuint(fdcan->tx_next_ns, ==, 0);
+    g_assert_null(capture->parent_obj.be);
+    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+    object_unref(OBJECT(capture));
+}
+
+static void assert_attempt(const TxCaptureChardev *capture, unsigned call,
+                            const uint8_t *expected, unsigned length)
+{
+    g_assert_cmpuint(call, <, capture->calls);
+    g_assert_cmpuint(capture->attempts[call].length, ==, length);
+    g_assert_cmpmem(capture->attempts[call].bytes, length, expected, length);
+}
+
+static void test_tx_shortwrite_retry(void)
+{
+    const int results[] = { 17, 0, -1, 67 };
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(capture->calls, ==, 1);
+    assert_attempt(capture, 0, expected_wire, 84);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.iomem.ops->read(fdcan.iomem.opaque,
+                                          FDCAN_TXBTO, 4), ==, 1);
+
+    /* Only the real virtual retry timer may release this pending suffix. */
+    for (unsigned retry = 1; retry <= 3; ++retry) {
+        int64_t deadline = 1000 + retry * INT64_C(1000000);
+
+        g_assert_true(timer_pending(fdcan.tx_timer));
+        g_assert_cmpuint(fdcan.tx_next_ns, ==, deadline);
+        test_clock_ns = deadline - 1;
+        g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+        g_assert_cmpuint(capture->calls, ==, retry);
+        g_assert_cmpuint(capture->accepted_length, ==, 17);
+        g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+        test_clock_ns = deadline;
+        g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+        g_assert_cmpuint(capture->calls, ==, retry + 1);
+        assert_attempt(capture, retry, expected_wire + 17, 67);
+        if (retry < 3) {
+            g_assert_cmpuint(capture->accepted_length, ==, 17);
+            g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+        }
+    }
+    g_assert_cmpuint(capture->accepted_length, ==, 84);
+    g_assert_cmpmem(capture->accepted, 84, expected_wire, 84);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    test_clock_ns = 4001000;
+    g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(capture->calls, ==, 4);
+    g_assert_cmpuint(capture->accepted_length, ==, 84);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_bounded_queue_newest_drop(void)
+{
+    const int results[] = { 17 };
+    uint8_t ram[16];
+    uint8_t expected[84];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+
+    for (unsigned tag = 0; tag < 17; ++tag) {
+        ram[8] = tag;
+        fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    }
+    g_assert_cmpuint(capture->calls, ==, 16);
+    assert_attempt(capture, 0, expected_wire, 84);
+    for (unsigned call = 1; call < 16; ++call) {
+        assert_attempt(capture, call, expected_wire + 17, 67);
+    }
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 16);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+    capture->writable = true;
+    test_clock_ns = 1000999;
+    g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(capture->calls, ==, 16);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+
+    test_clock_ns = 1001000;
+    g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(capture->calls, ==, 32);
+    assert_attempt(capture, 16, expected_wire + 17, 67);
+    g_assert_cmpuint(capture->accepted_length, ==, 16 * 84);
+    for (unsigned tag = 0; tag < 16; ++tag) {
+        memcpy(expected, expected_wire, sizeof(expected));
+        expected[20] = tag; /* Independent wire payload byte zero. */
+        g_assert_cmpmem(capture->accepted + tag * 84, 84, expected, 84);
+        if (tag) {
+            assert_attempt(capture, 16 + tag, expected, 84);
+        }
+    }
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    test_clock_ns = 2001000;
+    g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(capture->calls, ==, 32);
+    g_assert_cmpuint(capture->accepted_length, ==, 16 * 84);
+    cleanup_tx_fixture(&fdcan, capture);
+}
 
 typedef struct IrqCapture {
     unsigned calls;
@@ -307,6 +551,9 @@ int main(int argc, char **argv)
     temp_fd = mkstemp(temp_file);
     g_assert_cmpint(temp_fd, >=, 0);
     module_call_init(MODULE_INIT_QOM);
+    type_register_static(&capture_type);
+    init_clocks(NULL);
+    qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/dm-fdcan-vmstate/round-trip-irq",
                     test_round_trip_restores_state_and_irq_projection);
@@ -318,8 +565,15 @@ int main(int argc, char **argv)
                     test_bus_off_round_trip_and_old_layout_rejection);
     g_test_add_func("/dm-fdcan-vmstate/raw-no-projection",
                     test_raw_description_has_no_runtime_projection);
+    g_test_add_func("/dm-fdcan-tx/shortwrite-retry", test_tx_shortwrite_retry);
+    g_test_add_func("/dm-fdcan-tx/bounded-queue-newest-drop",
+                    test_tx_bounded_queue_newest_drop);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);
+    for (QEMUClockType type = 0; type < QEMU_CLOCK_MAX; ++type) {
+        g_assert_false(qemu_clock_has_timers(type));
+    }
+    timerlistgroup_deinit(&main_loop_tlg);
     return ret;
 }
