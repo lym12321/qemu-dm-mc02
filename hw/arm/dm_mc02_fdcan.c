@@ -153,6 +153,10 @@ static void fdcan_flush_tx(DmMc02Fdcan *s)
         }
         written = qemu_chr_fe_write(&s->chr, s->tx_queue[slot] + offset,
                                     remaining);
+        /* CLOSED may have discarded the queue from inside the backend write. */
+        if (!qemu_chr_fe_backend_open(&s->chr)) {
+            return;
+        }
         if (written <= 0) {
             fdcan_schedule_retry(s);
             return;
@@ -1111,6 +1115,15 @@ static void can_event(void *opaque, QEMUChrEvent event)
 
     if (event == CHR_EVENT_CLOSED) {
         s->rx_wire_len = 0;
+        /* A replacement stream must not start with an old partial frame. */
+        s->tx_dropped += s->tx_queue_count;
+        s->tx_queue_head = 0;
+        s->tx_queue_count = 0;
+        memset(s->tx_queue_offset, 0, sizeof(s->tx_queue_offset));
+        if (s->tx_timer) {
+            timer_del(s->tx_timer);
+        }
+        s->tx_next_ns = 0;
     } else if (event == CHR_EVENT_OPENED) {
         fdcan_flush_tx(s);
     }

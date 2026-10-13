@@ -46,6 +46,7 @@ typedef struct TxCaptureChardev {
     int results[4];
     unsigned result_count;
     bool writable;
+    bool close_on_failure;
     unsigned calls;
     WriteAttempt attempts[32];
     unsigned accepted_length;
@@ -70,7 +71,10 @@ static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
              (capture->writable ? length : -1);
     capture->calls++;
     if (result < 0) {
-        errno = EAGAIN;
+        if (capture->close_on_failure) {
+            qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
+        }
+        errno = capture->close_on_failure ? EINVAL : EAGAIN;
     } else {
         g_assert_cmpint(result, <=, length);
         g_assert_cmpuint(capture->accepted_length + result, <=,
@@ -263,6 +267,123 @@ static void test_tx_bounded_queue_newest_drop(void)
     g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
     g_assert_cmpuint(capture->calls, ==, 32);
     g_assert_cmpuint(capture->accepted_length, ==, 16 * 84);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_disconnect_during_write(void)
+{
+    const int results[] = { 17, -1 };
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
+    capture->close_on_failure = true;
+    /* Public backend event reentrancy, not normal socket RX/HUP timing. */
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_false(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 2);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(capture->calls, ==, 2);
+    assert_attempt(capture, 1, expected_wire + 17, 67);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_disconnect_drops_old_session(void)
+{
+    const int results[] = { 17, -1 };
+    uint8_t ram[16];
+    uint8_t fresh[84];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    ram[8] = 1;
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_true(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpint(qemu_chr_be_can_write(CHARDEV(capture)), >, 0);
+    g_assert_cmpuint(capture->calls, ==, 2);
+    assert_attempt(capture, 0, expected_wire, 84);
+    assert_attempt(capture, 1, expected_wire + 17, 67);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 2);
+    g_assert_cmpuint(fdcan.tx_queue_offset[fdcan.tx_queue_head], ==, 17);
+    g_assert_cmpuint(fdcan.tx_queue_offset[(fdcan.tx_queue_head + 1) %
+                                          DM_MC02_FDCAN_TX_QUEUE_SIZE], ==, 0);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+    g_assert_cmpuint(fdcan.iomem.ops->read(fdcan.iomem.opaque,
+                                          FDCAN_TXBTO, 4), ==, 1);
+
+    /* Delayed native CLOSED is the boundary, not the blocked write itself. */
+    qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_CLOSED);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_false(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpuint(fdcan.tx_queue_head, ==, 0);
+    for (unsigned slot = 0; slot < DM_MC02_FDCAN_TX_QUEUE_SIZE; ++slot) {
+        g_assert_cmpuint(fdcan.tx_queue_offset[slot], ==, 0);
+    }
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 2);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(capture->calls, ==, 2);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpuint(fdcan.iomem.ops->read(fdcan.iomem.opaque,
+                                          FDCAN_TXBTO, 4), ==, 1);
+
+    qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_CLOSED);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 2);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+
+    /* Existing bounded admission while closed retains a fresh whole record. */
+    ram[8] = 0x55;
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_offset[fdcan.tx_queue_head], ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 2);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(capture->calls, ==, 2);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpuint(fdcan.iomem.ops->read(fdcan.iomem.opaque,
+                                          FDCAN_TXBTO, 4), ==, 1);
+
+    capture->writable = true;
+    qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_OPENED);
+    memcpy(fresh, expected_wire, sizeof(fresh));
+    fresh[20] = 0x55; /* Independent wire payload byte zero. */
+    g_assert_true(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpuint(capture->calls, ==, 3);
+    assert_attempt(capture, 2, fresh, 84);
+    g_assert_cmpuint(capture->accepted_length, ==, 17 + 84);
+    /* Never erase the prefix already accepted by the old connection. */
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpmem(capture->accepted + 17, 84, fresh, 84);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 2);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+
+    /* Advance after OPENED completes; the old retry must stay cancelled. */
+    test_clock_ns = 1001000;
+    g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+    g_assert_cmpuint(capture->calls, ==, 3);
+    g_assert_cmpuint(capture->accepted_length, ==, 17 + 84);
     cleanup_tx_fixture(&fdcan, capture);
 }
 
@@ -568,6 +689,10 @@ int main(int argc, char **argv)
     g_test_add_func("/dm-fdcan-tx/shortwrite-retry", test_tx_shortwrite_retry);
     g_test_add_func("/dm-fdcan-tx/bounded-queue-newest-drop",
                     test_tx_bounded_queue_newest_drop);
+    g_test_add_func("/dm-fdcan-tx/disconnect-drops-old-session",
+                    test_tx_disconnect_drops_old_session);
+    g_test_add_func("/dm-fdcan-tx/disconnect-during-write",
+                    test_tx_disconnect_during_write);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);
