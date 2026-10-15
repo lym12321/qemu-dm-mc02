@@ -676,6 +676,276 @@ static void test_execution_periodic_can(void)
     g_assert_cmpint(g_rmdir(directory), ==, 0);
     qtest_remove_abrt_handler(&cleanup);
 }
+
+static void execution_can_check(QTestState *qts, int64_t deadline)
+{
+    g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    g_assert_true(qtest_probe_child(qts));
+}
+
+static uint64_t execution_can_uint(QDict *state, const char *field)
+{
+    QNum *value = qobject_to(QNum, qdict_get(state, field));
+    uint64_t result;
+
+    g_assert_nonnull(value);
+    g_assert_true(qnum_get_try_uint(value, &result));
+    return result;
+}
+
+static QDict *execution_can_state(QTestState *qts, bool eval, int64_t time,
+                                  int64_t deadline)
+{
+    static const char *routes[] = {
+        "dm-mc02.fdcan1", "dm-mc02.fdcan2", "dm-mc02.fdcan3",
+    };
+    static const char *fields[] = {
+        "pending_frames", "pending_bytes", "tx_dropped", "tx_short_writes",
+    };
+    QDict *response, *state, *controllers;
+    QNum *timestamp;
+    int64_t actual_time;
+
+    execution_can_check(qts, deadline);
+    response = qtest_qmp(qts,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'fdcan-tx-state'}}");
+    execution_can_check(qts, deadline);
+    state = qdict_get_qdict(response, "return");
+    g_assert_nonnull(state);
+    g_assert_cmpuint(qdict_size(state), ==, 3);
+    g_assert_cmpuint(execution_can_uint(state, "schema"), ==, 1);
+    timestamp = qobject_to(QNum, qdict_get(state, "timestamp_ns"));
+    g_assert_nonnull(timestamp);
+    g_assert_true(qnum_get_try_int(timestamp, &actual_time));
+    g_assert_cmpint(actual_time, ==, time);
+    controllers = qdict_get_qdict(state, "controllers");
+    g_assert_nonnull(controllers);
+    g_assert_cmpuint(qdict_size(controllers), ==, eval ? 1 : 3);
+    for (unsigned i = 0; i < (eval ? 1 : G_N_ELEMENTS(routes)); ++i) {
+        QDict *controller = qdict_get_qdict(controllers,
+            eval ? "stm32h723-eval.fdcan1" : routes[i]);
+
+        g_assert_nonnull(controller);
+        g_assert_cmpuint(qdict_size(controller), ==, 4);
+        for (unsigned j = 0; j < G_N_ELEMENTS(fields); ++j) {
+            uint64_t value = execution_can_uint(controller, fields[j]);
+
+            if (eval || i || j == 2) {
+                g_assert_cmpuint(value, ==, 0);
+            } else if (j < 2) {
+                g_assert_cmpuint(value, <=, j ? 1344 : 16);
+            }
+        }
+    }
+    qobject_ref(state);
+    qobject_unref(response);
+    return state;
+}
+
+static void execution_can_empty_readonly(QTestState *qts, bool eval,
+                                        int64_t deadline)
+{
+    QDict *before = execution_can_state(qts, eval, 0, deadline);
+    QDict *after;
+    QDict *controllers = qdict_get_qdict(before, "controllers");
+    const QDictEntry *entry;
+
+    /* Both profiles must start with all four producer observations empty. */
+    for (entry = qdict_first(controllers); entry; entry = qdict_next(
+             controllers, entry)) {
+        QDict *controller = qobject_to(QDict, qdict_entry_value(entry));
+
+        g_assert_cmpuint(execution_can_uint(controller, "pending_frames"),
+                         ==, 0);
+        g_assert_cmpuint(execution_can_uint(controller, "pending_bytes"),
+                         ==, 0);
+        g_assert_cmpuint(execution_can_uint(controller, "tx_short_writes"),
+                         ==, 0);
+    }
+    after = execution_can_state(qts, eval, 0, deadline);
+    g_assert_true(qobject_is_equal(QOBJECT(before), QOBJECT(after)));
+    qobject_unref(after);
+    execution_can_check(qts, deadline);
+    qobject_unref(qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'qom-set','arguments':{'path':'/machine',"
+        "'property':'fdcan-tx-state','value':{}}}"));
+    execution_can_check(qts, deadline);
+    after = execution_can_state(qts, eval, 0, deadline);
+    g_assert_true(qobject_is_equal(QOBJECT(before), QOBJECT(after)));
+    qobject_unref(before);
+    qobject_unref(after);
+    execution_assert_stopped(qts, "prelaunch");
+    execution_can_check(qts, deadline);
+}
+
+static void test_execution_paused_can_drain(void)
+{
+    /* ST HAL classic slot0: ID0x200, DLC8; payload is an independent index. */
+    uint8_t tx_ram[16] = {
+        0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
+    };
+    /* Literal <IIB3xQ64s at1000ns; unspecified padding/payload bytes are0. */
+    static const uint8_t expected_wire[84] = {
+        [1] = 0x02, [8] = 0x08, [12] = 0xe8, [13] = 0x03,
+    };
+    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *extra_args = NULL;
+    ExecutionCanCleanup cleanup = { .fd = -1 };
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02,board-profile=STM32H723-EVAL -S");
+    QDict *state, *controller;
+    int64_t deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    unsigned submitted = 0, received = 0, partial_size = 0;
+    uint32_t counter;
+    uint8_t buffer[4096], partial[84], expected[84];
+    uint64_t pending_frames, pending_bytes;
+    ssize_t extra;
+
+    execution_can_empty_readonly(qts, true, deadline);
+    qtest_quit(qts);
+    g_assert_nonnull(g_mkdtemp(directory));
+    path = g_build_filename(directory, "can.sock", NULL);
+    quoted_path = g_shell_quote(path);
+    extra_args = g_strdup_printf(
+        "-chardev socket,id=can1,path=%s,server=on,wait=off "
+        "-serial none -serial none -serial none -serial none "
+        "-serial none -serial none -serial none -serial chardev:can1",
+        quoted_path);
+    cleanup.path = path;
+    cleanup.directory = directory;
+    qtest_add_abrt_handler(execution_can_abort_cleanup, &cleanup);
+    qts = execution_guest("dm-mc02,fdcan-host-ack=on,electrical-power=on",
+                           0x08000000, false, extra_args);
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    execution_can_empty_readonly(qts, false, deadline);
+    execution_can_check(qts, deadline);
+    cleanup.fd = unix_connect(path, NULL);
+    execution_can_check(qts, deadline);
+    g_assert_cmpint(cleanup.fd, >=, 0);
+    while (!qtest_qom_get_bool(qts, "/chardevs/can1", "connected")) {
+        execution_can_check(qts, deadline);
+    }
+    execution_can_check(qts, deadline);
+
+    /* Real PC15 output powers the rail; no model-only power override. */
+    qtest_writel(qts, RCC_BASE + 0xe0,
+                 qtest_readl(qts, RCC_BASE + 0xe0) | (1u << 2));
+    qtest_writel(qts, 0x58020800,
+                 (qtest_readl(qts, 0x58020800) & ~(3u << 30)) | (1u << 30));
+    qtest_writel(qts, 0x58020818, 1u << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x58020814) & (1u << 15), ==, 1u << 15);
+    g_assert_true(qtest_qom_get_bool(qts, "/machine", "system-5v-good"));
+    /* TFQS1, NDTB0, TFQM0, byte offset0, classic8-byte element. */
+    qtest_writel(qts, 0x4000a018, 1);
+    qtest_writel(qts, 0x4000a0c0, 0x01000000);
+    qtest_writel(qts, 0x4000a0c8, 0);
+    qtest_writel(qts, 0x4000a018, 0);
+    qtest_writel(qts, EXECUTION_COUNTER, EXECUTION_SENTINEL);
+    execution_run_to(qts, 1000);
+    counter = qtest_readl(qts, EXECUTION_COUNTER);
+    g_assert_cmpuint(counter, >, 0);
+    g_assert_cmphex(counter, !=, EXECUTION_SENTINEL);
+    execution_assert_stable(qts, 1000, counter);
+
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    state = execution_can_state(qts, false, 1000, deadline);
+    controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                  "dm-mc02.fdcan1");
+    g_assert_cmpuint(execution_can_uint(controller, "pending_frames"), ==, 0);
+    g_assert_cmpuint(execution_can_uint(controller, "pending_bytes"), ==, 0);
+    qobject_unref(state);
+    do {
+        execution_can_check(qts, deadline);
+        tx_ram[8] = submitted;
+        tx_ram[9] = submitted >> 8;
+        qtest_memwrite(qts, 0x4000ac00, tx_ram, sizeof(tx_ram));
+        execution_can_check(qts, deadline);
+        qtest_writel(qts, 0x4000a0d0, 1);
+        execution_can_check(qts, deadline);
+        submitted++;
+        state = execution_can_state(qts, false, 1000, deadline);
+        controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                      "dm-mc02.fdcan1");
+        pending_frames = execution_can_uint(controller, "pending_frames");
+        pending_bytes = execution_can_uint(controller, "pending_bytes");
+        qobject_unref(state);
+    } while (!pending_frames && submitted < 65536);
+    g_assert_cmpuint(pending_frames, ==, 1);
+    g_assert_cmpuint(pending_bytes, >, 0);
+    g_assert_cmpuint(pending_bytes, <=, 84);
+    g_test_message("Paused MMIO producer: %u records, pending bytes %" PRIu64,
+                    submitted, pending_bytes);
+    execution_can_check(qts, deadline);
+    g_assert_true(qtest_qom_get_bool(qts, "/chardevs/can1", "connected"));
+    execution_can_check(qts, deadline);
+    execution_assert_stable(qts, 1000, counter);
+    execution_can_check(qts, deadline);
+
+    /* No producer/config/time writes after pressure. QEMU owns readiness. */
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    do {
+        ssize_t length;
+
+        execution_can_check(qts, deadline);
+        length = recv(cleanup.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (length < 0) {
+            g_assert_true(errno == EAGAIN || errno == EINTR);
+        } else {
+            g_assert_cmpint(length, >, 0);
+            for (unsigned used = 0; used < length;) {
+                unsigned take = MIN(sizeof(partial) - partial_size,
+                                    length - used);
+
+                memcpy(partial + partial_size, buffer + used, take);
+                used += take;
+                partial_size += take;
+                if (partial_size == sizeof(partial)) {
+                    g_assert_cmpuint(received, <, submitted);
+                    memcpy(expected, expected_wire, sizeof(expected));
+                    expected[20] = received;
+                    expected[21] = received >> 8;
+                    g_assert_cmpmem(partial, sizeof(partial),
+                                    expected, sizeof(expected));
+                    received++;
+                    partial_size = 0;
+                }
+            }
+        }
+        execution_can_check(qts, deadline);
+        state = execution_can_state(qts, false, 1000, deadline);
+        controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                      "dm-mc02.fdcan1");
+        pending_frames = execution_can_uint(controller, "pending_frames");
+        pending_bytes = execution_can_uint(controller, "pending_bytes");
+        qobject_unref(state);
+        execution_assert_stable(qts, 1000, counter);
+        execution_can_check(qts, deadline);
+    } while (received < submitted || pending_frames);
+    g_assert_cmpuint(partial_size, ==, 0);
+    g_assert_cmpuint(pending_bytes, ==, 0);
+    g_assert_true(qtest_qom_get_bool(qts, "/chardevs/can1", "connected"));
+    execution_can_check(qts, deadline);
+    do {
+        execution_can_check(qts, deadline);
+        extra = recv(cleanup.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+    } while (extra < 0 && errno == EINTR);
+    g_assert_cmpint(extra, ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+    execution_can_check(qts, deadline);
+    execution_assert_stable(qts, 1000, counter);
+    execution_can_check(qts, deadline);
+
+    /* Pending zero alone is not delivery; all-N reads prove this fixture. */
+    g_assert_cmpint(close(cleanup.fd), ==, 0);
+    cleanup.fd = -1;
+    qtest_quit(qts);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    qtest_remove_abrt_handler(&cleanup);
+}
 #endif
 
 static bool qom_list_has_child(QTestState *qts, const char *name,
@@ -1029,6 +1299,8 @@ int main(int argc, char **argv)
 #ifdef CONFIG_LINUX
     g_test_add_func("/dm-mc02/virtual-execution/periodic-can",
                     test_execution_periodic_can);
+    g_test_add_func("/dm-mc02/virtual-execution/paused-can-drain",
+                    test_execution_paused_can_drain);
 #endif
     g_test_add_func("/dm-mc02/armv7m/qom-children-and-irq-width",
                     test_armv7m_children_and_irq_width);

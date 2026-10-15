@@ -13,6 +13,7 @@
 #include "qapi/error.h"
 #include "qapi/visitor.h"
 #include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qnum.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
 #include "hw/arm/armv7m.h"
@@ -333,6 +334,9 @@ static bool dm_mc02_get_buzzer_enabled(Object *obj, Error **errp);
 static void dm_mc02_get_board_state(Object *obj, Visitor *v,
                                      const char *name, void *opaque,
                                      Error **errp);
+static void dm_mc02_get_fdcan_tx_state(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp);
 static bool dm_mc02_get_buzzer_level(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_frequency(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_duty(Object *obj, Error **errp);
@@ -1530,6 +1534,8 @@ static void dm_mc02_machine_instance_init(Object *obj)
                             dm_mc02_set_gpio_input);
     object_property_add(obj, "board-state", "any", dm_mc02_get_board_state,
                         NULL, NULL, NULL);
+    object_property_add(obj, "fdcan-tx-state", "any",
+                        dm_mc02_get_fdcan_tx_state, NULL, NULL, NULL);
     object_property_add_str(obj, "vin-mv", dm_mc02_get_vin_mv,
                             dm_mc02_set_vin_mv);
     object_property_add_str(obj, "imu-noise-gyro-dps",
@@ -2576,6 +2582,51 @@ static bool dm_mc02_ws2812_decode(const DmMc02MachineState *s,
     *first_brightness = MAX(((*first_rgb >> 16) & 0xff),
                             MAX((*first_rgb >> 8) & 0xff, *first_rgb & 0xff));
     return true;
+}
+
+static void dm_mc02_get_fdcan_tx_state(Object *obj, Visitor *v,
+                                      const char *name, void *opaque,
+                                      Error **errp)
+{
+    const DmMc02MachineState *s = DM_MC02_MACHINE(obj);
+    DmMc02FdcanTxState snapshots[ARRAY_SIZE(s->fdcan)];
+    QDict *state, *controllers;
+    QObject *result;
+
+    if (!s->board || !s->initialized_fdcan_count ||
+        s->initialized_fdcan_count > ARRAY_SIZE(s->fdcan) ||
+        s->initialized_fdcan_count != s->board->fdcan_count) {
+        error_setg(errp,
+                   "fdcan-tx-state is available after FDCAN initialization");
+        return;
+    }
+    for (size_t i = 0; i < s->initialized_fdcan_count; ++i) {
+        if (!dm_mc02_fdcan_get_tx_state(&s->fdcan[i], &snapshots[i])) {
+            error_setg(errp, "Invalid TX queue state for %s",
+                       s->board->fdcans[i].name);
+            return;
+        }
+    }
+
+    state = qdict_new();
+    controllers = qdict_new();
+    qdict_put_int(state, "schema", 1);
+    qdict_put_int(state, "timestamp_ns", qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    for (size_t i = 0; i < s->initialized_fdcan_count; ++i) {
+        const DmMc02FdcanTxState *snapshot = &snapshots[i];
+        QDict *values = qdict_new();
+
+        qdict_put_int(values, "pending_frames", snapshot->pending_frames);
+        qdict_put_int(values, "pending_bytes", snapshot->pending_bytes);
+        qdict_put(values, "tx_dropped", qnum_from_uint(snapshot->tx_dropped));
+        qdict_put(values, "tx_short_writes",
+                  qnum_from_uint(snapshot->tx_short_writes));
+        qdict_put(controllers, s->board->fdcans[i].name, values);
+    }
+    qdict_put(state, "controllers", controllers);
+    result = QOBJECT(state);
+    visit_type_any(v, name, &result, errp);
+    qobject_unref(result);
 }
 
 static void dm_mc02_get_board_state(Object *obj, Visitor *v,
