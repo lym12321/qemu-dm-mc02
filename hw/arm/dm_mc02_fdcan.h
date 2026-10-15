@@ -26,6 +26,12 @@ typedef struct DmMc02FdcanTxState {
     uint64_t tx_short_writes;
 } DmMc02FdcanTxState;
 
+typedef struct DmMc02FdcanRxState {
+    uint64_t completed_frames;
+    uint32_t partial_bytes;
+    uint64_t rx_dropped;
+} DmMc02FdcanRxState;
+
 typedef struct DmMc02Fdcan {
     MemoryRegion iomem;
     uint8_t regs[DM_MC02_FDCAN_REGION_SIZE];
@@ -36,6 +42,8 @@ typedef struct DmMc02Fdcan {
     bool chr_enabled;
     uint8_t rx_wire[DM_MC02_CAN_WIRE_SIZE];
     uint16_t rx_wire_len;
+    /* Transient host receipt observation, not component VMState. */
+    uint64_t rx_wire_completed;
     uint8_t rx_fifo_fill;
     uint8_t rx_fifo_get;
     uint8_t rx_fifo_put;
@@ -100,6 +108,24 @@ void dm_mc02_fdcan_reset(DmMc02Fdcan *state);
  */
 bool dm_mc02_fdcan_get_tx_state(const DmMc02Fdcan *state,
                                DmMc02FdcanTxState *out);
+
+/*
+ * Observe completed chardev records after synchronous dispatch, including
+ * malformed or rejected records. Partial bytes and native CAN-bus/loopback
+ * ingress do not advance the count. UINT64_MAX is an exhausted sentinel;
+ * callers must reserve room strictly below it before sending.
+ *
+ * The count resets with the component and is not serialized. Reset, restore,
+ * reconnect or rail changes invalidate in-flight receipts; CLOSED and rail-off
+ * retain the count but discard the existing partial tail. This is not storage
+ * acceptance, firmware consumption, timestamp scheduling or peer continuity.
+ * rx_dropped retains its existing aggregate/reset semantics.
+ *
+ * No IO or projection; serialize with mutation. Null arguments or a tail of
+ * 84 bytes or more return false without changing the output.
+ */
+bool dm_mc02_fdcan_get_rx_state(const DmMc02Fdcan *state,
+                               DmMc02FdcanRxState *out);
 
 /* Validate serialized controller-owned state without touching bus, chardev,
  * timer or IRQ wiring. */

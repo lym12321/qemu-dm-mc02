@@ -1,4 +1,4 @@
-/* Focused VMState and TX transport tests for the reusable FDCAN component. */
+/* Focused VMState and host transport tests for the reusable FDCAN component. */
 #include "qemu/osdep.h"
 #include "chardev/char.h"
 #include "hw/arm/dm_mc02_fdcan.h"
@@ -23,6 +23,7 @@
 #define FDCAN_ILS  0x058
 #define FDCAN_ILE  0x05c
 #define FDCAN_RXF0C 0x0a0
+#define FDCAN_RXF0S 0x0a4
 #define FDCAN_RXF1C 0x0b0
 #define FDCAN_TXBC  0x0c0
 #define FDCAN_PSR   0x044
@@ -1316,6 +1317,231 @@ static void test_tx_state_geometry(void)
     }
 }
 
+static void assert_rx_state(const DmMc02Fdcan *fdcan, uint64_t completed,
+                            unsigned partial, uint64_t dropped)
+{
+    DmMc02FdcanRxState state;
+
+    g_assert_true(dm_mc02_fdcan_get_rx_state(fdcan, &state));
+    g_assert_cmpuint(state.completed_frames, ==, completed);
+    g_assert_cmpuint(state.partial_bytes, ==, partial);
+    g_assert_cmpuint(state.rx_dropped, ==, dropped);
+}
+
+/*
+ * RM0468 RX element: standard ID 0x200 at bits 28:18, DLC 8 at
+ * bits 19:16, ANMF at bit 31 for global nonmatching FIFO0 acceptance.
+ * This no-filter profile reports FIDX=0x7f in bits 30:24.
+ * The fixed host timestamp is not an RX scheduling or storage timestamp.
+ */
+static const uint8_t expected_rx_element[16] = {
+    0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0xff,
+    0x00, 0x40, 0xff, 0xc0, 0x00, 0x00, 0x00, 0x00,
+};
+
+static TxCaptureChardev *init_rx_fixture(DmMc02Fdcan *fdcan, uint8_t *ram)
+{
+    const int results[] = { 0 };
+    TxCaptureChardev *capture = init_tx_fixture(fdcan, ram, results, 0);
+
+    /* One 16-byte FIFO0 element at byte offset zero; GFC reset accepts. */
+    fdcan->iomem.ops->write(fdcan, FDCAN_RXF0C, 0x00010000, 4);
+    fdcan->iomem.ops->write(fdcan, FDCAN_IE, 1, 4); /* RF0NE */
+    fdcan->iomem.ops->write(fdcan, FDCAN_ILE, 1, 4);
+    return capture;
+}
+
+static void test_rx_completed_fragments(void)
+{
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_rx_fixture(&fdcan, ram);
+    IrqCapture irq_capture = { 0 };
+    qemu_irq irq = qemu_allocate_irq(capture_irq, &irq_capture, 0);
+
+    dm_mc02_fdcan_set_irq(&fdcan, 0, irq);
+    assert_rx_state(&fdcan, 0, 0, 0);
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 19);
+    assert_rx_state(&fdcan, 0, 19, 0);
+    qemu_chr_be_write(CHARDEV(capture), expected_wire + 19, 64);
+    assert_rx_state(&fdcan, 0, 83, 0);
+    g_assert_cmpint(qemu_chr_be_can_write(CHARDEV(capture)), ==, 1);
+    g_assert_cmpmem(ram, sizeof(ram), tx_element, sizeof(tx_element));
+    g_assert_cmphex(fdcan.iomem.ops->read(&fdcan, FDCAN_RXF0S, 4) & 0x7f,
+                    ==, 0);
+    g_assert_cmphex(fdcan.iomem.ops->read(&fdcan, FDCAN_IR, 4), ==, 0);
+    g_assert_cmpint(irq_capture.level, ==, 0);
+
+    qemu_chr_be_write(CHARDEV(capture), expected_wire + 83, 1);
+    /* A receipt is visible only after the actual RAM and IRQ dispatch. */
+    assert_rx_state(&fdcan, 1, 0, 0);
+    g_assert_cmpmem(ram, sizeof(ram), expected_rx_element,
+                    sizeof(expected_rx_element));
+    g_assert_cmphex(fdcan.iomem.ops->read(&fdcan, FDCAN_RXF0S, 4) & 0x7f,
+                    ==, 1);
+    g_assert_cmphex(fdcan.iomem.ops->read(&fdcan, FDCAN_IR, 4), ==, 1);
+    g_assert_cmpint(irq_capture.level, ==, 1);
+    g_assert_cmpuint(capture->calls, ==, 0);
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    cleanup_tx_fixture(&fdcan, capture);
+    qemu_free_irq(irq);
+}
+
+static void test_rx_completed_rejections_saturation(void)
+{
+    uint8_t ram[16], malformed[84];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_rx_fixture(&fdcan, ram);
+
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 84); /* FIFO full */
+    assert_rx_state(&fdcan, 2, 0, 1);
+    memcpy(malformed, expected_wire, sizeof(malformed));
+    malformed[9] = 1; /* Reserved host-wire byte, not a controller frame. */
+    qemu_chr_be_write(CHARDEV(capture), malformed, sizeof(malformed));
+    assert_rx_state(&fdcan, 3, 0, 2);
+    fdcan.iomem.ops->write(&fdcan, FDCAN_CCCR, 1, 4); /* INIT rejects. */
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+    assert_rx_state(&fdcan, 4, 0, 3);
+    g_assert_cmpmem(ram, sizeof(ram), expected_rx_element,
+                    sizeof(expected_rx_element));
+
+    fdcan.rx_wire_completed = UINT64_MAX - 1;
+    qemu_chr_be_write(CHARDEV(capture), malformed, sizeof(malformed));
+    assert_rx_state(&fdcan, UINT64_MAX, 0, 4);
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+    assert_rx_state(&fdcan, UINT64_MAX, 0, 5);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_rx_state_observation(void)
+{
+    const int results[] = { 17 };
+    uint8_t ram[16], ram_before[16];
+    DmMc02Fdcan fdcan, before;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results, 1);
+    TxCaptureChardev capture_before;
+    IrqCapture irq_capture = { 0 }, irq_before;
+    qemu_irq irq = qemu_allocate_irq(capture_irq, &irq_capture, 0);
+    int64_t timer_expire;
+
+    dm_mc02_fdcan_set_irq(&fdcan, 0, irq);
+    fdcan.iomem.ops->write(&fdcan, FDCAN_IE, 1u << 9, 4);
+    fdcan.iomem.ops->write(&fdcan, FDCAN_ILE, 1, 4);
+    fdcan.iomem.ops->write(&fdcan, FDCAN_TXBAR, 1, 4);
+    qemu_chr_be_write(CHARDEV(capture), expected_wire, 17);
+    g_assert_cmpuint(capture->calls, ==, 1);
+    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(irq_capture.level, ==, 1);
+    memcpy(&before, &fdcan, sizeof(before));
+    memcpy(&capture_before, capture, sizeof(capture_before));
+    memcpy(ram_before, ram, sizeof(ram_before));
+    irq_before = irq_capture;
+    timer_expire = timer_expire_time_ns(fdcan.tx_timer);
+
+    for (unsigned query = 0; query < 3; ++query) {
+        assert_rx_state(&fdcan, 0, 17, 0);
+    }
+    g_assert_false(dm_mc02_fdcan_get_rx_state(&fdcan, NULL));
+    g_assert_cmpmem(&fdcan, sizeof(fdcan), &before, sizeof(before));
+    g_assert_cmpmem(capture, sizeof(*capture),
+                    &capture_before, sizeof(capture_before));
+    g_assert_cmpmem(ram, sizeof(ram), ram_before, sizeof(ram_before));
+    g_assert_cmpuint(irq_capture.calls, ==, irq_before.calls);
+    g_assert_cmpint(irq_capture.level, ==, irq_before.level);
+    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(timer_expire_time_ns(fdcan.tx_timer), ==, timer_expire);
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    cleanup_tx_fixture(&fdcan, capture);
+    qemu_free_irq(irq);
+}
+
+static void test_rx_state_geometry(void)
+{
+    DmMc02Fdcan fdcan = {
+        .rx_wire_completed = UINT64_C(0x8000000000000001),
+        .rx_wire_len = 83,
+        .rx_dropped = UINT64_MAX,
+        /* TX geometry is outside this observation contract. */
+        .tx_queue_head = UINT8_MAX,
+    };
+    DmMc02FdcanRxState state, untouched;
+    const uint16_t invalid[] = { 84, UINT16_MAX };
+
+    assert_rx_state(&fdcan, UINT64_C(0x8000000000000001), 83, UINT64_MAX);
+    memset(&state, 0xa5, sizeof(state));
+    memcpy(&untouched, &state, sizeof(untouched));
+    g_assert_false(dm_mc02_fdcan_get_rx_state(NULL, &state));
+    g_assert_cmpmem(&state, sizeof(state), &untouched, sizeof(untouched));
+    for (unsigned i = 0; i < G_N_ELEMENTS(invalid); ++i) {
+        fdcan.rx_wire_len = invalid[i];
+        g_assert_false(dm_mc02_fdcan_get_rx_state(&fdcan, &state));
+        g_assert_cmpmem(&state, sizeof(state), &untouched, sizeof(untouched));
+    }
+}
+
+static void test_rx_completed_lifecycle(void)
+{
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        const int results[] = { 0 };
+        uint8_t ram[16];
+        DmMc02Fdcan fdcan;
+        TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results, 0);
+
+        /* No RX storage: receipt counts dispatch, independently of storage. */
+        qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+        qemu_chr_be_write(CHARDEV(capture), expected_wire, 13);
+        assert_rx_state(&fdcan, 1, 13, 1);
+        if (mode == 0) {
+            qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_CLOSED);
+        } else {
+            dm_mc02_fdcan_set_powered(&fdcan, false);
+        }
+        assert_rx_state(&fdcan, 1, 0, 1);
+        g_assert_cmpint(qemu_chr_be_can_write(CHARDEV(capture)), ==, 84);
+        if (mode == 0) {
+            qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_OPENED);
+        } else {
+            dm_mc02_fdcan_set_powered(&fdcan, true);
+        }
+        assert_rx_state(&fdcan, 1, 0, 1);
+        qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+        assert_rx_state(&fdcan, 2, 0, 2);
+        qemu_chr_be_write(CHARDEV(capture), expected_wire, 13);
+        dm_mc02_fdcan_reset(&fdcan);
+        assert_rx_state(&fdcan, 0, 0, 0);
+        qemu_chr_be_write(CHARDEV(capture), expected_wire, 84);
+        assert_rx_state(&fdcan, 1, 0, 1); /* Reset leaves INIT asserted. */
+        cleanup_tx_fixture(&fdcan, capture);
+    }
+}
+
+static void test_rx_native_bus_not_wire(void)
+{
+    uint8_t ram[16], sender_ram[16];
+    DmMc02Fdcan fdcan, sender;
+    TxCaptureChardev *capture = init_rx_fixture(&fdcan, ram);
+    CanBusState *bus = CAN_BUS(object_new(TYPE_CAN_BUS));
+
+    memcpy(sender_ram, tx_element, sizeof(sender_ram));
+    g_assert_true(dm_mc02_fdcan_init(&sender, NULL, "test-fdcan-sender",
+                                     DM_MC02_FDCAN_REGION_SIZE, sender_ram,
+                                     sizeof(sender_ram), NULL, &error_abort));
+    sender.iomem.ops->write(&sender, FDCAN_TXBC, 0x01000000, 4);
+    sender.iomem.ops->write(&sender, FDCAN_CCCR, 0, 4);
+    dm_mc02_fdcan_set_canbus(&fdcan, bus);
+    dm_mc02_fdcan_set_canbus(&sender, bus);
+    sender.iomem.ops->write(&sender, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpmem(ram, sizeof(ram), expected_rx_element,
+                    sizeof(expected_rx_element));
+    g_assert_cmphex(fdcan.iomem.ops->read(&fdcan, FDCAN_IR, 4), ==, 1);
+    assert_rx_state(&fdcan, 0, 0, 0);
+    assert_rx_state(&sender, 0, 0, 0);
+    dm_mc02_fdcan_cleanup(&sender);
+    cleanup_tx_fixture(&fdcan, capture);
+    object_unref(OBJECT(bus));
+}
+
 static void prepare_source(DmMc02Fdcan *state)
 {
     memset(state, 0, sizeof(*state));
@@ -1544,6 +1770,17 @@ int main(int argc, char **argv)
     g_test_add_func("/dm-fdcan-tx/state-observation",
                     test_tx_state_observation);
     g_test_add_func("/dm-fdcan-tx/state-geometry", test_tx_state_geometry);
+    g_test_add_func("/dm-fdcan-rx/completed-fragments",
+                    test_rx_completed_fragments);
+    g_test_add_func("/dm-fdcan-rx/completed-rejections-saturation",
+                    test_rx_completed_rejections_saturation);
+    g_test_add_func("/dm-fdcan-rx/state-observation",
+                    test_rx_state_observation);
+    g_test_add_func("/dm-fdcan-rx/state-geometry", test_rx_state_geometry);
+    g_test_add_func("/dm-fdcan-rx/completed-lifecycle",
+                    test_rx_completed_lifecycle);
+    g_test_add_func("/dm-fdcan-rx/native-bus-not-wire",
+                    test_rx_native_bus_not_wire);
     g_test_add_func("/dm-fdcan-tx/writable-source-retry",
                     test_tx_writable_source_retry);
     g_test_add_func("/dm-fdcan-tx/writable-source-single-owner",

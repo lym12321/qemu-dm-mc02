@@ -1155,6 +1155,9 @@ static void can_receive(void *opaque, const uint8_t *buf, int size)
     }
     while (s->rx_wire_len >= DM_MC02_CAN_WIRE_SIZE) {
         receive_wire(s, s->rx_wire);
+        if (s->rx_wire_completed < UINT64_MAX) {
+            s->rx_wire_completed++;
+        }
         s->rx_wire_len -= DM_MC02_CAN_WIRE_SIZE;
         memmove(s->rx_wire, s->rx_wire + DM_MC02_CAN_WIRE_SIZE,
                 s->rx_wire_len);
@@ -1470,6 +1473,7 @@ void dm_mc02_fdcan_reset(DmMc02Fdcan *s)
     fdcan_store(s, FDCAN_XIDAM, FDCAN_EF_ID_MASK, 4);
     memset(s->rx_wire, 0, sizeof(s->rx_wire));
     s->rx_wire_len = 0;
+    s->rx_wire_completed = 0;
     s->rx_fifo_fill = 0;
     s->rx_fifo_get = 0;
     s->rx_fifo_put = 0;
@@ -1549,6 +1553,19 @@ bool dm_mc02_fdcan_get_tx_state(const DmMc02Fdcan *s, DmMc02FdcanTxState *out)
         .pending_bytes = pending_bytes,
         .tx_dropped = s->tx_dropped,
         .tx_short_writes = s->tx_short_writes,
+    };
+    return true;
+}
+
+bool dm_mc02_fdcan_get_rx_state(const DmMc02Fdcan *s, DmMc02FdcanRxState *out)
+{
+    if (!s || !out || s->rx_wire_len >= DM_MC02_CAN_WIRE_SIZE) {
+        return false;
+    }
+    *out = (DmMc02FdcanRxState) {
+        .completed_frames = s->rx_wire_completed,
+        .partial_bytes = s->rx_wire_len,
+        .rx_dropped = s->rx_dropped,
     };
     return true;
 }

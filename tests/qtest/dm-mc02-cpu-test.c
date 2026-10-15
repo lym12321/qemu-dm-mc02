@@ -787,6 +787,216 @@ static void execution_can_empty_readonly(QTestState *qts, bool eval,
     execution_can_check(qts, deadline);
 }
 
+static QDict *execution_can_rx_state(QTestState *qts, bool eval, int64_t time,
+                                     int64_t deadline)
+{
+    static const char *routes[] = {
+        "dm-mc02.fdcan1", "dm-mc02.fdcan2", "dm-mc02.fdcan3",
+    };
+    static const char *fields[] = {
+        "completed_frames", "partial_bytes", "rx_dropped",
+    };
+    QDict *response, *state, *controllers;
+
+    execution_can_check(qts, deadline);
+    response = qtest_qmp(qts,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'fdcan-rx-state'}}");
+    execution_can_check(qts, deadline);
+    state = qdict_get_qdict(response, "return");
+    g_assert_nonnull(state);
+    g_assert_cmpuint(qdict_size(state), ==, 3);
+    g_assert_cmpuint(execution_can_uint(state, "schema"), ==, 1);
+    g_assert_cmpuint(execution_can_uint(state, "timestamp_ns"), ==, time);
+    controllers = qdict_get_qdict(state, "controllers");
+    g_assert_nonnull(controllers);
+    g_assert_cmpuint(qdict_size(controllers), ==, eval ? 1 : 3);
+    for (unsigned i = 0; i < (eval ? 1 : G_N_ELEMENTS(routes)); i++) {
+        QDict *controller = qdict_get_qdict(controllers,
+            eval ? "stm32h723-eval.fdcan1" : routes[i]);
+
+        g_assert_nonnull(controller);
+        g_assert_cmpuint(qdict_size(controller), ==, 3);
+        for (unsigned j = 0; j < G_N_ELEMENTS(fields); j++) {
+            uint64_t value = execution_can_uint(controller, fields[j]);
+
+            if (eval || i) {
+                g_assert_cmpuint(value, ==, 0);
+            } else if (j == 1) {
+                g_assert_cmpuint(value, <, 84);
+            }
+        }
+    }
+    qobject_ref(state);
+    qobject_unref(response);
+    return state;
+}
+
+static void execution_can_rx_empty_readonly(QTestState *qts, bool eval,
+                                            int64_t deadline)
+{
+    QDict *before = execution_can_rx_state(qts, eval, 0, deadline);
+    QDict *after;
+    QDict *controllers = qdict_get_qdict(before, "controllers");
+    QDict *controller = qdict_get_qdict(controllers,
+        eval ? "stm32h723-eval.fdcan1" : "dm-mc02.fdcan1");
+
+    g_assert_cmpuint(execution_can_uint(controller, "completed_frames"), ==, 0);
+    g_assert_cmpuint(execution_can_uint(controller, "partial_bytes"), ==, 0);
+    g_assert_cmpuint(execution_can_uint(controller, "rx_dropped"), ==, 0);
+    execution_can_check(qts, deadline);
+    qobject_unref(qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'qom-set','arguments':{'path':'/machine',"
+        "'property':'fdcan-rx-state','value':{}}}"));
+    after = execution_can_rx_state(qts, eval, 0, deadline);
+    g_assert_true(qobject_is_equal(QOBJECT(before), QOBJECT(after)));
+    qobject_unref(before);
+    qobject_unref(after);
+    execution_assert_stopped(qts, "prelaunch");
+    execution_can_check(qts, deadline);
+}
+
+static void execution_can_rx_wait(QTestState *qts, uint64_t completed,
+                                  unsigned partial, uint64_t dropped,
+                                  int64_t deadline)
+{
+    for (;;) {
+        QDict *state = execution_can_rx_state(qts, false, 100, deadline);
+        QDict *controllers = qdict_get_qdict(state, "controllers");
+        QDict *controller = qdict_get_qdict(controllers, "dm-mc02.fdcan1");
+        uint64_t count = execution_can_uint(controller, "completed_frames");
+        uint64_t tail = execution_can_uint(controller, "partial_bytes");
+        uint64_t drops = execution_can_uint(controller, "rx_dropped");
+
+        g_assert_cmpuint(count, <=, completed);
+        g_assert_cmpuint(drops, <=, dropped);
+        qobject_unref(state);
+        if (count == completed && tail == partial && drops == dropped) {
+            return;
+        }
+        execution_can_check(qts, deadline);
+    }
+}
+
+static void test_execution_paused_can_receipt(void)
+{
+    /*
+     * Thumb polling guest: wait for RXF0S.F0FL, copy the first payload word
+     * to the counter, acknowledge FIFO0 index 0, then WFI. No ISR is needed.
+     * The literal pool and instructions are independent of the CAN model.
+     */
+    uint8_t image[0x6c] = { 0 };
+    /* Fixed84 ID0x321/DLC8, future metadata time1000000ns, literal payload. */
+    static const uint8_t wire[84] = {
+        [0] = 0x21, [1] = 0x03, [8] = 0x08,
+        [12] = 0x40, [13] = 0x42, [14] = 0x0f,
+        [20] = 0x11, [21] = 0x22, [22] = 0x33, [23] = 0x44,
+        [24] = 0x55, [25] = 0x66, [26] = 0x77, [27] = 0x88,
+    };
+    uint8_t malformed[84], ram[16];
+    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *extra_args = NULL;
+    ExecutionCanCleanup cleanup = { .fd = -1 };
+    QTestState *qts = qtest_init(
+        "-machine dm-mc02,board-profile=STM32H723-EVAL -S");
+    int64_t deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+
+    execution_can_rx_empty_readonly(qts, true, deadline);
+    qtest_quit(qts);
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    stw_le_p(image + 0x40, 0x4806); /* ldr r0, [pc, #24]: RXF0S */
+    stw_le_p(image + 0x42, 0x6801); /* ldr r1, [r0] */
+    stw_le_p(image + 0x44, 0x227f); /* movs r2, #127 */
+    stw_le_p(image + 0x46, 0x4211); /* tst r1, r2 */
+    stw_le_p(image + 0x48, 0xd0fb); /* beq 0x42 */
+    stw_le_p(image + 0x4a, 0x4805); /* ldr r0, [pc, #20]: payload */
+    stw_le_p(image + 0x4c, 0x6801); /* ldr r1, [r0] */
+    stw_le_p(image + 0x4e, 0x4805); /* ldr r0, [pc, #20]: counter */
+    stw_le_p(image + 0x50, 0x6001); /* str r1, [r0]: actual payload */
+    stw_le_p(image + 0x52, 0x4805); /* ldr r0, [pc, #20]: RXF0A */
+    stw_le_p(image + 0x54, 0x2100); /* movs r1, #0 */
+    stw_le_p(image + 0x56, 0x6001); /* str r1, [r0]: acknowledge */
+    stw_le_p(image + 0x58, 0xbf30); /* wfi */
+    stw_le_p(image + 0x5a, 0xe7fd); /* b 0x58 */
+    stl_le_p(image + 0x5c, 0x4000a0a4);
+    stl_le_p(image + 0x60, 0x4000ac08);
+    stl_le_p(image + 0x64, EXECUTION_COUNTER);
+    stl_le_p(image + 0x68, 0x4000a0a8);
+
+    g_assert_nonnull(g_mkdtemp(directory));
+    path = g_build_filename(directory, "can.sock", NULL);
+    quoted_path = g_shell_quote(path);
+    extra_args = g_strdup_printf(
+        "-chardev socket,id=can1,path=%s,server=on,wait=off "
+        "-serial none -serial none -serial none -serial none "
+        "-serial none -serial none -serial none -serial chardev:can1",
+        quoted_path);
+    cleanup.path = path;
+    cleanup.directory = directory;
+    qtest_add_abrt_handler(execution_can_abort_cleanup, &cleanup);
+    qts = execution_start_image("dm-mc02", image, sizeof(image), extra_args);
+    execution_can_rx_empty_readonly(qts, false, deadline);
+    cleanup.fd = unix_connect(path, NULL);
+    g_assert_cmpint(cleanup.fd, >=, 0);
+    while (!qtest_qom_get_bool(qts, "/chardevs/can1", "connected")) {
+        execution_can_check(qts, deadline);
+    }
+    g_assert_true(qtest_qom_get_bool(qts, "/machine", "system-5v-good"));
+    qtest_writel(qts, EXECUTION_COUNTER, EXECUTION_SENTINEL);
+    /* RM0468/CMSIS RXF0C: two slots at byte offset0; classic8-byte data. */
+    qtest_writel(qts, 0x4000a018, 1);
+    qtest_writel(qts, 0x4000a0a0, 0x00020000);
+    qtest_writel(qts, 0x4000a0bc, 0);
+    qtest_writel(qts, 0x4000a018, 0);
+    execution_run_to(qts, 100);
+    execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
+
+    execution_can_check(qts, deadline);
+    g_assert_cmpint(send(cleanup.fd, wire, 83, MSG_DONTWAIT), ==, 83);
+    execution_can_rx_wait(qts, 0, 83, 0, deadline);
+    execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 0);
+    g_assert_cmpint(send(cleanup.fd, wire + 83, 1, MSG_DONTWAIT), ==, 1);
+    execution_can_rx_wait(qts, 1, 0, 0, deadline);
+    execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 1); /* IR.RF0N */
+    qtest_memread(qts, 0x4000ac00, ram, sizeof(ram));
+    /* HAL FDCAN_GetRxMessage layout, independently decoded from message RAM. */
+    g_assert_cmphex(ldl_le_p(ram), ==, 0x0c840000); /* ID0x321 << 18 */
+    g_assert_cmphex(ldl_le_p(ram + 4) & 0x800f0000, ==, 0x80080000);
+    g_assert_cmpmem(ram + 8, 8, wire + 20, 8);
+
+    /* Unknown wire flag is processed, but cannot publish another FIFO slot. */
+    memcpy(malformed, wire, sizeof(malformed));
+    malformed[4] = 0x80;
+    g_assert_cmpint(send(cleanup.fd, malformed, sizeof(malformed),
+                         MSG_DONTWAIT), ==,
+                    sizeof(malformed));
+    execution_can_rx_wait(qts, 2, 0, 1, deadline);
+    execution_assert_state(qts, "reached", true, 100);
+    execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 1);
+    g_assert_cmphex(qtest_readl(qts, 0x4000ac08), ==, 0x44332211);
+
+    /* Receipt at100ns is independent of this later real guest read/store. */
+    execution_run_to(qts, 200);
+    execution_assert_stable(qts, 200, 0x44332211);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 0);
+    execution_can_check(qts, deadline);
+    g_assert_cmpint(close(cleanup.fd), ==, 0);
+    cleanup.fd = -1;
+    qtest_quit(qts);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    qtest_remove_abrt_handler(&cleanup);
+}
+
 static void test_execution_paused_can_drain(void)
 {
     /* ST HAL classic slot0: ID0x200, DLC8; payload is an independent index. */
@@ -1560,6 +1770,8 @@ int main(int argc, char **argv)
                     test_execution_paused_can_drain);
     g_test_add_func("/dm-mc02/virtual-execution/preblocked-cpu-can",
                     test_execution_preblocked_cpu_can);
+    g_test_add_func("/dm-mc02/virtual-execution/paused-can-receipt",
+                    test_execution_paused_can_receipt);
 #endif
     g_test_add_func("/dm-mc02/armv7m/qom-children-and-irq-width",
                     test_armv7m_children_and_irq_width);
