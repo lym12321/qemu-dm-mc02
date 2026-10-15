@@ -60,10 +60,14 @@ typedef struct DmMc02Fdcan {
     uint8_t tx_queue_head;
     uint8_t tx_queue_count;
     uint64_t tx_short_writes;
-    /* Absolute virtual deadline for retrying a partial/blocked chardev
-     * frame.  The timer itself remains destination-owned runtime state. */
+    /*
+     * Nominal virtual fallback deadline for a partial/blocked chardev frame.
+     * Native writable readiness may retry earlier without advancing time.
+     */
     uint64_t tx_next_ns;
     QEMUTimer *tx_timer;
+    /* Default-context frontend source; destination-owned, never serialized. */
+    guint tx_watch_tag;
     bool irq_level[2];
     bool irq_level_valid[2];
 } DmMc02Fdcan;
@@ -89,8 +93,10 @@ bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *state);
  * after loading all serialized controller fields. */
 bool dm_mc02_fdcan_message_ram_state_valid(const DmMc02Fdcan *state);
 
-/* Rebuild destination-owned timer and IRQ projections after component state
- * restore.  CAN/chardev/message-RAM wiring remains caller-owned. */
+/*
+ * Rebuild destination-owned retry and IRQ projections after validated state
+ * restore into a quiescent destination. Wiring remains caller-owned.
+ */
 void dm_mc02_fdcan_sync_runtime(DmMc02Fdcan *state);
 
 /* Component-only VMState contracts; neither registers machine migration. */

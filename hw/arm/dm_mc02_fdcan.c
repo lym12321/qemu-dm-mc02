@@ -121,6 +121,28 @@ static bool fdcan_in_init(const DmMc02Fdcan *s)
 }
 
 static void fdcan_flush_tx(DmMc02Fdcan *s);
+static gboolean fdcan_tx_writable(void *unused, GIOCondition condition,
+                                 void *opaque);
+
+static void fdcan_remove_tx_watch(DmMc02Fdcan *s)
+{
+    guint tag = s->tx_watch_tag;
+
+    s->tx_watch_tag = 0;
+    if (tag) {
+        /* FDCAN installs its frontend handlers in the default main context. */
+        g_source_remove(tag);
+    }
+}
+
+static bool fdcan_watch_tx(DmMc02Fdcan *s)
+{
+    if (!s->tx_watch_tag) {
+        s->tx_watch_tag = qemu_chr_fe_add_watch(&s->chr, G_IO_OUT | G_IO_HUP,
+                                               fdcan_tx_writable, s);
+    }
+    return s->tx_watch_tag != 0;
+}
 
 static void fdcan_tx_retry(void *opaque)
 {
@@ -130,14 +152,40 @@ static void fdcan_tx_retry(void *opaque)
     fdcan_flush_tx(s);
 }
 
-static void fdcan_schedule_retry(DmMc02Fdcan *s)
+static void fdcan_schedule_retry(DmMc02Fdcan *s, bool writable)
 {
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 
     s->tx_next_ns = now < INT64_MAX - 1000000 ? now + 1000000 : INT64_MAX;
+    if (writable && fdcan_watch_tx(s)) {
+        if (s->tx_timer) {
+            timer_del(s->tx_timer);
+        }
+        return;
+    }
+    fdcan_remove_tx_watch(s);
     if (s->tx_timer) {
         timer_mod(s->tx_timer, s->tx_next_ns);
     }
+}
+
+static gboolean fdcan_tx_writable(void *unused, GIOCondition condition,
+                                 void *opaque)
+{
+    DmMc02Fdcan *s = opaque;
+
+    /* This one-shot source removes itself after dispatch. */
+    s->tx_watch_tag = 0;
+    if (s->tx_queue_count && s->chr_enabled && s->transceiver_powered &&
+        qemu_chr_fe_backend_open(&s->chr)) {
+        if (condition & G_IO_HUP) {
+            /* Native read/HUP owns CLOSED; avoid rearming a failed socket. */
+            fdcan_schedule_retry(s, false);
+        } else {
+            fdcan_flush_tx(s);
+        }
+    }
+    return G_SOURCE_REMOVE;
 }
 
 static void fdcan_flush_tx(DmMc02Fdcan *s)
@@ -147,18 +195,22 @@ static void fdcan_flush_tx(DmMc02Fdcan *s)
         unsigned offset = s->tx_queue_offset[slot];
         int remaining = DM_MC02_CAN_WIRE_SIZE - offset;
         int written;
+        int write_errno;
 
-        if (!s->chr_enabled || !qemu_chr_fe_backend_open(&s->chr)) {
+        if (!s->chr_enabled || !s->transceiver_powered ||
+            !qemu_chr_fe_backend_open(&s->chr)) {
             return;
         }
         written = qemu_chr_fe_write(&s->chr, s->tx_queue[slot] + offset,
                                     remaining);
+        write_errno = errno;
         /* CLOSED may have discarded the queue from inside the backend write. */
         if (!qemu_chr_fe_backend_open(&s->chr)) {
             return;
         }
         if (written <= 0) {
-            fdcan_schedule_retry(s);
+            fdcan_schedule_retry(s, written == 0 || write_errno == EAGAIN ||
+                                    write_errno == EWOULDBLOCK);
             return;
         }
         if (written < remaining) {
@@ -166,13 +218,14 @@ static void fdcan_flush_tx(DmMc02Fdcan *s)
         }
         s->tx_queue_offset[slot] += written;
         if (s->tx_queue_offset[slot] < DM_MC02_CAN_WIRE_SIZE) {
-            fdcan_schedule_retry(s);
+            fdcan_schedule_retry(s, true);
             return;
         }
         s->tx_queue_head = (s->tx_queue_head + 1) %
                            DM_MC02_FDCAN_TX_QUEUE_SIZE;
         s->tx_queue_count--;
     }
+    fdcan_remove_tx_watch(s);
     if (s->tx_timer) {
         timer_del(s->tx_timer);
     }
@@ -1114,6 +1167,7 @@ static void can_event(void *opaque, QEMUChrEvent event)
     DmMc02Fdcan *s = opaque;
 
     if (event == CHR_EVENT_CLOSED) {
+        fdcan_remove_tx_watch(s);
         s->rx_wire_len = 0;
         /* A replacement stream must not start with an old partial frame. */
         s->tx_dropped += s->tx_queue_count;
@@ -1338,6 +1392,7 @@ void dm_mc02_fdcan_cleanup(DmMc02Fdcan *state)
     if (!state) {
         return;
     }
+    fdcan_remove_tx_watch(state);
     dm_can_bus_adapter_disconnect(&state->can_bus);
     timer_free(state->tx_timer);
     state->tx_timer = NULL;
@@ -1368,6 +1423,7 @@ void dm_mc02_fdcan_set_powered(DmMc02Fdcan *state, bool powered)
         if (!powered) {
             uint32_t pending = state->tx_pending_mask;
 
+            fdcan_remove_tx_watch(state);
             /* A transceiver power cut cannot complete a bus transaction, but
              * the controller must not leave guest-visible TX requests stuck
              * forever.  Complete each request as a coarse no-ACK error. */
@@ -1405,6 +1461,7 @@ void dm_mc02_fdcan_reset(DmMc02Fdcan *s)
     if (!s) {
         return;
     }
+    fdcan_remove_tx_watch(s);
     memset(s->regs, 0, sizeof(s->regs));
     /* M_CAN is disconnected from the bus until software completes
      * initialization and clears CCCR.INIT. */
@@ -1609,6 +1666,7 @@ void dm_mc02_fdcan_sync_runtime(DmMc02Fdcan *s)
     }
 
     deadline = s->tx_next_ns;
+    fdcan_remove_tx_watch(s);
     if (s->tx_timer) {
         timer_del(s->tx_timer);
     }
@@ -1620,7 +1678,9 @@ void dm_mc02_fdcan_sync_runtime(DmMc02Fdcan *s)
     if (deadline && s->tx_queue_count && s->tx_timer && s->chr_enabled &&
         s->transceiver_powered && qemu_chr_fe_backend_open(&s->chr)) {
         s->tx_next_ns = deadline < now ? now : deadline;
-        timer_mod(s->tx_timer, s->tx_next_ns);
+        if (!fdcan_watch_tx(s)) {
+            timer_mod(s->tx_timer, s->tx_next_ns);
+        }
     }
 }
 

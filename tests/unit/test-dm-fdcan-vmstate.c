@@ -46,19 +46,67 @@ typedef struct WriteAttempt {
     uint8_t bytes[84];
 } WriteAttempt;
 
+typedef struct TxCaptureSource {
+    GSource parent;
+    GIOCondition condition;
+} TxCaptureSource;
+
 typedef struct TxCaptureChardev {
     Chardev parent_obj;
     int results[4];
     unsigned result_count;
     bool writable;
     bool close_on_failure;
+    int failure_errno;
+    bool watch_supported;
+    unsigned watch_created;
+    GSource *watch_source;
     unsigned calls;
     WriteAttempt attempts[32];
     unsigned accepted_length;
     uint8_t accepted[16 * 84];
 } TxCaptureChardev;
 
-/* The mock controls only backend write outcomes and records actual bytes. */
+static gboolean capture_source_dispatch(GSource *source, GSourceFunc callback,
+                                         gpointer opaque)
+{
+    TxCaptureSource *capture_source = (TxCaptureSource *)source;
+    FEWatchFunc func = (FEWatchFunc)callback;
+
+    g_source_set_ready_time(source, -1);
+    return func(NULL, capture_source->condition, opaque);
+}
+
+static GSourceFuncs capture_source_funcs = {
+    .dispatch = capture_source_dispatch,
+};
+
+static GSource *capture_add_watch(Chardev *chr, GIOCondition condition)
+{
+    TxCaptureChardev *capture = (TxCaptureChardev *)chr;
+    TxCaptureSource *source;
+
+    if (!capture->watch_supported) {
+        return NULL;
+    }
+    source = (TxCaptureSource *)g_source_new(&capture_source_funcs,
+                                            sizeof(*source));
+    source->condition = condition & G_IO_OUT;
+    g_source_set_ready_time(&source->parent, -1);
+    g_clear_pointer(&capture->watch_source, g_source_unref);
+    capture->watch_source = g_source_ref(&source->parent);
+    capture->watch_created++;
+    return &source->parent;
+}
+
+static void capture_finalize(Object *obj)
+{
+    TxCaptureChardev *capture = (TxCaptureChardev *)obj;
+
+    g_clear_pointer(&capture->watch_source, g_source_unref);
+}
+
+/* The mock controls backend writes/readiness and records actual bytes. */
 static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
 {
     TxCaptureChardev *capture = (TxCaptureChardev *)chr;
@@ -79,7 +127,8 @@ static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
         if (capture->close_on_failure) {
             qemu_chr_be_event(chr, CHR_EVENT_CLOSED);
         }
-        errno = capture->close_on_failure ? EINVAL : EAGAIN;
+        errno = capture->close_on_failure ? EINVAL :
+                (capture->failure_errno ? capture->failure_errno : EAGAIN);
     } else {
         g_assert_cmpint(result, <=, length);
         g_assert_cmpuint(capture->accepted_length + result, <=,
@@ -93,12 +142,14 @@ static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
 static void capture_class_init(ObjectClass *klass, void *data)
 {
     CHARDEV_CLASS(klass)->chr_write = capture_write;
+    CHARDEV_CLASS(klass)->chr_add_watch = capture_add_watch;
 }
 
 static const TypeInfo capture_type = {
     .name = TYPE_TX_CAPTURE_CHARDEV,
     .parent = TYPE_CHARDEV,
     .instance_size = sizeof(TxCaptureChardev),
+    .instance_finalize = capture_finalize,
     .class_init = capture_class_init,
 };
 
@@ -217,6 +268,200 @@ static void test_tx_shortwrite_retry(void)
     g_assert_cmpuint(capture->calls, ==, 4);
     g_assert_cmpuint(capture->accepted_length, ==, 84);
     cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_writable_source_retry(void)
+{
+    const int results[] = { 17, 0, -1, 67 };
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+
+    capture->watch_supported = true;
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(capture->watch_created, ==, 1);
+    g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
+    g_assert_cmpuint(capture->calls, ==, 1);
+    assert_attempt(capture, 0, expected_wire, 84);
+    g_assert_cmpuint(capture->accepted_length, ==, 17);
+    g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_offset[fdcan.tx_queue_head], ==, 17);
+
+    for (unsigned retry = 1; retry <= 3; ++retry) {
+        g_assert_nonnull(capture->watch_source);
+        g_assert_false(g_source_is_destroyed(capture->watch_source));
+        g_assert_cmpint(g_source_get_ready_time(capture->watch_source), ==, -1);
+        g_assert_false(timer_pending(fdcan.tx_timer));
+        g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+        g_main_context_iteration(NULL, FALSE);
+        g_assert_cmpuint(capture->calls, ==, retry);
+        g_assert_cmpuint(capture->watch_created, ==, retry);
+        g_assert_cmpuint(capture->accepted_length, ==, 17);
+        g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+
+        /* Dispatch the installed public frontend callback through GLib. */
+        g_source_set_ready_time(capture->watch_source, 0);
+        g_assert_true(g_main_context_iteration(NULL, FALSE));
+        g_assert_cmpuint(capture->calls, ==, retry + 1);
+        assert_attempt(capture, retry, expected_wire + 17, 67);
+        g_assert_cmpint(test_clock_ns, ==, 1000);
+    }
+    g_assert_cmpuint(capture->watch_created, ==, 3);
+    g_assert_true(g_source_is_destroyed(capture->watch_source));
+    g_assert_cmpuint(capture->accepted_length, ==, 84);
+    g_assert_cmpmem(capture->accepted, 84, expected_wire, 84);
+    g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_main_context_iteration(NULL, FALSE);
+    g_assert_cmpuint(capture->calls, ==, 4);
+    g_assert_cmpint(test_clock_ns, ==, 1000);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_writable_source_single_owner(void)
+{
+    const int results[] = { 17, 0, 67 };
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+    guint tag;
+
+    capture->watch_supported = true;
+    capture->writable = true;
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    tag = fdcan.tx_watch_tag;
+    g_assert_cmpuint(tag, !=, 0);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(fdcan.tx_watch_tag, ==, tag);
+    g_assert_cmpuint(capture->watch_created, ==, 1);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 2);
+    assert_attempt(capture, 1, expected_wire + 17, 67);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_source_set_ready_time(capture->watch_source, 0);
+    g_assert_true(g_main_context_iteration(NULL, FALSE));
+    g_assert_cmpuint(capture->calls, ==, 4);
+    assert_attempt(capture, 2, expected_wire + 17, 67);
+    assert_attempt(capture, 3, expected_wire, 84);
+    g_assert_cmpuint(capture->accepted_length, ==, 168);
+    g_assert_cmpmem(capture->accepted, 84, expected_wire, 84);
+    g_assert_cmpmem(capture->accepted + 84, 84, expected_wire, 84);
+    g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_true(g_source_is_destroyed(capture->watch_source));
+    g_assert_cmpint(test_clock_ns, ==, 1000);
+    cleanup_tx_fixture(&fdcan, capture);
+}
+
+static void test_tx_writable_source_errors(void)
+{
+    /* Fatal write, HUP before native CLOSED, and synchronous write CLOSED. */
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        const int results[] = { 17, -1 };
+        uint8_t ram[16];
+        DmMc02Fdcan fdcan;
+        TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                                   G_N_ELEMENTS(results));
+
+        capture->watch_supported = true;
+        fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        if (mode == 0) {
+            capture->failure_errno = EPIPE;
+            /* A second producer call must remove the already armed source. */
+            fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        } else {
+            if (mode == 1) {
+                TxCaptureSource *source =
+                    (TxCaptureSource *)capture->watch_source;
+
+                source->condition = G_IO_OUT | G_IO_HUP;
+            } else {
+                capture->close_on_failure = true;
+            }
+            g_source_set_ready_time(capture->watch_source, 0);
+            g_assert_true(g_main_context_iteration(NULL, FALSE));
+        }
+        g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
+        g_assert_true(g_source_is_destroyed(capture->watch_source));
+        g_assert_cmpuint(capture->watch_created, ==, 1);
+        g_assert_cmpuint(capture->calls, ==, mode == 1 ? 1 : 2);
+        if (mode != 1) {
+            assert_attempt(capture, 1, expected_wire + 17, 67);
+        }
+        g_assert_cmpuint(capture->accepted_length, ==, 17);
+        g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+        if (mode < 2) {
+            g_assert_true(qemu_chr_fe_backend_open(&fdcan.chr));
+            g_assert_true(timer_pending(fdcan.tx_timer));
+            g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+            g_assert_cmpuint(fdcan.tx_queue_count, ==, mode == 0 ? 2 : 1);
+        } else {
+            g_assert_false(qemu_chr_fe_backend_open(&fdcan.chr));
+            g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+            g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+        }
+        g_main_context_iteration(NULL, FALSE);
+        g_assert_cmpuint(capture->calls, ==, mode == 1 ? 1 : 2);
+        qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_CLOSED);
+        g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+        g_assert_false(timer_pending(fdcan.tx_timer));
+        g_assert_cmpint(test_clock_ns, ==, 1000);
+        cleanup_tx_fixture(&fdcan, capture);
+    }
+}
+
+static void test_tx_writable_source_terminal_cancel(void)
+{
+    /* Distinct owners must cancel before replacing state or releasing it. */
+    for (unsigned mode = 0; mode < 4; ++mode) {
+        const int results[] = { 17 };
+        uint8_t ram[16];
+        DmMc02Fdcan fdcan;
+        TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                                   G_N_ELEMENTS(results));
+
+        capture->watch_supported = true;
+        fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
+        g_source_set_ready_time(capture->watch_source, 0);
+        switch (mode) {
+        case 0:
+            dm_mc02_fdcan_reset(&fdcan);
+            break;
+        case 1:
+            dm_mc02_fdcan_set_powered(&fdcan, false);
+            break;
+        case 2:
+            qemu_chr_be_event(CHARDEV(capture), CHR_EVENT_CLOSED);
+            break;
+        default:
+            dm_mc02_fdcan_cleanup(&fdcan);
+            break;
+        }
+        g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
+        g_assert_true(g_source_is_destroyed(capture->watch_source));
+        g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+        g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+        /* An already-ready source cannot invoke the detached component. */
+        g_main_context_iteration(NULL, FALSE);
+        g_assert_cmpuint(capture->calls, ==, 1);
+        g_assert_cmpuint(capture->accepted_length, ==, 17);
+        g_assert_cmpmem(capture->accepted, 17, expected_wire, 17);
+        g_assert_cmpint(test_clock_ns, ==, 1000);
+        if (mode == 3) {
+            g_assert_null(fdcan.tx_timer);
+            g_assert_null(capture->parent_obj.be);
+            object_unref(OBJECT(capture));
+        } else {
+            g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+            cleanup_tx_fixture(&fdcan, capture);
+        }
+    }
 }
 
 static void test_tx_bounded_queue_newest_drop(void)
@@ -485,25 +730,18 @@ static void recv_socket_wire(int fd, uint8_t wire[84])
     g_assert_cmpint(g_get_monotonic_time(), <, deadline);
 }
 
-static void test_tx_native_socket_reconnect(void)
+static Chardev *init_socket_fixture(DmMc02Fdcan *fdcan, uint8_t ram[16],
+                                    char *directory, char **path)
 {
-    g_autofree char *directory =
-        g_strdup_printf("%s/dm-qemu.fdcan.XXXXXX", g_get_tmp_dir());
-    g_autofree char *path = NULL;
     QemuOpts *opts;
     Chardev *chr;
-    DmMc02Fdcan fdcan;
-    uint8_t ram[16], wire[84], expected[84], extra;
-    unsigned attempt;
-    int peer;
-    int64_t deadline;
 
     g_assert_nonnull(g_mkdtemp(directory));
-    path = g_build_filename(directory, "can.sock", NULL);
+    *path = g_build_filename(directory, "can.sock", NULL);
     opts = qemu_opts_create(qemu_find_opts("chardev"), "test-fdcan-socket",
                             1, &error_abort);
     qemu_opt_set(opts, "backend", "socket", &error_abort);
-    qemu_opt_set(opts, "path", path, &error_abort);
+    qemu_opt_set(opts, "path", *path, &error_abort);
     qemu_opt_set_bool(opts, "server", true, &error_abort);
     qemu_opt_set_bool(opts, "wait", false, &error_abort);
     chr = qemu_chr_new_from_opts(opts, NULL, &error_abort);
@@ -513,15 +751,46 @@ static void test_tx_native_socket_reconnect(void)
                                             &error_abort));
     g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
     test_clock_ns = 1000;
-    memcpy(ram, tx_element, sizeof(ram));
+    memcpy(ram, tx_element, sizeof(tx_element));
     ram[8] = 0xa5;
-    g_assert_true(dm_mc02_fdcan_init(&fdcan, NULL, "test-fdcan-socket",
+    g_assert_true(dm_mc02_fdcan_init(fdcan, NULL, "test-fdcan-socket",
                                      DM_MC02_FDCAN_REGION_SIZE, ram,
-                                     sizeof(ram), chr, &error_abort));
-    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_CCCR, 0, 4);
-    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBC, 0x01000000, 4);
-    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXESC, 0, 4);
-    dm_mc02_fdcan_set_host_ack(&fdcan, true);
+                                     sizeof(tx_element), chr, &error_abort));
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_CCCR, 0, 4);
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_TXBC, 0x01000000, 4);
+    fdcan->iomem.ops->write(fdcan->iomem.opaque, FDCAN_TXESC, 0, 4);
+    dm_mc02_fdcan_set_host_ack(fdcan, true);
+    return chr;
+}
+
+static void cleanup_socket_fixture(DmMc02Fdcan *fdcan, Chardev *chr,
+                                    const char *directory, const char *path)
+{
+    dm_mc02_fdcan_cleanup(fdcan);
+    g_assert_null(fdcan->tx_timer);
+    g_assert_cmpuint(fdcan->tx_watch_tag, ==, 0);
+    g_assert_cmpuint(fdcan->tx_next_ns, ==, 0);
+    g_assert_null(chr->be);
+    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+    object_unparent(OBJECT(chr));
+    g_assert_cmpint(access(path, F_OK), ==, -1);
+    g_assert_cmpint(errno, ==, ENOENT);
+    g_assert_cmpint(rmdir(directory), ==, 0);
+}
+
+static void test_tx_native_socket_reconnect(void)
+{
+    g_autofree char *directory =
+        g_strdup_printf("%s/dm-qemu.fdcan.XXXXXX", g_get_tmp_dir());
+    g_autofree char *path = NULL;
+    DmMc02Fdcan fdcan;
+    uint8_t ram[16], wire[84], expected[84], extra;
+    Chardev *chr = init_socket_fixture(&fdcan, ram, directory, &path);
+    GSource *old_watch;
+    unsigned attempt;
+    int peer;
+    int64_t deadline;
+
     peer = connect_socket_peer(path);
     wait_socket_state(chr, &fdcan, true);
 
@@ -543,7 +812,11 @@ static void test_tx_native_socket_reconnect(void)
     g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
     g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
     g_assert_cmpuint(fdcan.tx_queue_offset[fdcan.tx_queue_head], <, 84);
-    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    old_watch = g_main_context_find_source_by_id(NULL, fdcan.tx_watch_tag);
+    g_assert_nonnull(old_watch);
+    g_source_ref(old_watch);
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
     g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
     g_test_message("Native socket pressure after %u frames; pending offset %u",
@@ -563,6 +836,9 @@ static void test_tx_native_socket_reconnect(void)
         g_assert_cmpuint(fdcan.tx_queue_offset[i], ==, 0);
     }
     g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
+    g_assert_true(g_source_is_destroyed(old_watch));
+    g_source_unref(old_watch);
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
     g_assert_false(timer_pending(fdcan.tx_timer));
     g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
@@ -591,15 +867,105 @@ static void test_tx_native_socket_reconnect(void)
     g_assert_cmpint(close(peer), ==, 0);
     wait_socket_state(chr, &fdcan, false);
     g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
-    dm_mc02_fdcan_cleanup(&fdcan);
-    g_assert_null(fdcan.tx_timer);
+    cleanup_socket_fixture(&fdcan, chr, directory, path);
+}
+
+static gboolean socket_read_wakeup(GIOChannel *channel, GIOCondition condition,
+                                    gpointer opaque)
+{
+    return G_SOURCE_CONTINUE;
+}
+
+static void test_tx_native_socket_writable_drain(void)
+{
+    g_autofree char *directory =
+        g_strdup_printf("%s/dm-qemu.fdcan.XXXXXX", g_get_tmp_dir());
+    g_autofree char *path = NULL;
+    DmMc02Fdcan fdcan;
+    uint8_t ram[16], wire[84], expected[84], extra;
+    Chardev *chr = init_socket_fixture(&fdcan, ram, directory, &path);
+    int peer = connect_socket_peer(path);
+    unsigned count, received = 0, offset = 0;
+    int64_t deadline;
+    GIOChannel *reader;
+    GSource *read_wakeup, *timeout;
+
+    wait_socket_state(chr, &fdcan, true);
+    deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    for (count = 0; count < 65536; ++count) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        ram[8] = count;
+        ram[9] = count >> 8;
+        fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        if (fdcan.tx_queue_count) {
+            break;
+        }
+    }
+    g_assert_cmpuint(count, >, 0);
+    g_assert_cmpuint(count, <, 65536);
+    count++; /* Include the one pending record; do not submit another TX. */
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+    g_test_message("Native fixed-clock drain of %u records; head offset %u",
+                    count, fdcan.tx_queue_offset[fdcan.tx_queue_head]);
+
+    /* One reader; native IN only wakes the same loop that also services OUT. */
+    reader = g_io_channel_unix_new(peer);
+    read_wakeup = g_io_create_watch(reader, G_IO_IN | G_IO_HUP);
+    g_source_set_callback(read_wakeup, (GSourceFunc)socket_read_wakeup,
+                           NULL, NULL);
+    g_source_attach(read_wakeup, NULL);
+    deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    timeout = g_timeout_source_new(2000);
+    g_source_set_callback(timeout, socket_deadline_wakeup, NULL, NULL);
+    g_source_set_ready_time(timeout, deadline);
+    g_source_attach(timeout, NULL);
+    while (received < count) {
+        ssize_t length;
+
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        length = recv(peer, wire + offset, sizeof(wire) - offset, 0);
+        if (length < 0 && errno == EINTR) {
+            continue;
+        }
+        if (length < 0 && errno == EAGAIN) {
+            g_main_context_iteration(NULL, TRUE);
+        } else {
+            g_assert_cmpint(length, >, 0);
+            offset += length;
+            if (offset == sizeof(wire)) {
+                memcpy(expected, expected_wire, sizeof(expected));
+                expected[20] = received;
+                expected[21] = received >> 8;
+                g_assert_cmpmem(wire, sizeof(wire), expected, sizeof(expected));
+                received++;
+                offset = 0;
+            }
+            g_main_context_iteration(NULL, FALSE);
+        }
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    }
+    g_source_destroy(timeout);
+    g_source_unref(timeout);
+    g_source_destroy(read_wakeup);
+    g_source_unref(read_wakeup);
+    g_io_channel_unref(reader);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
-    g_assert_null(chr->be);
-    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
-    object_unparent(OBJECT(chr));
-    g_assert_cmpint(access(path, F_OK), ==, -1);
-    g_assert_cmpint(errno, ==, ENOENT);
-    g_assert_cmpint(rmdir(directory), ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_true(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpint(recv(peer, &extra, 1, 0), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+    g_assert_cmpint(close(peer), ==, 0);
+    wait_socket_state(chr, &fdcan, false);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    cleanup_socket_fixture(&fdcan, chr, directory, path);
 }
 #endif
 
@@ -669,6 +1035,111 @@ static int load_state(DmMc02Fdcan *state,
                       const VMStateDescription *description)
 {
     return load_state_v(state, description, description->version_id);
+}
+
+static void test_tx_writable_source_restore(void)
+{
+    const int partial[] = { 17 };
+    const int suffix[] = { 67 };
+    uint8_t ram[16];
+    DmMc02Fdcan source;
+    TxCaptureChardev *capture = init_tx_fixture(&source, ram, partial, 1);
+
+    capture->watch_supported = true;
+    source.iomem.ops->write(source.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(source.tx_watch_tag, !=, 0);
+    save_state(&source, dm_mc02_fdcan_vmstate());
+    cleanup_tx_fixture(&source, capture);
+
+    /* Producer projection only: migration does not move the physical prefix. */
+    for (unsigned mode = 0; mode < 3; ++mode) {
+        DmMc02Fdcan restored;
+
+        capture = init_tx_fixture(&restored, ram, suffix, 1);
+        capture->watch_supported = mode != 2;
+        g_assert_cmpint(load_state(&restored, mode == 1 ?
+                                   dm_mc02_fdcan_vmstate_raw() :
+                                   dm_mc02_fdcan_vmstate()), ==, 0);
+        g_assert_cmpuint(capture->calls, ==, 0);
+        g_assert_cmpuint(restored.tx_queue_count, ==, 1);
+        g_assert_cmpuint(restored.tx_queue_offset[restored.tx_queue_head],
+                          ==, 17);
+        g_assert_cmpuint(restored.tx_next_ns, ==, 1001000);
+        if (mode == 1) {
+            g_assert_cmpuint(restored.tx_watch_tag, ==, 0);
+            g_assert_cmpuint(capture->watch_created, ==, 0);
+            g_assert_false(timer_pending(restored.tx_timer));
+            g_main_context_iteration(NULL, FALSE);
+            g_assert_cmpuint(capture->calls, ==, 0);
+            dm_mc02_fdcan_sync_runtime(&restored);
+        } else if (mode == 0) {
+            GSource *prior = g_source_ref(capture->watch_source);
+
+            g_assert_cmpuint(capture->watch_created, ==, 1);
+            dm_mc02_fdcan_sync_runtime(&restored);
+            g_assert_true(g_source_is_destroyed(prior));
+            g_source_unref(prior);
+        }
+        g_assert_cmpuint(capture->calls, ==, 0);
+        if (mode < 2) {
+            g_assert_cmpuint(restored.tx_watch_tag, !=, 0);
+            g_assert_false(timer_pending(restored.tx_timer));
+            g_assert_cmpuint(capture->watch_created, ==, mode == 0 ? 2 : 1);
+            g_source_set_ready_time(capture->watch_source, 0);
+            g_assert_true(g_main_context_iteration(NULL, FALSE));
+            g_assert_true(g_source_is_destroyed(capture->watch_source));
+            g_assert_cmpint(test_clock_ns, ==, 1000);
+        } else {
+            g_assert_cmpuint(restored.tx_watch_tag, ==, 0);
+            g_assert_true(timer_pending(restored.tx_timer));
+            test_clock_ns = 1000999;
+            g_assert_false(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+            g_assert_cmpuint(capture->calls, ==, 0);
+            test_clock_ns = 1001000;
+            g_assert_true(qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL));
+        }
+        g_assert_cmpuint(capture->calls, ==, 1);
+        assert_attempt(capture, 0, expected_wire + 17, 67);
+        g_assert_cmpuint(capture->accepted_length, ==, 67);
+        g_assert_cmpmem(capture->accepted, 67, expected_wire + 17, 67);
+        g_assert_cmpuint(restored.tx_queue_count, ==, 0);
+        g_assert_cmpuint(restored.tx_watch_tag, ==, 0);
+        g_assert_cmpuint(restored.tx_next_ns, ==, 0);
+        cleanup_tx_fixture(&restored, capture);
+    }
+}
+
+static void test_tx_writable_source_restore_reject(void)
+{
+    /* Invalid normal state and truncated raw input cannot create runtime IO. */
+    for (unsigned mode = 0; mode < 2; ++mode) {
+        const int results[] = { 17 };
+        uint8_t ram[16];
+        DmMc02Fdcan source, restored;
+        TxCaptureChardev *capture = init_tx_fixture(&source, ram, results, 1);
+        const VMStateDescription *description = mode == 0 ?
+            dm_mc02_fdcan_vmstate() : dm_mc02_fdcan_vmstate_raw();
+
+        capture->watch_supported = true;
+        source.iomem.ops->write(source.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        if (mode == 0) {
+            source.tx_queue_offset[source.tx_queue_head] = 84;
+        }
+        save_state(&source, description);
+        cleanup_tx_fixture(&source, capture);
+        if (mode == 1) {
+            g_assert_cmpint(ftruncate(temp_fd, 7), ==, 0);
+        }
+        capture = init_tx_fixture(&restored, ram, results, 0);
+        capture->watch_supported = true;
+        g_assert_cmpint(load_state(&restored, description), !=, 0);
+        g_assert_cmpuint(restored.tx_watch_tag, ==, 0);
+        g_assert_cmpuint(capture->watch_created, ==, 0);
+        g_assert_false(timer_pending(restored.tx_timer));
+        g_main_context_iteration(NULL, FALSE);
+        g_assert_cmpuint(capture->calls, ==, 0);
+        cleanup_tx_fixture(&restored, capture);
+    }
 }
 
 static void capture_irq(void *opaque, int n, int level)
@@ -905,6 +1376,18 @@ int main(int argc, char **argv)
     g_test_add_func("/dm-fdcan-vmstate/raw-no-projection",
                     test_raw_description_has_no_runtime_projection);
     g_test_add_func("/dm-fdcan-tx/shortwrite-retry", test_tx_shortwrite_retry);
+    g_test_add_func("/dm-fdcan-tx/writable-source-retry",
+                    test_tx_writable_source_retry);
+    g_test_add_func("/dm-fdcan-tx/writable-source-single-owner",
+                    test_tx_writable_source_single_owner);
+    g_test_add_func("/dm-fdcan-tx/writable-source-errors",
+                    test_tx_writable_source_errors);
+    g_test_add_func("/dm-fdcan-tx/writable-source-terminal-cancel",
+                    test_tx_writable_source_terminal_cancel);
+    g_test_add_func("/dm-fdcan-tx/writable-source-restore",
+                    test_tx_writable_source_restore);
+    g_test_add_func("/dm-fdcan-tx/writable-source-restore-reject",
+                    test_tx_writable_source_restore_reject);
     g_test_add_func("/dm-fdcan-tx/bounded-queue-newest-drop",
                     test_tx_bounded_queue_newest_drop);
     g_test_add_func("/dm-fdcan-tx/disconnect-drops-old-session",
@@ -914,6 +1397,8 @@ int main(int argc, char **argv)
 #ifdef CONFIG_LINUX
     g_test_add_func("/dm-fdcan-tx/native-socket-reconnect",
                     test_tx_native_socket_reconnect);
+    g_test_add_func("/dm-fdcan-tx/native-socket-writable-drain",
+                    test_tx_native_socket_writable_drain);
 #endif
     ret = g_test_run();
     close(temp_fd);

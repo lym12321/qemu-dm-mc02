@@ -23,8 +23,9 @@ static int dm_mc02_fdcan_post_load(void *opaque, int version_id)
         return -EINVAL;
     }
 
-    /* CAN bus, chardev, message RAM, timer object and IRQ handles are
-     * destination-owned.  Rebuild only derived sizes, the retry timer and
+    /*
+     * CAN bus, chardev, message RAM, retry sources and IRQ handles are
+     * destination-owned.  Rebuild only derived sizes, retry projection and
      * level-sensitive IRQ projection after every serialized field is valid. */
     dm_mc02_fdcan_sync_runtime(state);
     return 0;
