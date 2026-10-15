@@ -9,7 +9,12 @@ approximation of the GPIO latch and does not establish electrical LED drive.
 
 from __future__ import annotations
 
+import math
 import re
+import socket
+import time
+
+from sim.transports.can_stream import CanStream
 
 
 def validate_gpio_pin(pin: str) -> str:
@@ -95,6 +100,115 @@ def digital_level(endpoint: str, snapshot: dict) -> int:
     if endpoint == "key":
         return state["key"]["level"]
     return int(state["led"]["rgb"] != 0)
+
+
+def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
+                     controller: str, chardev: str, tx_dropped: int,
+                     deadline: float, check) -> None:
+    """Publish already admitted CAN output to a borrowed per-frame ``sink``.
+
+    Restricted to the original plain nonblocking AF_UNIX connection, sole writer
+    and sole reader, without mux or FD passing. The owner must quiesce all
+    producers and exclude reset, purge, power, configuration and connection
+    changes from the execution fence until return.
+    Paused CPUs alone do not establish this premise. ``tx_dropped`` is the
+    no-drop baseline established before that producer interval.
+
+    The caller owns QMP command timeouts, liveness ``check()``, and the absolute
+    finite ``time.monotonic()`` deadline. Checks surround dependency calls; they
+    cannot preempt a blocking QMP/check/sink. Errors propagate with partial sink
+    effects and physical tails retained. The caller must freeze the attempt;
+    this function does not recover, roll back, close resources or advance time.
+    Success is output consumption, not a CPU/world or equal-time timer barrier.
+    """
+    command = getattr(qmp, "command", None)
+    if not callable(command) or not callable(check) or not callable(sink):
+        raise TypeError("QMP command, check and sink must be callable")
+    _integer(target_ns, "target_ns", 0x7fffffffffffffff)
+    _integer(tx_dropped, "tx_dropped", 0xffffffffffffffff)
+    for name, value in (("controller", controller), ("chardev", chardev)):
+        if (not isinstance(value, str) or
+                re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None):
+            raise ValueError(f"{name} must be a nonempty native identity")
+    if (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError("deadline must be finite monotonic seconds")
+    if (type(stream) is not CanStream or
+            type(stream.sock) is not socket.socket or
+            stream.sock.family != socket.AF_UNIX or
+            stream.sock.type != socket.SOCK_STREAM or stream.sock.fileno() < 0 or
+            stream.sock.getblocking()):
+        raise ValueError("require canonical CanStream on a nonblocking AF_UNIX stream")
+
+    def guard():
+        if time.monotonic() >= deadline:
+            raise TimeoutError("paused CAN output deadline expired")
+        check()
+        if time.monotonic() >= deadline:
+            raise TimeoutError("paused CAN output deadline expired")
+
+    def query(name, arguments=None):
+        guard()
+        value = command(name, arguments)
+        guard()
+        return value
+
+    def observe():
+        execution = _object(query("x-query-virtual-execution"), "execution")
+        for field in ("current-ns", "target-ns"):
+            value = _field(execution, field, "execution")
+            _integer(value, f"execution.{field}", 0x7fffffffffffffff)
+            if value != target_ns:
+                raise RuntimeError("CAN output execution time or target changed")
+        if _field(execution, "state", "execution") != "reached":
+            raise RuntimeError("CAN output execution target is not reached")
+        status = _object(query("query-status"), "query-status")
+        if (status.get("running") is not False or status.get("status") != "paused"):
+            raise RuntimeError("QEMU must remain paused during CAN output drain")
+        if query("qom-get", {"path": f"/chardevs/{chardev}",
+                              "property": "connected"}) is not True:
+            raise ConnectionError("CAN output chardev is disconnected")
+        state = _object(query("qom-get", {
+            "path": "/machine", "property": "fdcan-tx-state",
+        }), "fdcan-tx-state")
+        schema = _field(state, "schema", "fdcan-tx-state")
+        _integer(schema, "fdcan-tx-state.schema", 1)
+        if schema != 1:
+            raise ValueError("unsupported fdcan-tx-state schema")
+        timestamp = _field(state, "timestamp_ns", "fdcan-tx-state")
+        _integer(timestamp, "fdcan-tx-state.timestamp_ns", 0x7fffffffffffffff)
+        if timestamp != target_ns:
+            raise RuntimeError("CAN output observation time changed")
+        controllers = _object(_field(state, "controllers", "fdcan-tx-state"),
+                              "controllers")
+        tx = _object(_field(controllers, controller, "controllers"), controller)
+        for field, maximum in (("pending_frames", 16), ("pending_bytes", 1344),
+                               ("tx_dropped", 0xffffffffffffffff),
+                               ("tx_short_writes", 0xffffffffffffffff)):
+            _integer(_field(tx, field, controller), f"{controller}.{field}", maximum)
+        frames, count = tx["pending_frames"], tx["pending_bytes"]
+        if not frames <= count <= frames * 84:
+            raise ValueError("inconsistent CAN output pending counts")
+        if tx["tx_dropped"] != tx_dropped:
+            raise RuntimeError("CAN output drop count changed")
+        return frames == 0
+
+    while True:
+        empty = observe()
+        guard()
+        batch = stream.receive()  # Canonical parser: exactly one recv(4096).
+        guard()
+        for frame in batch:
+            guard()
+            sink(frame)
+            guard()
+        # With the canonical parser, [] and an empty tail means this fresh
+        # receive got EAGAIN (EOF and malformed records raise). A previous empty
+        # read cannot be reused after observing producer zero.
+        if empty and not batch and not stream.buffer:
+            if not observe():
+                raise RuntimeError("CAN output producer changed during drain")
+            guard()
+            return
 
 
 class QemuBoard:

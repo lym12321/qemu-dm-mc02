@@ -1731,6 +1731,21 @@ FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发�
 调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
 字节数，不证明该次调用中未遇到后续错误，也不代表对端已消费。
 
+主机代码可调用 `sim.boards.drain_paused_can(qmp, stream, sink, *, target_ns,
+controller, chardev, tx_dropped, deadline, check)`，把已准入的 CAN 输出逐帧交给
+`sink(frame)`；frame 沿用 `CanStream.receive()` 的 tuple。此操作要求原生执行目标已
+`reached`、QEMU 保持 `paused`，并使用同一条普通非阻塞 AF_UNIX 连接、唯一 writer 和 reader，
+不使用 mux、TLS 或 FD passing。
+调用者必须在整个区间排除新发送、复位、断电、配置、重连和其它清队列事件，且在 producer
+区间开始前建立 `tx_dropped` 基线。CPU 暂停本身不能证明这些前提。
+
+`deadline` 是有限的 `time.monotonic()` 绝对期限；`check()` 检查进程存活，QMP 的单命令
+超时仍由调用者配置，可复用 `deadline_qmp_call`。操作先观察发送队列为零，再要求一次新的
+空读及空 framing tail，最后复核执行状态和队列。它每轮只读最多 4096 字节，不收集无限结果。
+EOF、解码、状态变化、sink 或超时错误直接失败，保留部分效果和借用连接；调用者须停止该次
+尝试。任意阻塞 callback 无法被此软期限抢占。此操作不推进 world，也不证明全局锁步、
+同一时刻所有 timer/IRQ 已处理、任意复位恢复或真实 CAN 时序。
+
 ### trobot motor/MuJoCo test
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
