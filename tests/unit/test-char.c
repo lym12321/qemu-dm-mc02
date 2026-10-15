@@ -5,18 +5,178 @@
 #include "qemu/module.h"
 #include "qemu/option.h"
 #include "qemu/sockets.h"
+#include "chardev/char-fd.h"
 #include "chardev/char-fe.h"
+#include "chardev/char-io.h"
 #include "sysemu/sysemu.h"
 #include "qapi/error.h"
 #include "qapi/qapi-commands-char.h"
 #include "qapi/qmp/qdict.h"
 #include "qom/qom-qobject.h"
+#include "io/channel-buffer.h"
 #include "io/channel-socket.h"
 #include "qapi/qobject-input-visitor.h"
 #include "qapi/qapi-visit-sockets.h"
 #include "socket-helpers.h"
 
 static bool quit;
+
+#define TYPE_TEST_WRITE_CHANNEL "test-char-write-channel"
+OBJECT_DECLARE_SIMPLE_TYPE(TestWriteChannel, TEST_WRITE_CHANNEL)
+
+struct TestWriteChannel {
+    QIOChannelBuffer parent;
+    const ssize_t *results;
+    size_t nresults;
+    size_t calls;
+};
+
+static QIOChannelClass *test_write_channel_parent;
+
+/* Only script the dependency; native QIOChannelBuffer owns accepted bytes. */
+static ssize_t test_write_channel_writev(QIOChannel *ioc,
+                                         const struct iovec *iov, size_t niov,
+                                         int *fds, size_t nfds, int flags,
+                                         Error **errp)
+{
+    TestWriteChannel *tioc = TEST_WRITE_CHANNEL(ioc);
+    struct iovec shortened;
+    ssize_t result;
+
+    g_assert_cmpuint(niov, ==, 1);
+    g_assert_null(fds);
+    g_assert_cmpuint(nfds, ==, 0);
+    g_assert_cmpint(flags, ==, 0);
+    g_assert_cmpuint(tioc->calls, <, tioc->nresults);
+    result = tioc->results[tioc->calls++];
+    if (result < 0) {
+        if (result != QIO_CHANNEL_ERR_BLOCK) {
+            error_setg_errno(errp, EPIPE, "Scripted write failure");
+        }
+        return result;
+    }
+
+    g_assert_cmpint(result, >, 0);
+    g_assert_cmpuint(result, <=, iov[0].iov_len);
+    shortened = iov[0];
+    shortened.iov_len = result;
+    return test_write_channel_parent->io_writev(ioc, &shortened, 1,
+                                                fds, nfds, flags, errp);
+}
+
+static void test_write_channel_class_init(ObjectClass *oc, void *data)
+{
+    QIOChannelClass *ioc = QIO_CHANNEL_CLASS(oc);
+
+    test_write_channel_parent = QIO_CHANNEL_CLASS(object_class_get_parent(oc));
+    ioc->io_writev = test_write_channel_writev;
+}
+
+static const TypeInfo test_write_channel_type = {
+    .name = TYPE_TEST_WRITE_CHANNEL,
+    .parent = TYPE_QIO_CHANNEL_BUFFER,
+    .instance_size = sizeof(TestWriteChannel),
+    .class_init = test_write_channel_class_init,
+};
+
+#define TYPE_TEST_SEND_FD "chardev-test-send-fd"
+
+/* FDChardev is abstract; inherit its production write path unchanged. */
+static const TypeInfo test_send_fd_type = {
+    .name = TYPE_TEST_SEND_FD,
+    .parent = TYPE_CHARDEV_FD,
+};
+
+typedef struct SendErrorTest {
+    ssize_t failure;
+    int expected_errno;
+    bool through_fd;
+} SendErrorTest;
+
+static const uint8_t send_bytes[] = {
+    0x00, 0x13, 0xa5, 0x7f, 0x80, 0x5a, 0xfe, 0xff,
+};
+
+static int test_send_write(QIOChannel *ioc, CharBackend *be,
+                           const uint8_t *buf, int len)
+{
+    if (be) {
+        return qemu_chr_fe_write(be, buf, len);
+    }
+    return io_channel_send_full(ioc, buf, len, NULL, 0);
+}
+
+static void char_send_error_test(gconstpointer opaque)
+{
+    const SendErrorTest *test = opaque;
+    const ssize_t results[] = { 3, test->failure, test->failure, 5 };
+    TestWriteChannel *ioc = TEST_WRITE_CHANNEL(
+        object_new(TYPE_TEST_WRITE_CHANNEL));
+    QIOChannelBuffer *buffer = QIO_CHANNEL_BUFFER(ioc);
+    CharBackend be = { 0 };
+    Chardev *chr = NULL;
+    int ret, saved_errno;
+
+    ioc->results = results;
+    ioc->nresults = G_N_ELEMENTS(results);
+    if (test->through_fd) {
+        chr = CHARDEV(object_new(TYPE_TEST_SEND_FD));
+        FD_CHARDEV(chr)->ioc_out = QIO_CHANNEL(object_ref(ioc));
+        qemu_chr_fe_init(&be, chr, &error_abort);
+    }
+
+    ret = test_send_write(QIO_CHANNEL(ioc), chr ? &be : NULL,
+                          send_bytes, sizeof(send_bytes));
+    g_assert_cmpuint(ioc->calls, ==, 2);
+    g_assert_cmpuint(buffer->usage, ==, 3);
+    g_assert_cmpmem(buffer->data, 3, send_bytes, 3);
+    g_assert_cmpint(ret, ==, 3);
+
+    errno = 0;
+    ret = test_send_write(QIO_CHANNEL(ioc), chr ? &be : NULL,
+                          send_bytes + 3, 5);
+    saved_errno = errno;
+    g_assert_cmpint(ret, ==, -1);
+    g_assert_cmpint(saved_errno, ==, test->expected_errno);
+    g_assert_cmpuint(ioc->calls, ==, 3);
+    g_assert_cmpuint(buffer->usage, ==, 3);
+    g_assert_cmpmem(buffer->data, 3, send_bytes, 3);
+
+    ret = test_send_write(QIO_CHANNEL(ioc), chr ? &be : NULL,
+                          send_bytes + 3, 5);
+    g_assert_cmpint(ret, ==, 5);
+    g_assert_cmpuint(ioc->calls, ==, ioc->nresults);
+    g_assert_cmpuint(buffer->usage, ==, sizeof(send_bytes));
+    g_assert_cmpmem(buffer->data, buffer->usage,
+                    send_bytes, sizeof(send_bytes));
+
+    if (chr) {
+        qemu_chr_fe_deinit(&be, true);
+    }
+    object_unref(OBJECT(ioc));
+}
+
+static void char_send_completed_test(void)
+{
+    static const ssize_t results[] = { 3, 5 };
+    TestWriteChannel *ioc = TEST_WRITE_CHANNEL(
+        object_new(TYPE_TEST_WRITE_CHANNEL));
+    QIOChannelBuffer *buffer = QIO_CHANNEL_BUFFER(ioc);
+
+    ioc->results = results;
+    ioc->nresults = G_N_ELEMENTS(results);
+    g_assert_cmpint(io_channel_send_full(QIO_CHANNEL(ioc), send_bytes, 0,
+                                        NULL, 0), ==, 0);
+    g_assert_cmpuint(ioc->calls, ==, 0);
+    g_assert_cmpuint(buffer->usage, ==, 0);
+    g_assert_cmpint(io_channel_send_full(QIO_CHANNEL(ioc), send_bytes,
+                                        sizeof(send_bytes), NULL, 0), ==, 8);
+    g_assert_cmpuint(ioc->calls, ==, ioc->nresults);
+    g_assert_cmpuint(buffer->usage, ==, sizeof(send_bytes));
+    g_assert_cmpmem(buffer->data, buffer->usage,
+                    send_bytes, sizeof(send_bytes));
+    object_unref(OBJECT(ioc));
+}
 
 typedef struct FeHandler {
     int read_count;
@@ -1442,6 +1602,14 @@ static SocketAddress unixaddr = {
 
 int main(int argc, char **argv)
 {
+    static const SendErrorTest send_fatal = { -1, EINVAL, false };
+    static const SendErrorTest send_block = {
+        QIO_CHANNEL_ERR_BLOCK, EAGAIN, false,
+    };
+    static const SendErrorTest fd_fatal = { -1, EINVAL, true };
+    static const SendErrorTest fd_block = {
+        QIO_CHANNEL_ERR_BLOCK, EAGAIN, true,
+    };
     bool has_ipv4, has_ipv6;
 
     qemu_init_main_loop(&error_abort);
@@ -1455,7 +1623,20 @@ int main(int argc, char **argv)
     }
 
     module_call_init(MODULE_INIT_QOM);
+    type_register_static(&test_write_channel_type);
+    type_register_static(&test_send_fd_type);
     qemu_add_opts(&qemu_chardev_opts);
+
+    g_test_add_data_func("/char/io-channel-send/fatal", &send_fatal,
+                         char_send_error_test);
+    g_test_add_data_func("/char/io-channel-send/block", &send_block,
+                         char_send_error_test);
+    g_test_add_func("/char/io-channel-send/completed",
+                    char_send_completed_test);
+    g_test_add_data_func("/char/fd-send/fatal", &fd_fatal,
+                         char_send_error_test);
+    g_test_add_data_func("/char/fd-send/block", &fd_block,
+                         char_send_error_test);
 
     g_test_add_func("/char/null", char_null_test);
     g_test_add_func("/char/invalid", char_invalid_test);

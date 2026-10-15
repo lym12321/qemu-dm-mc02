@@ -131,6 +131,10 @@ int io_channel_send_full(QIOChannel *ioc,
             errno = EAGAIN;
             return -1;
         } else if (ret < 0) {
+            if (offset) {
+                return offset;
+            }
+
             errno = EINVAL;
             return -1;
         }

@@ -38,6 +38,13 @@ GSource *io_add_watch_poll(Chardev *chr,
 
 void remove_fd_in_watch(Chardev *chr);
 
+/*
+ * Both helpers return bytes accepted, including a prefix before a later error
+ * or would-block result.
+ * Return -1 only when no bytes were accepted: errno is EAGAIN for would-block,
+ * EINVAL for other channel errors. A positive result does not expose a later
+ * channel error; errno is meaningful only after -1. A zero length returns 0.
+ */
 int io_channel_send(QIOChannel *ioc, const void *buf, size_t len);
 
 int io_channel_send_full(QIOChannel *ioc, const void *buf, size_t len,
