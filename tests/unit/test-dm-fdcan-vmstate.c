@@ -6,9 +6,14 @@
 #include "migration/qemu-file-types.h"
 #include "migration/qemu-file.h"
 #include "migration/savevm.h"
+#include "qemu/config-file.h"
+#include "qemu/main-loop.h"
 #include "qemu/module.h"
+#include "qemu/option.h"
+#include "qemu/sockets.h"
 #include "io/channel-file.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/sysemu.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -387,6 +392,217 @@ static void test_tx_disconnect_drops_old_session(void)
     cleanup_tx_fixture(&fdcan, capture);
 }
 
+#ifdef CONFIG_LINUX
+static gboolean socket_deadline_wakeup(gpointer opaque)
+{
+    return G_SOURCE_REMOVE;
+}
+
+static void wait_socket_state(Chardev *chr, DmMc02Fdcan *fdcan, bool connected)
+{
+    int64_t deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    GSource *timeout = g_timeout_source_new(2000);
+
+    g_source_set_callback(timeout, socket_deadline_wakeup, NULL, NULL);
+    g_source_set_ready_time(timeout, deadline);
+    g_source_attach(timeout, NULL);
+    for (;;) {
+        bool actual = object_property_get_bool(OBJECT(chr), "connected",
+                                               &error_abort);
+        bool opened = qemu_chr_fe_backend_open(&fdcan->chr);
+
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        if (actual == connected && opened == connected) {
+            break;
+        }
+        /* Native listener/read/HUP only; do not run the virtual retry timer. */
+        g_main_context_iteration(NULL, TRUE);
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    }
+    g_source_destroy(timeout);
+    g_source_unref(timeout);
+}
+
+static int connect_socket_peer(const char *path)
+{
+    struct sockaddr_un addr = { .sun_family = AF_UNIX };
+    int64_t deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    int ret;
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpuint(strlen(path), <, sizeof(addr.sun_path));
+    strcpy(addr.sun_path, path);
+    ret = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret < 0) {
+        GPollFD pfd = { .fd = fd, .events = G_IO_OUT };
+        int error;
+        socklen_t length = sizeof(error);
+
+        g_assert_cmpint(errno, ==, EINPROGRESS);
+        do {
+            int64_t remaining = deadline - g_get_monotonic_time();
+
+            g_assert_cmpint(remaining, >, 0);
+            ret = qemu_poll_ns(&pfd, 1, remaining * 1000);
+        } while (ret < 0 && errno == EINTR);
+        g_assert_cmpint(ret, ==, 1);
+        g_assert_cmpint(getsockopt(fd, SOL_SOCKET, SO_ERROR, &error, &length),
+                        ==, 0);
+        g_assert_cmpint(error, ==, 0);
+    }
+    g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    return fd;
+}
+
+static void recv_socket_wire(int fd, uint8_t wire[84])
+{
+    int64_t deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    unsigned received = 0;
+
+    while (received < 84) {
+        int64_t remaining = deadline - g_get_monotonic_time();
+        ssize_t length;
+
+        g_assert_cmpint(remaining, >, 0);
+        length = recv(fd, wire + received, 84 - received, 0);
+        if (length < 0 && errno == EINTR) {
+            continue;
+        }
+        if (length < 0 && errno == EAGAIN) {
+            GPollFD pfd = { .fd = fd, .events = G_IO_IN };
+            int ret = qemu_poll_ns(&pfd, 1, remaining * 1000);
+
+            if (ret < 0 && errno == EINTR) {
+                continue;
+            }
+            g_assert_cmpint(ret, ==, 1);
+        } else {
+            g_assert_cmpint(length, >, 0);
+            received += length;
+        }
+    }
+    g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+}
+
+static void test_tx_native_socket_reconnect(void)
+{
+    g_autofree char *directory =
+        g_strdup_printf("%s/dm-qemu.fdcan.XXXXXX", g_get_tmp_dir());
+    g_autofree char *path = NULL;
+    QemuOpts *opts;
+    Chardev *chr;
+    DmMc02Fdcan fdcan;
+    uint8_t ram[16], wire[84], expected[84], extra;
+    unsigned attempt;
+    int peer;
+    int64_t deadline;
+
+    g_assert_nonnull(g_mkdtemp(directory));
+    path = g_build_filename(directory, "can.sock", NULL);
+    opts = qemu_opts_create(qemu_find_opts("chardev"), "test-fdcan-socket",
+                            1, &error_abort);
+    qemu_opt_set(opts, "backend", "socket", &error_abort);
+    qemu_opt_set(opts, "path", path, &error_abort);
+    qemu_opt_set_bool(opts, "server", true, &error_abort);
+    qemu_opt_set_bool(opts, "wait", false, &error_abort);
+    chr = qemu_chr_new_from_opts(opts, NULL, &error_abort);
+    qemu_opts_del(opts);
+    g_assert_nonnull(chr);
+    g_assert_false(object_property_get_bool(OBJECT(chr), "connected",
+                                            &error_abort));
+    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+    test_clock_ns = 1000;
+    memcpy(ram, tx_element, sizeof(ram));
+    ram[8] = 0xa5;
+    g_assert_true(dm_mc02_fdcan_init(&fdcan, NULL, "test-fdcan-socket",
+                                     DM_MC02_FDCAN_REGION_SIZE, ram,
+                                     sizeof(ram), chr, &error_abort));
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_CCCR, 0, 4);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBC, 0x01000000, 4);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXESC, 0, 4);
+    dm_mc02_fdcan_set_host_ack(&fdcan, true);
+    peer = connect_socket_peer(path);
+    wait_socket_state(chr, &fdcan, true);
+
+    /* Stop at the first pending record, before queue admission drops. */
+    deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+    for (attempt = 0; attempt < 65536; ++attempt) {
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+        if (fdcan.tx_queue_count) {
+            break;
+        }
+    }
+    g_assert_cmpuint(attempt, >, 0);
+    g_assert_cmpuint(attempt, <, 65536);
+    g_assert_true(object_property_get_bool(OBJECT(chr), "connected",
+                                           &error_abort));
+    g_assert_true(qemu_chr_fe_backend_open(&fdcan.chr));
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    g_assert_cmpuint(fdcan.tx_queue_offset[fdcan.tx_queue_head], <, 84);
+    g_assert_true(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    g_test_message("Native socket pressure after %u frames; pending offset %u",
+                    attempt + 1, fdcan.tx_queue_offset[fdcan.tx_queue_head]);
+    memcpy(expected, expected_wire, sizeof(expected));
+    expected[20] = 0xa5;
+    /* Peek proves an old complete record arrived without relieving pressure. */
+    g_assert_cmpint(recv(peer, wire, sizeof(wire), MSG_PEEK), ==, 84);
+    g_assert_cmpmem(wire, sizeof(wire), expected, sizeof(expected));
+
+    g_assert_cmpint(close(peer), ==, 0);
+    wait_socket_state(chr, &fdcan, false);
+    /* Native CLOSED must purge before any reconnect, TX or virtual timer. */
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_queue_head, ==, 0);
+    for (unsigned i = 0; i < G_N_ELEMENTS(fdcan.tx_queue_offset); ++i) {
+        g_assert_cmpuint(fdcan.tx_queue_offset[i], ==, 0);
+    }
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+
+    peer = connect_socket_peer(path);
+    wait_socket_state(chr, &fdcan, true);
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(recv(peer, &extra, 1, 0), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+    ram[8] = 0x55;
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    recv_socket_wire(peer, wire);
+    expected[20] = 0x55;
+    g_assert_cmpmem(wire, sizeof(wire), expected, sizeof(expected));
+    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    g_assert_cmpint(recv(peer, &extra, 1, 0), ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+
+    g_assert_cmpint(close(peer), ==, 0);
+    wait_socket_state(chr, &fdcan, false);
+    g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    dm_mc02_fdcan_cleanup(&fdcan);
+    g_assert_null(fdcan.tx_timer);
+    g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
+    g_assert_null(chr->be);
+    g_assert_false(qemu_clock_has_timers(QEMU_CLOCK_VIRTUAL));
+    object_unparent(OBJECT(chr));
+    g_assert_cmpint(access(path, F_OK), ==, -1);
+    g_assert_cmpint(errno, ==, ENOENT);
+    g_assert_cmpint(rmdir(directory), ==, 0);
+}
+#endif
+
 typedef struct IrqCapture {
     unsigned calls;
     int level;
@@ -673,7 +889,9 @@ int main(int argc, char **argv)
     g_assert_cmpint(temp_fd, >=, 0);
     module_call_init(MODULE_INIT_QOM);
     type_register_static(&capture_type);
-    init_clocks(NULL);
+    g_assert_cmpint(qemu_init_main_loop(&error_abort), ==, 0);
+    g_assert_cmpint(socket_init(), ==, 0);
+    qemu_add_opts(&qemu_chardev_opts);
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/dm-fdcan-vmstate/round-trip-irq",
@@ -693,6 +911,10 @@ int main(int argc, char **argv)
                     test_tx_disconnect_drops_old_session);
     g_test_add_func("/dm-fdcan-tx/disconnect-during-write",
                     test_tx_disconnect_during_write);
+#ifdef CONFIG_LINUX
+    g_test_add_func("/dm-fdcan-tx/native-socket-reconnect",
+                    test_tx_native_socket_reconnect);
+#endif
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);
