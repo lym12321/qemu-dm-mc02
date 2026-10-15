@@ -470,6 +470,7 @@ static void test_tx_bounded_queue_newest_drop(void)
     uint8_t ram[16];
     uint8_t expected[84];
     DmMc02Fdcan fdcan;
+    DmMc02FdcanTxState tx_state;
     TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
                                                G_N_ELEMENTS(results));
 
@@ -487,6 +488,11 @@ static void test_tx_bounded_queue_newest_drop(void)
     g_assert_cmpuint(fdcan.tx_short_writes, ==, 1);
     g_assert_cmpuint(fdcan.tx_queue_count, ==, 16);
     g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 16);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 1327);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 1);
+    g_assert_cmpuint(tx_state.tx_short_writes, ==, 1);
     g_assert_true(timer_pending(fdcan.tx_timer));
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
     capture->writable = true;
@@ -511,6 +517,11 @@ static void test_tx_bounded_queue_newest_drop(void)
     }
     g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
     g_assert_cmpuint(fdcan.tx_dropped, ==, 1);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 0);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 0);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 1);
+    g_assert_cmpuint(tx_state.tx_short_writes, ==, 1);
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
     g_assert_false(timer_pending(fdcan.tx_timer));
     test_clock_ns = 2001000;
@@ -882,6 +893,7 @@ static void test_tx_native_socket_writable_drain(void)
         g_strdup_printf("%s/dm-qemu.fdcan.XXXXXX", g_get_tmp_dir());
     g_autofree char *path = NULL;
     DmMc02Fdcan fdcan;
+    DmMc02FdcanTxState tx_state;
     uint8_t ram[16], wire[84], expected[84], extra;
     Chardev *chr = init_socket_fixture(&fdcan, ram, directory, &path);
     int peer = connect_socket_peer(path);
@@ -897,20 +909,23 @@ static void test_tx_native_socket_writable_drain(void)
         ram[8] = count;
         ram[9] = count >> 8;
         fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
-        if (fdcan.tx_queue_count) {
+        g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+        if (tx_state.pending_frames) {
             break;
         }
     }
     g_assert_cmpuint(count, >, 0);
     g_assert_cmpuint(count, <, 65536);
     count++; /* Include the one pending record; do not submit another TX. */
-    g_assert_cmpuint(fdcan.tx_queue_count, ==, 1);
-    g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
+    g_assert_cmpuint(tx_state.pending_frames, ==, 1);
+    g_assert_cmpuint(tx_state.pending_bytes, >, 0);
+    g_assert_cmpuint(tx_state.pending_bytes, <=, 84);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 0);
     g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
     g_assert_false(timer_pending(fdcan.tx_timer));
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 1001000);
-    g_test_message("Native fixed-clock drain of %u records; head offset %u",
-                    count, fdcan.tx_queue_offset[fdcan.tx_queue_head]);
+    g_test_message("Native fixed-clock drain of %u records; pending bytes %u",
+                    count, tx_state.pending_bytes);
 
     /* One reader; native IN only wakes the same loop that also services OUT. */
     reader = g_io_channel_unix_new(peer);
@@ -954,7 +969,10 @@ static void test_tx_native_socket_writable_drain(void)
     g_source_destroy(read_wakeup);
     g_source_unref(read_wakeup);
     g_io_channel_unref(reader);
-    g_assert_cmpuint(fdcan.tx_queue_count, ==, 0);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 0);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 0);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 0);
     g_assert_cmpuint(fdcan.tx_watch_tag, ==, 0);
     g_assert_cmpuint(fdcan.tx_next_ns, ==, 0);
     g_assert_cmpuint(fdcan.tx_dropped, ==, 0);
@@ -1149,6 +1167,153 @@ static void capture_irq(void *opaque, int n, int level)
     (void)n;
     capture->calls++;
     capture->level = level;
+}
+
+static void test_tx_state_observation(void)
+{
+    const int results[] = { 17, 0, -1 };
+    uint8_t ram[16];
+    DmMc02Fdcan fdcan, before;
+    DmMc02FdcanTxState tx_state;
+    TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results,
+                                               G_N_ELEMENTS(results));
+    TxCaptureChardev capture_before;
+    IrqCapture irq_capture = { 0 }, irq_before;
+    qemu_irq irq = qemu_allocate_irq(capture_irq, &irq_capture, 0);
+    uint64_t timer_expire;
+    guint source_id;
+
+    capture->watch_supported = true;
+    dm_mc02_fdcan_set_irq(&fdcan, 0, irq);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_IE, 1u << 9, 4);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_ILE, 1, 4);
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(capture->calls, ==, 1);
+    assert_attempt(capture, 0, expected_wire, 84);
+    g_assert_cmpint(irq_capture.level, ==, 1);
+    g_assert_cmpuint(fdcan.tx_watch_tag, !=, 0);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpint(g_source_get_ready_time(capture->watch_source), ==, -1);
+
+    /* Repeated observations cannot progress an armed but unready suffix. */
+    memcpy(&before, &fdcan, sizeof(before));
+    memcpy(&capture_before, capture, sizeof(capture_before));
+    irq_before = irq_capture;
+    source_id = g_source_get_id(capture->watch_source);
+    timer_expire = timer_expire_time_ns(fdcan.tx_timer);
+    for (unsigned query = 0; query < 3; ++query) {
+        g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+        g_assert_cmpuint(tx_state.pending_frames, ==, 1);
+        g_assert_cmpuint(tx_state.pending_bytes, ==, 67);
+        g_assert_cmpuint(tx_state.tx_dropped, ==, 0);
+        g_assert_cmpuint(tx_state.tx_short_writes, ==, 1);
+    }
+    g_assert_cmpmem(&fdcan, sizeof(fdcan), &before, sizeof(before));
+    g_assert_cmpmem(capture, sizeof(*capture),
+                    &capture_before, sizeof(capture_before));
+    g_assert_cmpuint(irq_capture.calls, ==, irq_before.calls);
+    g_assert_cmpint(irq_capture.level, ==, irq_before.level);
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+    g_assert_false(timer_pending(fdcan.tx_timer));
+    g_assert_cmpuint(timer_expire_time_ns(fdcan.tx_timer), ==, timer_expire);
+    g_assert_cmpuint(g_source_get_id(capture->watch_source), ==, source_id);
+    g_assert_cmpint(g_source_get_ready_time(capture->watch_source), ==, -1);
+    g_assert_false(g_source_is_destroyed(capture->watch_source));
+
+    for (unsigned retry = 1; retry <= 2; ++retry) {
+        g_source_set_ready_time(capture->watch_source, 0);
+        g_assert_true(g_main_context_iteration(NULL, FALSE));
+        g_assert_cmpuint(capture->calls, ==, retry + 1);
+        assert_attempt(capture, retry, expected_wire + 17, 67);
+        g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+        g_assert_cmpuint(tx_state.pending_frames, ==, 1);
+        g_assert_cmpuint(tx_state.pending_bytes, ==, 67);
+        g_assert_cmpuint(tx_state.tx_short_writes, ==, 1);
+    }
+    fdcan.iomem.ops->write(fdcan.iomem.opaque, FDCAN_TXBAR, 1, 4);
+    g_assert_cmpuint(capture->calls, ==, 4);
+    assert_attempt(capture, 3, expected_wire + 17, 67);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 2);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 151);
+
+    capture->writable = true;
+    g_source_set_ready_time(capture->watch_source, 0);
+    g_assert_true(g_main_context_iteration(NULL, FALSE));
+    g_assert_cmpuint(capture->calls, ==, 6);
+    assert_attempt(capture, 4, expected_wire + 17, 67);
+    assert_attempt(capture, 5, expected_wire, 84);
+    g_assert_cmpmem(capture->accepted, 84, expected_wire, 84);
+    g_assert_cmpmem(capture->accepted + 84, 84, expected_wire, 84);
+    g_assert_cmpuint(fdcan.tx_queue_offset[0], ==, 84);
+    g_assert_cmpuint(fdcan.tx_queue_offset[1], ==, 84);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 0);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 0);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 0);
+    g_assert_cmpuint(tx_state.tx_short_writes, ==, 1);
+    g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
+
+    dm_mc02_fdcan_reset(&fdcan);
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 0);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 0);
+    g_assert_cmpuint(tx_state.tx_dropped, ==, 0);
+    g_assert_cmpuint(tx_state.tx_short_writes, ==, 0);
+    cleanup_tx_fixture(&fdcan, capture);
+    qemu_free_irq(irq);
+}
+
+static void test_tx_state_geometry(void)
+{
+    DmMc02Fdcan fdcan = {
+        .tx_queue_head = 15,
+        .tx_queue_count = 2,
+        .tx_queue_offset = { [15] = 17, [4] = 84 },
+        .tx_dropped = UINT64_C(0x8000000000000001),
+        .tx_short_writes = UINT64_MAX,
+        /* Unrelated controller state is outside this observation contract. */
+        .rx_wire_len = UINT16_MAX,
+    };
+    DmMc02Fdcan before;
+    DmMc02FdcanTxState tx_state, untouched;
+
+    g_assert_true(dm_mc02_fdcan_get_tx_state(&fdcan, &tx_state));
+    g_assert_cmpuint(tx_state.pending_frames, ==, 2);
+    g_assert_cmpuint(tx_state.pending_bytes, ==, 151);
+    g_assert_cmpuint(tx_state.tx_dropped, ==,
+                     UINT64_C(0x8000000000000001));
+    g_assert_cmpuint(tx_state.tx_short_writes, ==, UINT64_MAX);
+    memcpy(&before, &fdcan, sizeof(before));
+    g_assert_false(dm_mc02_fdcan_get_tx_state(&fdcan, NULL));
+    g_assert_cmpmem(&fdcan, sizeof(fdcan), &before, sizeof(before));
+    memset(&tx_state, 0xa5, sizeof(tx_state));
+    memcpy(&untouched, &tx_state, sizeof(untouched));
+    g_assert_false(dm_mc02_fdcan_get_tx_state(NULL, &tx_state));
+    g_assert_cmpmem(&tx_state, sizeof(tx_state),
+                    &untouched, sizeof(untouched));
+
+    for (unsigned invalid = 0; invalid < 4; ++invalid) {
+        DmMc02Fdcan bad = fdcan;
+
+        switch (invalid) {
+        case 0:
+            bad.tx_queue_head = 16;
+            break;
+        case 1:
+            bad.tx_queue_count = 17;
+            break;
+        case 2:
+            bad.tx_queue_offset[15] = 84; /* Active record must be pending. */
+            break;
+        case 3:
+            bad.tx_queue_offset[4] = 85; /* Inactive offset still bounded. */
+            break;
+        }
+        g_assert_false(dm_mc02_fdcan_get_tx_state(&bad, &tx_state));
+        g_assert_cmpmem(&tx_state, sizeof(tx_state),
+                        &untouched, sizeof(untouched));
+    }
 }
 
 static void prepare_source(DmMc02Fdcan *state)
@@ -1376,6 +1541,9 @@ int main(int argc, char **argv)
     g_test_add_func("/dm-fdcan-vmstate/raw-no-projection",
                     test_raw_description_has_no_runtime_projection);
     g_test_add_func("/dm-fdcan-tx/shortwrite-retry", test_tx_shortwrite_retry);
+    g_test_add_func("/dm-fdcan-tx/state-observation",
+                    test_tx_state_observation);
+    g_test_add_func("/dm-fdcan-tx/state-geometry", test_tx_state_geometry);
     g_test_add_func("/dm-fdcan-tx/writable-source-retry",
                     test_tx_writable_source_retry);
     g_test_add_func("/dm-fdcan-tx/writable-source-single-owner",

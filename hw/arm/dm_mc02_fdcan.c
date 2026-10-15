@@ -1507,6 +1507,52 @@ static bool fdcan_fifo_state_valid(uint8_t fill, uint8_t get, uint8_t put,
                   !fill && !get && !put;
 }
 
+static bool fdcan_tx_queue_bytes(const DmMc02Fdcan *s, uint32_t *pending_bytes)
+{
+    uint32_t bytes = 0;
+
+    if (s->tx_queue_head >= DM_MC02_FDCAN_TX_QUEUE_SIZE ||
+        s->tx_queue_count > DM_MC02_FDCAN_TX_QUEUE_SIZE) {
+        return false;
+    }
+    for (unsigned i = 0; i < DM_MC02_FDCAN_TX_QUEUE_SIZE; ++i) {
+        bool active = s->tx_queue_count &&
+            ((i >= s->tx_queue_head &&
+              i - s->tx_queue_head < s->tx_queue_count) ||
+             (i < s->tx_queue_head &&
+              i + DM_MC02_FDCAN_TX_QUEUE_SIZE - s->tx_queue_head <
+              s->tx_queue_count));
+
+        if (s->tx_queue_offset[i] > DM_MC02_CAN_WIRE_SIZE ||
+            (active && s->tx_queue_offset[i] == DM_MC02_CAN_WIRE_SIZE)) {
+            return false;
+        }
+        if (active) {
+            bytes += DM_MC02_CAN_WIRE_SIZE - s->tx_queue_offset[i];
+        }
+    }
+    if (pending_bytes) {
+        *pending_bytes = bytes;
+    }
+    return true;
+}
+
+bool dm_mc02_fdcan_get_tx_state(const DmMc02Fdcan *s, DmMc02FdcanTxState *out)
+{
+    uint32_t pending_bytes;
+
+    if (!s || !out || !fdcan_tx_queue_bytes(s, &pending_bytes)) {
+        return false;
+    }
+    *out = (DmMc02FdcanTxState) {
+        .pending_frames = s->tx_queue_count,
+        .pending_bytes = pending_bytes,
+        .tx_dropped = s->tx_dropped,
+        .tx_short_writes = s->tx_short_writes,
+    };
+    return true;
+}
+
 bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *s)
 {
     uint8_t rx_fifo_size;
@@ -1515,8 +1561,7 @@ bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *s)
     uint32_t valid_mask;
 
     if (!s || s->rx_wire_len > sizeof(s->rx_wire) ||
-        s->tx_queue_head >= DM_MC02_FDCAN_TX_QUEUE_SIZE ||
-        s->tx_queue_count > DM_MC02_FDCAN_TX_QUEUE_SIZE ||
+        !fdcan_tx_queue_bytes(s, NULL) ||
         s->tx_next_ns > INT64_MAX) {
         return false;
     }
@@ -1547,19 +1592,6 @@ bool dm_mc02_fdcan_state_valid(const DmMc02Fdcan *s)
     }
     if (!s->tx_queue_count && s->tx_next_ns) {
         return false;
-    }
-    for (unsigned i = 0; i < DM_MC02_FDCAN_TX_QUEUE_SIZE; ++i) {
-        bool active = s->tx_queue_count &&
-            ((i >= s->tx_queue_head &&
-              i - s->tx_queue_head < s->tx_queue_count) ||
-             (i < s->tx_queue_head &&
-              i + DM_MC02_FDCAN_TX_QUEUE_SIZE - s->tx_queue_head <
-              s->tx_queue_count));
-
-        if (s->tx_queue_offset[i] > DM_MC02_CAN_WIRE_SIZE ||
-            (active && s->tx_queue_offset[i] == DM_MC02_CAN_WIRE_SIZE)) {
-            return false;
-        }
     }
     return true;
 }

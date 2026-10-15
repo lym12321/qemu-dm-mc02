@@ -19,6 +19,13 @@
 #define DM_MC02_CAN_WIRE_SIZE 84
 #define DM_MC02_FDCAN_TX_QUEUE_SIZE 16
 
+typedef struct DmMc02FdcanTxState {
+    uint32_t pending_frames;
+    uint32_t pending_bytes;
+    uint64_t tx_dropped;
+    uint64_t tx_short_writes;
+} DmMc02FdcanTxState;
+
 typedef struct DmMc02Fdcan {
     MemoryRegion iomem;
     uint8_t regs[DM_MC02_FDCAN_REGION_SIZE];
@@ -82,6 +89,17 @@ void dm_mc02_fdcan_set_canbus(DmMc02Fdcan *state, CanBusState *canbus);
 void dm_mc02_fdcan_set_powered(DmMc02Fdcan *state, bool powered);
 void dm_mc02_fdcan_set_host_ack(DmMc02Fdcan *state, bool enabled);
 void dm_mc02_fdcan_reset(DmMc02Fdcan *state);
+
+/*
+ * Copy host-wire queue observations without IO or runtime projection.
+ * pending_bytes counts only the remaining suffixes of active records.
+ * Counters retain their existing aggregate/reset semantics. Neither an empty
+ * queue nor these counters attest peer consumption or error-free delivery.
+ * The caller must serialize with mutation. Null arguments or invalid queue
+ * geometry return false without changing the output.
+ */
+bool dm_mc02_fdcan_get_tx_state(const DmMc02Fdcan *state,
+                               DmMc02FdcanTxState *out);
 
 /* Validate serialized controller-owned state without touching bus, chardev,
  * timer or IRQ wiring. */
