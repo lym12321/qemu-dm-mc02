@@ -1713,6 +1713,20 @@ FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发�
 重试，连接关闭仍由原生 chardev 事件处理。成功发送导致的队列排空只表示后端接受了记录，不能证明
 对端解码、CPU 中断处理或外部 plant 已完成。
 
+可通过原生 QMP 读取当前主机发送队列：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"fdcan-tx-state"}}
+```
+
+返回 `schema: 1`、QEMU 虚拟时间 `timestamp_ns` 和 `controllers`；控制器名称来自当前
+板卡 profile，例如 `dm-mc02.fdcan1`。各控制器的 `pending_frames` 是尚未完成的记录数，
+`pending_bytes` 是这些记录剩余的字节数；`tx_dropped`、`tx_short_writes` 是既有累计计数，
+随控制器复位清零。此属性只读，查询不触发发送或推进虚拟时间，尚未初始化时返回错误。
+`pending` 字段只描述当前仍待发送的记录；关闭连接、复位或断电也可能清空队列。
+成功发送引起的排空仅表示后端接受，确认对端收到数据仍需实际读取并校验。查询也不能证明
+此前没有发送错误，或 CPU、IRQ、外部 plant 已完成当前时刻的工作。
+
 ### trobot motor/MuJoCo test
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
