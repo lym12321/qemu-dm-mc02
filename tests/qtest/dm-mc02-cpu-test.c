@@ -520,41 +520,28 @@ static void execution_can_recv(int fd, uint8_t *buffer, size_t size,
     g_assert_cmpint(g_get_monotonic_time(), <=, deadline);
 }
 
-static void test_execution_periodic_can(void)
-{
-    /*
-     * Independent classic CAN RAM layout: ST HAL FDCAN_CopyMessageToRAM,
-     * standard ID << 18, DLC << 16, then eight literal payload bytes.
-     * The wire contract is <IIB3xQ64s; no production encoder supplies expected.
-     */
-    static const uint8_t tx_ram[2][16] = {
-        { 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
-          0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 },
-        { 0x00, 0x00, 0xfc, 0x07, 0x00, 0x00, 0x08, 0x00,
-          0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 },
-    };
-    static const uint8_t expected_wire[2][84] = {
-        { [1] = 0x02, [8] = 0x08,
-          [20] = 0x11, [21] = 0x22, [22] = 0x33, [23] = 0x44,
-          [24] = 0x55, [25] = 0x66, [26] = 0x77, [27] = 0x88 },
-        { [0] = 0xff, [1] = 0x01, [8] = 0x08,
-          [20] = 0x88, [21] = 0x77, [22] = 0x66, [23] = 0x55,
-          [24] = 0x44, [25] = 0x33, [26] = 0x22, [27] = 0x11 },
-    };
-    static const int64_t targets[] = {
-        1000000, 2000000, 3000000, 3000200,
-    };
-    uint8_t image[0x74] = { 0 };
-    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
-    g_autofree char *path = NULL;
-    g_autofree char *quoted_path = NULL;
-    g_autofree char *extra_args = NULL;
-    ExecutionCanCleanup cleanup = { .fd = -1 };
-    QTestState *qts;
-    int64_t connect_deadline;
-    int64_t receive_deadline = 0;
-    uint64_t previous_timestamp = 0;
+/*
+ * Independent classic CAN RAM layout: ST HAL FDCAN_CopyMessageToRAM,
+ * standard ID << 18, DLC << 16, then eight literal payload bytes.
+ * The wire contract is <IIB3xQ64s; no production encoder supplies expected.
+ */
+static const uint8_t periodic_can_tx_ram[2][16] = {
+    { 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
+      0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 },
+    { 0x00, 0x00, 0xfc, 0x07, 0x00, 0x00, 0x08, 0x00,
+      0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 },
+};
+static const uint8_t periodic_can_expected_wire[2][84] = {
+    { [1] = 0x02, [8] = 0x08,
+      [20] = 0x11, [21] = 0x22, [22] = 0x33, [23] = 0x44,
+      [24] = 0x55, [25] = 0x66, [26] = 0x77, [27] = 0x88 },
+    { [0] = 0xff, [1] = 0x01, [8] = 0x08,
+      [20] = 0x88, [21] = 0x77, [22] = 0x66, [23] = 0x55,
+      [24] = 0x44, [25] = 0x33, [26] = 0x22, [27] = 0x11 },
+};
 
+static void execution_periodic_can_image(uint8_t image[0x74])
+{
     /*
      * Thumb handler submits the two frames, then increments the pair ledger.
      * Third invocation disables SysTick. The finite paths take 12/15 guest
@@ -585,6 +572,25 @@ static void test_execution_periodic_can(void)
     stl_le_p(image + 0x68, 0x4000a0d0);
     stl_le_p(image + 0x6c, EXECUTION_COUNTER);
     stl_le_p(image + 0x70, SYST_CSR);
+}
+
+static void test_execution_periodic_can(void)
+{
+    static const int64_t targets[] = {
+        1000000, 2000000, 3000000, 3000200,
+    };
+    uint8_t image[0x74] = { 0 };
+    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *extra_args = NULL;
+    ExecutionCanCleanup cleanup = { .fd = -1 };
+    QTestState *qts;
+    int64_t connect_deadline;
+    int64_t receive_deadline = 0;
+    uint64_t previous_timestamp = 0;
+
+    execution_periodic_can_image(image);
 
     g_assert_nonnull(g_mkdtemp(directory));
     path = g_build_filename(directory, "can.sock", NULL);
@@ -624,7 +630,8 @@ static void test_execution_periodic_can(void)
     qtest_writel(qts, 0x4000a018, 1);
     qtest_writel(qts, 0x4000a0c0, 0x02000000);
     qtest_writel(qts, 0x4000a0c8, 0);
-    qtest_memwrite(qts, 0x4000ac00, tx_ram, sizeof(tx_ram));
+    qtest_memwrite(qts, 0x4000ac00, periodic_can_tx_ram,
+                   sizeof(periodic_can_tx_ram));
     qtest_writel(qts, 0x4000a018, 0);
     /* CMSIS D1CPRE /8: 64 MHz -> 8 MHz, integer 125 ns, exactly 1 ms. */
     qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8);
@@ -658,8 +665,9 @@ static void test_execution_periodic_can(void)
             g_assert_cmpuint(timestamp, <=, targets[pair]);
             previous_timestamp = timestamp;
             memset(wire + 12, 0, 8);
-            g_assert_cmpmem(wire, sizeof(wire), expected_wire[frame],
-                            sizeof(expected_wire[frame]));
+            g_assert_cmpmem(wire, sizeof(wire),
+                            periodic_can_expected_wire[frame],
+                            sizeof(periodic_can_expected_wire[frame]));
         }
     }
     g_assert_cmphex(qtest_readl(qts, SYST_CSR) &
@@ -939,6 +947,255 @@ static void test_execution_paused_can_drain(void)
     execution_can_check(qts, deadline);
 
     /* Pending zero alone is not delivery; all-N reads prove this fixture. */
+    g_assert_cmpint(close(cleanup.fd), ==, 0);
+    cleanup.fd = -1;
+    qtest_quit(qts);
+    g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+    g_assert_cmpint(g_rmdir(directory), ==, 0);
+    qtest_remove_abrt_handler(&cleanup);
+}
+
+static void test_execution_preblocked_cpu_can(void)
+{
+    /* Slot0 prefix: ID0x200/DLC8, independent uint16 index and fixed marker. */
+    uint8_t tx_ram[16] = {
+        0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x08, 0x00,
+        0x00, 0x00, 0xa5, 0x5a,
+    };
+    /* Literal <IIB3xQ64s at0ns, including zero padding and payload tail. */
+    static const uint8_t prefix_wire[84] = {
+        [1] = 0x02, [8] = 0x08, [22] = 0xa5, [23] = 0x5a,
+    };
+    static const int64_t targets[] = {
+        1000000, 2000000, 3000000, 3000200,
+    };
+    /* Original periodic guest/shift0 regression values, not Cortex-M cycles. */
+    static const uint64_t cpu_timestamps[] = {
+        1000003, 1000005, 2000003, 2000005, 3000003, 3000005,
+    };
+    uint8_t image[0x74] = { 0 };
+    g_autofree char *directory = g_strdup("/tmp/dm-qemu.vtime-can.XXXXXX");
+    g_autofree char *path = NULL;
+    g_autofree char *quoted_path = NULL;
+    g_autofree char *extra_args = NULL;
+    ExecutionCanCleanup cleanup = { .fd = -1 };
+    QTestState *qts;
+    QDict *state, *controller;
+    int64_t deadline;
+    unsigned submitted = 0, received = 0, partial_size = 0;
+    uint8_t buffer[4096], partial[84], expected[84];
+    uint64_t pending_frames, pending_bytes, blocked_bytes, short_writes;
+    uint64_t previous_timestamp = 0;
+    ssize_t extra;
+
+    execution_periodic_can_image(image);
+    g_assert_nonnull(g_mkdtemp(directory));
+    path = g_build_filename(directory, "can.sock", NULL);
+    quoted_path = g_shell_quote(path);
+    extra_args = g_strdup_printf(
+        "-chardev socket,id=can1,path=%s,server=on,wait=off "
+        "-serial none -serial none -serial none -serial none "
+        "-serial none -serial none -serial none -serial chardev:can1",
+        quoted_path);
+    cleanup.path = path;
+    cleanup.directory = directory;
+    qtest_add_abrt_handler(execution_can_abort_cleanup, &cleanup);
+    qts = execution_start_image(
+        "dm-mc02,fdcan-host-ack=on,electrical-power=on",
+        image, sizeof(image), extra_args);
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    execution_can_check(qts, deadline);
+    cleanup.fd = unix_connect(path, NULL);
+    execution_can_check(qts, deadline);
+    g_assert_cmpint(cleanup.fd, >=, 0);
+    while (!qtest_qom_get_bool(qts, "/chardevs/can1", "connected")) {
+        execution_can_check(qts, deadline);
+    }
+    execution_can_check(qts, deadline);
+
+    qtest_writel(qts, EXECUTION_COUNTER, 0);
+    /* Real PC15 output powers the rail before any host or CPU submission. */
+    qtest_writel(qts, RCC_BASE + 0xe0,
+                 qtest_readl(qts, RCC_BASE + 0xe0) | (1u << 2));
+    qtest_writel(qts, 0x58020800,
+                 (qtest_readl(qts, 0x58020800) & ~(3u << 30)) | (1u << 30));
+    qtest_writel(qts, 0x58020818, 1u << 15);
+    g_assert_cmphex(qtest_readl(qts, 0x58020814) & (1u << 15), ==, 1u << 15);
+    g_assert_true(qtest_qom_get_bool(qts, "/machine", "system-5v-good"));
+    execution_can_check(qts, deadline);
+    /* TFQS2 from the outset; NDTB0/TFQM0, offset0, classic8-byte slots. */
+    qtest_writel(qts, 0x4000a018, 1);
+    qtest_writel(qts, 0x4000a0c0, 0x02000000);
+    qtest_writel(qts, 0x4000a0c8, 0);
+    qtest_memwrite(qts, 0x4000ac00, periodic_can_tx_ram,
+                   sizeof(periodic_can_tx_ram));
+    qtest_writel(qts, 0x4000a018, 0);
+    g_assert_cmphex(qtest_readl(qts, 0x4000a054), ==, 0); /* IE */
+    g_assert_cmphex(qtest_readl(qts, 0x4000a05c), ==, 0); /* ILE */
+    /* Same integer125ns SysTick input and 1ms period as periodic-can. */
+    qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8);
+    qtest_writel(qts, SYST_RVR, 7999);
+    qtest_writel(qts, SYST_CVR, 0);
+    qtest_writel(qts, SYST_CSR,
+                 SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE);
+    execution_can_check(qts, deadline);
+    execution_can_empty_readonly(qts, false, deadline);
+    g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==, 0);
+    execution_can_check(qts, deadline);
+
+    /* No peer reads: stop at the first pending record, not a fixed OS count. */
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    do {
+        execution_can_check(qts, deadline);
+        tx_ram[8] = submitted;
+        tx_ram[9] = submitted >> 8;
+        qtest_memwrite(qts, 0x4000ac00, tx_ram, sizeof(tx_ram));
+        execution_can_check(qts, deadline);
+        qtest_writel(qts, 0x4000a0d0, 1);
+        execution_can_check(qts, deadline);
+        submitted++;
+        state = execution_can_state(qts, false, 0, deadline);
+        controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                      "dm-mc02.fdcan1");
+        pending_frames = execution_can_uint(controller, "pending_frames");
+        pending_bytes = execution_can_uint(controller, "pending_bytes");
+        short_writes = execution_can_uint(controller, "tx_short_writes");
+        qobject_unref(state);
+    } while (!pending_frames && submitted < 65536);
+    g_assert_cmpuint(pending_frames, ==, 1);
+    g_assert_cmpuint(pending_bytes, >, 0);
+    g_assert_cmpuint(pending_bytes, <=, 84);
+    blocked_bytes = pending_bytes;
+    g_test_message("Preblocked prefix: %u records, pending bytes %" PRIu64
+                   ", short writes %" PRIu64,
+                   submitted, blocked_bytes, short_writes);
+
+    /* Restore only slot0; the queued prefix must retain its original bytes. */
+    execution_can_check(qts, deadline);
+    qtest_memwrite(qts, 0x4000ac00, periodic_can_tx_ram[0],
+                   sizeof(periodic_can_tx_ram[0]));
+    execution_can_check(qts, deadline);
+    state = execution_can_state(qts, false, 0, deadline);
+    controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                  "dm-mc02.fdcan1");
+    g_assert_cmpuint(execution_can_uint(controller, "pending_frames"), ==, 1);
+    g_assert_cmpuint(execution_can_uint(controller, "pending_bytes"),
+                     ==, blocked_bytes);
+    qobject_unref(state);
+    g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==, 0);
+    execution_assert_stopped(qts, "prelaunch");
+    execution_can_check(qts, deadline);
+
+    for (unsigned pair = 0; pair < G_N_ELEMENTS(targets); pair++) {
+        g_assert_true(qtest_probe_child(qts));
+        execution_run_to(qts, targets[pair]);
+        g_assert_true(qtest_probe_child(qts));
+        deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+        execution_assert_stable(qts, targets[pair], pair);
+        execution_can_check(qts, deadline);
+        state = execution_can_state(qts, false, targets[pair], deadline);
+        controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                      "dm-mc02.fdcan1");
+        g_assert_cmpuint(execution_can_uint(controller, "pending_frames"),
+                         ==, 1 + 2 * pair);
+        g_assert_cmpuint(execution_can_uint(controller, "pending_bytes"),
+                         ==, blocked_bytes + 168 * pair);
+        short_writes = execution_can_uint(controller, "tx_short_writes");
+        g_test_message("CPU fence %" PRId64 " ns: ledger %u, pending %u, "
+                       "bytes %" PRIu64 ", short writes %" PRIu64,
+                       targets[pair], pair, 1 + 2 * pair,
+                       blocked_bytes + 168 * pair, short_writes);
+        qobject_unref(state);
+        execution_can_check(qts, deadline);
+    }
+    g_assert_cmphex(qtest_readl(qts, SYST_CSR) &
+                    (SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE),
+                    ==, 0);
+    g_assert_cmphex(qtest_readl(qts, SCB_ICSR) &
+                    (0x1ffu | SCB_ICSR_PENDSTSET), ==, 0);
+    execution_assert_stable(qts, 3000200, 3);
+    execution_can_check(qts, deadline);
+
+    /* Producer is finished. Only observation and this sole peer may drain. */
+    deadline = g_get_monotonic_time() + 2 * G_TIME_SPAN_SECOND;
+    do {
+        ssize_t length;
+
+        execution_can_check(qts, deadline);
+        length = recv(cleanup.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+        if (length < 0) {
+            g_assert_true(errno == EAGAIN || errno == EINTR);
+        } else {
+            g_assert_cmpint(length, >, 0);
+            for (unsigned used = 0; used < length;) {
+                unsigned take = MIN(sizeof(partial) - partial_size,
+                                    length - used);
+
+                memcpy(partial + partial_size, buffer + used, take);
+                used += take;
+                partial_size += take;
+                if (partial_size == sizeof(partial)) {
+                    g_assert_cmpuint(received, <, submitted + 6);
+                    if (received < submitted) {
+                        memcpy(expected, prefix_wire, sizeof(expected));
+                        expected[20] = received;
+                        expected[21] = received >> 8;
+                    } else {
+                        unsigned cpu_record = received - submitted;
+                        unsigned pair = cpu_record / 2 + 1;
+                        unsigned frame = cpu_record % 2;
+                        uint64_t timestamp = ldq_le_p(partial + 12);
+
+                        g_test_message("Preblocked CPU record %u timestamp %"
+                                       PRIu64 " ns", cpu_record, timestamp);
+                        g_assert_cmpuint(timestamp, >, previous_timestamp);
+                        g_assert_cmpuint(timestamp, ==,
+                                         cpu_timestamps[cpu_record]);
+                        g_assert_cmpuint(timestamp, >=, pair * 1000000);
+                        g_assert_cmpuint(timestamp, <=, pair * 1000000 + 17);
+                        g_assert_cmpuint(timestamp, <=, 3000200);
+                        previous_timestamp = timestamp;
+                        memcpy(expected, periodic_can_expected_wire[frame],
+                               sizeof(expected));
+                        stq_le_p(expected + 12, cpu_timestamps[cpu_record]);
+                    }
+                    g_assert_cmpmem(partial, sizeof(partial),
+                                    expected, sizeof(expected));
+                    received++;
+                    partial_size = 0;
+                }
+            }
+        }
+        execution_can_check(qts, deadline);
+        state = execution_can_state(qts, false, 3000200, deadline);
+        controller = qdict_get_qdict(qdict_get_qdict(state, "controllers"),
+                                      "dm-mc02.fdcan1");
+        pending_frames = execution_can_uint(controller, "pending_frames");
+        pending_bytes = execution_can_uint(controller, "pending_bytes");
+        short_writes = execution_can_uint(controller, "tx_short_writes");
+        qobject_unref(state);
+        execution_assert_stable(qts, 3000200, 3);
+        execution_can_check(qts, deadline);
+    } while (received < submitted + 6 || pending_frames);
+    g_assert_cmpuint(received, ==, submitted + 6);
+    g_assert_cmpuint(partial_size, ==, 0);
+    g_assert_cmpuint(pending_frames, ==, 0);
+    g_assert_cmpuint(pending_bytes, ==, 0);
+    g_test_message("Preblocked peer: %u complete records, short writes %"
+                   PRIu64, received, short_writes);
+    g_assert_true(qtest_qom_get_bool(qts, "/chardevs/can1", "connected"));
+    execution_can_check(qts, deadline);
+    do {
+        execution_can_check(qts, deadline);
+        extra = recv(cleanup.fd, buffer, sizeof(buffer), MSG_DONTWAIT);
+    } while (extra < 0 && errno == EINTR);
+    g_assert_cmpint(extra, ==, -1);
+    g_assert_cmpint(errno, ==, EAGAIN);
+    execution_can_check(qts, deadline);
+    execution_assert_stable(qts, 3000200, 3);
+    execution_can_check(qts, deadline);
+
+    /* Exact bytes and record count verify this finite peer stream. */
     g_assert_cmpint(close(cleanup.fd), ==, 0);
     cleanup.fd = -1;
     qtest_quit(qts);
@@ -1301,6 +1558,8 @@ int main(int argc, char **argv)
                     test_execution_periodic_can);
     g_test_add_func("/dm-mc02/virtual-execution/paused-can-drain",
                     test_execution_paused_can_drain);
+    g_test_add_func("/dm-mc02/virtual-execution/preblocked-cpu-can",
+                    test_execution_preblocked_cpu_can);
 #endif
     g_test_add_func("/dm-mc02/armv7m/qom-children-and-irq-width",
                     test_armv7m_children_and_irq_width);
