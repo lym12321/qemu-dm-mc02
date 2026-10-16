@@ -3,6 +3,7 @@ import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 import json
+import logging
 import os
 import signal
 import socket
@@ -11,9 +12,12 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
 from dm_mc02_qmp import QmpSession
+from qemu.qmp import QMPClient
+from qemu.qmp.message import Message
 
 
 @contextmanager
@@ -72,6 +76,59 @@ def batch_peer(test, handler):
 
 
 class QmpClientTest(unittest.TestCase):
+    def test_disabled_debug_hooks_preserve_message_without_formatting(self):
+        client = QMPClient()
+        client.logger = logging.Logger("qmp-test-child", logging.NOTSET)
+        client.logger.parent = logging.Logger("qmp-test-parent", logging.WARNING)
+        self.assertEqual(client.logger.getEffectiveLevel(), logging.WARNING)
+        message = Message(b'{"execute":"query-status","id":"literal"}')
+        with patch.object(Message, "__str__", side_effect=AssertionError("unexpected formatting")) as formatted:
+            self.assertIs(client._cb_outbound(message), message)
+            self.assertIs(client._cb_inbound(message), message)
+            self.assertEqual(bytes(message), b'{"execute":"query-status","id":"literal"}')
+            formatted.assert_not_called()
+
+    def test_enabled_debug_hooks_capture_exact_snapshot_before_later_mutation(self):
+        records = []
+        class DeferredHandler(logging.Handler):
+            def emit(self, record):
+                records.append(record)
+        handler = DeferredHandler()
+        handler.setFormatter(logging.Formatter("%(levelname)s:%(message)s"))
+        client = QMPClient()
+        client.logger = logging.Logger("qmp-test-snapshot", logging.DEBUG)
+        client.logger.addHandler(handler)
+        outbound = Message(b'{"execute":"query-status","id":"literal"}')
+        inbound = Message(b'{"return":{"status":"paused"},"id":"literal"}')
+        self.assertIs(client._cb_outbound(outbound), outbound)
+        self.assertIs(client._cb_inbound(inbound), inbound)
+        self.assertEqual(bytes(outbound), b'{"execute":"query-status","id":"literal"}')
+        self.assertEqual(bytes(inbound), b'{"return":{"status":"paused"},"id":"literal"}')
+        outbound["execute"] = "changed"
+        inbound["return"] = {"status": "running"}
+        original_outbound = '{\n  "execute": "query-status",\n  "id": "literal"\n}'
+        original_inbound = '{\n  "return": {\n    "status": "paused"\n  },\n  "id": "literal"\n}'
+        self.assertEqual([record.args for record in records],
+                         [(original_outbound,), (original_inbound,)])
+        self.assertTrue(all(type(record.args[0]) is str for record in records))
+        self.assertEqual([handler.format(record) for record in records],
+                         ["DEBUG:--> " + original_outbound, "DEBUG:<-- " + original_inbound])
+
+    def test_enabled_debug_formatting_exception_propagates_but_disabled_does_not(self):
+        client = QMPClient()
+        client.logger = logging.Logger("qmp-test-exception", logging.DEBUG)
+        message = Message(b'{"return":{}}')
+        failure = ValueError("message formatting failed")
+        with patch.object(Message, "__str__", side_effect=failure) as formatted:
+            with self.assertRaises(ValueError) as caught:
+                client._cb_inbound(message)
+            self.assertIs(caught.exception, failure)
+            formatted.assert_called_once_with()
+            client.logger.disabled = True
+            self.assertIs(client._cb_inbound(message), message)
+            self.assertEqual(formatted.call_count, 1)
+            self.assertEqual(bytes(message), b'{"return":{}}')
+
     def assert_batch_settled(self, client):
         # Test-only white-box evidence for upstream pending requests and the
         # owned batch tasks. Ordinary reader/writer tasks live until close.
