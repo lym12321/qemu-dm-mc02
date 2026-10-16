@@ -926,7 +926,8 @@ class AsyncProtocol(Generic[T]):
         :param msg: raw outbound message
         :return: final outbound message
         """
-        self.logger.debug("--> %s", str(msg))
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("--> %s", str(msg))
         return msg
 
     @upper_half
@@ -946,7 +947,8 @@ class AsyncProtocol(Generic[T]):
         :param msg: raw inbound message
         :return: processed inbound message
         """
-        self.logger.debug("<-- %s", str(msg))
+        if self.logger.isEnabledFor(logging.DEBUG):
+            self.logger.debug("<-- %s", str(msg))
         return msg
 
     @upper_half
