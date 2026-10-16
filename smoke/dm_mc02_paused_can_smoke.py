@@ -100,6 +100,7 @@ def run(binary, report):
     trace = deque(maxlen=16)
     observed = {"wire_count": 0, "sink_count": 0, "read_calls": 0,
                 "max_read_bytes": 0, "cpu_timestamps_ns": []}
+    qmp_groups = {"calls": 0, "completed": 0, "sizes": {}, "phases": {}}
     wire_hash = hashlib.sha256()
     last_tx = None
     last_rx = None
@@ -123,13 +124,8 @@ def run(binary, report):
             raise RuntimeError(f"native QEMU exited early ({owner.process.returncode})")
         return remaining
 
-    def command(name, arguments=None):
+    def observe_result(name, arguments, result):
         nonlocal last_tx, last_rx, first_input_rx
-        check()
-        result = deadline_qmp_call(
-            qmp, deadline, f"paused CAN {phase}",
-            lambda: qmp.command(name, arguments))
-        check()
         if name == "qom-get" and arguments.get("property") == "fdcan-tx-state":
             tx = result["controllers"]["dm-mc02.fdcan1"]
             last_tx = event("tx", timestamp_ns=result["timestamp_ns"], **tx)
@@ -141,7 +137,34 @@ def run(binary, report):
                 expect(rx == {"completed_frames": 0, "partial_bytes": 83,
                               "rx_dropped": 0}, "helper did not first observe real RX83")
                 first_input_rx = entry
+
+    def command(name, arguments=None):
+        check()
+        result = deadline_qmp_call(
+            qmp, deadline, f"paused CAN {phase}",
+            lambda: qmp.command(name, arguments))
+        check()
+        observe_result(name, arguments, result)
         return result
+
+    def command_many(commands):
+        check()
+        qmp_groups["calls"] += 1
+        values = deadline_qmp_call(
+            qmp, deadline, f"paused CAN {phase}",
+            lambda: qmp.command_many(commands))
+        check()
+        qmp_groups["completed"] += 1
+        for counts, key in ((qmp_groups["sizes"], str(len(commands))),
+                            (qmp_groups["phases"], phase)):
+            counts[key] = counts.get(key, 0) + 1
+        # Record actual values after the whole group returns. These event
+        # sequence numbers do not represent individual reply arrival times.
+        for (name, arguments), value in zip(commands, values, strict=True):
+            observe_result(name, arguments, value)
+        return values
+
+    helper_qmp = SimpleNamespace(command=command, command_many=command_many)
 
     def qom(path, prop):
         return command("qom-get", {"path": path, "property": prop})
@@ -266,7 +289,7 @@ def run(binary, report):
 
                 phase = "initial_baseline"
                 initial = observe_initial_paused_can(
-                    SimpleNamespace(command=command), can, timestamp_ns=0,
+                    helper_qmp, can, timestamp_ns=0,
                     controller="dm-mc02.fdcan1", chardev="can1",
                     deadline=deadline, check=check)
                 expect(initial == {
@@ -396,7 +419,7 @@ def run(binary, report):
                                              "icsr": icsr, "cpu_frames": cpu_frames, **tx})
                     phase = "drain"
                     empty_read = None
-                    drain_paused_can(SimpleNamespace(command=command), can, sink,
+                    drain_paused_can(helper_qmp, can, sink,
                         target_ns=target, controller="dm-mc02.fdcan1", chardev="can1",
                         tx_dropped=0, deadline=deadline, check=check)
                     expect(observed["wire_count"] == observed["sink_count"] ==
@@ -442,7 +465,7 @@ def run(binary, report):
                         expect(not can.tx_pending and not can.buffer, "stream is not drained")
                         can.tx_queue.append(memoryview(INPUT_WIRE[83:]))
                         phase = "input_suffix_wait"
-                        receipt = wait_paused_can_input(SimpleNamespace(command=command), can,
+                        receipt = wait_paused_can_input(helper_qmp, can,
                             target_ns=target, controller="dm-mc02.fdcan1", chardev="can1",
                             completed_frames=1, deadline=deadline, check=check)
                         expect(receipt == {"completed_frames": 1, "partial_bytes": 0,
@@ -470,7 +493,7 @@ def run(binary, report):
                         check()
                         can.send(0x321, 0, 8, 1000000, PAYLOADS[0])
                         check()
-                        rejected = wait_paused_can_input(SimpleNamespace(command=command), can,
+                        rejected = wait_paused_can_input(helper_qmp, can,
                             target_ns=target, controller="dm-mc02.fdcan1", chardev="can1",
                             completed_frames=2, deadline=deadline, check=check)
                         expect(rejected == {"completed_frames": 2, "partial_bytes": 0,
@@ -510,7 +533,7 @@ def run(binary, report):
                 connected(True)
                 before = dict(observed)
                 try:
-                    drain_paused_can(SimpleNamespace(command=command), can, sink,
+                    drain_paused_can(helper_qmp, can, sink,
                         target_ns=3000200, controller="dm-mc02.fdcan1", chardev="can1",
                         tx_dropped=0, deadline=deadline, check=check)
                 except ConnectionError as exc:
@@ -527,7 +550,7 @@ def run(binary, report):
                 queued = memoryview(INPUT_WIRE)
                 can.tx_queue.append(queued)
                 try:
-                    wait_paused_can_input(SimpleNamespace(command=command), can,
+                    wait_paused_can_input(helper_qmp, can,
                         target_ns=3000200, controller="dm-mc02.fdcan1", chardev="can1",
                         completed_frames=3, deadline=deadline, check=check)
                 except ConnectionError as exc:
@@ -545,6 +568,16 @@ def run(binary, report):
                         "queued_suffix_bytes": len(queued), "queued_suffix_retained": True}
                 else:
                     raise AssertionError("original EOF was accepted as input completion")
+                expect(qmp_groups["calls"] == qmp_groups["completed"],
+                       "a native QMP observation group did not complete")
+                expect(qmp_groups["sizes"].get("5") == 2 and
+                       qmp_groups["phases"].get("initial_baseline") == 2,
+                       "initial helper did not use two fresh five-query groups")
+                expect(set(qmp_groups["sizes"]) == {"4", "5"} and
+                       all(qmp_groups["phases"].get(name, 0) > 0 for name in
+                           ("drain", "input_suffix_wait", "input_fifo_full",
+                            "original_peer_eof", "original_input_peer_eof")),
+                       "native drain/receipt/EOF helper missed public batch queries")
                 stopped(3000200, 3)
                 expect(tx_state(3000200)["pending_bytes"] == 0, "EOF gate created backlog")
                 check()
@@ -570,6 +603,7 @@ def run(binary, report):
         report["trace_tail"] = list(trace)
         report["trace_events"] = sequence
         report["observed"] = observed
+        report["qmp_observation_groups"] = qmp_groups
         cleanup_errors = list(peer_cleanup_errors)
         for label, action in (
             ("native process", lambda: expect(owner is None or
@@ -618,6 +652,8 @@ def main():
                 ROOT / "qemu/upstream/tests/qtest/dm-mc02-cpu-test.c",
                 ROOT / "qemu/upstream/pc-bios/efi-virtio.rom"]
             for name in ("dm_mc02_firmware_rtf", "dm_mc02_qmp", "dm_mc02_test_harness",
+                         "qemu.qmp.legacy", "qemu.qmp.qmp_client",
+                         "qemu.qmp.message", "qemu.qmp.protocol",
                          "qemu.machine.qtest", "sim.boards", "sim.boards.qemu",
                          "sim.boards.launch", "sim.transports.can_stream",
                          "sim.transports.stream", "sim.transports.can_codec",

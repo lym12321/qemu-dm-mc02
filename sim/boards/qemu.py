@@ -107,6 +107,9 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
     command = getattr(qmp, "command", None)
     if not callable(command) or not callable(check):
         raise TypeError("QMP command and check must be callable")
+    command_many = getattr(qmp, "command_many", None)
+    if command_many is not None and not callable(command_many):
+        raise TypeError("QMP command_many must be callable or None")
     _integer(target_ns, "target_ns", 0x7fffffffffffffff)
     for name, value in (("controller", controller), ("chardev", chardev)):
         if (not isinstance(value, str) or
@@ -134,33 +137,86 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
         guard()
         return value
 
-    def fence():
-        execution = _object(query("x-query-virtual-execution"), "execution")
-        for field in (("current-ns",) if initial else ("current-ns", "target-ns")):
-            value = _field(execution, field, "execution")
-            _integer(value, f"execution.{field}", 0x7fffffffffffffff)
-            if value != target_ns:
-                raise RuntimeError(f"CAN {direction} execution time or target changed")
+    def observe():
+        connection = {"path": f"/chardevs/{chardev}", "property": "connected"}
+        tx_arguments = {"path": "/machine", "property": "fdcan-tx-state"}
+        rx_arguments = {"path": "/machine", "property": "fdcan-rx-state"}
+        if command_many is None:
+            # Keep immediate validation: a bad scalar reply must stop later IO.
+            _can_execution_state(query("x-query-virtual-execution"), target_ns,
+                                 direction, initial)
+            _can_paused_status(query("query-status"), direction, initial)
+            _can_connection_state(query("qom-get", connection), direction)
+            if initial:
+                tx = _can_tx_state(query("qom-get", tx_arguments), controller,
+                                   target_ns, direction)
+                rx = _can_rx_state(query("qom-get", rx_arguments), controller,
+                                   target_ns, direction)
+                return tx, rx
+            if direction == "output":
+                return (_can_tx_state(query("qom-get", tx_arguments), controller,
+                                      target_ns, direction),)
+            return (_can_rx_state(query("qom-get", rx_arguments), controller,
+                                  target_ns, direction),)
+
+        requests = (("x-query-virtual-execution", None), ("query-status", None),
+                    ("qom-get", connection))
         if initial:
-            if (_field(execution, "state", "execution") != "idle" or
-                    "target-ns" in execution):
-                raise RuntimeError("CAN initial baseline requires idle execution without a target")
-        elif _field(execution, "state", "execution") != "reached":
-            raise RuntimeError(f"CAN {direction} execution target is not reached")
-        status = _object(query("query-status"), "query-status")
-        allowed = ("prelaunch", "paused") if initial else ("paused",)
-        if (status.get("running") is not False or status.get("status") not in allowed):
-            raise RuntimeError(f"QEMU must remain paused during CAN {direction} drain")
-        if query("qom-get", {"path": f"/chardevs/{chardev}",
-                              "property": "connected"}) is not True:
-            raise ConnectionError(f"CAN {direction} chardev is disconnected")
-    return guard, query, fence
+            requests += (("qom-get", tx_arguments), ("qom-get", rx_arguments))
+        elif direction == "output":
+            requests += (("qom-get", tx_arguments),)
+        else:
+            requests += (("qom-get", rx_arguments),)
+        guard()
+        values = command_many(requests)
+        guard()
+        if type(values) is not tuple:
+            raise TypeError("QMP command_many result must be a plain tuple")
+        if len(values) != len(requests):
+            raise ValueError("QMP command_many result has wrong arity")
+        _can_execution_state(values[0], target_ns, direction, initial)
+        _can_paused_status(values[1], direction, initial)
+        _can_connection_state(values[2], direction)
+        if initial:
+            tx = _can_tx_state(values[3], controller, target_ns, direction)
+            rx = _can_rx_state(values[4], controller, target_ns, direction)
+            return tx, rx
+        if direction == "output":
+            return (_can_tx_state(values[3], controller, target_ns, direction),)
+        return (_can_rx_state(values[3], controller, target_ns, direction),)
+
+    return guard, observe
 
 
-def _can_transfer_state(query, property_name, controller, target_ns, direction):
-    state = _object(query("qom-get", {
-        "path": "/machine", "property": property_name,
-    }), property_name)
+def _can_execution_state(value, target_ns, direction, initial):
+    execution = _object(value, "execution")
+    for field in (("current-ns",) if initial else ("current-ns", "target-ns")):
+        value = _field(execution, field, "execution")
+        _integer(value, f"execution.{field}", 0x7fffffffffffffff)
+        if value != target_ns:
+            raise RuntimeError(f"CAN {direction} execution time or target changed")
+    if initial:
+        if (_field(execution, "state", "execution") != "idle" or
+                "target-ns" in execution):
+            raise RuntimeError("CAN initial baseline requires idle execution without a target")
+    elif _field(execution, "state", "execution") != "reached":
+        raise RuntimeError(f"CAN {direction} execution target is not reached")
+
+
+def _can_paused_status(value, direction, initial):
+    status = _object(value, "query-status")
+    allowed = ("prelaunch", "paused") if initial else ("paused",)
+    if status.get("running") is not False or status.get("status") not in allowed:
+        raise RuntimeError(f"QEMU must remain paused during CAN {direction} drain")
+
+
+def _can_connection_state(value, direction):
+    if value is not True:
+        raise ConnectionError(f"CAN {direction} chardev is disconnected")
+
+
+def _can_transfer_state(value, property_name, controller, target_ns, direction):
+    state = _object(value, property_name)
     schema = _field(state, "schema", property_name)
     _integer(schema, f"{property_name}.schema", 1)
     if schema != 1:
@@ -173,8 +229,8 @@ def _can_transfer_state(query, property_name, controller, target_ns, direction):
     return _object(_field(controllers, controller, "controllers"), controller)
 
 
-def _can_tx_state(query, controller, timestamp_ns, direction):
-    tx = _can_transfer_state(query, "fdcan-tx-state", controller,
+def _can_tx_state(value, controller, timestamp_ns, direction):
+    tx = _can_transfer_state(value, "fdcan-tx-state", controller,
                              timestamp_ns, direction)
     for field, maximum in (("pending_frames", 16), ("pending_bytes", 1344),
                            ("tx_dropped", 0xffffffffffffffff),
@@ -186,8 +242,8 @@ def _can_tx_state(query, controller, timestamp_ns, direction):
     return tx
 
 
-def _can_rx_state(query, controller, timestamp_ns, direction):
-    rx = _can_transfer_state(query, "fdcan-rx-state", controller,
+def _can_rx_state(value, controller, timestamp_ns, direction):
+    rx = _can_transfer_state(value, "fdcan-rx-state", controller,
                              timestamp_ns, direction)
     for field, maximum in (("completed_frames", 0xfffffffffffffffe),
                            ("partial_bytes", 83),
@@ -227,16 +283,14 @@ def observe_initial_paused_can(qmp, stream: CanStream, *, timestamp_ns: int,
     or CPU/world barrier. On failure, retain effects/resources and freeze.
     """
     _integer(timestamp_ns, "timestamp_ns", 0x7fffffffffffffff)
-    guard, query, fence = _paused_can_io(
+    guard, observe_state = _paused_can_io(
         qmp, stream, target_ns=timestamp_ns, controller=controller, chardev=chardev,
         deadline=deadline, check=check, direction="initial-baseline", initial=True)
 
     def observe():
         if stream.tx_pending or stream.buffer:
             raise RuntimeError("CAN initial baseline requires empty host queues")
-        fence()
-        tx = _can_tx_state(query, controller, timestamp_ns, "initial-baseline")
-        rx = _can_rx_state(query, controller, timestamp_ns, "initial-baseline")
+        tx, rx = observe_state()
         if tx["pending_frames"] or tx["pending_bytes"] or rx["partial_bytes"]:
             raise RuntimeError("CAN initial baseline requires empty native queues")
         _empty_can_output(stream, guard)
@@ -267,22 +321,24 @@ def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
     no-drop baseline established before that producer interval.
 
     The caller owns QMP command timeouts, liveness ``check()``, and the absolute
-    finite ``time.monotonic()`` deadline. Checks surround dependency calls; they
-    cannot preempt a blocking QMP/check/sink. Errors propagate with partial sink
-    effects and physical tails retained. The caller must freeze the attempt;
-    this function does not recover, roll back, close resources or advance time.
+    finite ``time.monotonic()`` deadline. Optional ``command_many`` batches each
+    fresh independent observation; checks surround the whole group instead of
+    each scalar reply. Batch failures propagate without fallback or retry.
+    Checks surround dependency calls and cannot preempt a blocking QMP/check/sink.
+    Errors propagate with partial sink effects and physical tails retained. The
+    caller must freeze the attempt; this function does not recover, roll back,
+    close resources or advance time.
     Success is output consumption, not a CPU/world or equal-time timer barrier.
     """
     if not callable(sink):
         raise TypeError("QMP command, check and sink must be callable")
     _integer(tx_dropped, "tx_dropped", 0xffffffffffffffff)
-    guard, query, fence = _paused_can_io(
+    guard, observe_state = _paused_can_io(
         qmp, stream, target_ns=target_ns, controller=controller, chardev=chardev,
         deadline=deadline, check=check, direction="output")
 
     def observe():
-        fence()
-        tx = _can_tx_state(query, controller, target_ns, "output")
+        tx, = observe_state()
         if tx["tx_dropped"] != tx_dropped:
             raise RuntimeError("CAN output drop count changed")
         return tx["pending_frames"] == 0
@@ -326,15 +382,14 @@ def wait_paused_can_input(qmp, stream: CanStream, *, target_ns: int,
     No time is advanced and no baseline or count is cached across calls.
     """
     _integer(completed_frames, "completed_frames", 0xfffffffffffffffe)
-    guard, query, fence = _paused_can_io(
+    guard, observe_state = _paused_can_io(
         qmp, stream, target_ns=target_ns, controller=controller, chardev=chardev,
         deadline=deadline, check=check, direction="input")
     if stream.buffer:
         raise RuntimeError("drain CAN output before waiting for input")
 
     def observe():
-        fence()
-        rx = _can_rx_state(query, controller, target_ns, "input")
+        rx, = observe_state()
         if rx["completed_frames"] > completed_frames:
             raise RuntimeError("CAN input completed count exceeds goal")
         _empty_can_output(stream, guard)
