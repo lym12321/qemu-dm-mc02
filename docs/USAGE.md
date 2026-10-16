@@ -1754,6 +1754,19 @@ FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发�
 `rx_dropped` 沿用既有累计/复位语义，完成计数不证明存储成功、固件中断或 BSP 消费，
 也不按报文时间戳调度输入，不建立 CPU/world 时间屏障。
 
+需要同时观察执行状态和 CAN 时，可读取只读的 `can-execution-state`：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"can-execution-state"}}
+```
+
+返回 `schema: 1`，以及 `execution`、`status`、`fdcan-tx-state`、`fdcan-rx-state`。
+这四项分别沿用 `x-query-virtual-execution`、`query-status` 和上述两个属性的完整返回值。
+查询不停止 CPU、不排空队列、不推进虚拟时间；任一子查询失败则整次读取失败。
+各项依次取样，运行中的 CPU 或主机输入仍可改变状态，不能将它作为原子快照或时间屏障。
+连接状态仍须通过实际 transport 对应的 `/chardevs/<id>` 的 `connected` 属性另行查询。
+现有主机 CAN helpers 暂时继续使用原来的独立查询。
+
 共享 chardev 发送 helper 在已写出部分字节后遇到阻塞或错误时，返回已写出的长度，
 调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
 字节数，不证明该次调用中未遇到后续错误，也不代表对端已消费。
