@@ -241,6 +241,10 @@ class Observation:
             self.qmps.append(qmp)
             command = qmp.command
             index = len(self.qmps) - 1
+            execution = {"peer": index, "successful_runs": 0,
+                         "first_target_ns": None, "last_target_ns": None,
+                         "last_execution": None, "last_status": None}
+            self.report.setdefault("cpu_execution", []).append(execution)
 
             def observed_command(name, arguments=None):
                 try:
@@ -250,9 +254,21 @@ class Observation:
                         "peer": index, "command": name,
                         "error": f"{type(error).__name__}: {error}"}, 16)
                     raise
-                if name in ("cont", "stop", "system_reset", "quit"):
+                first_run = name == "x-run-to-virtual-time" and not execution["successful_runs"]
+                if name == "x-run-to-virtual-time":
+                    target = arguments["target-ns"]
+                    execution["successful_runs"] += 1
+                    if first_run:
+                        execution["first_target_ns"] = target
+                    execution["last_target_ns"] = target
+                elif name == "x-query-virtual-execution":
+                    execution["last_execution"] = dict(value) if isinstance(value, dict) else value
+                elif name == "query-status":
+                    execution["last_status"] = dict(value) if isinstance(value, dict) else value
+                if name in ("cont", "stop", "system_reset", "quit") or first_run:
                     append_bounded(self.report, "qmp_events", {
-                        "peer": index, "command": name, "result": value}, 16)
+                        "peer": index, "command": name, "result": value,
+                        **({"target_ns": target} if first_run else {})}, 16)
                 return value
 
             qmp.command = observed_command
@@ -393,6 +409,9 @@ class Observation:
         close = runtime.close
 
         def observed_close():
+            # The runtime publishes only complete groups; a failed step may
+            # have later native effects beyond this retained diagnostic cut.
+            self.report["can_input_states"] = runtime.can_input_states
             if self.mode == "interrupt" and self.report.get("injected"):
                 before = list(self.report["native_calls"]["step_ns"])
                 self.report["failed_before_close"] = runtime.failed
@@ -763,11 +782,14 @@ class FirmwareObservation(Observation):
             index = len(self.qmps) - 1
             name = self.manifest.robots[index].name
             command, close = qmp.command, qmp.close
+            execution_started = False
             row = {"attempts": 0, "completed": False}
             self.report["qmp_cleanup"].append(row)
             def observed_command(operation, arguments=None):
-                if operation == "cont":
+                nonlocal execution_started
+                if operation in ("cont", "x-run-to-virtual-time") and not execution_started:
                     self.check_cont()
+                    execution_started = True
                 result = command(operation, arguments)
                 if operation == "stop":
                     self.watchdog(index, name, "paused")
@@ -931,7 +953,7 @@ class RefereeObservation(FirmwareObservation):
                         "logical_ns": runtime.t_sim_ns, "batch_identity": id(events),
                         "exact_batch": events is expected,
                         "offsets_ns": [event.offset_ns for event in events],
-                        "before_cont": not any(item["command"] == "cont"
+                        "before_cont": not any(item["command"] in ("cont", "x-run-to-virtual-time")
                                                for item in self.report["qmp_events"]), "accepted": False}
                     append_bounded(evidence, "queue_calls", row, 2)
                     result = queue(name, events, session_id=session_id)
@@ -1289,19 +1311,15 @@ def check_dji_scenario_observations(report):
 
 
 class _CanWrittenBytes:
-    """Forward each real socket write once, retaining only one physical suffix."""
+    """Match observed written prefixes, retaining only one physical suffix."""
 
-    def __init__(self, sock, observer, peer):
-        self.borrowed_socket, self.observer, self.peer = sock, observer, peer
+    def __init__(self, observer, peer):
+        self.observer, self.peer = observer, peer
         self.suffix = bytearray()
         self.cursor = 0
 
-    def __getattr__(self, name):
-        return getattr(self.borrowed_socket, name)
-
-    def send(self, data):
-        written = self.borrowed_socket.send(data)
-        self.suffix.extend(data[:written])
+    def observe(self, data):
+        self.suffix.extend(data)
         while len(self.suffix) >= 84:
             raw = bytes(self.suffix[:84])
             del self.suffix[:84]
@@ -1316,7 +1334,6 @@ class _CanWrittenBytes:
             if raw[:20] != expected or raw[20:28].hex() != row["data_hex"] or raw[28:] != bytes(56):
                 raise ValueError("DJI Scenario physical CAN bytes differ from original source send")
             self.cursor += 1
-        return written
 
 
 def _dji_command_summary():
@@ -1324,12 +1341,24 @@ def _dji_command_summary():
             "first": None, "last": None, "transitions": []}
 
 
-def _record_dji_command(summary, row):
+def _dji_command_invalid_field(row):
     data = row["data_hex"]
-    if (row["can_id"] not in (0x200, 0x1ff) or row["flags"] != 0 or row["dlc"] != 8
-            or data not in ("0040ffc000000000", "0000000000000000")
-            or row["can_id"] == 0x1ff and data != "0000000000000000"):
+    if row["can_id"] not in (0x200, 0x1ff):
+        return "can_id"
+    if row["flags"] != 0:
+        return "flags"
+    if row["dlc"] != 8:
+        return "dlc"
+    if (data not in ("0040ffc000000000", "0000000000000000") or
+            row["can_id"] == 0x1ff and data != "0000000000000000"):
+        return "data_hex"
+    return None
+
+
+def _record_dji_command(summary, row):
+    if _dji_command_invalid_field(row) is not None:
         raise ValueError("DJI Scenario command differs from literal CURRENT profile: " + repr(row))
+    data = row["data_hex"]
     if summary["count"] >= 10000:
         raise BufferError("DJI Scenario command observation exhausted")
     summary["count"] += 1
@@ -1356,6 +1385,22 @@ class DjiScenarioObservation(FirmwareObservation):
         self.buffers = {name: bytearray() for name in DJI_SCENARIO_MEMBERS}
         self.written = []
 
+    def _reject_command(self, name, layer, row, field, error):
+        if self.report.get("first_rejected_command") is not None:
+            return
+        wire = row.get("wire_hex")
+        self.report["first_rejected_command"] = {
+            "member": name, "layer": layer, "field": field, "row": dict(row),
+            "wire_hex": wire, "error_type": type(error).__name__, "error": str(error)}
+
+    def _record_command(self, group, name, layer, row):
+        try:
+            _record_dji_command(self.report[group][name], row)
+        except BaseException as error:
+            self._reject_command(name, layer, row,
+                                 _dji_command_invalid_field(row) or "observation_capacity", error)
+            raise
+
     def world(self, manifest):
         try:
             plant = super().world(manifest)
@@ -1371,7 +1416,7 @@ class DjiScenarioObservation(FirmwareObservation):
                     if reset is None:
                         raise ValueError("DJI Scenario command delivery preceded actual RESET epoch")
                     epoch = reset["decoded"]["virtual_time_ns"]
-                    _record_dji_command(self.report["command_deliveries"][name], {
+                    self._record_command("command_deliveries", name, "Fabric delivery", {
                         "peer": peer, "can_id": frame.can_id, "flags": frame.flags,
                         "dlc": frame.dlc, "data_hex": frame.data.hex(),
                         "mapped_qemu_ns": epoch + delivery.timestamp_ns,
@@ -1395,24 +1440,55 @@ class DjiScenarioObservation(FirmwareObservation):
                 # Retain original bytes before the original receive consumes them.
                 # The production codec still owns decoding and validation.
                 if len(raw) != 84:
-                    raise ValueError("DJI Scenario command wire is not84 bytes")
+                    error = ValueError("DJI Scenario command wire is not84 bytes")
+                    self._reject_command(name, "CAN records before codec",
+                        {"peer": peer, "wire_hex": raw.hex()}, "wire_length", error)
+                    raise error
                 row = {"peer": peer, "can_id": int.from_bytes(raw[:4], "little"),
                     "flags": int.from_bytes(raw[4:8], "little"), "dlc": raw[8],
                     "qemu_ns": int.from_bytes(raw[12:20], "little"),
                     "data_hex": raw[20:28].hex(), "wire_hex": raw.hex()}
                 if raw[9:12] != bytes(3) or raw[28:] != bytes(56):
-                    raise ValueError("DJI Scenario command wire reserved bytes disagree")
-                _record_dji_command(self.report["command_wire"][name], row)
+                    error = ValueError("DJI Scenario command wire reserved bytes disagree")
+                    self._reject_command(name, "CAN records before codec", row,
+                        "header_reserved" if raw[9:12] != bytes(3) else "payload_padding", error)
+                    raise error
+                self._record_command("command_wire", name, "CAN records before codec", row)
                 yield raw
         stream.receive_records = observed_records
-        written = _CanWrittenBytes(sock, self, peer)
+        written = _CanWrittenBytes(self, peer)
         self.written.append(written)
-        stream.sock = written
+        flush = stream.flush
+
+        def observe_progress(before):
+            after = b"".join(bytes(view) for view in stream.tx_queue)
+            if len(after) > len(before) or not before.endswith(after):
+                raise ValueError("DJI Scenario CAN flush did not retain the original suffix")
+            written.observe(before[:len(before) - len(after)])
+
+        def observed_flush():
+            before = b"".join(bytes(view) for view in stream.tx_queue)
+            try:
+                result = flush()
+            except BaseException as error:
+                try:
+                    observe_progress(before)
+                except BaseException as observation:
+                    error.add_note("DJI Scenario CAN flush observation failed: " +
+                                   f"{type(observation).__name__}: {observation}")
+                    if observation is not error:
+                        for note in tuple(getattr(observation, "__notes__", ())):
+                            error.add_note(note)
+                raise
+            observe_progress(before)
+            return result
+
+        stream.flush = observed_flush
         return stream
 
     def command(self, index, can_id, flags, dlc, stamp, data):
         name = self.manifest.robots[index].name
-        _record_dji_command(self.report["commands"][name], {"peer": index,
+        self._record_command("commands", name, "CAN decoded ingress", {"peer": index,
             "can_id": can_id, "flags": flags, "dlc": dlc, "qemu_ns": stamp, "data_hex": data.hex()})
 
     def shared(self, *args, **options):
@@ -1431,7 +1507,8 @@ class DjiScenarioObservation(FirmwareObservation):
             def observed_setter(name, delay_ns):
                 peer = [item.name for item in self.manifest.robots].index(name)
                 row = {"member": name, "delay_ns": delay_ns, "logical_ns": runtime.t_sim_ns,
-                    "before_cont": not any(item["command"] == "cont" for item in self.report["qmp_events"]),
+                    "before_cont": not any(item["command"] in ("cont", "x-run-to-virtual-time")
+                                           for item in self.report["qmp_events"]),
                     "accepted": False, "pending_sources": [dict(device=index, **source)
                         for index in range(peer * 4, peer * 4 + 4)
                         for source in self.feedback_sources[index].values()],
@@ -1996,7 +2073,19 @@ def main(args):
                 assert str(primary) == "interrupted by signal 15"
                 assert report.get("terminal_retry_verified")
             elif args.mode == "reset":
-                assert isinstance(primary, V2SessionReset)
+                assert any(event["peer"] == 0 and event["command"] == "system_reset"
+                           for event in report["qmp_events"])
+                if isinstance(primary, V2SessionReset):
+                    report["reset_observation"] = "cosim_session_reset"
+                else:
+                    assert type(primary) is RuntimeError
+                    assert str(primary) == "CAN input execution target is not reached"
+                    execution = report["cpu_execution"][0]
+                    assert execution["last_execution"]["state"] == "cancelled"
+                    assert execution["last_execution"]["target-ns"] == execution["last_target_ns"]
+                    assert execution["last_status"]["running"] is False
+                    assert execution["last_status"]["status"] == "paused"
+                    report["reset_observation"] = "native_cancelled_before_next_cpu"
             elif args.mode == "peer-exit" and isinstance(primary, ExecInterruptedError):
                 # QEMU can disconnect this native QMP before its quit response
                 # or the following snapshot. Require the actual exit0 as well;

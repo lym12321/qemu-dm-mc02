@@ -25,6 +25,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim import processes
 from sim.arena import runtime
 from sim.arena.manifest import load_manifest
+from sim.boards import qemu as board_qmp
 from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
@@ -38,7 +39,7 @@ from tools import dm_mc02_firmware_rtf as rtf
 from test_arena_manifest import ROBOT_DOCUMENT, referee_configuration, write_arena, write_executable
 from test_lab_runtime import snapshot
 from test_robot_runtime import Pipe
-from test_sim_shared_world import Boards, NativeStub, can_wire
+from test_sim_shared_world import Boards, NativeCpuQmp, NativeStub, can_wire
 
 
 class Peer:
@@ -100,6 +101,8 @@ class Environment:
         self.uart_chunks, self.uart_reads = [[], []], [0, 0]
         self.uart_port_chunks, self.uart_port_reads, self.uart_send_budget = {}, {}, {}
         self.can_commands = [None, None]
+        self.can_intervals = [{}, {}]
+        self.cpus, self.execution_events = {}, []
         self.snapshots = [[], []]
         self.sockets, self.producers = {}, {}
         self.boards = self.plant = None
@@ -121,7 +124,7 @@ class Environment:
         monkeypatch.setattr(runtime, "stop", self.stop)
         clock = SimpleNamespace(monotonic=lambda: self.clock,
                                 monotonic_ns=lambda: round(self.clock * 1e9))
-        for module in (runtime, shared_world, cosim, rtf):
+        for module in (runtime, shared_world, board_qmp, cosim, rtf):
             monkeypatch.setattr(module, "time", clock)
         monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select))
 
@@ -177,11 +180,11 @@ class Environment:
         self.clock += self.connect_delay
         if self.connection_failure == (index, "qmp"):
             raise OSError(f"peer{index} qmp connection failure")
-        return SimpleNamespace(command=lambda name, arguments=None: self.command(index, name),
+        return SimpleNamespace(command=lambda name, arguments=None: self.command(index, name, arguments),
                                settimeout=lambda value: None,
                                close=lambda: self.close_qmp(index))
 
-    def connect(self, path, timeout):
+    def connect(self, path, timeout, *, wrapped_can=False):
         index, name = int(Path(path).parent.name[-1]), Path(path).name
         self.events.append(f"peer{index} {name} connect")
         self.clock += self.connect_delay
@@ -190,10 +193,16 @@ class Environment:
         left, right = socket.socketpair()
         for sock in (left, right):
             sock.setblocking(False)
-        value = Peer(self, index, name, left, right)
+        # Native execution admission needs this exact original AF_UNIX socket.
+        # Direct observer isolation alone opts into a physical-write wrapper.
+        value = left if name == "can1" and not wrapped_can else Peer(self, index, name, left, right)
         self.sockets[index, name], self.producers[index, name] = value, right
-        if name == "can1" and self.can_commands[index] is not None:
-            right.send(can_wire((1000, 2000)[index], self.can_commands[index]))
+        if name == "can1":
+            cpu = NativeCpuQmp(index, right, (1000, 2000)[index], self.native, self.execution_events)
+            cpu.output = self.can_intervals[index]
+            self.cpus[index] = cpu
+            if self.can_commands[index] is not None:
+                self.schedule_can(index, can_wire((1000, 2000)[index], self.can_commands[index]), interval=1)
         if all((number, "cosim") in self.producers for number in range(2)):
             if self.boards is None:
                 self.boards = Boards(tuple(self.producers[number, "cosim"] for number in range(2)),
@@ -206,15 +215,26 @@ class Environment:
         if label in self.close_failures:
             raise OSError(label + " close failure")
 
-    def command(self, index, name):
+    def command(self, index, name, arguments=None):
         self.qmp_callback(index, name)
-        if name == "qom-get":
-            stamp = (1000, 2000)[index] + sum(self.native.steps) + 100 * len(self.snapshots[index])
+        if name == "qom-get" and arguments == {"path": "/machine", "property": "board-state"}:
+            stamp = self.cpus[index].current
             self.snapshots[index].append((stamp, self.uart_reads[index]))
             return snapshot(stamp)
         self.events.append(f"peer{index} {name}")
         if name == "stop":
             self.pause_callback(index)
+            return
+        return self.cpus[index].command(name, arguments)
+
+    def schedule_can(self, index, raw, *, interval=None):
+        """The native producer emits these literal bytes inside one CPU run."""
+        if interval is None:
+            interval = len(self.cpus[index].requests) + 1
+        self.can_intervals[index][interval] = self.can_intervals[index].get(interval, b"") + raw
+
+    def received_can(self, index):
+        return bytes(self.cpus[index].received)
 
     def popen(self, argv, **kwargs):
         self.launches.append((list(argv), kwargs))
@@ -260,14 +280,14 @@ class Environment:
 
     def assert_clean(self):
         assert self.native.closed == (1 if self.plant is not None else 0)
-        assert all(peer.sock.fileno() == -1 for peer in self.sockets.values())
+        assert all(peer.fileno() == -1 for peer in self.sockets.values())
         assert all(process.stdout.file.closed and process.stderr.file.closed
                    for process in self.children)
         assert all(f"owner{index} cleanup" in self.events for index in range(len(self.owners)))
 
     def release(self):
         for peer in self.sockets.values():
-            peer.sock.close()
+            (peer.sock if isinstance(peer, Peer) else peer).close()
         for producer in self.producers.values():
             producer.close()
         for process in self.children:
@@ -378,13 +398,38 @@ def arena_tool_observation(environment, monkeypatch):
     report = {"native_calls": {"reset": 0, "step_ns": [], "close": 0},
               "feedback": [], "commands": [], "can_receive_errors": []}
     observer = tool.Observation(report, manifest, "normal")
-    decisions, writes, streams = [], [], []
+    decisions, writes, streams, write_hook = [], [], [], [None]
     def acquire(actual):
         plant = environment.create_plant(actual)
         for bus in dict.fromkeys(device.bus for device in plant.devices):
             bus.log = decisions.append
         return plant
-    observer.original_world, observer.original_can = acquire, runtime.CanStream
+    canonical = runtime.CanStream
+    def physical_can(sock):
+        stream = canonical(sock)
+        if isinstance(sock, Peer):
+            return stream  # Direct IO isolation keeps its existing send hook.
+        index = next(index for (index, name), peer in environment.sockets.items()
+                     if name == "can1" and peer is sock)
+        flush = stream.flush
+        def physical_flush():
+            before = b"".join(stream.tx_queue)
+            if not before:
+                return flush()
+            event = report["feedback"][-1]
+            decision = next(row for row in reversed(decisions) if row.destination == "qemu")
+            attempt = index, decision, event["accepted"], observer.feedback_deliveries[index]
+            if write_hook[0] is not None:
+                write_hook[0](index, before)
+            result = flush()
+            after = b"".join(stream.tx_queue)
+            assert before.endswith(after)
+            if len(before) != len(after):
+                writes.append(attempt)
+            return result
+        stream.flush = physical_flush
+        return stream
+    observer.original_world, observer.original_can = acquire, physical_can
     monkeypatch.setattr(runtime, "create_arena_plant", observer.world)
     monkeypatch.setattr(runtime, "CanStream", observer.can)
     # Select only the tool's input assertion profile. Actual current still
@@ -404,14 +449,15 @@ def arena_tool_observation(environment, monkeypatch):
         plant.reset(Session(7, 500))
         for index, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
             bus.reset(500)
-            peer = environment.connect(environment.directory / f"peer{index}" / "can1", 1)
+            peer = environment.connect(environment.directory / f"peer{index}" / "can1", 1, wrapped_can=True)
             stream = observer.can(peer)
             streams.append(stream)
             endpoint = QemuCanEndpoint(bus, stream)
             endpoint.bind_mapper(cosim.QemuTimestampMapper((1000, 2000)[index], 500))
         return plant.devices[0], streams[0]
     return SimpleNamespace(tool=tool, observer=observer, report=report, manifest=manifest,
-                           decisions=decisions, writes=writes, streams=streams, direct=direct)
+                           decisions=decisions, writes=writes, streams=streams, direct=direct,
+                           write_hook=write_hook)
 
 
 @pytest.mark.parametrize("invalid", ["missing-source", "source-time", "payload", "can-id"])
@@ -591,7 +637,7 @@ def test_arena_tool_observation_actual_socket_sources_follow_overtaking_and_equa
     def restore(value, member, delay):
         if value.t_sim_ns == 2_000_500:
             monkeypatch.setattr(fixture.tool, "COMMANDS", ("2000000000000000", "f000000000000000"))
-            environment.producers[0, "can1"].send(can_wire(1000, "2000 0000 0000 0000"))
+            environment.schedule_can(0, can_wire(1000, "2000 0000 0000 0000"))
     observed.after_set = restore
     actions = ((0, "east", 2_000_000), (2_000_000, "east", 0)) if delayed else ()
     if via_scenario:
@@ -650,7 +696,7 @@ def test_arena_tool_observation_actual_socket_sources_follow_overtaking_and_equa
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
             bytes.fromhex("0000 0000 " + (current if motor_id == 1 else "0000") + " 19 00").ljust(64, b"\0"))
             for stamp, current in group for motor_id in range(1, 5))
-        assert environment.producers[index, "can1"].recv(4096) == expected
+        assert environment.received_can(index) == expected
 
 
 @pytest.mark.parametrize("interrupt", [False, True], ids=["io-error", "interrupt"])
@@ -661,13 +707,10 @@ def test_arena_tool_observation_send_failure_retains_source_and_original_runtime
     environment.world_close_failure = OSError("observer cleanup failed")
     environment.world_close_failure.add_note("observer nested cleanup evidence")
     calls = []
-    send = Peer.send
-    def reject(peer, data):
-        if peer.name == "can1":
-            calls.append((peer.index, bytes(data)))
-            raise primary
-        return send(peer, data)
-    monkeypatch.setattr(Peer, "send", reject)
+    def reject(index, data):
+        calls.append((index, bytes(data)))
+        raise primary
+    fixture.write_hook[0] = reject
     with pytest.raises(type(primary)) as caught:
         environment.run(environment.manifest(upper=True), duration=.001)
     assert caught.value is primary
@@ -818,7 +861,7 @@ def test_loaded_scenario_can_delays_consumes_actual_arena_bus_without_rereading(
     environment.can_commands[0] = "1000 0000 0000 0000"
     def after_set(value, member, delay):
         if value.t_sim_ns == 500_000:
-            environment.producers[0, "can1"].send(can_wire(1000, "0800 0000 0000 0000"))
+            environment.schedule_can(0, can_wire(1000, "0800 0000 0000 0000"))
     observed.after_set = after_set
     if via_cli:
         from sim import cli
@@ -874,7 +917,7 @@ def test_loaded_scenario_can_delays_consumes_actual_arena_bus_without_rereading(
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
             (current if index == 0 and motor_id == 1 else zero).ljust(64, b"\0"))
             for motor_id in range(1, 5))
-        assert environment.producers[index, "can1"].recv(4096) == expected
+        assert environment.received_can(index) == expected
 
 
 @pytest.mark.parametrize("duration_ns,seconds,scheduled", [
@@ -1232,7 +1275,7 @@ def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_st
 
 
 @pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
-def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admission(
+def test_can_delay_schedule_keeps_queued_native_interval_wire_policy_by_actual_admission(
         environment, monkeypatch, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
     deliveries, ingresses, boundaries = ([], []), [], []
@@ -1248,19 +1291,15 @@ def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admi
         ingresses.append((frame.timestamp_ns, frame.data, current_time_ns, value.bus.delay_ns))
         return ingest(value, frame, current_time_ns)
     monkeypatch.setattr(QemuCanEndpoint, "ingest", admission)
-    def observe_step(index, frame):
-        if index == 0 and frame.header.kind == 2 and frame.header.step_id == 1:
-            # Physical input during the completed interval's ACK wait. Its
-            # future source time must not select the later zero-delay policy.
-            environment.producers[0, "can1"].send(can_wire(1_701_000, "3000 0000 0000 0000"))
-        return False
     def after_set(value, member, delay):
         boundaries.append((value.t_sim_ns, tuple(item.endpoint.bus.pending for item in value.bindings)))
         if value.t_sim_ns == 0:
-            environment.boards.on_frame = observe_step
+            # CPU output is drained in its explicit interval, before world or
+            # ACK work. Its future metadata retains this admitted delay policy.
+            environment.schedule_can(0, can_wire(1_701_000, "3000 0000 0000 0000"), interval=1)
         elif value.t_sim_ns == 1_500_000:
-            # This older-stamped command remains unread until after control.
-            environment.producers[0, "can1"].send(can_wire(1_201_000, "2000 0000 0000 0000"))
+            # The next CPU interval emits an older-stamped command after control.
+            environment.schedule_can(0, can_wire(1_201_000, "2000 0000 0000 0000"))
     observed.after_set = after_set
     environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
     actions = ((0, "east", 2_000_000), (1_000_000, "east", 3_000_000), (1_500_000, "east", 0))
@@ -1278,12 +1317,12 @@ def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admi
     old, future, newer = (bytes.fromhex(value) for value in (
         "1000 0000 0000 0000", "3000 0000 0000 0000", "2000 0000 0000 0000"))
     assert [row for row in ingresses if row[1] in (future, newer)] == [
-        (1_701_000, future, 1_000_000, 2_000_000), (1_201_000, newer, 1_500_000, 0)]
+        (1_701_000, future, 0, 2_000_000), (1_201_000, newer, 1_500_000, 0)]
     assert [(row.frame.data, row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.late)
             for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
         (newer, 6, 1_200_000, 1_200_000, 1_500_000, True),
         (old, 0, 0, 2_000_000, 2_500_000, True),
-        (future, 5, 1_700_000, 3_700_000, 4_000_000, True)]
+        (future, 1, 1_700_000, 3_700_000, 4_000_000, True)]
     # Independent C620 layouts, fixed stationary rotor and separate QEMU epochs.
     # New feedback overtakes the completed1ms batch, whose old2ms due remains.
     zero = bytes.fromhex("0000 0000 0000 19 00")
@@ -1295,10 +1334,10 @@ def test_can_delay_schedule_keeps_queued_and_ack_wait_wire_policy_by_actual_admi
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
             (bytes.fromhex("0000 0000 " + current + " 19 00") if motor_id == 1 else zero).ljust(64, b"\0"))
             for stamp, current in groups for motor_id in range(1, 5))
-        assert environment.producers[index, "can1"].recv(4096) == expected
+        assert environment.received_can(index) == expected
     assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns)
             for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
-        (7, 2_500_000, 2_500_000, 2_500_000), (1, 1_000_000, 3_000_000, 3_500_000),
+        (7, 2_500_000, 2_500_000, 2_500_000), (2, 1_000_000, 3_000_000, 3_500_000),
         (11, 3_500_000, 3_500_000, 3_500_000), (15, 4_000_000, 4_000_000, 4_000_000)]
     ratio = 3591 / 187  # Pinned DJI M3508 specification, no production converter.
     expected_currents = ((0, -4096), (0, -4096), (8192, -4096), (4096, -4096), (4096, -4096))
@@ -1467,6 +1506,13 @@ def test_setup_interrupt_after_factory_return_closes_caller_owned_plant(environm
 def test_one_owner_canonical_aliases_literal_upper_commands_and_exact_final_tick(environment):
     environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
     responses, events = [], []
+    def before_cpu_request(index, name):
+        if name != "x-run-to-virtual-time":
+            return
+        completed = len(environment.cpus[index].requests)
+        assert all(len(cpu.receipts) == 4 * completed for cpu in environment.cpus.values())
+        assert [frame.header.kind for _, frame, _ in responses[-2:]] == [5 if not completed else 3] * 2
+    environment.qmp_callback = before_cpu_request
     result = environment.run(environment.manifest(upper=True), emit=events.append,
                              on_response=lambda *item: responses.append(item))
     environment.events.append("returned")
@@ -1497,7 +1543,20 @@ def test_one_owner_canonical_aliases_literal_upper_commands_and_exact_final_tick
     assert [name for name, _, _ in responses] == ["east", "west"] * 4
     assert [frame.header.kind for _, frame, _ in responses] == [5, 5, 3, 3, 3, 3, 3, 3]
     assert environment.boards.events[:2] == [(0, 1, 0, ()), (1, 1, 0, ())]
-    assert all("-S" in command for _, command, _, _ in environment.owners)
+    for _, command, _, _ in environment.owners:
+        assert "-S" in command
+        assert command[command.index("-accel") + 1] == "tcg,thread=single"
+        assert command[command.index("-icount") + 1] == "shift=0,align=off,sleep=off"
+    assert not any(event.endswith(" cont") for event in environment.events)
+    assert [environment.cpus[index].requests for index in range(2)] == [
+        [1_001_000, 2_001_000, 2_501_000], [1_002_000, 2_002_000, 2_502_000]]
+    for index in range(2):
+        cpu = environment.cpus[index]
+        assert type(environment.sockets[index, "can1"]) is socket.socket
+        assert cpu.state == "reached" and cpu.current == cpu.requests[-1]
+        # Two completed 1ms batches; the final 0.5ms crosses no feedback period.
+        assert len(cpu.receipts) == cpu.completed == 8 and not cpu.partial
+        assert b"".join(cpu.receipts) == environment.received_can(index)
     assert len(environment.launches) == 2  # Upper processes only: no chassis workers.
     for (argv, options), member in zip(environment.launches, environment.manifest(upper=True).robots):
         assert argv == list(member.robot.upper_computers[0].command)
@@ -1508,6 +1567,23 @@ def test_one_owner_canonical_aliases_literal_upper_commands_and_exact_final_tick
     assert len(result.children) == 2
     with pytest.raises(FrozenInstanceError):
         result.origin_ns = 1
+
+
+def test_later_native_cpu_target_failure_keeps_partial_execution_and_cleans_all(environment):
+    primary = OSError("second CPU target refused")
+    def reject(index, name):
+        if index == 1 and name == "x-run-to-virtual-time":
+            raise primary
+    environment.qmp_callback = reject
+    with pytest.raises(OSError) as caught:
+        environment.run(environment.manifest(upper=True))
+    assert caught.value is primary
+    environment.assert_clean()
+    assert environment.native.resets == 1 and environment.native.steps == []
+    assert environment.cpus[0].requests == [1_001_000] and environment.cpus[0].state == "running"
+    assert environment.cpus[1].requests == [] and environment.cpus[1].state == "idle"
+    assert all(not cpu.receipts for cpu in environment.cpus.values())
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
 
 
 def test_independent_split_nul_markers_use_post_read_stamps_and_completed_world_origin(environment):

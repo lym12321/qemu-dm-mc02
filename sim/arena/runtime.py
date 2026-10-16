@@ -1,8 +1,9 @@
 """Two native QEMUs and upper processes around one admitted joint world.
 
-Duration uses shared logical world time. UART observations retain their own
-QEMU time bounds; ACKs and bounded IO waits do not establish a CPU barrier or
-wall-clock pacing. Any failure requires recreation of the complete run.
+Duration uses shared logical world time. Native CPU targets and paused CAN
+receipts surround the sole world step. UART observations retain their own QEMU
+time bounds; target completion does not close equal-time IRQ/device events or
+establish wall-clock pacing. Any failure requires recreation of the complete run.
 """
 
 from dataclasses import dataclass
@@ -19,7 +20,9 @@ from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready
-from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
+from sim.robots.shared_world import (
+    BoardBinding, BoardExecution, RefereeBinding, SharedWorldRuntime,
+)
 from sim.transports import StreamTransport, connect_unix
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import StepFramedSocket
@@ -72,7 +75,7 @@ class ArenaResult:
     limits: tuple[str, ...] = (
         "Fixed two-chassis toy profile; physical parameters are uncalibrated.",
         "Duration is shared logical time; QEMU epochs remain independent.",
-        "ACK/DONE and bounded IO waits do not establish CPU lockstep or wall pacing.",
+        "Native CPU cuts do not close equal-time IRQ/device events or establish wall pacing.",
         "Omitted ready markers do not verify application readiness or sensor consumption.",
         "Response callbacks see actual observations, not a complete wire trace.",
         "Child output retains bounded sampled tails and may encounter pipe backpressure.",
@@ -266,7 +269,9 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
         uart = member.robot.ready.endpoint.split(".", 1)[1] if member.robot.ready else "uart1"
         uarts = tuple(dict.fromkeys((uart, "uart7") if member.name in configured else (uart,)))
         sockets = ("qmp", "cosim", "can1", *uarts)
-        commands.append((member, uarts, sockets, qemu_command(firmware, binary, sockets)))
+        command = qemu_command(firmware, binary, sockets)
+        command += ["-accel", "tcg,thread=single", "-icount", "shift=0,align=off,sleep=off"]
+        commands.append((member, uarts, sockets, command))
     runtime = None
     resources, contexts = [], []
     referees = []
@@ -315,7 +320,10 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             bus = plant.devices[offset].bus
             offset += len(member.robot.devices)
             bindings.append(BoardBinding(member.name, QemuCanEndpoint(bus, peer.can),
-                                          peer.cosim, member.prefix[:-1]))
+                peer.cosim, member.prefix[:-1], BoardExecution(
+                    lambda name, arguments=None, peer=peer: run.call(
+                        peer, lambda: peer.qmp.command(name, arguments)),
+                    "dm-mc02.fdcan1", "can1")))
             for upper in member.robot.upper_computers:
                 run.guard()
                 process = subprocess.Popen(list(upper.command), cwd=upper.cwd, shell=False,
@@ -356,8 +364,6 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
         for peer, response in zip(run.peers, responses):
             peer.reset_qemu_ns = codec.decode_reset_ack_payload(response.payload).virtual_time_ns
             peer.last_ns = run.call(peer, peer.board.snapshot)["timestamp_ns"]
-        for peer in run.peers:
-            run.call(peer, peer.board.resume)
         def pump():
             ready = run.pump()
             now = runtime.t_sim_ns

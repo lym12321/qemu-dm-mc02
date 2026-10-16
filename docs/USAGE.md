@@ -303,6 +303,10 @@ print(result.origin_ns, result.end_ns, result.boards)
 后续 QEMU、连接、上位机和 ready 等待使用同一期限。模型 binding 在进程启动前准入。
 运行层直接使用两组原生 QMP/co-sim/CAN/UART 连接和唯一 shared-world runtime，
 上位机保持各子配置的原样 argv、工作目录和独立进程组。
+Arena 默认以单线程 TCG、固定 `icount shift=0` 和 `-S` 启动两块板，并将 CPU
+执行交给 shared-world runtime。每步所有 CPU 到达映射目标且 CAN 输出排空后，
+世界才推进一次；反馈的原生输入处理回执完成后才允许下一步。运行期间须由此入口
+独占 CPU 控制、原始 CAN 连接及配置。
 
 `duration` 是所有声明的 UART ready 标记匹配之后的共享世界时间，范围 1 ns–3600 s；
 省略所有标记时从世界时间 0 开始。ready 等待期间继续提供世界输入，匹配后不再次 reset。
@@ -328,7 +332,8 @@ UART7 接收初始化后输出。每个成员匹配自己的标记后，发布�
 提前退出（包括退出码 0）、期限、RESET/EOF、QMP、transport、solver、输出或清理错误
 均使本次运行失败。成功只在独立清理世界、上位机、连接和两组 QEMU 后返回。
 native 准入及各资源的有界清理不计入 active host 期限，阻塞 native 调用仍需外层 timeout。
-该固定 profile 尚不提供独立 QMP/GDB 参数、wall-clock pacing 或 CPU 时间屏障。
+该固定 profile 尚不提供独立 QMP/GDB 参数或 wall-clock pacing。CPU 目标完成
+不代表同刻 IRQ/器件事件全部闭合，CAN 输入处理也不代表固件消费。
 
 实际进程与数据交付的验证入口为：
 
@@ -1028,7 +1033,8 @@ rmdir -- "$dm_run_dir"
 实验性原生 QMP 执行接口可让一个 CPU 在指定的绝对虚拟时间暂停。直接启动 QEMU 时使用
 `-accel tcg,thread=single -S -icount shift=0,align=off,sleep=off`，保留原生 QMP 连接。
 该接口要求一个 CPU、固定 icount、paused/prelaunch，且没有 replay、block node/backend、
-用户 IOThread、活动 migration 或后台 dump。默认 launcher 和 Arena 暂未接入此接口。
+用户 IOThread、活动 migration 或后台 dump。Arena 通过 shared-world runtime
+使用该接口；直接启动的调用方自行拥有执行顺序。
 
 ```json
 {"execute":"x-run-to-virtual-time","arguments":{"target-ns":1000000}}
@@ -2307,9 +2313,8 @@ plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续
 
 Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
 
-当前 Debug/Release 原生场景门尚未通过：QEMU CPU 虚拟时钟推进快于共享世界的
-1ms 步，带未来时间戳的周期命令积压后触发 CAN 容量拒绝。该入口保留诊断报告；
-CPU 与共享世界时间边界落实前，不能把这个夹具视为已验证的原生消费者。
+历史 Debug/Release 原生场景门因 CPU 与共享世界推进失配、周期命令积压而失败。
+Arena 现已接入分段 CPU 执行；该专用固件场景的重新验证尚未完成，原失败报告保留。
 
 ```bash
 cd ../trobot

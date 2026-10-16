@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import shlex
+import socket
 import struct
 import subprocess
 import signal
@@ -28,7 +29,7 @@ from sim.fabric.endpoints import QemuCanEndpoint
 from sim.transports.cosim import QemuTimestampMapper
 from sim.transports import StreamTransport
 from sim.scenario import ScenarioCanDelay, load_manifest as load_scenario, runtime as scenario_runtime
-from test_arena_runtime import Environment
+from test_arena_runtime import Environment, Peer
 from test_sim_shared_world import can_wire
 
 
@@ -157,7 +158,7 @@ def dji_scenario_observation(tmp_path, monkeypatch):
         streams = []
         for index, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
             bus.reset(0)
-            peer = environment.connect(tmp_path / f"peer{index}" / "can1", 1)
+            peer = environment.connect(tmp_path / f"peer{index}" / "can1", 1, wrapped_can=True)
             stream = observer.can(peer)
             endpoint = QemuCanEndpoint(bus, stream)
             endpoint.bind_mapper(QemuTimestampMapper((1000, 2000)[index], 0))
@@ -471,26 +472,27 @@ def dji_scenario_consumed(dji_scenario_observation):
     environment, observer, report = fixture.environment, fixture.observer, fixture.report
     environment.can_commands = ["0040ffc000000000"] * 2
     environment.uart_chunks = [[b"TTEST READY dji.scenario.ready 0 0\n"] for _ in range(2)]
-    received = [bytearray(), bytearray()]
     controls = [bytearray(), bytearray()]
-    published, commands = set(), set()
+    published = set()
+    # Fixed 10ms command cadence belongs to the native interval producer, not
+    # arbitrary QMP queries. Initial literal commands emit in interval1.
+    for index, origin in enumerate((1000, 2000)):
+        for now in range(10_000_000, 1_000_000_000, 10_000_000):
+            raw = "0040ffc000000000" if now < 280_000_000 else "0000000000000000"
+            environment.schedule_can(index, can_wire(origin + now, raw),
+                                     interval=now // 1_000_000 + 1)
     def service(index, operation):
         now = sum(environment.native.steps)
-        if operation == "cont":
+        if operation == "x-run-to-virtual-time" and not environment.cpus[index].requests:
             observer.check_cont()
-            report["qmp_events"].append(dict(peer=index, command="cont"))
-        if operation != "qom-get" or (index, "can1") not in environment.producers:
+            report["qmp_events"].append(dict(peer=index, command=operation))
+        if operation != "qom-get":
             return
-        for name, destination in (("can1", received[index]), ("uart1", controls[index])):
-            if (index, name) in environment.producers:
-                try:
-                    destination.extend(environment.producers[index, name].recv(4096))
-                except BlockingIOError:
-                    pass
-        if now % 10_000_000 == 0 and (index, now) not in commands:
-            commands.add((index, now))
-            raw = "0040ffc000000000" if now < 280_000_000 else "0000000000000000"
-            environment.producers[index, "can1"].send(can_wire((1000, 2000)[index] + now, raw))
+        if (index, "uart1") in environment.producers:
+            try:
+                controls[index].extend(environment.producers[index, "uart1"].recv(4096))
+            except BlockingIOError:
+                pass
         if now == 20_000_000 and (index, 1) not in published:
             published.add((index, 1))
             rows = [row for row in scenario_case_rows() if row["name"] in
@@ -511,6 +513,8 @@ def dji_scenario_consumed(dji_scenario_observation):
     for name in ("east", "west"):
         arena_module.check_dji_scenario_coverage(report["cases"][name], report["summaries"][name])
     arena_module.check_dji_scenario_observations(report)
+    # NativeCpuQmp is the only CAN input reader; this exposes its actual bytes.
+    received = [environment.cpus[index].received for index in range(2)]
     return SimpleNamespace(**vars(fixture), result=result, received=received, controls=controls)
 
 
@@ -526,6 +530,8 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
     assert observer.feedback_deliveries == {0: None, 1: None}
     assert all(binding.endpoint.bus.delay_ns == 0 and not binding.endpoint.stream.tx_pending
                for binding in observer.runtime.bindings)
+    assert report["qmp_events"] == [dict(peer=index, command="x-run-to-virtual-time") for index in range(2)]
+    assert report.get("first_rejected_command") is None
     evidence = report["scenario_observation"]
     assert [(row["logical_ns"], row["member"], row["delay_ns"], row["before_cont"])
             for row in evidence["actions"]] == [(0, "east", 5_000_000, True), (250_000_000, "east", 0, False)]
@@ -533,6 +539,12 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
     assert all(245_000_000 < row["world_ns"] <= 250_000_000
                for row in evidence["actions"][1]["pending_sources"])
     for index, name in enumerate(("east", "west")):
+        cpu = fixture.environment.cpus[index]
+        binding = observer.runtime.bindings[index]
+        assert binding.endpoint.stream.sock is fixture.environment.sockets[index, "can1"]
+        assert type(binding.endpoint.stream.sock) is socket.socket
+        assert len(cpu.requests) == 1000 and cpu.requests[0] == (1000, 2000)[index] + 1_000_000
+        assert cpu.requests[-1] == (1000, 2000)[index] + 1_000_000_000
         assert [evidence["samples"][name][phase]["logical_ns"] for phase in ("1", "2")] == [20_000_000, 260_000_000]
         assert evidence["stages"][name]["logical_ns"] == 20_000_000
         control = evidence["controls"][name]
@@ -541,7 +553,8 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
         assert observer.controls[name].sock is fixture.environment.sockets[index, "uart1"]
         assert fixture.controls[index] == b"\xa5"
         assert report["commands"][name]["count"] == report["command_wire"][name]["count"]
-        assert report["commands"][name]["active_count"] > 0 and report["commands"][name]["zero_count"] > 0
+        for group in ("commands", "command_wire"):
+            assert tuple(report[group][name][key] for key in ("count", "active_count", "zero_count")) == (100, 28, 72)
         delivery = report["command_deliveries"][name]["first"]
         assert (delivery["source_world_ns"], delivery["due_ns"], delivery["delivered_ns"],
                 delivery["mapped_qemu_ns"], delivery["data_hex"]) == (
@@ -557,6 +570,8 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
             (1000, 2000)[index] + row["delivered_ns"],
             bytes.fromhex(row["data_hex"]).ljust(64, b"\0")) for row in rows)
         assert bytes(fixture.received[index]) == expected
+        assert cpu.completed == len(cpu.receipts) == len(rows) == 4000 and not cpu.partial
+        assert b"".join(cpu.receipts) == expected
         assert all(bytes.fromhex(row["physical_wire_hex"]) == expected[offset * 84:(offset + 1) * 84]
                    for offset, row in enumerate(rows))
     east = [row for row in report["feedback"] if row["peer"] == 0 and row["can_id"] == 0x201]
@@ -568,9 +583,12 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
         (248_000_000, 253_000_000, 253_000_000), (253_000_000, 253_000_000, 253_000_000)]
 
 
-def test_dji_scenario_actual_prefix_admission_requires_exact_original_suffix_completion(dji_scenario_observation):
+def test_dji_scenario_actual_prefix_admission_requires_exact_original_suffix_completion(
+        dji_scenario_observation, monkeypatch):
     fixture = dji_scenario_observation
     device, stream = fixture.direct()
+    original_socket = fixture.environment.sockets[0, "can1"]
+    assert stream.sock is original_socket
     fixture.environment.uart_send_budget[0, "can1"] = 17
     frame = device.feedback()
     device.bus.send(device, frame)
@@ -580,10 +598,24 @@ def test_dji_scenario_actual_prefix_admission_requires_exact_original_suffix_com
     row, = fixture.report["feedback"]
     assert row["accepted"] and not row.get("physical_complete") and stream.tx_pending
     assert fixture.environment.producers[0, "can1"].recv(4096) == expected[:17]
+    assert [bytes(part) for part in stream.tx_queue] == [expected[17:]]
+    assert fixture.observer.written[0].suffix == expected[:17]
+    primary = OSError("original CAN suffix write failed")
+    with monkeypatch.context() as failing:
+        def reject(peer, data):
+            raise primary
+        failing.setattr(Peer, "send", reject)
+        with pytest.raises(OSError) as caught:
+            stream.flush()
+        assert caught.value is primary
+    assert stream.sock is original_socket
+    assert [bytes(part) for part in stream.tx_queue] == [expected[17:]]
+    assert fixture.observer.written[0].suffix == expected[:17] and not row.get("physical_complete")
     fixture.environment.uart_send_budget[0, "can1"] = 67
     assert stream.flush() and not stream.tx_pending
     assert fixture.environment.producers[0, "can1"].recv(4096) == expected[17:]
     assert row["physical_complete"] and bytes.fromhex(row["physical_wire_hex"]) == expected
+    assert stream.sock is original_socket
     assert len(fixture.report["feedback"]) == 1 and not fixture.observer.written[0].suffix
 
 
@@ -696,8 +728,31 @@ def test_dji_scenario_command_admission_rejects_literal_profile_and_observation_
         for index in range(8):
             fixture.observer.command(0, ident, 0, 8, 1000 + index,
                 raw if index % 2 == 0 else bytes(8))
-    with pytest.raises((ValueError, BufferError)):
-        fixture.observer.command(0, ident, flags, dlc, 2000, raw)
+    wire = struct.pack("<IIB3xQ64s", ident, flags, dlc, 2000, raw.ljust(64, b"\0"))
+    if invalid in ("count", "transitions"):
+        with pytest.raises((ValueError, BufferError)):
+            fixture.observer.command(0, ident, flags, dlc, 2000, raw)
+    else:
+        _, stream = fixture.direct()
+        assert fixture.environment.producers[0, "can1"].send(wire) == 84
+        with pytest.raises(ValueError):
+            stream.receive()
+    rejected = fixture.report["first_rejected_command"]
+    assert rejected["member"] == "east"
+    assert rejected["field"] == {"flags": "flags", "dlc": "dlc", "unused-slot": "data_hex",
+        "id": "data_hex", "count": "observation_capacity", "transitions": "observation_capacity"}[invalid]
+    if invalid in ("count", "transitions"):
+        assert rejected["layer"] == "CAN decoded ingress" and rejected["wire_hex"] is None
+    else:
+        assert rejected["layer"] == "CAN records before codec"
+        assert rejected["wire_hex"] == rejected["row"]["wire_hex"] == wire.hex()
+        assert (rejected["row"]["can_id"], rejected["row"]["flags"], rejected["row"]["dlc"],
+                rejected["row"]["qemu_ns"], rejected["row"]["data_hex"]) == (
+                    ident, flags, dlc, 2000, raw.hex())
+    saved = deepcopy(rejected)
+    with pytest.raises(ValueError):
+        fixture.observer.command(1, 0x201, 0, 8, 3000, bytes(8))
+    assert fixture.report["first_rejected_command"] is rejected and rejected == saved
     assert len(summary["transitions"]) <= 8
 
 
