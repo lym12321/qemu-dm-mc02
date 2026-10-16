@@ -24,6 +24,13 @@ Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是�
 `set_key(True)`、`set_vin(24000)` 注入公开输入，`pause()`/`resume()`/`reset()` 使用
 原生 QMP。调用方负责 QMP 的期限和关闭；这些 API 不判断应用是否已启动。
 
+`QmpSession.command_many(((name, arguments), ...))` 可在同一连接上查询 1–8 个
+互相独立的命令，按输入顺序返回结果元组；参数为 `dict` 或 `None`，整组须先通过
+JSON 序列化检查，并配置有限的正超时；组等待和取消清理分别使用该超时。
+它不是原子快照；错误按输入顺序选择首个异常，
+其余异常附入 notes。超时或中断会取消并等待本组请求清理，但已发送的命令仍可能执行。
+失败后应停止当前操作并关闭连接，不得重试整组或跨 I/O、CPU、world 边界复用结果。
+
 外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
 socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
 

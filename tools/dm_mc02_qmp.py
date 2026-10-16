@@ -56,6 +56,10 @@ class QmpSession(QEMUMonitorProtocol):
         """Return the command value; QEMU raises on a QMP error response."""
         return self.cmd(name, **(arguments or {}))
 
+    def command_many(self, commands):
+        """Return an ordered group of independent values through canonical QMP."""
+        return self.cmd_many(commands)
+
     def command_raw(self, name, arguments=None):
         """Return QEMU's response envelope for explicit negative assertions."""
         return self.cmd_raw(name, arguments)
