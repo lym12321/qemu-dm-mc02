@@ -127,6 +127,69 @@ static QDict *execution_query(QTestState *qts)
     return result;
 }
 
+/* Only call at stopped, stable IO points; this is not an atomic snapshot. */
+static QDict *execution_can_snapshot(QTestState *qts, const char *state,
+                                     int64_t current, bool has_target,
+                                     int64_t target, const char *run_state)
+{
+    static const char *fields[] = {
+        "execution", "status", "fdcan-tx-state", "fdcan-rx-state",
+    };
+    static const char *commands[] = {
+        "x-query-virtual-execution", "query-status",
+    };
+    QDict *response = qtest_qmp(qts,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'can-execution-state'}}");
+    QDict *snapshot = qdict_get_qdict(response, "return");
+    QDict *execution, *status;
+
+    g_assert_nonnull(snapshot);
+    g_assert_cmpuint(qdict_size(snapshot), ==, 5);
+    g_assert_cmpint(qdict_get_int(snapshot, "schema"), ==, 1);
+    execution = qdict_get_qdict(snapshot, "execution");
+    g_assert_nonnull(execution);
+    g_assert_cmpuint(qdict_size(execution), ==, has_target ? 3 : 2);
+    g_assert_cmpstr(qdict_get_str(execution, "state"), ==, state);
+    g_assert_cmpint(qdict_get_int(execution, "current-ns"), ==, current);
+    g_assert_cmpint(qdict_haskey(execution, "target-ns"), ==, has_target);
+    if (has_target) {
+        g_assert_cmpint(qdict_get_int(execution, "target-ns"), ==, target);
+    }
+    status = qdict_get_qdict(snapshot, "status");
+    g_assert_nonnull(status);
+    g_assert_cmpuint(qdict_size(status), ==, 3);
+    g_assert_false(qdict_get_bool(status, "running"));
+    g_assert_false(qdict_get_bool(status, "singlestep"));
+    g_assert_cmpstr(qdict_get_str(status, "status"), ==, run_state);
+    for (unsigned i = 2; i < G_N_ELEMENTS(fields); i++) {
+        QDict *can = qdict_get_qdict(snapshot, fields[i]);
+
+        g_assert_nonnull(can);
+        g_assert_cmpuint(qdict_size(can), ==, 3);
+        g_assert_cmpint(qdict_get_int(can, "schema"), ==, 1);
+        g_assert_cmpint(qdict_get_int(can, "timestamp_ns"), ==, current);
+        g_assert_nonnull(qdict_get_qdict(can, "controllers"));
+    }
+
+    /* Supplement independent literals with unchanged public-getter values. */
+    for (unsigned i = 0; i < G_N_ELEMENTS(fields); i++) {
+        QDict *separate = i < G_N_ELEMENTS(commands) ?
+            qtest_qmp(qts, "{'execute':%s}", commands[i]) :
+            qtest_qmp(qts,
+                "{'execute':'qom-get','arguments':{'path':'/machine',"
+                "'property':%s}}", fields[i]);
+
+        g_assert_nonnull(qdict_get(separate, "return"));
+        g_assert_true(qobject_is_equal(qdict_get(snapshot, fields[i]),
+                                      qdict_get(separate, "return")));
+        qobject_unref(separate);
+    }
+    qobject_ref(snapshot);
+    qobject_unref(response);
+    return snapshot;
+}
+
 static void execution_assert_stopped(QTestState *qts, const char *state)
 {
     QDict *response = qtest_qmp(qts, "{'execute':'query-status'}");
@@ -314,6 +377,35 @@ static void test_execution_busy_guest(void)
     check_execution_busy_guest("mps2-an500", 0, "-only-migratable");
 }
 
+static void test_execution_can_snapshot_compat(void)
+{
+    QTestState *qts = execution_guest("dm-mc02", 0x08000000, false,
+                                     "-compat deprecated-output=hide");
+    QDict *response = qtest_qmp(qts,
+        "{'execute':'qom-get','arguments':{'path':'/machine',"
+        "'property':'can-execution-state'}}");
+    QDict *snapshot = qdict_get_qdict(response, "return");
+    QDict *status;
+    QDict *separate = qtest_qmp(qts, "{'execute':'query-status'}");
+    QDict *original = qdict_get_qdict(separate, "return");
+
+    g_assert_nonnull(snapshot);
+    g_assert_cmpuint(qdict_size(snapshot), ==, 5);
+    g_assert_cmpint(qdict_get_int(snapshot, "schema"), ==, 1);
+    status = qdict_get_qdict(snapshot, "status");
+    g_assert_nonnull(status);
+    g_assert_nonnull(original);
+    g_assert_cmpuint(qdict_size(status), ==, 2);
+    g_assert_false(qdict_haskey(status, "singlestep"));
+    g_assert_false(qdict_haskey(original, "singlestep"));
+    g_assert_false(qdict_get_bool(status, "running"));
+    g_assert_cmpstr(qdict_get_str(status, "status"), ==, "prelaunch");
+    g_assert_true(qobject_is_equal(QOBJECT(status), QOBJECT(original)));
+    qobject_unref(separate);
+    qobject_unref(response);
+    qtest_quit(qts);
+}
+
 static void test_execution_wfi_systick(void)
 {
     QTestState *qts = execution_guest("dm-mc02", 0x08000000, true, NULL);
@@ -337,6 +429,12 @@ static void test_execution_wfi_systick(void)
     execution_assert_stable(qts, 1000, 0);
     uint32_t icsr = qtest_readl(qts, SCB_ICSR);
     g_assert_true((icsr & SCB_ICSR_PENDSTSET) || (icsr & 0x1ff) == 15);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        qobject_unref(execution_can_snapshot(qts, "reached", 1000, true,
+                                            1000, "paused"));
+        g_assert_cmphex(qtest_readl(qts, SCB_ICSR), ==, icsr);
+        execution_assert_stable(qts, 1000, 0);
+    }
     /* Completion at T is a stopped CPU, not a guest IRQ-handler barrier. */
     execution_run_to(qts, 1001);
     execution_assert_stable(qts, 1001, 0);
@@ -410,6 +508,9 @@ static void test_execution_cancel_and_reentry(void)
     g_assert_cmpint(current, <, far_target);
     counter = qtest_readl(qts, EXECUTION_COUNTER);
     execution_assert_stable(qts, current, counter);
+    qobject_unref(execution_can_snapshot(qts, "cancelled", current, true,
+                                        far_target, "paused"));
+    execution_assert_stable(qts, current, counter);
     execution_run_to(qts, current + 1003);
     execution_assert_migration_blocker(qts, false);
     /* Refusing a stale target preserves the latest successful result. */
@@ -417,6 +518,8 @@ static void test_execution_cancel_and_reentry(void)
         "{'execute':'x-run-to-virtual-time','arguments':{'target-ns':%"
         PRId64 "}}", current + 1003));
     execution_assert_state(qts, "reached", true, current + 1003);
+    qobject_unref(execution_can_snapshot(qts, "reached", current + 1003,
+                                        true, current + 1003, "paused"));
     qtest_writel(qts, SYST_RVR, 0x1234);
     qtest_qmp_assert_success(qts,
         "{'execute':'x-run-to-virtual-time','arguments':{'target-ns':%"
@@ -431,11 +534,19 @@ static void test_execution_cancel_and_reentry(void)
     result = execution_query(qts);
     current = qdict_get_int(result, "current-ns");
     qobject_unref(result);
+    qobject_unref(execution_can_snapshot(qts, "cancelled", current, true,
+                                        far_target, "paused"));
+    g_assert_cmphex(qtest_readl(qts, SYST_RVR), ==, 0);
     execution_run_to(qts, current + 1003);
     qtest_qmp_assert_success(qts, "{'execute':'system_reset'}");
     execution_assert_state(qts, "cancelled", true, current + 1003);
     /* Native reset of a stopped VM returns to PRELAUNCH, not PAUSED. */
     execution_assert_stopped(qts, "prelaunch");
+    result = execution_query(qts);
+    qobject_unref(execution_can_snapshot(qts, "cancelled",
+                                        qdict_get_int(result, "current-ns"),
+                                        true, current + 1003, "prelaunch"));
+    qobject_unref(result);
     execution_run_to(qts, current + 2006);
     qtest_quit(qts);
 }
@@ -754,8 +865,18 @@ static QDict *execution_can_state(QTestState *qts, bool eval, int64_t time,
 static void execution_can_empty_readonly(QTestState *qts, bool eval,
                                         int64_t deadline)
 {
+    static const char *routes[] = {
+        "dm-mc02.fdcan1", "dm-mc02.fdcan2", "dm-mc02.fdcan3",
+    };
+    static const char *tx_fields[] = {
+        "pending_frames", "pending_bytes", "tx_dropped", "tx_short_writes",
+    };
+    static const char *rx_fields[] = {
+        "completed_frames", "partial_bytes", "rx_dropped",
+    };
     QDict *before = execution_can_state(qts, eval, 0, deadline);
     QDict *after;
+    QDict *snapshot_before = NULL;
     QDict *controllers = qdict_get_qdict(before, "controllers");
     const QDictEntry *entry;
 
@@ -782,6 +903,49 @@ static void execution_can_empty_readonly(QTestState *qts, bool eval,
     after = execution_can_state(qts, eval, 0, deadline);
     g_assert_true(qobject_is_equal(QOBJECT(before), QOBJECT(after)));
     qobject_unref(before);
+    qobject_unref(after);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        QDict *snapshot = execution_can_snapshot(qts, "idle", 0, false, 0,
+                                                 "prelaunch");
+
+        if (!repeat) {
+            snapshot_before = snapshot;
+            qobject_ref(snapshot_before);
+        } else {
+            g_assert_true(qobject_is_equal(QOBJECT(snapshot_before),
+                                          QOBJECT(snapshot)));
+        }
+        for (unsigned direction = 0; direction < 2; direction++) {
+            QDict *can = qdict_get_qdict(snapshot,
+                direction ? "fdcan-rx-state" : "fdcan-tx-state");
+            QDict *all = qdict_get_qdict(can, "controllers");
+            const char *const *fields = direction ? rx_fields : tx_fields;
+            unsigned field_count = direction ? G_N_ELEMENTS(rx_fields) :
+                                               G_N_ELEMENTS(tx_fields);
+
+            g_assert_nonnull(all);
+            g_assert_cmpuint(qdict_size(all), ==, eval ? 1 : 3);
+            for (unsigned i = 0; i < (eval ? 1 : G_N_ELEMENTS(routes)); i++) {
+                QDict *controller = qdict_get_qdict(all,
+                    eval ? "stm32h723-eval.fdcan1" : routes[i]);
+
+                g_assert_nonnull(controller);
+                g_assert_cmpuint(qdict_size(controller), ==, field_count);
+                for (unsigned j = 0; j < field_count; j++) {
+                    g_assert_cmpuint(execution_can_uint(controller, fields[j]),
+                                     ==, 0);
+                }
+            }
+        }
+        qobject_unref(snapshot);
+        execution_can_check(qts, deadline);
+    }
+    qobject_unref(qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'qom-set','arguments':{'path':'/machine',"
+        "'property':'can-execution-state','value':{}}}"));
+    after = execution_can_snapshot(qts, "idle", 0, false, 0, "prelaunch");
+    g_assert_true(qobject_is_equal(QOBJECT(snapshot_before), QOBJECT(after)));
+    qobject_unref(snapshot_before);
     qobject_unref(after);
     execution_assert_stopped(qts, "prelaunch");
     execution_can_check(qts, deadline);
@@ -878,6 +1042,43 @@ static void execution_can_rx_wait(QTestState *qts, uint64_t completed,
     }
 }
 
+static void execution_can_rx_snapshot_readonly(QTestState *qts,
+                                               uint64_t completed,
+                                               unsigned partial,
+                                               uint64_t dropped,
+                                               int64_t deadline)
+{
+    uint8_t before[16], after[16];
+    uint32_t fifo = qtest_readl(qts, 0x4000a0a4);
+    uint32_t ir = qtest_readl(qts, 0x4000a050);
+    uint32_t pending = qtest_readl(qts, NVIC_ISPR0);
+
+    qtest_memread(qts, 0x4000ac00, before, sizeof(before));
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        QDict *snapshot = execution_can_snapshot(qts, "reached", 100, true,
+                                                 100, "paused");
+        QDict *can = qdict_get_qdict(snapshot, "fdcan-rx-state");
+        QDict *controller = qdict_get_qdict(qdict_get_qdict(can, "controllers"),
+                                          "dm-mc02.fdcan1");
+
+        g_assert_cmpuint(execution_can_uint(controller, "completed_frames"),
+                         ==, completed);
+        g_assert_cmpuint(execution_can_uint(controller, "partial_bytes"),
+                         ==, partial);
+        g_assert_cmpuint(execution_can_uint(controller, "rx_dropped"),
+                         ==, dropped);
+        qobject_unref(snapshot);
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==,
+                        EXECUTION_SENTINEL);
+        g_assert_cmphex(qtest_readl(qts, 0x4000a0a4), ==, fifo);
+        g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, ir);
+        g_assert_cmphex(qtest_readl(qts, NVIC_ISPR0), ==, pending);
+        qtest_memread(qts, 0x4000ac00, after, sizeof(after));
+        g_assert_cmpmem(after, sizeof(after), before, sizeof(before));
+        execution_can_check(qts, deadline);
+    }
+}
+
 static void test_execution_paused_can_receipt(void)
 {
     /*
@@ -960,6 +1161,7 @@ static void test_execution_paused_can_receipt(void)
     execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
     g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 0);
     g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 0);
+    execution_can_rx_snapshot_readonly(qts, 0, 83, 0, deadline);
     g_assert_cmpint(send(cleanup.fd, wire + 83, 1, MSG_DONTWAIT), ==, 1);
     execution_can_rx_wait(qts, 1, 0, 0, deadline);
     execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
@@ -970,6 +1172,7 @@ static void test_execution_paused_can_receipt(void)
     g_assert_cmphex(ldl_le_p(ram), ==, 0x0c840000); /* ID0x321 << 18 */
     g_assert_cmphex(ldl_le_p(ram + 4) & 0x800f0000, ==, 0x80080000);
     g_assert_cmpmem(ram + 8, 8, wire + 20, 8);
+    execution_can_rx_snapshot_readonly(qts, 1, 0, 0, deadline);
 
     /* Unknown wire flag is processed, but cannot publish another FIFO slot. */
     memcpy(malformed, wire, sizeof(malformed));
@@ -983,6 +1186,7 @@ static void test_execution_paused_can_receipt(void)
     g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 1);
     g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 1);
     g_assert_cmphex(qtest_readl(qts, 0x4000ac08), ==, 0x44332211);
+    execution_can_rx_snapshot_readonly(qts, 2, 0, 1, deadline);
 
     /* Receipt at100ns is independent of this later real guest read/store. */
     execution_run_to(qts, 200);
@@ -1316,6 +1520,30 @@ static void test_execution_preblocked_cpu_can(void)
                        targets[pair], pair, 1 + 2 * pair,
                        blocked_bytes + 168 * pair, short_writes);
         qobject_unref(state);
+        for (unsigned repeat = 0; repeat < 2; repeat++) {
+            uint8_t ram[sizeof(periodic_can_tx_ram)];
+            QDict *snapshot = execution_can_snapshot(qts, "reached",
+                targets[pair], true, targets[pair], "paused");
+            QDict *can = qdict_get_qdict(snapshot, "fdcan-tx-state");
+
+            controller = qdict_get_qdict(qdict_get_qdict(can, "controllers"),
+                                         "dm-mc02.fdcan1");
+            g_assert_cmpuint(execution_can_uint(controller, "pending_frames"),
+                             ==, 1 + 2 * pair);
+            g_assert_cmpuint(execution_can_uint(controller, "pending_bytes"),
+                             ==, blocked_bytes + 168 * pair);
+            g_assert_cmpuint(execution_can_uint(controller, "tx_dropped"),
+                             ==, 0);
+            qobject_unref(snapshot);
+            g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==, pair);
+            g_assert_cmphex(qtest_readl(qts, 0x4000a054), ==, 0); /* IE */
+            g_assert_cmphex(qtest_readl(qts, 0x4000a05c), ==, 0); /* ILE */
+            g_assert_cmphex(qtest_readl(qts, 0x4000a0c0), ==, 0x02000000);
+            qtest_memread(qts, 0x4000ac00, ram, sizeof(ram));
+            g_assert_cmpmem(ram, sizeof(ram), periodic_can_tx_ram,
+                            sizeof(periodic_can_tx_ram));
+            execution_can_check(qts, deadline);
+        }
         execution_can_check(qts, deadline);
     }
     g_assert_cmphex(qtest_readl(qts, SYST_CSR) &
@@ -1755,6 +1983,8 @@ int main(int argc, char **argv)
                     test_execution_reject_targets);
     g_test_add_func("/dm-mc02/virtual-execution/busy-guest",
                     test_execution_busy_guest);
+    g_test_add_func("/dm-mc02/virtual-execution/can-snapshot-compat",
+                    test_execution_can_snapshot_compat);
     g_test_add_func("/dm-mc02/virtual-execution/wfi-systick",
                     test_execution_wfi_systick);
     g_test_add_func("/dm-mc02/virtual-execution/cancel-reentry",

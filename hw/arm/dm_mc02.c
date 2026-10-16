@@ -11,9 +11,13 @@
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
 #include "qapi/error.h"
+#include "qapi/compat-policy.h"
 #include "qapi/visitor.h"
+#include "qapi/qapi-commands-run-state.h"
+#include "qapi/qapi-visit-run-state.h"
 #include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qnum.h"
+#include "qom/qom-qobject.h"
 #include "exec/address-spaces.h"
 #include "sysemu/dma.h"
 #include "hw/arm/armv7m.h"
@@ -340,6 +344,9 @@ static void dm_mc02_get_fdcan_tx_state(Object *obj, Visitor *v,
 static void dm_mc02_get_fdcan_rx_state(Object *obj, Visitor *v,
                                       const char *name, void *opaque,
                                       Error **errp);
+static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp);
 static bool dm_mc02_get_buzzer_level(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_frequency(Object *obj, Error **errp);
 static char *dm_mc02_get_buzzer_duty(Object *obj, Error **errp);
@@ -1541,6 +1548,8 @@ static void dm_mc02_machine_instance_init(Object *obj)
                         dm_mc02_get_fdcan_tx_state, NULL, NULL, NULL);
     object_property_add(obj, "fdcan-rx-state", "any",
                         dm_mc02_get_fdcan_rx_state, NULL, NULL, NULL);
+    object_property_add(obj, "can-execution-state", "any",
+                        dm_mc02_get_can_execution_state, NULL, NULL, NULL);
     object_property_add_str(obj, "vin-mv", dm_mc02_get_vin_mv,
                             dm_mc02_set_vin_mv);
     object_property_add_str(obj, "imu-noise-gyro-dps",
@@ -2675,6 +2684,54 @@ static void dm_mc02_get_fdcan_rx_state(Object *obj, Visitor *v,
     qdict_put(state, "controllers", controllers);
     result = QOBJECT(state);
     visit_type_any(v, name, &result, errp);
+    qobject_unref(result);
+}
+
+/* Compose public observations without stopping execution or flushing IO. */
+static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
+                                           const char *name, void *opaque,
+                                           Error **errp)
+{
+    g_autoptr(VirtualExecutionInfo) execution = NULL;
+    g_autoptr(StatusInfo) status = NULL;
+    QObject *tx, *rx, *result = NULL;
+    Visitor *output;
+    uint32_t schema = 1;
+
+    execution = qmp_x_query_virtual_execution(errp);
+    if (!execution) {
+        return;
+    }
+    status = qmp_query_status(errp);
+    if (!status) {
+        return;
+    }
+    tx = object_property_get_qobject(obj, "fdcan-tx-state", errp);
+    if (!tx) {
+        return;
+    }
+    rx = object_property_get_qobject(obj, "fdcan-rx-state", errp);
+    if (!rx) {
+        goto out;
+    }
+
+    /* Generated output visitors preserve the original QMP field semantics. */
+    output = qobject_output_visitor_new_qmp(&result);
+    visit_start_struct(output, NULL, NULL, 0, &error_abort);
+    visit_type_uint32(output, "schema", &schema, &error_abort);
+    visit_type_VirtualExecutionInfo(output, "execution", &execution,
+                                   &error_abort);
+    visit_type_StatusInfo(output, "status", &status, &error_abort);
+    visit_type_any(output, "fdcan-tx-state", &tx, &error_abort);
+    visit_type_any(output, "fdcan-rx-state", &rx, &error_abort);
+    visit_end_struct(output, NULL);
+    visit_complete(output, &result);
+    visit_free(output);
+    visit_type_any(v, name, &result, errp);
+
+out:
+    qobject_unref(tx);
+    qobject_unref(rx);
     qobject_unref(result);
 }
 
