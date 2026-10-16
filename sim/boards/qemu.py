@@ -102,6 +102,72 @@ def digital_level(endpoint: str, snapshot: dict) -> int:
     return int(state["led"]["rgb"] != 0)
 
 
+def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
+                   deadline, check, direction):
+    command = getattr(qmp, "command", None)
+    if not callable(command) or not callable(check):
+        raise TypeError("QMP command and check must be callable")
+    _integer(target_ns, "target_ns", 0x7fffffffffffffff)
+    for name, value in (("controller", controller), ("chardev", chardev)):
+        if (not isinstance(value, str) or
+                re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None):
+            raise ValueError(f"{name} must be a nonempty native identity")
+    if (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+        raise ValueError("deadline must be finite monotonic seconds")
+    if (type(stream) is not CanStream or
+            type(stream.sock) is not socket.socket or
+            stream.sock.family != socket.AF_UNIX or
+            stream.sock.type != socket.SOCK_STREAM or stream.sock.fileno() < 0 or
+            stream.sock.getblocking()):
+        raise ValueError("require canonical CanStream on a nonblocking AF_UNIX stream")
+
+    def guard():
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"paused CAN {direction} deadline expired")
+        check()
+        if time.monotonic() >= deadline:
+            raise TimeoutError(f"paused CAN {direction} deadline expired")
+
+    def query(name, arguments=None):
+        guard()
+        value = command(name, arguments)
+        guard()
+        return value
+
+    def fence():
+        execution = _object(query("x-query-virtual-execution"), "execution")
+        for field in ("current-ns", "target-ns"):
+            value = _field(execution, field, "execution")
+            _integer(value, f"execution.{field}", 0x7fffffffffffffff)
+            if value != target_ns:
+                raise RuntimeError(f"CAN {direction} execution time or target changed")
+        if _field(execution, "state", "execution") != "reached":
+            raise RuntimeError(f"CAN {direction} execution target is not reached")
+        status = _object(query("query-status"), "query-status")
+        if (status.get("running") is not False or status.get("status") != "paused"):
+            raise RuntimeError(f"QEMU must remain paused during CAN {direction} drain")
+        if query("qom-get", {"path": f"/chardevs/{chardev}",
+                              "property": "connected"}) is not True:
+            raise ConnectionError(f"CAN {direction} chardev is disconnected")
+    return guard, query, fence
+
+
+def _can_transfer_state(query, property_name, controller, target_ns, direction):
+    state = _object(query("qom-get", {
+        "path": "/machine", "property": property_name,
+    }), property_name)
+    schema = _field(state, "schema", property_name)
+    _integer(schema, f"{property_name}.schema", 1)
+    if schema != 1:
+        raise ValueError(f"unsupported {property_name} schema")
+    timestamp = _field(state, "timestamp_ns", property_name)
+    _integer(timestamp, f"{property_name}.timestamp_ns", 0x7fffffffffffffff)
+    if timestamp != target_ns:
+        raise RuntimeError(f"CAN {direction} observation time changed")
+    controllers = _object(_field(state, "controllers", property_name), "controllers")
+    return _object(_field(controllers, controller, "controllers"), controller)
+
+
 def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
                      controller: str, chardev: str, tx_dropped: int,
                      deadline: float, check) -> None:
@@ -121,66 +187,17 @@ def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
     this function does not recover, roll back, close resources or advance time.
     Success is output consumption, not a CPU/world or equal-time timer barrier.
     """
-    command = getattr(qmp, "command", None)
-    if not callable(command) or not callable(check) or not callable(sink):
+    if not callable(sink):
         raise TypeError("QMP command, check and sink must be callable")
-    _integer(target_ns, "target_ns", 0x7fffffffffffffff)
     _integer(tx_dropped, "tx_dropped", 0xffffffffffffffff)
-    for name, value in (("controller", controller), ("chardev", chardev)):
-        if (not isinstance(value, str) or
-                re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None):
-            raise ValueError(f"{name} must be a nonempty native identity")
-    if (type(deadline) not in (int, float) or not math.isfinite(deadline)):
-        raise ValueError("deadline must be finite monotonic seconds")
-    if (type(stream) is not CanStream or
-            type(stream.sock) is not socket.socket or
-            stream.sock.family != socket.AF_UNIX or
-            stream.sock.type != socket.SOCK_STREAM or stream.sock.fileno() < 0 or
-            stream.sock.getblocking()):
-        raise ValueError("require canonical CanStream on a nonblocking AF_UNIX stream")
-
-    def guard():
-        if time.monotonic() >= deadline:
-            raise TimeoutError("paused CAN output deadline expired")
-        check()
-        if time.monotonic() >= deadline:
-            raise TimeoutError("paused CAN output deadline expired")
-
-    def query(name, arguments=None):
-        guard()
-        value = command(name, arguments)
-        guard()
-        return value
+    guard, query, fence = _paused_can_io(
+        qmp, stream, target_ns=target_ns, controller=controller, chardev=chardev,
+        deadline=deadline, check=check, direction="output")
 
     def observe():
-        execution = _object(query("x-query-virtual-execution"), "execution")
-        for field in ("current-ns", "target-ns"):
-            value = _field(execution, field, "execution")
-            _integer(value, f"execution.{field}", 0x7fffffffffffffff)
-            if value != target_ns:
-                raise RuntimeError("CAN output execution time or target changed")
-        if _field(execution, "state", "execution") != "reached":
-            raise RuntimeError("CAN output execution target is not reached")
-        status = _object(query("query-status"), "query-status")
-        if (status.get("running") is not False or status.get("status") != "paused"):
-            raise RuntimeError("QEMU must remain paused during CAN output drain")
-        if query("qom-get", {"path": f"/chardevs/{chardev}",
-                              "property": "connected"}) is not True:
-            raise ConnectionError("CAN output chardev is disconnected")
-        state = _object(query("qom-get", {
-            "path": "/machine", "property": "fdcan-tx-state",
-        }), "fdcan-tx-state")
-        schema = _field(state, "schema", "fdcan-tx-state")
-        _integer(schema, "fdcan-tx-state.schema", 1)
-        if schema != 1:
-            raise ValueError("unsupported fdcan-tx-state schema")
-        timestamp = _field(state, "timestamp_ns", "fdcan-tx-state")
-        _integer(timestamp, "fdcan-tx-state.timestamp_ns", 0x7fffffffffffffff)
-        if timestamp != target_ns:
-            raise RuntimeError("CAN output observation time changed")
-        controllers = _object(_field(state, "controllers", "fdcan-tx-state"),
-                              "controllers")
-        tx = _object(_field(controllers, controller, "controllers"), controller)
+        fence()
+        tx = _can_transfer_state(query, "fdcan-tx-state", controller,
+                                 target_ns, "output")
         for field, maximum in (("pending_frames", 16), ("pending_bytes", 1344),
                                ("tx_dropped", 0xffffffffffffffff),
                                ("tx_short_writes", 0xffffffffffffffff)):
@@ -209,6 +226,75 @@ def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
                 raise RuntimeError("CAN output producer changed during drain")
             guard()
             return
+
+
+def wait_paused_can_input(qmp, stream: CanStream, *, target_ns: int,
+                          controller: str, chardev: str, completed_frames: int,
+                          deadline: float, check) -> dict:
+    """Flush admitted input and observe its synchronous native processing.
+
+    The caller establishes a pre-send native baseline and the exact number of
+    complete records on this sole writer, reserving the absolute goal strictly
+    below UINT64_MAX. The original peer, reached/paused target and configuration
+    must remain unchanged from before sending; reset, restore, rail, purge,
+    reconnect and extra input invalidate that attempt.
+
+    Drain QEMU output first. This operation only peeks at the original socket;
+    unread output or a retained output tail is refused without consuming it.
+    It borrows the same canonical stream and deadline/check/QMP bounds as
+    drain_paused_can, preserving effects and resources on failure. Return the
+    final native controller dict, including actual rx_dropped: completed input
+    includes rejected records and does not prove FIFO or firmware consumption.
+    No time is advanced and no baseline or count is cached across calls.
+    """
+    _integer(completed_frames, "completed_frames", 0xfffffffffffffffe)
+    guard, query, fence = _paused_can_io(
+        qmp, stream, target_ns=target_ns, controller=controller, chardev=chardev,
+        deadline=deadline, check=check, direction="input")
+    if stream.buffer:
+        raise RuntimeError("drain CAN output before waiting for input")
+
+    def empty_output():
+        guard()
+        if stream.buffer:
+            raise RuntimeError("drain CAN output before waiting for input")
+        try:
+            pending = stream.sock.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
+            pass
+        else:
+            if not pending:
+                raise ConnectionError("QEMU FDCAN socket closed")
+            raise RuntimeError("drain CAN output before waiting for input")
+        guard()
+
+    def observe():
+        fence()
+        rx = _can_transfer_state(query, "fdcan-rx-state", controller,
+                                 target_ns, "input")
+        for field, maximum in (("completed_frames", 0xfffffffffffffffe),
+                               ("partial_bytes", 83),
+                               ("rx_dropped", 0xffffffffffffffff)):
+            _integer(_field(rx, field, controller), f"{controller}.{field}", maximum)
+        if rx["completed_frames"] > completed_frames:
+            raise RuntimeError("CAN input completed count exceeds goal")
+        empty_output()
+        return rx
+
+    while True:
+        rx = observe()
+        if rx["completed_frames"] == completed_frames:
+            if rx["partial_bytes"] or stream.tx_pending:
+                raise RuntimeError("CAN input has bytes beyond completed goal")
+            final = observe()
+            if (final["completed_frames"] != completed_frames or
+                    final["partial_bytes"] or stream.tx_pending):
+                raise RuntimeError("CAN input changed during final observation")
+            guard()
+            return final
+        guard()
+        stream.flush()
+        guard()
 
 
 class QemuBoard:

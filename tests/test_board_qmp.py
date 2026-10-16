@@ -9,7 +9,9 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.boards import QemuBoard, drain_paused_can, validate_gpio_pin
+from sim.boards import (
+    QemuBoard, drain_paused_can, validate_gpio_pin, wait_paused_can_input,
+)
 from sim.transports.can_stream import CanStream
 
 
@@ -195,6 +197,12 @@ class PausedCanQmp:
         self.commands = []
         self.tx_queries = 0
         self.on_tx = lambda number: None
+        self.rx = {"schema": 1, "timestamp_ns": 1000, "controllers": {
+            "dm-mc02.fdcan1": {"completed_frames": 0, "partial_bytes": 0,
+                              "rx_dropped": 0},
+        }}
+        self.rx_queries = 0
+        self.on_rx = lambda number: None
         self.closed = False
 
     def command(self, name, arguments=None):
@@ -206,6 +214,11 @@ class PausedCanQmp:
         if arguments == {"path": "/chardevs/can1", "property": "connected"}:
             assert name == "qom-get"
             return self.connected
+        if arguments == {"path": "/machine", "property": "fdcan-rx-state"}:
+            assert name == "qom-get"
+            self.rx_queries += 1
+            self.on_rx(self.rx_queries)
+            return deepcopy(self.rx)
         assert (name, arguments) == ("qom-get", {
             "path": "/machine", "property": "fdcan-tx-state",
         })
@@ -216,6 +229,10 @@ class PausedCanQmp:
     @property
     def controller(self):
         return self.tx["controllers"]["dm-mc02.fdcan1"]
+
+    @property
+    def rx_controller(self):
+        return self.rx["controllers"]["dm-mc02.fdcan1"]
 
 
 @pytest.fixture
@@ -458,3 +475,265 @@ def test_paused_can_requires_nonblocking_plain_stream(paused_can):
             run_paused_can(datagram, qmp, lambda frame: None)
         assert qmp.commands == []
         assert_can_borrows_open(datagram, qmp)
+
+
+def run_paused_can_input(stream, qmp, **overrides):
+    options = dict(target_ns=1000, controller="dm-mc02.fdcan1", chardev="can1",
+                   completed_frames=1, deadline=1.0, check=lambda: None)
+    options.update(overrides)
+    return wait_paused_can_input(qmp, stream, **options)
+
+
+def test_paused_can_input_waits_for_receipt_after_queued_socket_write(paused_can):
+    stream, peer, qmp, _ = paused_can
+    # Borrow the existing bounded TX queue; no substitute writer or socket.
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    observed = bytearray()
+
+    def dispatch(number):
+        if number == 1:
+            assert stream.tx_pending
+            with pytest.raises(BlockingIOError):
+                peer.recv(84)
+        elif number == 2:
+            # Kernel acceptance is already complete, while the native consumer
+            # has only seen a partial record and must not report completion.
+            assert not stream.tx_pending
+            observed.extend(peer.recv(83))
+            assert bytes(observed) == CAN_LITERAL[:83]
+            qmp.rx_controller["partial_bytes"] = 83
+        elif number == 3:
+            observed.extend(peer.recv(1))
+            assert bytes(observed) == CAN_LITERAL
+            # Dispatch completion includes controller rejection/FIFO drops.
+            qmp.rx_controller.update(completed_frames=1, partial_bytes=0,
+                                     rx_dropped=1)
+        elif number == 4:
+            # This aggregate also includes non-chardev ingress. Its growth
+            # remains diagnostic during the fresh final receipt observation.
+            qmp.rx_controller["rx_dropped"] = 2
+
+    qmp.on_rx = dispatch
+    assert run_paused_can_input(stream, qmp) == {
+        "completed_frames": 1, "partial_bytes": 0, "rx_dropped": 2,
+    }
+    assert qmp.rx_queries == 4  # Initial, partial, complete, fresh final.
+    assert bytes(observed) == CAN_LITERAL
+    assert not stream.tx_pending and not stream.buffer
+    assert_can_borrows_open(stream, qmp)
+
+
+def test_paused_can_input_accepts_absolute_goal_below_exhaustion(paused_can):
+    stream, _, qmp, _ = paused_can
+    goal = (1 << 64) - 2
+    qmp.rx_controller.update(completed_frames=goal, rx_dropped=(1 << 64) - 1,
+                             extension="retained")
+    result = run_paused_can_input(stream, qmp, completed_frames=goal)
+    assert result == {"completed_frames": goal, "partial_bytes": 0,
+                      "rx_dropped": (1 << 64) - 1, "extension": "retained"}
+    assert qmp.rx_queries == 2
+    assert_can_borrows_open(stream, qmp)
+
+
+def test_paused_can_input_keeps_actual_backpressure_suffix_until_peer_reads(paused_can):
+    stream, peer, qmp, _ = paused_can
+    stream.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+    for total in range(1, 129):
+        stream.send(*CAN_DECODED)
+        if stream.tx_pending:
+            break
+    else:
+        pytest.fail("finite CAN prefill did not reach socket backpressure")
+    expected = CAN_LITERAL * total
+    suffix = b"".join(bytes(part) for part in stream.tx_queue)
+    assert suffix and expected.endswith(suffix)
+    consumed = bytearray()
+
+    def dispatch(number):
+        assert number <= 32, "bounded socketpair dispatch did not complete"
+        if number <= 2:
+            # First wait-loop flush meets the actual full host socket. Neither
+            # its EAGAIN nor QMP polling may discard the retained TX suffix.
+            assert b"".join(bytes(part) for part in stream.tx_queue) == suffix
+        if number >= 2:
+            try:
+                consumed.extend(peer.recv(4096))
+            except BlockingIOError:
+                pass
+            assert bytes(consumed) == expected[:len(consumed)]
+            complete, partial = divmod(len(consumed), 84)
+            qmp.rx_controller.update(completed_frames=complete,
+                                     partial_bytes=partial)
+
+    qmp.on_rx = dispatch
+    result = run_paused_can_input(stream, qmp, completed_frames=total)
+    assert bytes(consumed) == expected
+    assert result == {"completed_frames": total, "partial_bytes": 0,
+                      "rx_dropped": 0}
+    assert qmp.rx_queries >= 4
+    assert not stream.tx_pending
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("mismatch", ["queue", "partial"])
+def test_paused_can_input_rejects_inconsistent_completed_goal(paused_can, mismatch):
+    stream, peer, qmp, _ = paused_can
+    if mismatch == "queue":
+        stream.tx_queue.append(memoryview(CAN_LITERAL))
+    else:
+        qmp.rx_controller["partial_bytes"] = 1
+    with pytest.raises(RuntimeError):
+        run_paused_can_input(stream, qmp, completed_frames=0)
+    assert [bytes(part) for part in stream.tx_queue] == (
+        [CAN_LITERAL] if mismatch == "queue" else [])
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("goal", [0, 1])
+def test_paused_can_input_original_eof_precedes_flush_or_success(paused_can, goal):
+    stream, peer, qmp, _ = paused_can
+    stream.tx_queue.append(memoryview(CAN_LITERAL[19:]))
+    peer.close()
+    assert qmp.connected is True  # A replacement may own native connected=true.
+    with pytest.raises(ConnectionError):
+        run_paused_can_input(stream, qmp, completed_frames=goal)
+    assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL[19:]]
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("buffered", [False, True])
+def test_paused_can_input_leaves_unread_output_and_tail_intact(paused_can, buffered):
+    stream, peer, qmp, _ = paused_can
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    if buffered:
+        stream.buffer.extend(CAN_LITERAL[:19])
+    assert peer.send(CAN_LITERAL) == 84
+    with pytest.raises(RuntimeError):
+        run_paused_can_input(stream, qmp)
+    assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
+    assert bytes(stream.buffer) == (CAN_LITERAL[:19] if buffered else b"")
+    assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("change", ["fence", "count", "partial", "eof", "output"])
+def test_paused_can_input_reobserves_native_and_original_peer_before_return(
+        paused_can, change):
+    stream, peer, qmp, _ = paused_can
+    qmp.rx_controller["completed_frames"] = 1
+
+    def changed(number):
+        if change == "fence" and number == 1:
+            qmp.execution["state"] = "cancelled"
+        if number == 2:
+            if change == "count":
+                qmp.rx_controller["completed_frames"] = 0
+            elif change == "partial":
+                qmp.rx_controller["partial_bytes"] = 1
+            elif change == "eof":
+                peer.close()
+            elif change == "output":
+                assert peer.send(CAN_LITERAL[:19]) == 19
+
+    qmp.on_rx = changed
+    with pytest.raises(ConnectionError if change == "eof" else RuntimeError):
+        run_paused_can_input(stream, qmp)
+    if change == "output":
+        assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL[:19]
+    assert not stream.buffer and not stream.tx_pending
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("section,field,value,error", [
+    ("rx", "schema", 2, ValueError),
+    ("rx", "timestamp_ns", 999, RuntimeError),
+    ("rx_controller", "completed_frames", True, TypeError),
+    ("rx_controller", "completed_frames", 2, RuntimeError),
+    ("rx_controller", "completed_frames", (1 << 64) - 1, ValueError),
+    ("rx_controller", "partial_bytes", 84, ValueError),
+    ("rx_controller", "rx_dropped", 1 << 64, ValueError),
+])
+def test_paused_can_input_invalid_native_state_precedes_flush(
+        paused_can, section, field, value, error):
+    stream, peer, qmp, _ = paused_can
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    getattr(qmp, section)[field] = value
+    with pytest.raises(error):
+        run_paused_can_input(stream, qmp)
+    assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+def test_paused_can_input_missing_controller_field_precedes_flush(paused_can):
+    stream, _, qmp, _ = paused_can
+    del qmp.rx_controller["partial_bytes"]
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    with pytest.raises(ValueError, match="partial_bytes"):
+        run_paused_can_input(stream, qmp)
+    assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"completed_frames": True}, {"completed_frames": -1},
+    {"completed_frames": (1 << 64) - 1}, {"target_ns": True},
+    {"deadline": float("inf")}, {"deadline": float("nan")},
+    {"controller": ""}, {"chardev": "can1/other"}, {"check": None},
+])
+def test_paused_can_input_argument_admission_precedes_native_io(paused_can, overrides):
+    stream, peer, qmp, _ = paused_can
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    with pytest.raises((TypeError, ValueError)):
+        run_paused_can_input(stream, qmp, **overrides)
+    assert qmp.commands == []
+    assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+def test_paused_can_input_requires_canonical_nonblocking_stream(paused_can):
+    stream, _, qmp, _ = paused_can
+    stream.sock.setblocking(True)
+    with pytest.raises(ValueError, match="nonblocking AF_UNIX"):
+        run_paused_can_input(stream, qmp)
+    assert qmp.commands == []
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("dependency", ["qmp", "check", "slow-qmp", "stalled"])
+def test_paused_can_input_dependency_and_deadline_failures_preserve_borrow(
+        paused_can, dependency):
+    stream, peer, qmp, clock = paused_can
+    stream.tx_queue.append(memoryview(CAN_LITERAL))
+    failure = RuntimeError(f"{dependency} failed")
+
+    def fail():
+        raise failure
+
+    if dependency == "qmp":
+        qmp.command = lambda *args: fail()
+    elif dependency == "slow-qmp":
+        qmp.on_rx = lambda number: clock.__setitem__(0, 2.0)
+    elif dependency == "stalled":
+        # The host write completed, but no consumer receipt ever arrives.
+        qmp.on_rx = lambda number: clock.__setitem__(0, 2.0) if number == 2 else None
+    timeout = dependency in ("slow-qmp", "stalled")
+    with pytest.raises(TimeoutError if timeout else RuntimeError) as caught:
+        run_paused_can_input(stream, qmp,
+                             check=fail if dependency == "check" else lambda: None)
+    if not timeout:
+        assert caught.value is failure
+    if dependency == "stalled":
+        assert not stream.tx_pending
+        assert peer.recv(84) == CAN_LITERAL
+    else:
+        assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+    assert not stream.buffer
+    assert_can_borrows_open(stream, qmp)

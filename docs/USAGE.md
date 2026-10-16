@@ -1760,6 +1760,19 @@ EOF、解码、状态变化、sink 或超时错误直接失败，保留部分效
 尝试。任意阻塞 callback 无法被此软期限抢占。此操作不推进 world，也不证明全局锁步、
 同一时刻所有 timer/IRQ 已处理、任意复位恢复或真实 CAN 时序。
 
+`sim.boards.wait_paused_can_input(qmp, stream, *, target_ns, controller, chardev,
+completed_frames, deadline, check)` 使用相同的原连接、暂停目标及期限约束，刷新既有
+发送队列，并等待原生接收计数精确达到 `completed_frames`。调用者必须在发送前取得
+基线、知道本批完整记录数，并保证绝对目标严格小于 `UINT64_MAX`；不得用当前队列长度
+推算记录数。整个尝试中须排除额外输入、复位、restore、断电、配置、重连或清队列。
+
+先用既有 reader 排空 QEMU 输出。等待操作只对原 socket 做非消费 peek；存在未读输出、
+framing tail 或原连接 EOF 时直接失败并保留字节，即使原生属性显示另一个 peer 已连接。
+达到目标时还要求发送队列和原生部分记录均为空，再重新查询执行状态与接收计数。
+返回最后一次原生控制器字典；`rx_dropped` 可以增长，因为处理完成包含被拒收的记录。
+此返回值证明同步输入处理已返回，固件消费与存储成功仍须分别验证。错误保留已发生的
+效果、后缀和借用资源，调用者须停止该次尝试；操作不负责恢复或推进 CPU/world。
+
 ### trobot motor/MuJoCo test
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
