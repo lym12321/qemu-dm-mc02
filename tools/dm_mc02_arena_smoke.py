@@ -1293,7 +1293,9 @@ def check_dji_scenario_observations(report):
         for key in ("commands", "command_wire", "command_deliveries"):
             commands = report[key][name]
             if (commands["count"] <= 0 or commands["active_count"] <= 0 or commands["zero_count"] <= 0
-                    or commands["count"] > 10000 or len(commands["transitions"]) > 8):
+                    or commands["count"] > 10000
+                    or not 0 < commands["transition_count"] <= commands["count"]
+                    or len(commands["transitions"]) != min(commands["transition_count"], 8)):
                 raise ValueError("DJI Scenario active/disabled command evidence incomplete")
     east = [row for row in report["feedback"] if row["peer"] == 0 and row["accepted"]]
     west = [row for row in report["feedback"] if row["peer"] == 1 and row["accepted"]]
@@ -1338,7 +1340,7 @@ class _CanWrittenBytes:
 
 def _dji_command_summary():
     return {"count": 0, "active_count": 0, "zero_count": 0,
-            "first": None, "last": None, "transitions": []}
+            "first": None, "last": None, "transition_count": 0, "transitions": []}
 
 
 def _dji_command_invalid_field(row):
@@ -1368,7 +1370,11 @@ def _record_dji_command(summary, row):
         summary["first"] = row
     previous = summary["last"]
     if previous is None or (previous["can_id"], previous["data_hex"]) != (row["can_id"], data):
-        append_bounded(summary, "transitions", row, 8)
+        summary["transition_count"] += 1
+        # A delay change can interleave old and new legal command values.
+        # Count every transition; retain only the first eight diagnostic rows.
+        if len(summary["transitions"]) < 8:
+            summary["transitions"].append(row)
     summary["last"] = row
 
 
@@ -1667,8 +1673,9 @@ def run_dji_scenario(elf, output, firmware, *, qemu=None):
         "skips": {name: [] for name in DJI_SCENARIO_MEMBERS},
         "missing_skips": {name: ["plant.physics"] for name in DJI_SCENARIO_MEMBERS},
         "observation_bounds": {"feedback": 10000, "steps": 1250, "pending_per_device": 256,
-            "commands_per_peer": 10000, "command_transitions_per_peer": 8},
+            "commands_per_peer": 10000, "sampled_command_transitions_per_peer": 8},
         "limitations": ["Actual motor::dji/BSP/HAL/FDCAN consumer of one eight-device native world.",
+            "Every command is checked and counted; transition_count is exact, transitions retains only the first8 changes and last is the actual last row.",
             "Both first complete reports must precede the reset-relative250ms event; no ready reanchor.",
             "UART1 a5 releases application observation only, without world events or CPU synchronization.",
             "Copied raw tuple has a completed admitted same-peer witness; repeated raw bytes do not identify a unique firmware source or exact host pairing.",

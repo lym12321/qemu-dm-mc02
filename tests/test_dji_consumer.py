@@ -68,7 +68,8 @@ def scenario_summaries():
 
 def scenario_empty_report():
     def command_summary():
-        return dict(count=0, active_count=0, zero_count=0, first=None, last=None, transitions=[])
+        return dict(count=0, active_count=0, zero_count=0, transition_count=0,
+                    first=None, last=None, transitions=[])
     return {"native_calls": dict(reset=0, step_ns=[], close=0), "feedback": [],
         "can_receive_errors": [], "qmp_events": [], "uart": ["", ""], "ready": {}, "watchdogs": {},
         "cases": {name: [] for name in ("east", "west")},
@@ -120,8 +121,22 @@ def scenario_completed_report():
             wire_hex="a5", accepted=True, completed=True, send_attempts=1, flush_attempts=1,
             borrowed_stream_identity=peer + 1)
         for key in ("commands", "command_wire", "command_deliveries"):
-            report[key][name] = dict(count=2, active_count=1, zero_count=1,
-                                    first=None, last=None, transitions=[])
+            transitions = [dict(peer=peer, can_id=0x200, flags=0, dlc=8,
+                qemu_ns=epoch + stamp, data_hex=raw)
+                for stamp, raw in ((0, "0040ffc000000000"), (280_000_000, "0000000000000000"))]
+            if key == "command_wire":
+                for row in transitions:
+                    row["wire_hex"] = struct.pack("<IIB3xQ64s", 0x200, 0, 8, row["qemu_ns"],
+                        bytes.fromhex(row["data_hex"]).ljust(64, b"\0")).hex()
+            if key == "command_deliveries":
+                for row, stamp, destination in zip(transitions, (0, 280_000_000), ("m3508-1", "m3508-4")):
+                    row.update(mapped_qemu_ns=row.pop("qemu_ns"), source_world_ns=stamp,
+                        due_ns=stamp + (5_000_000 if peer == 0 and stamp == 0 else 0),
+                        delivered_ns=stamp + (5_000_000 if peer == 0 and stamp == 0 else 0),
+                        destination=destination)
+            multiple = 4 if key == "command_deliveries" else 1
+            report[key][name] = dict(count=2 * multiple, active_count=multiple, zero_count=multiple,
+                transition_count=2, first=transitions[0], last=transitions[-1], transitions=transitions)
     # A retained delayed source follows a newer zero-delay source in actual delivery order.
     for world_time, due_time in ((251_000_000, 251_000_000), (247_000_000, 252_000_000)):
         row = dict(peer=0, can_id=0x201, accepted=True, world_ns=world_time,
@@ -708,7 +723,74 @@ def test_dji_scenario_borrowed_control_retries_only_flush_and_blocks_second_repo
         assert not observer.controls[name].tx_pending
 
 
-@pytest.mark.parametrize("invalid", ["flags", "dlc", "unused-slot", "id", "count", "transitions"])
+def test_dji_scenario_command_samples_first_eight_changes_and_keeps_exact_count_and_last(
+        dji_scenario_observation):
+    fixture = dji_scenario_observation
+    active, zero = "0040ffc000000000", "0000000000000000"
+    rows = [dict(peer=0, can_id=0x200, flags=0, dlc=8, qemu_ns=1000 + index, data_hex=raw)
+            for index, raw in enumerate((active, zero, active, zero, active, zero, active, zero, active))]
+    for row in rows:
+        fixture.observer.command(0, 0x200, 0, 8, row["qemu_ns"], bytes.fromhex(row["data_hex"]))
+    summary = fixture.report["commands"]["east"]
+    assert (summary["count"], summary["transition_count"], summary["active_count"], summary["zero_count"]) == (9, 9, 5, 4)
+    assert summary["transitions"] == rows[:8] and summary["first"] == rows[0] and summary["last"] == rows[8]
+    fixture.observer.command(0, 0x200, 0, 8, 2000, bytes.fromhex(active))
+    assert summary["count"] == 10 and summary["transition_count"] == 9
+    assert summary["transitions"] == rows[:8]
+    assert summary["last"] == dict(rows[8], qemu_ns=2000)
+    before = deepcopy(summary)
+    with pytest.raises(ValueError, match="literal CURRENT profile"):
+        fixture.observer.command(0, 0x200, 0, 8, 3000, bytes.fromhex("0041ffc000000000"))
+    assert summary == before and fixture.report["first_rejected_command"]["field"] == "data_hex"
+
+
+def test_dji_scenario_one_ms_fabric_commands_overtake_old_zero_after_fixed_delay_removal(
+        dji_scenario_observation):
+    fixture = dji_scenario_observation
+    environment, observer, report = fixture.environment, fixture.observer, fixture.report
+    active, zero = "0040ffc000000000", "0000000000000000"
+    environment.can_commands = [zero, zero]
+    environment.uart_chunks = [[b"TTEST READY dji.scenario.ready 0 0\n"] for _ in range(2)]
+    for index, origin in enumerate((1000, 2000)):
+        for millisecond in range(1, 260):
+            raw = active if 100 <= millisecond < 120 or millisecond >= 251 else zero
+            environment.schedule_can(index, can_wire(origin + millisecond * 1_000_000, raw),
+                                     interval=millisecond + 1)
+    def first_execution(index, name):
+        if name == "x-run-to-virtual-time" and not environment.cpus[index].requests:
+            observer.check_cont()
+            report["qmp_events"].append(dict(peer=index, command=name))
+    environment.qmp_callback = first_execution
+    result = environment.run(fixture.scenario.arena, duration=.260,
+        can_delays=((0, "east", 5_000_000), (250_000_000, "east", 0)),
+        emit=observer.emit, on_response=observer.response)
+    environment.assert_clean()
+    assert result.steps == 260 and result.origin_ns == 0 and result.end_ns == 260_000_000
+    assert report.get("first_rejected_command") is None
+    assert [(row["logical_ns"], row["delay_ns"]) for row in report["scenario_observation"]["actions"]] == [
+        (0, 5_000_000), (250_000_000, 0)]
+    for group in ("commands", "command_wire"):
+        summary = report[group]["east"]
+        assert (summary["count"], summary["transition_count"]) == (260, 4)
+        assert [(row["qemu_ns"] - 1000, row["data_hex"]) for row in summary["transitions"]] == [
+            (0, zero), (100_000_000, active), (120_000_000, zero), (251_000_000, active)]
+    summary = report["command_deliveries"]["east"]
+    assert (summary["count"], summary["transition_count"], len(summary["transitions"])) == (1040, 10, 8)
+    assert [(row["source_world_ns"], row["delivered_ns"], row["data_hex"])
+            for row in summary["transitions"]] == [
+        (0, 5_000_000, zero), (100_000_000, 105_000_000, active), (120_000_000, 125_000_000, zero),
+        (251_000_000, 251_000_000, active), (247_000_000, 252_000_000, zero),
+        (252_000_000, 252_000_000, active), (248_000_000, 253_000_000, zero),
+        (253_000_000, 253_000_000, active)]
+    assert (summary["last"]["source_world_ns"], summary["last"]["delivered_ns"],
+            summary["last"]["data_hex"], summary["last"]["destination"]) == (
+                259_000_000, 259_000_000, active, "m3508-4")
+    assert report["command_deliveries"]["west"]["transition_count"] == 4
+    assert all(cpu.completed == len(cpu.receipts) == 1040 and not cpu.partial
+               for cpu in environment.cpus.values())
+
+
+@pytest.mark.parametrize("invalid", ["flags", "dlc", "unused-slot", "id", "count"])
 def test_dji_scenario_command_admission_rejects_literal_profile_and_observation_capacity(
         dji_scenario_observation, invalid):
     fixture = dji_scenario_observation
@@ -724,12 +806,8 @@ def test_dji_scenario_command_admission_rejects_literal_profile_and_observation_
         ident = 0x1ff
     elif invalid == "count":
         summary["count"] = 10000
-    else:
-        for index in range(8):
-            fixture.observer.command(0, ident, 0, 8, 1000 + index,
-                raw if index % 2 == 0 else bytes(8))
     wire = struct.pack("<IIB3xQ64s", ident, flags, dlc, 2000, raw.ljust(64, b"\0"))
-    if invalid in ("count", "transitions"):
+    if invalid == "count":
         with pytest.raises((ValueError, BufferError)):
             fixture.observer.command(0, ident, flags, dlc, 2000, raw)
     else:
@@ -740,8 +818,8 @@ def test_dji_scenario_command_admission_rejects_literal_profile_and_observation_
     rejected = fixture.report["first_rejected_command"]
     assert rejected["member"] == "east"
     assert rejected["field"] == {"flags": "flags", "dlc": "dlc", "unused-slot": "data_hex",
-        "id": "data_hex", "count": "observation_capacity", "transitions": "observation_capacity"}[invalid]
-    if invalid in ("count", "transitions"):
+        "id": "data_hex", "count": "observation_capacity"}[invalid]
+    if invalid == "count":
         assert rejected["layer"] == "CAN decoded ingress" and rejected["wire_hex"] is None
     else:
         assert rejected["layer"] == "CAN records before codec"
