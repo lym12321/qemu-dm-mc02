@@ -103,7 +103,7 @@ def digital_level(endpoint: str, snapshot: dict) -> int:
 
 
 def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
-                   deadline, check, direction):
+                   deadline, check, direction, initial=False):
     command = getattr(qmp, "command", None)
     if not callable(command) or not callable(check):
         raise TypeError("QMP command and check must be callable")
@@ -136,15 +136,20 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
 
     def fence():
         execution = _object(query("x-query-virtual-execution"), "execution")
-        for field in ("current-ns", "target-ns"):
+        for field in (("current-ns",) if initial else ("current-ns", "target-ns")):
             value = _field(execution, field, "execution")
             _integer(value, f"execution.{field}", 0x7fffffffffffffff)
             if value != target_ns:
                 raise RuntimeError(f"CAN {direction} execution time or target changed")
-        if _field(execution, "state", "execution") != "reached":
+        if initial:
+            if (_field(execution, "state", "execution") != "idle" or
+                    "target-ns" in execution):
+                raise RuntimeError("CAN initial baseline requires idle execution without a target")
+        elif _field(execution, "state", "execution") != "reached":
             raise RuntimeError(f"CAN {direction} execution target is not reached")
         status = _object(query("query-status"), "query-status")
-        if (status.get("running") is not False or status.get("status") != "paused"):
+        allowed = ("prelaunch", "paused") if initial else ("paused",)
+        if (status.get("running") is not False or status.get("status") not in allowed):
             raise RuntimeError(f"QEMU must remain paused during CAN {direction} drain")
         if query("qom-get", {"path": f"/chardevs/{chardev}",
                               "property": "connected"}) is not True:
@@ -166,6 +171,87 @@ def _can_transfer_state(query, property_name, controller, target_ns, direction):
         raise RuntimeError(f"CAN {direction} observation time changed")
     controllers = _object(_field(state, "controllers", property_name), "controllers")
     return _object(_field(controllers, controller, "controllers"), controller)
+
+
+def _can_tx_state(query, controller, timestamp_ns, direction):
+    tx = _can_transfer_state(query, "fdcan-tx-state", controller,
+                             timestamp_ns, direction)
+    for field, maximum in (("pending_frames", 16), ("pending_bytes", 1344),
+                           ("tx_dropped", 0xffffffffffffffff),
+                           ("tx_short_writes", 0xffffffffffffffff)):
+        _integer(_field(tx, field, controller), f"{controller}.{field}", maximum)
+    frames, count = tx["pending_frames"], tx["pending_bytes"]
+    if not frames <= count <= frames * 84:
+        raise ValueError("inconsistent CAN output pending counts")
+    return tx
+
+
+def _can_rx_state(query, controller, timestamp_ns, direction):
+    rx = _can_transfer_state(query, "fdcan-rx-state", controller,
+                             timestamp_ns, direction)
+    for field, maximum in (("completed_frames", 0xfffffffffffffffe),
+                           ("partial_bytes", 83),
+                           ("rx_dropped", 0xffffffffffffffff)):
+        _integer(_field(rx, field, controller), f"{controller}.{field}", maximum)
+    return rx
+
+
+def _empty_can_output(stream, guard):
+    guard()
+    if stream.buffer:
+        raise RuntimeError("drain CAN output before waiting for input")
+    try:
+        pending = stream.sock.recv(1, socket.MSG_PEEK)
+    except BlockingIOError:
+        pass
+    else:
+        if not pending:
+            raise ConnectionError("QEMU FDCAN socket closed")
+        raise RuntimeError("drain CAN output before waiting for input")
+    guard()
+
+
+def observe_initial_paused_can(qmp, stream: CanStream, *, timestamp_ns: int,
+                               controller: str, chardev: str,
+                               deadline: float, check) -> dict:
+    """Observe an empty original CAN connection before the first CPU target.
+
+    The owner keeps native execution idle at the supplied RESET origin, without
+    prior input, output producers, reset, restore, rail, configuration, purge or
+    connection changes. This borrows the same canonical stream, sole reader and
+    writer, deadline and QMP bounds as drain_paused_can; it never reads output,
+    flushes input, advances time or owns cleanup. Two complete observations must
+    agree before returning the native TX/RX controller objects as a baseline.
+
+    This does not establish an input receipt, firmware readiness, timer closure
+    or CPU/world barrier. On failure, retain effects/resources and freeze.
+    """
+    _integer(timestamp_ns, "timestamp_ns", 0x7fffffffffffffff)
+    guard, query, fence = _paused_can_io(
+        qmp, stream, target_ns=timestamp_ns, controller=controller, chardev=chardev,
+        deadline=deadline, check=check, direction="initial-baseline", initial=True)
+
+    def observe():
+        if stream.tx_pending or stream.buffer:
+            raise RuntimeError("CAN initial baseline requires empty host queues")
+        fence()
+        tx = _can_tx_state(query, controller, timestamp_ns, "initial-baseline")
+        rx = _can_rx_state(query, controller, timestamp_ns, "initial-baseline")
+        if tx["pending_frames"] or tx["pending_bytes"] or rx["partial_bytes"]:
+            raise RuntimeError("CAN initial baseline requires empty native queues")
+        _empty_can_output(stream, guard)
+        if stream.tx_pending:
+            raise RuntimeError("CAN initial baseline host input changed")
+        return {"tx": tx, "rx": rx}
+
+    first = observe()
+    final = observe()
+    for direction, fields in (("tx", ("tx_dropped", "tx_short_writes")),
+                              ("rx", ("completed_frames", "rx_dropped"))):
+        if any(first[direction][field] != final[direction][field] for field in fields):
+            raise RuntimeError("CAN initial baseline changed during observation")
+    guard()
+    return final
 
 
 def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
@@ -196,18 +282,10 @@ def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
 
     def observe():
         fence()
-        tx = _can_transfer_state(query, "fdcan-tx-state", controller,
-                                 target_ns, "output")
-        for field, maximum in (("pending_frames", 16), ("pending_bytes", 1344),
-                               ("tx_dropped", 0xffffffffffffffff),
-                               ("tx_short_writes", 0xffffffffffffffff)):
-            _integer(_field(tx, field, controller), f"{controller}.{field}", maximum)
-        frames, count = tx["pending_frames"], tx["pending_bytes"]
-        if not frames <= count <= frames * 84:
-            raise ValueError("inconsistent CAN output pending counts")
+        tx = _can_tx_state(query, controller, target_ns, "output")
         if tx["tx_dropped"] != tx_dropped:
             raise RuntimeError("CAN output drop count changed")
-        return frames == 0
+        return tx["pending_frames"] == 0
 
     while True:
         empty = observe()
@@ -254,31 +332,12 @@ def wait_paused_can_input(qmp, stream: CanStream, *, target_ns: int,
     if stream.buffer:
         raise RuntimeError("drain CAN output before waiting for input")
 
-    def empty_output():
-        guard()
-        if stream.buffer:
-            raise RuntimeError("drain CAN output before waiting for input")
-        try:
-            pending = stream.sock.recv(1, socket.MSG_PEEK)
-        except BlockingIOError:
-            pass
-        else:
-            if not pending:
-                raise ConnectionError("QEMU FDCAN socket closed")
-            raise RuntimeError("drain CAN output before waiting for input")
-        guard()
-
     def observe():
         fence()
-        rx = _can_transfer_state(query, "fdcan-rx-state", controller,
-                                 target_ns, "input")
-        for field, maximum in (("completed_frames", 0xfffffffffffffffe),
-                               ("partial_bytes", 83),
-                               ("rx_dropped", 0xffffffffffffffff)):
-            _integer(_field(rx, field, controller), f"{controller}.{field}", maximum)
+        rx = _can_rx_state(query, controller, target_ns, "input")
         if rx["completed_frames"] > completed_frames:
             raise RuntimeError("CAN input completed count exceeds goal")
-        empty_output()
+        _empty_can_output(stream, guard)
         return rx
 
     while True:

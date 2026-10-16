@@ -1773,6 +1773,14 @@ framing tail 或原连接 EOF 时直接失败并保留字节，即使原生属�
 此返回值证明同步输入处理已返回，固件消费与存储成功仍须分别验证。错误保留已发生的
 效果、后缀和借用资源，调用者须停止该次尝试；操作不负责恢复或推进 CPU/world。
 
+尚未执行首个目标时，可用 `sim.boards.observe_initial_paused_can(qmp, stream, *,
+timestamp_ns, controller, chardev, deadline, check)` 建立初始 CAN 基线。
+它要求执行状态为 `idle`、没有目标且时间精确等于 RESET_ACK 的原点，QEMU 保持
+`prelaunch` 或 `paused`；原连接、主机队列及原生发送和部分接收记录均须为空。
+函数不读取或刷新字节，以非消费 peek 拒绝未读输出和 EOF，并复核两次完整状态，
+返回最后的 `{"tx": ..., "rx": ...}` 控制器字典。期限、唯一 reader/writer 和排除
+复位、断电、配置、重连等条件与上述函数相同。此操作只建立启动基线，不推进时间。
+
 ### trobot motor/MuJoCo test
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：

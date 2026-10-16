@@ -27,7 +27,8 @@ from dm_mc02_firmware_rtf import deadline_qmp_call
 from dm_mc02_qmp import QmpSession
 from dm_mc02_test_harness import running_qemu
 from qemu.machine.qtest import QEMUQtestProtocol
-from sim.boards import drain_paused_can, wait_paused_can_input
+from sim.boards import (drain_paused_can, observe_initial_paused_can,
+                        wait_paused_can_input)
 from sim.boards.launch import qemu_command, resolve_qemu
 from sim.transports.can_stream import CanStream
 from sim.transports.unix import connect_unix
@@ -262,6 +263,20 @@ def run(binary, report):
                 expect(tx_state(0)["pending_frames"] == 0, "unexpected initial backlog")
                 expect(rx_state(0) == {"completed_frames": 0, "partial_bytes": 0,
                                        "rx_dropped": 0}, "unexpected initial RX baseline")
+
+                phase = "initial_baseline"
+                initial = observe_initial_paused_can(
+                    SimpleNamespace(command=command), can, timestamp_ns=0,
+                    controller="dm-mc02.fdcan1", chardev="can1",
+                    deadline=deadline, check=check)
+                expect(initial == {
+                    "tx": {"pending_frames": 0, "pending_bytes": 0,
+                           "tx_dropped": 0, "tx_short_writes": 0},
+                    "rx": {"completed_frames": 0, "partial_bytes": 0,
+                           "rx_dropped": 0},
+                }, f"unexpected initial helper baseline: {initial!r}")
+                report["initial_baseline"] = initial
+                stopped(0, 0, "prelaunch")
 
                 phase = "prefill"
                 deadline = min(overall, time.monotonic() + 2.0)

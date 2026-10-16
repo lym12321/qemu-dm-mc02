@@ -10,7 +10,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim.boards import (
-    QemuBoard, drain_paused_can, validate_gpio_pin, wait_paused_can_input,
+    QemuBoard, drain_paused_can, observe_initial_paused_can, validate_gpio_pin,
+    wait_paused_can_input,
 )
 from sim.transports.can_stream import CanStream
 
@@ -736,4 +737,193 @@ def test_paused_can_input_dependency_and_deadline_failures_preserve_borrow(
     else:
         assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
     assert not stream.buffer
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.fixture
+def initial_can(paused_can):
+    stream, peer, qmp, clock = paused_can
+    qmp.execution = {"state": "idle", "current-ns": 1000}
+    qmp.status = {"running": False, "status": "prelaunch"}
+    return stream, peer, qmp, clock
+
+
+def run_initial_can(stream, qmp, **overrides):
+    options = dict(timestamp_ns=1000, controller="dm-mc02.fdcan1", chardev="can1",
+                   deadline=1.0, check=lambda: None)
+    options.update(overrides)
+    return observe_initial_paused_can(qmp, stream, **options)
+
+
+@pytest.mark.parametrize("status", ["prelaunch", "paused"])
+def test_initial_can_returns_stable_native_baseline_without_io(initial_can, status):
+    stream, peer, qmp, _ = initial_can
+    qmp.status["status"] = status
+    qmp.controller.update(tx_dropped=3, tx_short_writes=7, native_extra="retained")
+    qmp.rx_controller.update(completed_frames=5, rx_dropped=2, native_extra=42)
+    before = deepcopy((qmp.execution, qmp.status, qmp.tx, qmp.rx))
+    original_socket = stream.sock
+    stream.receive = stream.flush = lambda: pytest.fail("initial baseline must not consume or flush")
+    result = run_initial_can(stream, qmp)
+    assert result == {
+        "tx": {"pending_frames": 0, "pending_bytes": 0, "tx_dropped": 3,
+               "tx_short_writes": 7, "native_extra": "retained"},
+        "rx": {"completed_frames": 5, "partial_bytes": 0, "rx_dropped": 2,
+               "native_extra": 42},
+    }
+    assert (qmp.execution, qmp.status, qmp.tx, qmp.rx) == before
+    assert qmp.tx_queries == qmp.rx_queries == 2
+    assert all(name in ("x-query-virtual-execution", "query-status", "qom-get")
+               for name, _ in qmp.commands)
+    assert stream.sock is original_socket
+    assert not stream.buffer and not stream.tx_pending
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("section,field,value,error", [
+    ("execution", "state", "reached", RuntimeError),
+    ("execution", "current-ns", 1001, RuntimeError),
+    ("execution", "target-ns", 1000, RuntimeError),
+    ("status", "running", True, RuntimeError),
+    ("status", "status", "shutdown", RuntimeError),
+    ("connected", None, False, ConnectionError),
+    ("tx", "schema", 2, ValueError),
+    ("controller", "pending_bytes", 1, ValueError),
+    ("controller", "tx_short_writes", 1 << 64, ValueError),
+    ("rx", "timestamp_ns", 999, RuntimeError),
+    ("rx_controller", "completed_frames", (1 << 64) - 1, ValueError),
+    ("rx_controller", "partial_bytes", 1, RuntimeError),
+])
+def test_initial_can_refuses_invalid_native_baseline(
+        initial_can, section, field, value, error):
+    stream, _, qmp, _ = initial_can
+    if field is None:
+        setattr(qmp, section, value)
+    else:
+        getattr(qmp, section)[field] = value
+    with pytest.raises(error):
+        run_initial_can(stream, qmp)
+    assert not stream.buffer and not stream.tx_pending
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("pending", ["host-input", "host-output", "native-output"])
+def test_initial_can_requires_empty_queues_without_draining(initial_can, pending):
+    stream, peer, qmp, _ = initial_can
+    if pending == "host-input":
+        stream.tx_queue.append(memoryview(CAN_LITERAL[19:]))
+    elif pending == "host-output":
+        stream.buffer.extend(CAN_LITERAL[:19])
+    else:
+        qmp.controller.update(pending_frames=1, pending_bytes=84)
+    with pytest.raises(RuntimeError, match="empty"):
+        run_initial_can(stream, qmp)
+    assert [bytes(part) for part in stream.tx_queue] == (
+        [CAN_LITERAL[19:]] if pending == "host-input" else [])
+    assert bytes(stream.buffer) == (CAN_LITERAL[:19] if pending == "host-output" else b"")
+    if pending != "native-output":
+        assert qmp.commands == []
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("peer_state", ["unread-output", "eof"])
+def test_initial_can_peeks_original_peer_without_consuming(initial_can, peer_state):
+    stream, peer, qmp, _ = initial_can
+    if peer_state == "eof":
+        peer.close()
+    else:
+        assert peer.send(CAN_LITERAL[:19]) == 19
+    assert qmp.connected is True  # A replacement's QOM status cannot prove this peer.
+    with pytest.raises(ConnectionError if peer_state == "eof" else RuntimeError):
+        run_initial_can(stream, qmp)
+    if peer_state != "eof":
+        assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL[:19]
+    assert not stream.buffer and not stream.tx_pending
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("change", [
+    "fence", "tx-count", "rx-count", "rx-drop", "native-output", "host-input", "output", "eof",
+])
+def test_initial_can_reobserves_full_native_state_and_peer(initial_can, change):
+    stream, peer, qmp, _ = initial_can
+
+    def changed(number):
+        if number == 1 and change == "fence":
+            qmp.execution["state"] = "cancelled"
+        if number != 2:
+            return
+        if change == "tx-count":
+            qmp.controller["tx_short_writes"] = 1
+        elif change == "rx-count":
+            qmp.rx_controller["completed_frames"] = 1
+        elif change == "rx-drop":
+            qmp.rx_controller["rx_dropped"] = 1
+        elif change == "native-output":
+            qmp.controller.update(pending_frames=1, pending_bytes=84)
+        elif change == "host-input":
+            stream.tx_queue.append(memoryview(CAN_LITERAL))
+        elif change == "output":
+            assert peer.send(CAN_LITERAL[:19]) == 19
+        elif change == "eof":
+            peer.close()
+
+    # Change TX fields before their second reply; RX/peer changes occur during
+    # the second RX reply, after all preceding native observations succeeded.
+    qmp.on_tx = changed if change in ("tx-count", "native-output") else lambda _: None
+    qmp.on_rx = lambda number: changed(number) if change not in ("tx-count", "native-output") else None
+    with pytest.raises(ConnectionError if change == "eof" else RuntimeError):
+        run_initial_can(stream, qmp)
+    if change == "output":
+        assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL[:19]
+    assert [bytes(part) for part in stream.tx_queue] == ([CAN_LITERAL] if change == "host-input" else [])
+    assert not stream.buffer
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("overrides", [
+    {"timestamp_ns": True}, {"timestamp_ns": 1 << 63}, {"deadline": float("inf")},
+    {"controller": ""}, {"chardev": "can1/other"}, {"check": None},
+])
+def test_initial_can_pure_admission_precedes_native_io(initial_can, overrides):
+    stream, peer, qmp, _ = initial_can
+    with pytest.raises((TypeError, ValueError)):
+        run_initial_can(stream, qmp, **overrides)
+    assert qmp.commands == []
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("dependency", ["qmp", "check", "slow-qmp"])
+def test_initial_can_dependency_failure_preserves_primary_and_borrow(initial_can, dependency):
+    stream, _, qmp, clock = initial_can
+    failure = KeyboardInterrupt("initial baseline dependency failed")
+
+    def fail():
+        raise failure
+
+    if dependency == "qmp":
+        qmp.command = lambda *args: fail()
+    elif dependency == "slow-qmp":
+        qmp.on_rx = lambda _: clock.__setitem__(0, 2.0)
+    with pytest.raises(TimeoutError if dependency == "slow-qmp" else KeyboardInterrupt) as caught:
+        run_initial_can(stream, qmp, check=fail if dependency == "check" else lambda: None)
+    if dependency != "slow-qmp":
+        assert caught.value is failure
+    assert not stream.buffer and not stream.tx_pending
+    assert_can_borrows_open(stream, qmp)
+
+
+def test_initial_can_does_not_weaken_reached_only_operations(initial_can):
+    stream, _, qmp, _ = initial_can
+    with pytest.raises(ValueError, match="target-ns"):
+        run_paused_can(stream, qmp, lambda _: pytest.fail("unexpected output"))
+    with pytest.raises(ValueError, match="target-ns"):
+        run_paused_can_input(stream, qmp, completed_frames=0)
+    assert not stream.buffer and not stream.tx_pending
     assert_can_borrows_open(stream, qmp)
