@@ -2170,11 +2170,27 @@ finally:
     # 调用方另行关闭所有借用连接，并清理 QEMU/QMP。
 ```
 
+上例由调用方拥有 CPU 执行。需要运行时分段推进所有 CPU 时，为每个绑定增加
+`BoardExecution(bounded_command, "dm-mc02.fdcan1", "can1")`；必须全部提供或全部省略。
+`bounded_command(name, arguments=None)` 借用原生 QMP，并由调用方限制每条命令耗时。
+QEMU 须以 `-S -accel tcg,thread=single -icount shift=0,align=off,sleep=off`
+启动。CAN 必须使用原始非阻塞 AF_UNIX socket 和标准 `CanStream`，运行时独占其
+读写；期间保持连接、配置、dispatch budget 和复位状态不变，回调不得直接提交 CAN。
+
 `start()` 只允许尝试一次：全部实际 RESET_ACK 到齐后，将各自 QEMU 时间原点
 映射到所给 Session 原点，再统一重置总线和世界一次。启动期间保留物理 CAN
 输入，不提前消费。每个 `step()` 先有界服务连接，再调用一次 Coordinator；
 plant 沿用既有命令超时分段。全部终点 IMU 编码成功后才发送各板 STEP，返回
 实际 ACK tuple；重试复用编码 bytes。`service()` 只收发和入队，不推进世界。
+
+提供 `BoardExecution` 时，启动还检查各原点处的初始空 CAN 基线。每步先检查全部
+目标和输入计数余量，再请求所有 CPU 执行到映射后的目标；实际 `reached/paused`
+到齐并排空所有 CAN 输出后，才推进一次既有世界和发送 IMU。全部反馈达到精确的
+原生输入处理计数后才返回，下一步 CPU 执行须等到此处。此模式的 `service()` 和
+ACK 等待不额外读取或刷新 CAN。`can_input_states` 返回最近完成的各板原生 RX
+快照副本；初始化、过滤或 FIFO 拒绝也计入处理数，`rx_dropped` 保留为诊断。
+区间内命令仍在目标边界交付并从下一区间影响物理世界。CPU 目标完成不代表同刻
+IRQ/器件事件全部闭合，输入处理也不代表固件消费；此组合不提供硅级时序或实时保证。
 
 `set_can_delay(name, delay_ns)` 在 start 成功后修改指定成员总线的后续入队延迟。
 值遵守 `CanBus.delay_ns` 的整数范围；命令和反馈共用该策略，已排队帧保留原截止时间。

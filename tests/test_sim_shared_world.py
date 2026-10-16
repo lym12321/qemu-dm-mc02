@@ -28,7 +28,9 @@ from sim.devices.referee import (
 from sim.fabric import CanBus
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.physics import ImuSample, JointState
-from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
+from sim.robots.shared_world import (
+    BoardBinding, BoardExecution, RefereeBinding, SharedWorldRuntime,
+)
 from sim.transports import StreamTransport
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import StepFramedSocket, V2SessionReset
@@ -1360,3 +1362,405 @@ def test_referee_close_reentry_and_errors_release_all_owners_once(
     assert len(events) == 5 and [sock.sends for sock, _ in pairs] == sends
     assert [bytes(view) for view in referees[0].endpoint.transport.tx_queue] == [queued]
     assert all(sock.reads == sock.closes == 0 and sock.fileno() >= 0 for sock, _ in pairs)
+
+
+class NativeCpuQmp:
+    """Isolate native execution; all CAN bytes still cross the original socket.
+
+    The receipt producer reads its real peer, retains every byte and increments
+    only at literal 84-byte boundaries. It never consults an endpoint, stream
+    queue, world algorithm or host submission counter.
+    """
+
+    def __init__(self, index, peer, origin, native, events):
+        self.index, self.peer, self.current = index, peer, origin
+        self.native, self.events = native, events
+        self.target = None
+        self.state = "idle"
+        self.requests, self.receipts = [], []
+        self.received = bytearray()
+        self.partial = bytearray()
+        self.completed = self.rx_dropped = self.tx_dropped = 0
+        self.output = {}
+        self.eof = False
+        self.polls = 0
+        self.fault = None
+        self.read_limits = []
+        self.report_completed = None
+        self.on_rx = self.on_run = self.on_reached = None
+
+    def _receive_input(self):
+        if not self.native.steps:
+            return
+        limit = self.read_limits.pop(0) if self.read_limits else 4096
+        if limit == 0:
+            self.events.append(("receipt-blocked", self.index))
+            return
+        try:
+            raw = self.peer.recv(limit)
+        except BlockingIOError:
+            return
+        assert raw, "unexpected native CAN input EOF"
+        self.received.extend(raw)
+        self.partial.extend(raw)
+        self.events.append(("receipt-bytes", self.index, bytes(raw)))
+        while len(self.partial) >= 84:
+            record = bytes(self.partial[:84])
+            del self.partial[:84]
+            self.receipts.append(record)
+            self.completed += 1
+            self.events.append(("receipt", self.index, record))
+
+    def command(self, name, arguments=None):
+        self.events.append(("qmp", self.index, name, arguments))
+        if name == "x-run-to-virtual-time":
+            assert set(arguments) == {"target-ns"}
+            assert self.state in ("idle", "reached")
+            self.target = arguments["target-ns"]
+            assert type(self.target) is int and self.target > self.current
+            if self.on_run is not None:
+                self.on_run()
+            self.requests.append(self.target)
+            self.polls = 0
+            self.state = "running"
+            self.events.append(("run", self.index, self.target))
+            return {}
+        if name == "x-query-virtual-execution":
+            self.events.append(("execution", self.index, self.state))
+            if self.state == "running":
+                self.polls += 1
+                if self.fault is not None:
+                    value = {"state": "running", "current-ns": self.current,
+                             "target-ns": self.target}
+                    value.update(self.fault)
+                    return value
+                if self.polls == 2:
+                    self.current, self.state = self.target, "reached"
+                    raw = self.output.get(len(self.requests), b"")
+                    if raw:
+                        assert self.peer.send(raw) == len(raw)
+                        self.events.append(("output", self.index, raw))
+                    if self.eof:
+                        self.peer.shutdown(socket.SHUT_WR)
+                    if self.on_reached is not None:
+                        self.on_reached()
+                    self.events.append(("reached", self.index, self.current))
+            result = {"state": self.state, "current-ns": self.current}
+            if self.target is not None:
+                result["target-ns"] = self.target
+            return result
+        if name == "query-status":
+            return {"running": self.state == "running", "status": (
+                "running" if self.state == "running" else
+                "prelaunch" if self.state == "idle" else "paused")}
+        assert name == "qom-get"
+        if arguments == {"path": "/chardevs/can1", "property": "connected"}:
+            return True
+        assert arguments["path"] == "/machine"
+        if arguments["property"] == "fdcan-tx-state":
+            controller = {"pending_frames": 0, "pending_bytes": 0,
+                          "tx_dropped": self.tx_dropped, "tx_short_writes": 0}
+        else:
+            assert arguments["property"] == "fdcan-rx-state"
+            self._receive_input()
+            if self.on_rx is not None:
+                self.on_rx()
+            completed = (self.completed if self.report_completed is None else
+                         self.report_completed(self.completed))
+            controller = {"completed_frames": completed,
+                          "partial_bytes": len(self.partial), "rx_dropped": self.rx_dropped}
+        return {"schema": 1, "timestamp_ns": self.current,
+                "controllers": {"dm-mc02.fdcan1": controller}}
+
+
+@pytest.fixture
+def exact_world_resources():
+    """Keep the legacy shared/referee fixture's types and exported tuple intact."""
+    with ExitStack() as stack:
+        native, events = NativeStub(), []
+        buses = (CanBus(), CanBus())
+        devices = tuple(M3508Device(bus, 1) for bus in buses)
+        plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))), gear_ratio=2)
+        stack.callback(lambda: None if plant.closed else plant.close())
+        streams, peers, cosims, cosim_peers = [], [], [], []
+        for _ in range(2):
+            for cls, output, remote in ((CanStream, streams, peers),
+                                        (StepFramedSocket, cosims, cosim_peers)):
+                left, right = socket.socketpair()
+                for sock in (left, right):
+                    sock.setblocking(False)
+                    stack.callback(sock.close)
+                output.append(cls(left))
+                remote.append(right)
+        boards = Boards(cosim_peers, native)
+        cpus = tuple(NativeCpuQmp(index, peer, origin, native, events)
+                     for index, (peer, origin) in enumerate(zip(peers, boards.origins)))
+        bindings = tuple(BoardBinding(
+            name, QemuCanEndpoint(bus, stream), cosim, name,
+            BoardExecution(cpu.command, "dm-mc02.fdcan1", "can1"))
+            for name, bus, stream, cosim, cpu in zip(
+                ("left", "right"), buses, streams, cosims, cpus))
+        yield plant, boards, native, bindings, cpus, events, stack
+
+
+@pytest.fixture
+def exact_setup(exact_world_resources):
+    plant, boards, native, bindings, cpus, events, stack = exact_world_resources
+    def observe(name, frame, decoded):
+        events.append(("response", name, frame.header.kind, frame.header.step_id))
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards, on_response=observe)
+    stack.callback(runtime.close)
+    return runtime, boards, native, bindings, cpus, events
+
+
+def assert_exact_frozen(runtime, native, cpus):
+    before = list(native.steps), tuple(tuple(cpu.requests) for cpu in cpus)
+    assert runtime.failed
+    for action in (lambda: runtime.step(1, deadline=time.monotonic() + 1),
+                   lambda: runtime.service(deadline=time.monotonic() + 1)):
+        with pytest.raises(RuntimeError):
+            action()
+    assert (native.steps, tuple(tuple(cpu.requests) for cpu in cpus)) == before
+
+
+def test_exact_cpu_group_reaches_drains_and_receives_before_the_next_interval(exact_setup):
+    runtime, boards, native, bindings, cpus, events = exact_setup
+    for cpu, origin, command in zip(cpus, boards.origins,
+                                     ("1000 0000 0000 0000", "f000 0000 0000 0000")):
+        cpu.output[1] = can_wire(origin + 1, command)
+    start(runtime)
+    assert native.resets == 1 and all(cpu.requests == [] for cpu in cpus)
+    assert all(type(item.endpoint.stream) is CanStream and
+               type(item.endpoint.stream.sock) is socket.socket for item in bindings)
+    with pytest.raises(FrozenInstanceError):
+        bindings[0].execution.chardev = "changed"
+    assert runtime.can_input_states == (
+        {"completed_frames": 0, "partial_bytes": 0, "rx_dropped": 0},) * 2
+    observed = runtime.can_input_states
+    observed[0]["completed_frames"] = 999
+    assert runtime.can_input_states[0]["completed_frames"] == 0
+    original_step = native.step
+    def world_step(dt):
+        assert all(cpu.state == "reached" for cpu in cpus)
+        assert all(item.endpoint.bus.pending == (0 if native.steps else 1) for item in bindings)
+        for item in bindings:
+            assert not item.endpoint.stream.buffer
+            with pytest.raises(BlockingIOError):
+                item.endpoint.stream.sock.recv(1, socket.MSG_PEEK)
+        events.append(("world", dt))
+        original_step(dt)
+    native.step = world_step
+    events.clear()
+    runtime.step(10_000_000, deadline=time.monotonic() + 1)
+    runs = [i for i, row in enumerate(events) if row[0] == "run"]
+    polls = [i for i, row in enumerate(events) if row[:1] == ("execution",) and row[2] == "running"]
+    assert len(runs) == 2 and max(runs) < min(polls)
+    assert [cpu.requests for cpu in cpus] == [[10_001_000], [10_002_000]]
+    assert native.steps == [10_000_000] and native.efforts == [("j1", 0), ("j2", 0)]
+    assert [device.current_raw for device in runtime.plant.devices] == [4096, -4096]
+    assert all(item.endpoint.bus.pending == 0 for item in bindings)
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    for cpu, origin in zip(cpus, boards.origins):
+        assert cpu.receipts == [struct.pack("<IIB3xQ64s", 0x201, 0, 8,
+                                            origin + 10_000_000, zero.ljust(64, b"\0"))]
+    # A second CPU request sees all prior ACKs and complete actual native input.
+    def next_run():
+        assert all(len(cpu.receipts) == 1 and not cpu.partial for cpu in cpus)
+        assert all(frames[-1].header.kind == codec.STEP and
+                   frames[-1].header.step_id == 1 for frames in boards.frames)
+        assert {(row[1], row[3]) for row in events
+                if row[0] == "response" and row[2] == codec.STEP_ACK} == {
+                    ("left", 1), ("right", 1)}
+    for cpu in cpus:
+        cpu.on_run = next_run
+    runtime.step(10_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [10_000_000, 10_000_000]
+    assert native.efforts == [("j1", 0), ("j2", 0), ("j1", .2), ("j2", -.2)]
+    assert [cpu.requests for cpu in cpus] == [[10_001_000, 20_001_000],
+                                            [10_002_000, 20_002_000]]
+    assert all(len(cpu.receipts) == 2 and cpu.completed == 2 for cpu in cpus)
+    assert [state["completed_frames"] for state in runtime.can_input_states] == [2, 2]
+    assert runtime.t_sim_ns == 20_000_500 and runtime.step_id == 2 and not runtime.failed
+
+
+@pytest.mark.parametrize("invalid", ["mixed", "type", "command", "controller", "chardev",
+                                    "stream", "socket", "budget"])
+def test_exact_full_admission_precedes_getters_ownership_and_io(exact_world_resources, invalid):
+    plant, boards, native, bindings, cpus, events, _ = exact_world_resources
+    item = bindings[1]
+    if invalid == "mixed":
+        item = replace(item, execution=None)
+    elif invalid == "type":
+        item = replace(item, execution=object())
+    elif invalid in ("command", "controller", "chardev"):
+        value = {"command": None, "controller": "bad/name", "chardev": ""}[invalid]
+        item = replace(item, execution=replace(item.execution, **{invalid: value}))
+    elif invalid == "stream":
+        stream = CountingCanStream(item.endpoint.stream.sock, native)
+        item = replace(item, endpoint=QemuCanEndpoint(item.endpoint.bus, stream, "other"))
+    elif invalid == "socket":
+        # An otherwise usable fd wrapper fails the exact original-socket premise.
+        item.endpoint.stream.sock = UartBudget(item.endpoint.stream.sock)
+    else:
+        item.endpoint.bus.dispatch_budget = 0
+    with pytest.raises((TypeError, ValueError)):
+        SharedWorldRuntime(plant, (bindings[0], item), check_running=boards)
+    assert native.reads == native.steps == [] and native.resets == native.closed == 0
+    assert not plant.closed and boards.frames == [[], []] and events == []
+
+
+@pytest.mark.parametrize("invalid", ["mapped_target", "delayed_target", "sample", "headroom", "budget_changed"])
+def test_exact_all_board_preflight_precedes_any_cpu_or_world_effect(exact_setup, monkeypatch, invalid):
+    runtime, boards, native, bindings, cpus, events = exact_setup
+    if invalid == "headroom":
+        # Two per-bus dispatch phases can each submit dispatch_budget records.
+        cpus[1].completed = (1 << 64) - 513
+    start(runtime)
+    dt = 1_000_000
+    if invalid == "mapped_target":
+        dt = (1 << 63) - 1500  # Only the later board's origin makes this overflow.
+    elif invalid == "delayed_target":
+        runtime.set_can_delay("right", (1 << 64) - 1)
+    elif invalid == "sample":
+        monkeypatch.setattr(SharedWorldRuntime, "step_id", property(lambda _: (1 << 32) - 1))
+    elif invalid == "budget_changed":
+        bindings[1].endpoint.bus.dispatch_budget += 1
+    before = list(events), list(native.reads)
+    with pytest.raises((ValueError, RuntimeError)):
+        runtime.step(dt, deadline=time.monotonic() + 1)
+    assert all(cpu.requests == cpu.receipts == [] for cpu in cpus)
+    assert native.steps == [] and native.resets == 1 and native.reads == before[1]
+    assert all(len(frames) == 1 for frames in boards.frames)
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_large_logical_epoch_keeps_native_cpu_targets_in_the_reset_epoch(exact_setup):
+    runtime, _, native, _, cpus, _ = exact_setup
+    runtime.start(Session(7, (1 << 63) + 500), (71, 72), deadline=time.monotonic() + 1)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert runtime.t_sim_ns == (1 << 63) + 1_000_500
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert native.steps == [1_000_000] and all(len(cpu.receipts) == 1 for cpu in cpus)
+    assert not runtime.failed
+
+
+@pytest.mark.parametrize("fault", ["cancelled", "overshoot", "backward", "target", "malformed"])
+def test_exact_native_execution_fault_freezes_before_world(exact_setup, fault):
+    runtime, _, native, _, cpus, _ = exact_setup
+    start(runtime)
+    cpus[0].fault = {
+        "cancelled": {"state": "cancelled"},
+        "overshoot": {"current-ns": 1_001_001},
+        "backward": {"current-ns": 999},
+        "target": {"target-ns": 1_001_001},
+        "malformed": {"current-ns": True},
+    }[fault]
+    with pytest.raises((TypeError, ValueError, RuntimeError)):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert native.steps == [] and native.resets == 1
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_partial_output_eof_keeps_the_original_tail_and_freezes(exact_setup):
+    runtime, _, native, bindings, cpus, _ = exact_setup
+    start(runtime)
+    raw = can_wire(1001, "1000 0000 0000 0000")
+    cpus[0].output[1], cpus[0].eof = raw[:19], True
+    with pytest.raises(ConnectionError):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert bytes(bindings[0].endpoint.stream.buffer) == raw[:19]
+    assert native.steps == [] and bindings[0].endpoint.bus.pending == 0
+    assert_exact_frozen(runtime, native, cpus)
+    runtime.close()
+    assert bytes(bindings[0].endpoint.stream.buffer) == raw[:19]
+    assert bindings[0].endpoint.stream.sock.fileno() >= 0
+
+
+def test_exact_tx_loss_keeps_prior_board_ingress_without_world_replay(exact_setup):
+    runtime, _, native, bindings, cpus, _ = exact_setup
+    start(runtime)
+    raw = can_wire(1001, "1000 0000 0000 0000")
+    cpus[0].output[1] = raw
+    cpus[1].on_reached = lambda: setattr(cpus[1], "tx_dropped", 1)
+    with pytest.raises(RuntimeError, match="drop"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [] and bindings[0].endpoint.bus.pending == 1
+    assert bindings[1].endpoint.bus.pending == 0
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_fragmented_native_receipt_wait_does_not_repeat_world_or_imu(exact_setup):
+    runtime, _, native, _, cpus, events = exact_setup
+    start(runtime)
+    cpus[0].read_limits = [19, 0, 0, 65]
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and native.reads == [
+        ("left", ()), ("right", ()), ("left", (1_000_000,)), ("right", (1_000_000,))]
+    assert [len(row[2]) for row in events if row[:2] == ("receipt-bytes", 0)] == [19, 65]
+    assert len([row for row in events if row == ("receipt-blocked", 0)]) == 2
+    assert all(cpu.completed == 1 and len(cpu.receipts) == 1 and not cpu.partial for cpu in cpus)
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert not runtime.failed
+
+
+def test_exact_native_rejected_records_still_complete_transport_receipt(exact_setup):
+    runtime, _, native, _, cpus, _ = exact_setup
+    start(runtime)
+    cpus[0].on_rx = lambda: setattr(cpus[0], "rx_dropped", cpus[0].completed)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and cpus[0].completed == cpus[0].rx_dropped == 1
+    assert len(cpus[0].receipts) == 1 and not runtime.failed
+    assert runtime.can_input_states == (
+        {"completed_frames": 1, "partial_bytes": 0, "rx_dropped": 1},
+        {"completed_frames": 1, "partial_bytes": 0, "rx_dropped": 0})
+    cpus[0].on_rx, cpus[0].rx_dropped = None, 0
+    with pytest.raises(RuntimeError, match="backward"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000]
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_native_receipt_beyond_goal_keeps_completed_world_and_freezes(exact_setup):
+    runtime, _, native, _, cpus, _ = exact_setup
+    start(runtime)
+    cpus[1].report_completed = lambda count: count + 1 if count else 0
+    with pytest.raises(RuntimeError, match="exceeds goal"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and all(len(cpu.receipts) == 1 for cpu in cpus)
+    assert runtime.t_sim_ns == 1_000_500 and runtime.step_id == 1
+    assert [state["completed_frames"] for state in runtime.can_input_states] == [0, 0]
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_receipt_reset_cannot_release_the_next_cpu_interval(exact_setup, monkeypatch):
+    runtime, _, native, _, cpus, _ = exact_setup
+    start(runtime)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    cpus[1].report_completed = lambda count: 0
+    now = [time.monotonic()]
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    cpus[1].on_rx = lambda: now.__setitem__(0, now[0] + .3)
+    with pytest.raises((RuntimeError, TimeoutError)):
+        runtime.step(1_000_000, deadline=now[0] + 1)
+    assert native.steps == [1_000_000] and all(len(cpu.receipts) == 1 for cpu in cpus)
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_ack_service_never_ingests_can_outside_the_explicit_drain(exact_setup):
+    runtime, boards, native, bindings, cpus, _ = exact_setup
+    start(runtime)
+    raw = can_wire(1_001_000, "1000 0000 0000 0000")
+    def unexpected_output(index, frame):
+        if index == 0 and frame.header.kind == codec.STEP:
+            assert cpus[0].peer.send(raw) == len(raw)
+        return False
+    boards.on_frame = unexpected_output
+    with pytest.raises(RuntimeError, match="drain CAN output"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and bindings[0].endpoint.bus.pending == 0
+    assert not bindings[0].endpoint.stream.buffer
+    assert bindings[0].endpoint.stream.sock.recv(84, socket.MSG_PEEK) == raw
+    assert_exact_frozen(runtime, native, cpus)

@@ -3,7 +3,9 @@
 The runtime borrows board endpoints and all nonblocking streams. One Coordinator
 owns the existing CAN/plant participant and optional referee engines; referee
 endpoints have a separate sequence lifecycle. This is a synchronous host
-composition, not a CPU target barrier. Execution failure is terminal except
+composition. Explicit execution bindings additionally coordinate native CPU
+targets and paused CAN transport; they do not close equal-time timers or create
+a global physics clock. Execution failure is terminal except
 snapshot capacity refusal: recreate the owner and boards, never replay a tick.
 Pure admission refusal preserves runtime readiness.
 Callbacks may observe state but must not reenter execution or cleanup.
@@ -11,9 +13,15 @@ Callbacks may observe state but must not reenter execution or cleanup.
 
 from dataclasses import dataclass
 import math
+import re
 import select
+import socket
 import time
+from typing import Callable
 
+from sim.boards import (
+    drain_paused_can, observe_initial_paused_can, wait_paused_can_input,
+)
 from sim.core import Coordinator, Session
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
@@ -31,11 +39,33 @@ from sim.transports import step_codec as codec
 
 
 @dataclass(frozen=True)
+class BoardExecution:
+    """Borrow a bounded native QMP command callable and CAN identities.
+
+    The caller excludes reset, restore, rail/configuration changes, reconnect,
+    extra CAN input and other CPU execution owners throughout the attempt.
+    ``command(name, arguments=None)`` must have its own finite command bound.
+    """
+
+    command: Callable
+    controller: str
+    chardev: str
+
+
+@dataclass(frozen=True)
 class BoardBinding:
     name: str
     endpoint: QemuCanEndpoint
     cosim: StepFramedSocket
     imu: str
+    execution: BoardExecution | None = None
+
+
+@dataclass(frozen=True)
+class _ExecutionCommands:
+    """Expose the guarded borrowed callable to the existing board helpers."""
+
+    command: Callable
 
 
 @dataclass(frozen=True)
@@ -101,6 +131,31 @@ class SharedWorldRuntime:
                 raise TypeError("board CAN requires the canonical CanStream")
             if not isinstance(item.cosim, StepFramedSocket):
                 raise TypeError("board co-sim requires StepFramedSocket")
+            if item.execution is not None:
+                if type(item.execution) is not BoardExecution:
+                    raise TypeError("board execution requires BoardExecution or None")
+                if not callable(item.execution.command):
+                    raise TypeError("board execution command must be callable")
+                for name in ("controller", "chardev"):
+                    value = getattr(item.execution, name)
+                    if (not isinstance(value, str) or
+                            re.fullmatch(r"[A-Za-z0-9_.-]+", value) is None):
+                        raise ValueError(f"{name} must be a nonempty native identity")
+                stream = item.endpoint.stream
+                if (type(stream) is not CanStream or
+                        type(stream.sock) is not socket.socket or
+                        stream.sock.family != socket.AF_UNIX or
+                        stream.sock.type != socket.SOCK_STREAM or
+                        stream.sock.fileno() < 0 or stream.sock.getblocking()):
+                    raise ValueError(
+                        "execution requires canonical CanStream on a nonblocking AF_UNIX stream")
+                budget = item.endpoint.bus.dispatch_budget
+                if type(budget) is not int or budget <= 0:
+                    raise ValueError("execution requires a positive fixed CAN dispatch budget")
+        executions = tuple(item.execution for item in bindings)
+        if any(item is not None for item in executions) and any(
+                item is None for item in executions):
+            raise ValueError("board execution bindings must be all present or all absent")
         for item in referees:
             if not isinstance(item.name, str) or not item.name or "\0" in item.name:
                 raise ValueError("referee names must be nonempty without NUL")
@@ -133,12 +188,23 @@ class SharedWorldRuntime:
         getter = getattr(plant.physics, "get_imu", None)
         if not callable(getter):
             raise TypeError("shared world physics requires get_imu")
+        exact_execution = executions[0] is not None
+        can_wiring = tuple(
+            (item.endpoint.bus, item.endpoint.stream, item.endpoint.stream.sock,
+             item.endpoint.bus.dispatch_budget) for item in bindings)
         # Getters are public, completed-state observations. No wiring, reset,
         # solver, transport or ownership effect occurs before full admission.
         for item in bindings:
             gyro, accel = imu_to_bmi088_units(getter(item.imu))
             codec.encode_imu_sample_v2(codec.ImuSampleV2(
                 gyro, accel, (0.0,) * 3, (0.0,) * 3, 0, 1))
+            if exact_execution:
+                for board, (bus, stream, sock, budget) in zip(bindings, can_wiring):
+                    if (board.endpoint.bus is not bus or board.endpoint.stream is not stream or
+                            stream.sock is not sock or type(bus.dispatch_budget) is not int or
+                            bus.dispatch_budget != budget):
+                        raise RuntimeError(
+                            "shared world execution CAN wiring or dispatch budget changed")
         coordinator = Coordinator({"can": CanParticipant(buses, (plant,)),
                                    **{"referee:" + item.name: item.engine for item in referees}})
         self.bindings = bindings
@@ -153,6 +219,10 @@ class SharedWorldRuntime:
         self._rx = ()
         self._tx = ()
         self._mappers = ()
+        self._exact_execution = exact_execution
+        self._can_wiring = can_wiring
+        self._can_baselines = ()
+        self._can_input_states = ()
 
     @property
     def t_sim_ns(self):
@@ -170,11 +240,134 @@ class SharedWorldRuntime:
     def closed(self):
         return self._coordinator.closed
 
+    @property
+    def can_input_states(self):
+        """Return the last complete native input observation group, if owned.
+
+        Counts include native rejects; ``rx_dropped`` is retained diagnostic
+        evidence, not firmware consumption. A failed attempt leaves the last
+        complete group available while preserving all subsequent native effects.
+        """
+        return tuple(dict(state) for state in self._can_input_states)
+
     def _guard(self, deadline):
+        self._check_execution_wiring()
         if self._check_running is not None:
             self._check_running()
+        self._check_execution_wiring()
         if time.monotonic() >= deadline:
             raise RuntimeError("shared world host deadline expired")
+
+    def _check_execution_wiring(self):
+        if not self._exact_execution:
+            return
+        for item, (bus, stream, sock, budget) in zip(self.bindings, self._can_wiring):
+            if (item.endpoint.bus is not bus or item.endpoint.stream is not stream or
+                    stream.sock is not sock or type(bus.dispatch_budget) is not int or
+                    bus.dispatch_budget != budget or sock.fileno() < 0 or
+                    sock.getblocking()):
+                raise RuntimeError("shared world execution CAN wiring or dispatch budget changed")
+
+    def _execution_io(self, index, deadline):
+        item = self.bindings[index]
+
+        def command(name, arguments=None):
+            self._guard(deadline)
+            result = item.execution.command(name, arguments)
+            self._guard(deadline)
+            return result
+
+        return {
+            "qmp": _ExecutionCommands(command), "stream": item.endpoint.stream,
+            "controller": item.execution.controller, "chardev": item.execution.chardev,
+            "deadline": deadline, "check": lambda: self._guard(deadline),
+        }
+
+    def _input_goal(self, index):
+        baseline = self._can_baselines[index]
+        count = self.bindings[index].endpoint.submitted_frames
+        if type(count) is not int or count < baseline["submitted_frames"]:
+            raise RuntimeError("shared world CAN submission count moved backwards")
+        goal = baseline["completed_frames"] + count - baseline["submitted_frames"]
+        if goal > 0xfffffffffffffffe:
+            raise ValueError("shared world CAN input goal exceeds native counter headroom")
+        return goal
+
+    def _wait_can_input(self, index, target, deadline):
+        rx = wait_paused_can_input(
+            **self._execution_io(index, deadline), target_ns=target,
+            completed_frames=self._input_goal(index))
+        if rx["rx_dropped"] < self._can_input_states[index]["rx_dropped"]:
+            raise RuntimeError("shared world CAN input drop count moved backwards")
+        return rx
+
+    def _run_cpus(self, targets, deadline):
+        # Revalidate the previous cut before any new CPU is released. The first
+        # cut has idle/no-target semantics, not a fabricated reached target.
+        starts = tuple(mapper.unmap(self.t_sim_ns, mapper.qemu_origin_ns)
+                       for mapper in self._mappers)
+        for index, start in enumerate(starts):
+            if self.step_id:
+                self._wait_can_input(index, start, deadline)
+            else:
+                observed = observe_initial_paused_can(
+                    **self._execution_io(index, deadline), timestamp_ns=start)
+                baseline = self._can_baselines[index]
+                if (any(observed["tx"][field] != baseline[field]
+                        for field in ("tx_dropped", "tx_short_writes")) or
+                        any(observed["rx"][field] != baseline[field]
+                            for field in ("completed_frames", "rx_dropped")) or
+                        self.bindings[index].endpoint.submitted_frames !=
+                        baseline["submitted_frames"]):
+                    raise RuntimeError("shared world initial CAN baseline changed")
+        commands = tuple(self._execution_io(index, deadline)["qmp"].command
+                         for index in range(len(self.bindings)))
+        # Admission replies do not prove completion. Submit every target before
+        # asking any board whether its native run actually reached that target.
+        for command, target in zip(commands, targets):
+            command("x-run-to-virtual-time", {"target-ns": target})
+        pending = set(range(len(self.bindings)))
+        previous = list(starts)
+        while pending:
+            for index in tuple(sorted(pending)):
+                execution = commands[index]("x-query-virtual-execution")
+                if not isinstance(execution, dict):
+                    raise ValueError("native execution must be an object")
+                current = execution.get("current-ns")
+                target = execution.get("target-ns")
+                if (type(current) is not int or type(target) is not int or
+                        not 0 <= current <= 0x7fffffffffffffff or
+                        target != targets[index]):
+                    raise RuntimeError("native CPU execution time or target is invalid")
+                if not previous[index] <= current <= target:
+                    raise RuntimeError("native CPU execution reversed or overshot its target")
+                previous[index] = current
+                state = execution.get("state")
+                if state not in ("running", "reached"):
+                    raise RuntimeError("native CPU execution was cancelled or is malformed")
+                if state == "reached":
+                    if current != target:
+                        raise RuntimeError("native CPU reached a different target")
+                    status = commands[index]("query-status")
+                    if (not isinstance(status, dict) or status.get("running") is not False or
+                            status.get("status") != "paused"):
+                        raise RuntimeError("native CPU must be paused at its reached target")
+                    pending.remove(index)
+            if pending:
+                self._service(deadline, 0.001)
+        # Every output producer is now quiescent. All canonical drains precede
+        # the same sole world step; interior timestamps keep the existing bus
+        # sampled-target policy and cannot retroactively affect this interval.
+        for index, target in enumerate(targets):
+            endpoint = self.bindings[index].endpoint
+
+            def sink(frame, endpoint=endpoint):
+                can_id, flags, dlc, timestamp, data = frame
+                endpoint.ingest(CanFrame(can_id, flags, dlc, data, timestamp), self.t_sim_ns)
+
+            drain_paused_can(
+                **self._execution_io(index, deadline), sink=sink, target_ns=target,
+                tx_dropped=self._can_baselines[index]["tx_dropped"])
 
     def _observe(self, index, frame, decoded):
         if self._on_response is not None:
@@ -202,10 +395,11 @@ class SharedWorldRuntime:
             self._guard(deadline)
         readable = [item.cosim.sock for item in self.bindings]
         writable = [item.cosim.sock for item in self.bindings if item.cosim.tx_pending]
-        if acked is None:
+        if acked is None and not self._exact_execution:
             readable.extend(item.endpoint.stream.sock for item in self.bindings)
             writable.extend(item.endpoint.stream.sock for item in self.bindings
                             if item.endpoint.stream.tx_pending)
+        if acked is None:
             writable.extend(item.endpoint.transport.sock for item in self.referees
                             if item.endpoint.transport.tx_pending)
         _, ready_write, _ = select.select(
@@ -214,7 +408,8 @@ class SharedWorldRuntime:
         for item in self.bindings:
             if item.cosim.sock in ready_write:
                 item.cosim.flush()
-            if acked is None and item.endpoint.stream.sock in ready_write:
+            if (acked is None and not self._exact_execution and
+                    item.endpoint.stream.sock in ready_write):
                 item.endpoint.stream.flush()
             self._guard(deadline)
         if acked is None:
@@ -224,7 +419,7 @@ class SharedWorldRuntime:
                 self._guard(deadline)
         # One canonical CAN read per stream; parsing/ingress never advances
         # time. The bus retains original ordering/future delivery and queues.
-        if acked is None:
+        if acked is None and not self._exact_execution:
             for item in self.bindings:
                 for can_id, flags, dlc, timestamp, data in item.endpoint.stream.receive():
                     item.endpoint.ingest(CanFrame(can_id, flags, dlc, data, timestamp),
@@ -302,6 +497,26 @@ class SharedWorldRuntime:
                 # queued bytes/suffixes; it does not isolate old UART input.
                 item.endpoint.reset(item.endpoint.next_sequence)
             self._guard(deadline)
+            if self._exact_execution:
+                baselines, input_states = [], []
+                for index, mapper in enumerate(mappers):
+                    submitted = self.bindings[index].endpoint.submitted_frames
+                    observed = observe_initial_paused_can(
+                        **self._execution_io(index, deadline),
+                        timestamp_ns=mapper.qemu_origin_ns)
+                    if self.bindings[index].endpoint.submitted_frames != submitted:
+                        raise RuntimeError("shared world initial CAN submissions changed")
+                    baselines.append({
+                        **{name: observed["tx"][name]
+                           for name in ("tx_dropped", "tx_short_writes")},
+                        **{name: observed["rx"][name]
+                           for name in ("completed_frames", "rx_dropped")},
+                        "submitted_frames": submitted,
+                    })
+                    input_states.append(dict(observed["rx"]))
+                self._guard(deadline)
+                self._can_baselines = tuple(baselines)
+                self._can_input_states = tuple(input_states)
             self._failed = False
             return tuple(responses)
         finally:
@@ -404,11 +619,24 @@ class SharedWorldRuntime:
                 raise ValueError("STEP sample ID must fit the unsigned 32-bit field")
             for item in self.bindings:
                 check_can_time(target + item.endpoint.bus.delay_ns)
-            for mapper in self._mappers:
-                check_can_time(mapper.unmap(target, mapper.qemu_origin_ns))
+            targets = tuple(mapper.unmap(target, mapper.qemu_origin_ns)
+                            for mapper in self._mappers)
+            for native_target in targets:
+                check_can_time(native_target)
+                if self._exact_execution and native_target > 0x7fffffffffffffff:
+                    raise ValueError("native CPU target must fit signed64")
+            if self._exact_execution:
+                self._check_execution_wiring()
+                for index, (_, _, _, budget) in enumerate(self._can_wiring):
+                    if self._input_goal(index) + 2 * budget > 0xfffffffffffffffe:
+                        raise ValueError("shared world CAN input lacks native counter headroom")
             self._guard(deadline)
             self._service(deadline, 0)
             self._guard(deadline)
+            if self._exact_execution:
+                self._run_cpus(targets, deadline)
+                self._service(deadline, 0)
+                self._guard(deadline)
             self._coordinator.step(dt_ns)
             self._guard(deadline)
             # Collect every completed IMU and encode every outgoing frame
@@ -437,6 +665,11 @@ class SharedWorldRuntime:
                 responses.append(response)
                 self._observe(index, response, codec.decode_step_ack_payload(response.payload))
                 self._guard(deadline)
+            if self._exact_execution:
+                states = tuple(dict(self._wait_can_input(index, native_target, deadline))
+                               for index, native_target in enumerate(targets))
+                self._guard(deadline)
+                self._can_input_states = states
             self._failed = False
             return tuple(responses)
         finally:
