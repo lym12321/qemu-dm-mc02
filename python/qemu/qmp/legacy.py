@@ -22,6 +22,7 @@ old interface.
 #
 
 import asyncio
+import math
 import socket
 from types import TracebackType
 from typing import (
@@ -30,12 +31,14 @@ from typing import (
     Dict,
     List,
     Optional,
+    Tuple,
     Type,
     TypeVar,
     Union,
 )
 
 from .error import QMPError
+from .message import Message
 from .protocol import Runstate, SocketAddrT
 from .qmp_client import QMPClient
 
@@ -215,6 +218,113 @@ class QEMUMonitorProtocol:
             self._qmp.execute(cmd, kwds),
             self._timeout
         )
+
+    def cmd_many(
+            self, commands: Tuple[Tuple[str, Optional[Dict[str, object]]], ...]
+    ) -> Tuple[QMPReturnValue, ...]:
+        """Execute 1..8 independent commands, returning values in input order.
+
+        All commands must serialize before any is issued. The existing finite,
+        positive RPC timeout bounds the group wait; cancellation cleanup has a
+        separate bound of the same duration.
+        This is not atomic: errors retain earlier command effects, with no retry
+        or rollback. Callers must use independent queries and freeze on failure.
+        Event routing, IDs and execution remain owned by QMPClient.
+        """
+        timeout = self._timeout
+        if type(timeout) not in (int, float) or timeout <= 0:
+            raise ValueError("cmd_many requires a finite positive timeout")
+        try:
+            timeout = float(timeout)
+        except OverflowError as error:
+            raise ValueError(
+                "cmd_many requires a finite positive timeout"
+            ) from error
+        if not math.isfinite(timeout):
+            raise ValueError("cmd_many requires a finite positive timeout")
+        if type(commands) is not tuple or not 1 <= len(commands) <= 8:
+            raise ValueError("cmd_many requires a plain tuple of 1..8 commands")
+        messages = []
+        for command in commands:
+            if type(command) is not tuple or len(command) != 2:
+                raise TypeError(
+                    "cmd_many commands must be plain (name, arguments) tuples"
+                )
+            name, arguments = command
+            if type(name) is not str or not name or '\0' in name:
+                raise ValueError(
+                    "cmd_many command names must be plain nonempty strings "
+                    "without NUL"
+                )
+            if arguments is not None and type(arguments) is not dict:
+                raise TypeError("cmd_many arguments must be a plain dict or None")
+            message = self._qmp.make_execute_msg(name, arguments)
+            # Canonical serialization/deserialization snapshots nested arguments
+            # too: later caller mutation cannot invalidate whole-group admission.
+            messages.append(Message(bytes(message)))
+
+        def note(error: BaseException, text: str) -> None:
+            # Keep this fork's Python >=3.8 support; Python >=3.11 renders these
+            # notes itself, older supported versions retain the same evidence.
+            add_note = getattr(error, 'add_note', None)
+            if add_note is not None:
+                add_note(text)
+            else:
+                setattr(error, '__notes__',
+                        getattr(error, '__notes__', []) + [text])
+
+        owned = []
+        groups = []
+
+        async def collect() -> Tuple[QMPReturnValue, ...]:
+            for message in messages:
+                owned.append(self._aloop.create_task(
+                    self._qmp.execute_msg(message)))
+            group = asyncio.gather(*owned, return_exceptions=True)
+            groups.append(group)
+            done, _ = await asyncio.wait((group,), timeout=timeout)
+            if not done:
+                raise asyncio.TimeoutError("cmd_many group timed out")
+            return tuple(group.result())
+
+        main = self._aloop.create_task(collect())
+        try:
+            values = self._sync(main)
+        except BaseException as error:
+            # run_until_complete may raise KeyboardInterrupt without cancelling
+            # its main future. Explicitly cancel every task owned by this call.
+            pending = (main, *groups, *owned)
+            for task in pending:
+                task.cancel()
+
+            async def settle() -> None:
+                _, remaining = await asyncio.wait(pending, timeout=timeout)
+                if remaining:
+                    raise asyncio.TimeoutError("cmd_many cancellation did not settle")
+                for task in pending:
+                    if not task.cancelled():
+                        task.exception()  # Retrieve any terminal exception.
+                for index, task in enumerate(owned):
+                    if not task.cancelled() and task.exception() is not None:
+                        failure = task.exception()
+                        note(error, f"cmd_many command {index} failed: " +
+                             f"{type(failure).__name__}: {failure}")
+
+            try:
+                self._sync(settle())
+            except BaseException as cleanup:
+                note(error, "cmd_many cleanup failed: " +
+                     f"{type(cleanup).__name__}: {cleanup}")
+            raise
+        failures = [(index, value) for index, value in enumerate(values)
+                    if isinstance(value, BaseException)]
+        if failures:
+            _, primary = failures[0]
+            for index, error in failures[1:]:
+                note(primary, f"cmd_many command {index} failed: " +
+                     f"{type(error).__name__}: {error}")
+            raise primary
+        return values
 
     def pull_event(self,
                    wait: Union[bool, float] = False) -> Optional[QMPMessage]:
