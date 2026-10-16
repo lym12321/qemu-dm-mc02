@@ -47,12 +47,23 @@ class QemuCanEndpoint:
         self._stream = stream
         self._send = send
         self._mapper: TimestampMapper | None = None
+        self._submitted_frames = 0
         bus.attach(self, name)
 
     @property
     def stream(self) -> QemuCanStream:
         """Return the actual borrowed stream without transferring ownership."""
         return self._stream
+
+    @property
+    def submitted_frames(self) -> int:
+        """Count successful send returns, including records still queued.
+
+        Logical resets and mapper changes preserve this endpoint-lifetime
+        count. A failed send may have IO effects without incrementing it;
+        callers must freeze after failure rather than infer receipt or retry.
+        """
+        return self._submitted_frames
 
     def bind_mapper(self, mapper: TimestampMapper) -> None:
         """Bind a validated RESET mapper without changing transport bytes."""
@@ -81,6 +92,7 @@ class QemuCanEndpoint:
         check_can_time(timestamp_ns)
         self._send(frame.can_id, frame.flags, frame.dlc,
                    timestamp_ns, frame.data)
+        self._submitted_frames += 1
 
 
 class SocketCanEndpoint:

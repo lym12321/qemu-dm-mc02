@@ -92,6 +92,7 @@ def test_fixed84_classic_and_fd_ingress_and_reset_epoch_egress(
         streams, flags, dlc, data):
     stream, peer = streams
     runtime, (device,) = runtime_for(stream)
+    assert runtime.endpoint.submitted_frames == 0
     runtime.reset(7, 100, worker.QemuTimestampMapper(9000, 100))
     peer.sendall(wire(0x310, flags, dlc, 9005, data))
     (can_id, received_flags, received_dlc, timestamp, payload), = stream.receive()
@@ -101,6 +102,7 @@ def test_fixed84_classic_and_fd_ingress_and_reset_epoch_egress(
     assert device.commands == []
     runtime.step(5)
     assert device.commands == [CanFrame(0x310, flags, dlc, data, 105)]
+    assert runtime.endpoint.submitted_frames == 1
     assert peer.recv(84) == wire(0x201, 0, 5, 9005, b"state")
     runtime.close()
     assert stream.sock.fileno() >= 0 and peer.fileno() >= 0
@@ -158,15 +160,59 @@ def test_partial_tx_retains_old_wire_suffix_across_new_reset(streams):
     runtime.step(1)
     old = wire(0x201, 0, 5, 1001, b"state")
     assert bytes(stream.tx_queue[0]) == old[7:]
+    assert runtime.endpoint.submitted_frames == 1
     runtime.reset(2, 0, worker.QemuTimestampMapper(2000, 0))
     assert bytes(stream.tx_queue[0]) == old[7:]
+    assert runtime.endpoint.submitted_frames == 1
     runtime.step(1)
     new = wire(0x201, 0, 5, 2001, b"state")
+    assert runtime.endpoint.submitted_frames == 2
     short.limit = 4096
     assert stream.flush()
     assert peer.recv(168) == old + new
+    assert runtime.endpoint.submitted_frames == 2
     assert len(device.steps) == 1
     runtime.close()
+
+
+def test_successful_submission_counts_queued_record_but_not_refusal_or_flush(streams):
+    stream, peer = streams
+    stream.sock.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1024)
+    stream.max_pending = 1
+    bus = CanBus()
+    endpoint = QemuCanEndpoint(bus, stream)
+    endpoint.bind_mapper(worker.QemuTimestampMapper(1000, 0))
+    frame = CanFrame(0x201, data=b"state", timestamp_ns=10)
+    for total in range(1, 129):
+        endpoint.receive(frame)
+        if stream.tx_pending:
+            break
+    else:
+        pytest.fail("finite CAN prefill did not reach socket backpressure")
+    assert endpoint.submitted_frames == total
+    expected = wire(0x201, 0, 5, 1010, b"state") * total
+    suffix = stream.tx_queue[0]
+    assert len(stream.tx_queue) == 1 and suffix and expected.endswith(bytes(suffix))
+    with pytest.raises(BufferError, match="FDCAN TX queue is full"):
+        endpoint.receive(frame)
+    assert endpoint.submitted_frames == total and stream.tx_queue[0] is suffix
+    assert not stream.flush() and stream.tx_queue[0] is suffix
+    endpoint.bind_mapper(worker.QemuTimestampMapper(2000, 0))
+    bus.reset(50)
+    assert endpoint.submitted_frames == total and stream.tx_queue[0] is suffix
+
+    received = bytearray()
+    for _ in range(32):
+        try:
+            received.extend(peer.recv(4096))
+        except BlockingIOError:
+            pass
+        stream.flush()
+        if len(received) == len(expected):
+            break
+    assert bytes(received) == expected and not stream.tx_pending
+    assert endpoint.submitted_frames == total
+    assert stream.sock.fileno() >= 0 and peer.fileno() >= 0
 
 
 def test_socketcan_native_datagram_both_directions_current_timestamp(streams):
@@ -206,16 +252,38 @@ def test_step_start_commands_then_devices_then_target_delivery(streams):
     runtime.reset(1, 0, worker.QemuTimestampMapper(1000, 0))
     runtime.ingest_qemu(CanFrame(0x200, data=b"now", timestamp_ns=1000), 0)
     runtime.ingest_qemu(CanFrame(0x200, data=b"future", timestamp_ns=1005), 0)
+    assert runtime.endpoint.submitted_frames == 0
     result = runtime.step(10)
     assert device.steps[0][1] == (CanFrame(0x200, data=b"now"),)
     assert [f.data for f in device.commands] == [b"now", b"future"]
     assert result == StepResult("ok", 10, {
         "delivered_start": 1, "delivered_target": 2, "pending": 0})
     assert peer.recv(84) == wire(0x201, 0, 5, 1010, b"state")
+    assert runtime.endpoint.submitted_frames == 1
     runtime.step(10)
     assert [f.data for f in device.steps[1][1]] == [b"now", b"future"]
     assert runtime.t_sim_ns == runtime.bus.t_sim_ns == 20
+    assert runtime.endpoint.submitted_frames == 2
     runtime.close()
+
+
+def test_dropped_feedback_does_not_submit_and_recovery_preserves_count(streams):
+    stream, peer = streams
+    bus = CanBus(drop=lambda _source, _destination, frame: frame.timestamp_ns == 20)
+    runtime, (device,) = runtime_for(stream, bus=bus)
+    try:
+        runtime.reset(1, 0, worker.QemuTimestampMapper(1000, 0))
+        runtime.step(10)
+        assert peer.recv(84) == wire(0x201, 0, 5, 1010, b"state")
+        runtime.step(10)
+        assert runtime.endpoint.submitted_frames == 1 and len(device.steps) == 2
+        with pytest.raises(BlockingIOError):
+            peer.recv(84)
+        runtime.step(10)
+        assert peer.recv(84) == wire(0x201, 0, 5, 1030, b"state")
+        assert runtime.endpoint.submitted_frames == 2
+    finally:
+        runtime.close()
 
 
 def test_delay_changes_keep_pending_due_and_reset_epoch_with_one_runtime_owner(streams):
@@ -231,6 +299,7 @@ def test_delay_changes_keep_pending_due_and_reset_epoch_with_one_runtime_owner(s
         assert runtime.step(10) == StepResult("ok", 110, {
             "delivered_start": 0, "delivered_target": 0, "pending": 2})
         assert device.steps[0][1] == () and device.commands == []
+        assert runtime.endpoint.submitted_frames == 0
         with pytest.raises(BlockingIOError):
             peer.recv(84)
 
@@ -244,12 +313,14 @@ def test_delay_changes_keep_pending_due_and_reset_epoch_with_one_runtime_owner(s
         assert device.commands == [CanFrame(0x200, data=b"new", timestamp_ns=110),
                                    CanFrame(0x200, data=b"old", timestamp_ns=120)]
         assert peer.recv(84) == wire(0x201, 0, 5, 9020, b"state")
+        assert runtime.endpoint.submitted_frames == 1
 
         bus.delay_ns = 30
         assert runtime.step(10) == StepResult("ok", 130, {
             "delivered_start": 0, "delivered_target": 1, "pending": 1})
         assert device.steps[2][1] == tuple(device.commands)
         assert peer.recv(84) == wire(0x201, 0, 5, 9030, b"state")
+        assert runtime.endpoint.submitted_frames == 2
         # Original command/feedback metadata, immutable enqueue deadlines and
         # actual settled delivery times remain separate public observations.
         assert [(row.frame.data, row.timestamp_ns, row.due_ns, row.delivered_ns)
@@ -260,11 +331,14 @@ def test_delay_changes_keep_pending_due_and_reset_epoch_with_one_runtime_owner(s
 
         runtime.reset(8, 500, worker.QemuTimestampMapper(20000, 500))
         assert bus.delay_ns == 30 and bus.pending == 0 and device.steps == device.commands == []
+        assert runtime.endpoint.submitted_frames == 2
         assert runtime.step(1).diagnostics == {
             "delivered_start": 0, "delivered_target": 0, "pending": 1}
+        assert runtime.endpoint.submitted_frames == 2
         assert runtime.step(30).diagnostics == {
             "delivered_start": 0, "delivered_target": 1, "pending": 1}
         assert peer.recv(84) == wire(0x201, 0, 5, 20031, b"state")
+        assert runtime.endpoint.submitted_frames == 3
         runtime.close()
         assert device.close_calls == 1 and bus.delay_ns == 30 and bus.pending == 1
         assert runtime.endpoint.stream is stream and stream.sock.fileno() >= 0 and peer.fileno() >= 0
@@ -390,6 +464,69 @@ def test_reset_failure_freezes_and_close_tries_every_device_once(streams):
     assert stream.sock.fileno() >= 0
 
 
+def test_send_error_after_wire_io_keeps_count_and_freezes_without_replay(streams):
+    stream, peer = streams
+    original_send = stream.send
+    primary = KeyboardInterrupt("send returned no success after wire IO")
+    calls = []
+
+    def send(*args):
+        calls.append(args)
+        original_send(*args)
+        if len(calls) == 2:
+            raise primary
+
+    stream.send = send
+    runtime, (device,) = runtime_for(stream)
+    try:
+        runtime.reset(1, 0, worker.QemuTimestampMapper(1000, 0))
+        runtime.step(10)
+        assert runtime.endpoint.submitted_frames == 1
+        with pytest.raises(KeyboardInterrupt) as caught:
+            runtime.step(10)
+        assert caught.value is primary
+        assert peer.recv(168) == (wire(0x201, 0, 5, 1010, b"state")
+                                  + wire(0x201, 0, 5, 1020, b"state"))
+        assert runtime.endpoint.submitted_frames == 1 and len(calls) == 2
+        assert runtime.coordinator.failed and runtime.t_sim_ns == 10
+        assert runtime.bus.t_sim_ns == 20 and runtime.bus.pending == 0
+        assert len(device.steps) == 2
+        with pytest.raises(RuntimeError, match="successful reset"):
+            runtime.step(10)
+        assert len(device.steps) == len(calls) == 2
+        with pytest.raises(BlockingIOError):
+            peer.recv(84)
+        runtime.reset(2, 0, worker.QemuTimestampMapper(2000, 0))
+        assert runtime.endpoint.submitted_frames == 1
+        runtime.step(10)
+        assert peer.recv(84) == wire(0x201, 0, 5, 2010, b"state")
+        assert runtime.endpoint.submitted_frames == 2 and len(calls) == 3
+    finally:
+        runtime.close()
+    assert runtime.endpoint.submitted_frames == 2
+    assert stream.sock.fileno() >= 0 and peer.fileno() >= 0
+
+
+def test_submission_is_read_only_and_uses_captured_send_after_normal_return():
+    calls = []
+
+    def send(*args):
+        calls.append((endpoint.submitted_frames, args))
+
+    stream = SimpleNamespace(send=send)
+    endpoint = QemuCanEndpoint(CanBus(), stream)
+    assert type(endpoint.submitted_frames) is int and endpoint.submitted_frames == 0
+    with pytest.raises(AttributeError):
+        endpoint.submitted_frames = 9
+    endpoint.bind_mapper(worker.QemuTimestampMapper(1000, 0))
+    stream.send = lambda *_: pytest.fail("endpoint replaced its captured send")
+    endpoint.receive(CanFrame(0x201, data=b"ok", timestamp_ns=10))
+    endpoint.receive(CanFrame(0x202, data=b"yes", timestamp_ns=20))
+    assert calls == [(0, (0x201, 0, 2, 1010, b"ok")),
+                     (1, (0x202, 0, 3, 1020, b"yes"))]
+    assert endpoint.submitted_frames == 2
+
+
 def test_endpoint_admission_and_invalid_mapper_preserve_existing_binding(streams):
     stream, peer = streams
     bus = CanBus()
@@ -400,13 +537,25 @@ def test_endpoint_admission_and_invalid_mapper_preserve_existing_binding(streams
         SocketCanEndpoint(bus, object())
     with pytest.raises(RuntimeError, match="RESET mapper"):
         endpoint.ingest(CanFrame(1), 0)
+    with pytest.raises(RuntimeError, match="RESET mapper"):
+        endpoint.receive(CanFrame(1))
+    assert endpoint.submitted_frames == 0
     mapper = worker.QemuTimestampMapper(1000, 0)
     endpoint.bind_mapper(mapper)
     with pytest.raises(ValueError):
         endpoint.bind_mapper(SimpleNamespace(map=mapper.map, unmap=mapper.unmap,
                                              qemu_origin_ns=-1))
+    assert endpoint.submitted_frames == 0
     endpoint.receive(CanFrame(2, data=b"ok", timestamp_ns=10))
     assert peer.recv(84) == wire(2, 0, 2, 1010, b"ok")
+    assert endpoint.submitted_frames == 1
+    endpoint.bind_mapper(SimpleNamespace(map=mapper.map, unmap=lambda *_: True,
+                                         qemu_origin_ns=1000))
+    with pytest.raises(ValueError):
+        endpoint.receive(CanFrame(2))
+    assert endpoint.submitted_frames == 1
+    with pytest.raises(BlockingIOError):
+        peer.recv(84)
     with pytest.raises(ValueError):
         endpoint.ingest(CanFrame(1), True)
     assert bus.pending == 0

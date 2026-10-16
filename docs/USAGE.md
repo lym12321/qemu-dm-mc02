@@ -2033,6 +2033,11 @@ coordinator.step(1_000_000)
 coordinator.close()
 ```
 
+`QemuCanEndpoint.submitted_frames` 是端点生命周期内发送调用正常返回的累计帧数，
+包括仍留在 transport 队列中的完整帧或未发送后缀；更换 RESET mapper 或逻辑 reset
+保留这个只读计数。它不表示 socket 接收、QEMU 处理、FIFO 接受或固件消费。
+发送异常可能已经产生部分 I/O，但不增加计数；调用方须冻结，不能据此重放或恢复发送。
+
 在 Gazebo SDK Python 环境中也可用同一 owner 绑定公开转子：
 
 ```python
