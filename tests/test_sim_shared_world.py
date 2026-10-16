@@ -1491,36 +1491,30 @@ class NativeCpuBatchQmp(NativeCpuQmp):
         return super().command(name, arguments)
 
     def command_many(self, commands):
-        fence = (("x-query-virtual-execution", None), ("query-status", None),
-                 ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
-        tx = ("qom-get", {"path": "/machine", "property": "fdcan-tx-state"})
-        rx = ("qom-get", {"path": "/machine", "property": "fdcan-rx-state"})
-        if commands == fence + (tx, rx):
-            direction = "initial"
-        elif commands == fence + (tx,):
-            direction = "output"
-        else:
-            assert commands == fence + (rx,), commands
-            direction = "input"
         assert type(commands) is tuple
-        if direction in ("initial", "input"):
-            self._receive_input()
-            if self.on_rx is not None:
-                self.on_rx()
+        assert commands == (
+            ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
+            ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
+        # Every aggregate observes the real peer. Labels only describe the
+        # existing CPU/world stages; they cannot select data or receive work.
+        self._receive_input()
+        if self.on_rx is not None:
+            self.on_rx()
+        direction = ("initial" if self.target is None else
+                     "output" if len(self.requests) > len(self.native.steps) else "input")
         execution = {"state": self.state, "current-ns": self.current}
         if self.target is not None:
             execution["target-ns"] = self.target
-        values = (execution, {"running": False, "status": (
-            "prelaunch" if self.state == "idle" else "paused")}, True)
-        if direction in ("initial", "output"):
-            values += ({"schema": 1, "timestamp_ns": self.current, "controllers": {
+        count = self.completed if self.report_completed is None else self.report_completed(self.completed)
+        values = ({"schema": 1, "execution": execution,
+                   "status": {"running": False, "status": (
+                       "prelaunch" if self.state == "idle" else "paused"), "singlestep": False},
+                   "fdcan-tx-state": {"schema": 1, "timestamp_ns": self.current, "controllers": {
                 "dm-mc02.fdcan1": {"pending_frames": 0, "pending_bytes": 0,
-                                  "tx_dropped": self.tx_dropped, "tx_short_writes": 0}}},)
-        if direction in ("initial", "input"):
-            count = self.completed if self.report_completed is None else self.report_completed(self.completed)
-            values += ({"schema": 1, "timestamp_ns": self.current, "controllers": {
+                                  "tx_dropped": self.tx_dropped, "tx_short_writes": 0}}},
+                   "fdcan-rx-state": {"schema": 1, "timestamp_ns": self.current, "controllers": {
                 "dm-mc02.fdcan1": {"completed_frames": count, "partial_bytes": len(self.partial),
-                                  "rx_dropped": self.rx_dropped}}},)
+                                  "rx_dropped": self.rx_dropped}}}}, True)
         self.groups.append((direction, values))
         self.events.append(("batch", self.index, direction))
         self.after_batch(direction, values)
@@ -1858,7 +1852,7 @@ def test_exact_batch_keeps_real_receipts_and_fresh_groups_before_next_cpu(
         assert cpu.receipts == [struct.pack("<IIB3xQ64s", 0x201, 0, 8,
                                             origin + 1_000_000, zero.ljust(64, b"\0"))]
         groups = [values for direction, values in cpu.groups if direction == "input"]
-        assert groups[-1][-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
+        assert groups[-1][0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
         assert len(groups) >= 2 and groups[-1] is not groups[-2]
         assert {direction for direction, _ in cpu.groups} == {"initial", "output", "input"}
         cpu.on_run = lambda: all_receipts_before_run()
@@ -1869,7 +1863,7 @@ def test_exact_batch_keeps_real_receipts_and_fresh_groups_before_next_cpu(
     if fragmented:
         assert [len(row[2]) for row in events if row[:2] == ("receipt-bytes", 0)] == [19, 65]
         first_input = next(values for direction, values in cpus[0].groups if direction == "input")
-        assert first_input[-1]["controllers"]["dm-mc02.fdcan1"] == {
+        assert first_input[0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"] == {
             "completed_frames": 0, "partial_bytes": 19, "rx_dropped": 0}
     runtime.step(1_000_000, deadline=time.monotonic() + 1)
     assert native.steps == [1_000_000, 1_000_000] and all(cpu.completed == 2 for cpu in cpus)
@@ -1894,7 +1888,8 @@ def test_exact_batch_failure_retains_effects_without_scalar_fallback_or_replay(b
     start(runtime)
     primary = KeyboardInterrupt("borrowed native batch interrupted")
     def fail(kind, values):
-        if kind == direction:
+        if (bool(native.steps) == (direction == "input") and
+                cpus[1].requests):
             raise primary
     cpus[1].after_batch = fail
     with pytest.raises(KeyboardInterrupt) as caught:
@@ -1919,7 +1914,7 @@ def test_exact_post_batch_guard_freezes_after_one_world_step(batch_exact_setup, 
     monkeypatch.setattr(runtime, "_check_running", check)
     monkeypatch.setattr(time, "monotonic", lambda: now[0])
     def invalidate(direction, values):
-        if direction == "input":
+        if native.steps and cpus[0].receipts:
             if violation == "deadline":
                 now[0] += 2
             else:
@@ -1939,15 +1934,15 @@ def test_exact_batch_final_result_is_fresh_and_bad_count_freezes_completed_world
     start(runtime)
     inputs = []
     def change_final(direction, values):
-        if direction == "input":
+        if native.steps and cpus[0].receipts:
             inputs.append(values)
             if len(inputs) == 2:
-                values[-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] = 2
+                values[0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] = 2
     cpus[0].after_batch = change_final
     with pytest.raises(RuntimeError, match="exceeds goal"):
         runtime.step(1_000_000, deadline=time.monotonic() + 1)
     assert len(inputs) == 2 and inputs[0] is not inputs[1]
-    assert inputs[0][-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
+    assert inputs[0][0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
     assert native.steps == [1_000_000] and len(cpus[0].receipts) == 1
     assert runtime.can_input_states == ({"completed_frames": 0, "partial_bytes": 0, "rx_dropped": 0},) * 2
     assert_exact_frozen(runtime, native, cpus)

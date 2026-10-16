@@ -931,23 +931,17 @@ def test_initial_can_does_not_weaken_reached_only_operations(initial_can):
 
 # This producer supplies complete independent native observations. In particular,
 # command_many must never be implemented by calling the scalar test producer.
-BATCH_FENCE = (
-    ("x-query-virtual-execution", None),
-    ("query-status", None),
+BATCH_GROUP = (
+    ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
     ("qom-get", {"path": "/chardevs/can1", "property": "connected"}),
 )
-BATCH_TX = ("qom-get", {"path": "/machine", "property": "fdcan-tx-state"})
-BATCH_RX = ("qom-get", {"path": "/machine", "property": "fdcan-rx-state"})
-BATCH_GROUPS = {"initial": BATCH_FENCE + (BATCH_TX, BATCH_RX),
-                "output": BATCH_FENCE + (BATCH_TX,),
-                "input": BATCH_FENCE + (BATCH_RX,)}
 
 
 class BatchPausedCanQmp:
     def __init__(self):
         self.execution = {"state": "reached", "current-ns": 1000,
                           "target-ns": 1000}
-        self.status = {"running": False, "status": "paused"}
+        self.status = {"running": False, "status": "paused", "singlestep": False}
         self.connected = True
         self.tx = {"schema": 1, "timestamp_ns": 1000, "controllers": {
             "dm-mc02.fdcan1": {"pending_frames": 0, "pending_bytes": 0,
@@ -958,6 +952,7 @@ class BatchPausedCanQmp:
                               "rx_dropped": 0},
         }}
         self.groups = []
+        self.direction = "output"  # Callback label, never selects native fields.
         self.phase = "first"
         self.on_group = lambda direction: None
         self.result = lambda values: values
@@ -968,16 +963,14 @@ class BatchPausedCanQmp:
 
     def command_many(self, commands):
         assert type(commands) is tuple
-        direction = next((key for key, value in BATCH_GROUPS.items()
-                          if commands == value), None)
-        assert direction is not None, commands
+        assert commands == BATCH_GROUP
         self.groups.append(deepcopy(commands))
-        self.on_group(direction)
-        values = (deepcopy(self.execution), deepcopy(self.status), self.connected)
-        if direction in ("initial", "output"):
-            values += (deepcopy(self.tx),)
-        if direction in ("initial", "input"):
-            values += (deepcopy(self.rx),)
+        self.on_group(self.direction)
+        values = ({"schema": 1, "execution": deepcopy(self.execution),
+                   "status": deepcopy(self.status),
+                   "fdcan-tx-state": deepcopy(self.tx),
+                   "fdcan-rx-state": deepcopy(self.rx),
+                   "native_extra": {"retained": True}}, self.connected)
         return self.result(values)
 
     @property
@@ -996,6 +989,7 @@ def batch_can(paused_can):
 
 
 def batch_operation(direction, stream, qmp, **options):
+    qmp.direction = direction
     if direction == "initial":
         return run_initial_can(stream, qmp, **options)
     if direction == "input":
@@ -1005,8 +999,9 @@ def batch_operation(direction, stream, qmp, **options):
 
 
 def initial_batch(qmp):
+    qmp.direction = "initial"
     qmp.execution = {"state": "idle", "current-ns": 1000}
-    qmp.status = {"running": False, "status": "prelaunch"}
+    qmp.status = {"running": False, "status": "prelaunch", "singlestep": False}
 
 
 def test_batch_initial_fetches_two_complete_fresh_groups_without_io(batch_can):
@@ -1028,7 +1023,7 @@ def test_batch_initial_fetches_two_complete_fresh_groups_without_io(batch_can):
         "rx": {"completed_frames": 5, "partial_bytes": 0, "rx_dropped": 2,
                "native_extra": "second"},
     }
-    assert qmp.groups == [BATCH_GROUPS["initial"]] * 2
+    assert qmp.groups == [BATCH_GROUP] * 2
     with pytest.raises(BlockingIOError):
         peer.recv(84)
     assert_can_borrows_open(stream, qmp)
@@ -1076,7 +1071,7 @@ def test_batch_output_observes_around_real_reads_and_fresh_empty(batch_can, frag
     expected_phases = ["first", "publish"] + (["suffix"] if fragmented else [])
     expected_phases += ["fresh-empty", "final"]
     assert [item.removeprefix("group:") for item in events if item.startswith("group:")] == expected_phases
-    assert qmp.groups == [BATCH_GROUPS["output"]] * len(expected_phases)
+    assert qmp.groups == [BATCH_GROUP] * len(expected_phases)
     assert seen == [CAN_DECODED] and not stream.buffer
     assert events[-2:] == ["read:fresh-empty", "group:final"]
     assert_can_borrows_open(stream, qmp)
@@ -1084,6 +1079,7 @@ def test_batch_output_observes_around_real_reads_and_fresh_empty(batch_can, frag
 
 def test_batch_input_flushes_real_queue_then_reobserves_exact_receipt(batch_can):
     stream, peer, qmp, _ = batch_can
+    qmp.direction = "input"
     stream.tx_queue.append(memoryview(CAN_LITERAL))
     observed, events = bytearray(), []
     original_flush = stream.flush
@@ -1126,7 +1122,7 @@ def test_batch_input_flushes_real_queue_then_reobserves_exact_receipt(batch_can)
     }
     assert events == ["group:first", "flush:await-flush", "group:flushed",
                       "flush:partial", "group:partial", "group:receipt"]
-    assert qmp.groups == [BATCH_GROUPS["input"]] * 4
+    assert qmp.groups == [BATCH_GROUP] * 4
     assert bytes(observed) == CAN_LITERAL and not stream.tx_pending
     assert_can_borrows_open(stream, qmp)
 
@@ -1162,7 +1158,7 @@ def test_batch_final_group_changes_are_rejected(
     qmp.on_group = change
     with pytest.raises(error):
         batch_operation(direction, stream, qmp)
-    assert qmp.groups == [BATCH_GROUPS[direction]] * 2
+    assert qmp.groups == [BATCH_GROUP] * 2
     assert not stream.buffer and not stream.tx_pending
     assert_can_borrows_open(stream, qmp)
 
@@ -1191,7 +1187,7 @@ def test_batch_requires_plain_tuple_and_exact_result_arity_before_io(
     }[shape]
     with pytest.raises(error, match="tuple|arity"):
         batch_operation(direction, stream, qmp)
-    assert qmp.groups == [BATCH_GROUPS[direction]]
+    assert qmp.groups == [BATCH_GROUP]
     if direction == "output":
         assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
     elif direction == "input":
@@ -1202,26 +1198,88 @@ def test_batch_requires_plain_tuple_and_exact_result_arity_before_io(
     assert_can_borrows_open(stream, qmp)
 
 
+@pytest.mark.parametrize("direction,invalid,error", [
+    ("output", "object", TypeError),
+    ("output", "schema", ValueError),
+    ("output", "bool-schema", TypeError),
+    ("output", "unsupported-schema", ValueError),
+    ("output", "execution", ValueError),
+    ("output", "status", ValueError),
+    ("output", "fdcan-tx-state", ValueError),
+    ("input", "fdcan-rx-state", ValueError),
+    ("initial", "fdcan-rx-state", ValueError),
+])
+def test_batch_composed_schema_and_consumed_sections_reject_before_io(
+        batch_can, direction, invalid, error):
+    stream, peer, qmp, _ = batch_can
+    if direction == "initial":
+        initial_batch(qmp)
+    elif direction == "output":
+        assert peer.send(CAN_LITERAL) == 84
+    else:
+        stream.tx_queue.append(memoryview(CAN_LITERAL))
+    stream.receive = stream.flush = lambda: pytest.fail("invalid aggregate did IO")
+
+    def malformed(values):
+        aggregate, connected = values
+        if invalid == "object":
+            aggregate = None
+        elif invalid == "bool-schema":
+            aggregate["schema"] = True
+        elif invalid == "unsupported-schema":
+            aggregate["schema"] = 2
+        else:
+            del aggregate[invalid]
+        return aggregate, connected
+
+    qmp.result = malformed
+    with pytest.raises(error, match="can-execution-state"):
+        batch_operation(direction, stream, qmp)
+    assert qmp.groups == [BATCH_GROUP]
+    if direction == "output":
+        assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
+    elif direction == "input":
+        assert [bytes(part) for part in stream.tx_queue] == [CAN_LITERAL]
+        with pytest.raises(BlockingIOError):
+            peer.recv(84)
+    assert not stream.buffer
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("direction", ["output", "input"])
+def test_batch_validates_only_consumed_direction_and_tolerates_extra_fields(batch_can, direction):
+    stream, _, qmp, _ = batch_can
+    if direction == "input":
+        qmp.rx_controller["completed_frames"] = 1
+    setattr(qmp, "rx" if direction == "output" else "tx", None)
+    batch_operation(direction, stream, qmp)
+    assert qmp.groups == [BATCH_GROUP] * 2
+    assert_can_borrows_open(stream, qmp)
+
+
 @pytest.mark.parametrize("first,error,match", [
     ("execution", RuntimeError, "not reached"),
     ("status", RuntimeError, "paused"),
     ("connection", ConnectionError, "disconnected"),
     ("shape", TypeError, "tuple"),
+    ("schema", ValueError, "schema"),
 ])
 def test_batch_errors_keep_input_order_and_shape_precedes_values(batch_can, first, error, match):
     stream, peer, qmp, _ = batch_can
     assert peer.send(CAN_LITERAL) == 84
     qmp.tx["schema"] = 2
     qmp.connected = False
-    if first in ("execution", "status", "shape"):
+    if first in ("execution", "status", "shape", "schema"):
         qmp.status["running"] = True
-    if first in ("execution", "shape"):
+    if first in ("execution", "shape", "schema"):
         qmp.execution["state"] = "cancelled"
     if first == "shape":
         qmp.result = list
+    elif first == "schema":
+        qmp.result = lambda values: ({**values[0], "schema": 2}, values[1])
     with pytest.raises(error, match=match):
         run_paused_can(stream, qmp, lambda frame: pytest.fail("unexpected sink"))
-    assert qmp.groups == [BATCH_GROUPS["output"]]
+    assert qmp.groups == [BATCH_GROUP]
     assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
     assert not stream.buffer
 
@@ -1234,7 +1292,7 @@ def test_batch_initial_validates_tx_before_rx_in_the_same_group(batch_can):
     stream.receive = stream.flush = lambda: pytest.fail("invalid initial group did IO")
     with pytest.raises(ValueError, match="schema"):
         run_initial_can(stream, qmp)
-    assert qmp.groups == [BATCH_GROUPS["initial"]]
+    assert qmp.groups == [BATCH_GROUP]
     assert_can_borrows_open(stream, qmp)
 
 
@@ -1254,7 +1312,7 @@ def test_batch_failure_preserves_original_exception_without_scalar_fallback(batc
     with pytest.raises(RuntimeError) as caught:
         batch_operation(direction, stream, qmp)
     assert caught.value is failure
-    assert qmp.groups == [BATCH_GROUPS[direction]]
+    assert qmp.groups == [BATCH_GROUP]
     assert_can_borrows_open(stream, qmp)
 
 
@@ -1295,7 +1353,7 @@ def test_batch_guards_stop_before_receive_sink_or_flush(batch_can, direction, ph
         batch_operation(direction, stream, qmp, check=check)
     if not timeout:
         assert caught.value is failure
-    assert qmp.groups == ([] if phase == "pre" else [BATCH_GROUPS[direction]])
+    assert qmp.groups == ([] if phase == "pre" else [BATCH_GROUP])
     if direction == "output":
         assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
     elif direction == "input":
@@ -1309,6 +1367,7 @@ def test_batch_guards_stop_before_receive_sink_or_flush(batch_can, direction, ph
 @pytest.mark.parametrize("direction", ["output", "input"])
 def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, direction):
     stream, peer, qmp, _ = batch_can
+    qmp.direction = direction
     failure, seen = RuntimeError("later observation failed"), []
 
     def fail_after_effect(kind):
@@ -1343,7 +1402,7 @@ def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, 
         assert peer.recv(84) == CAN_LITERAL
         assert not stream.buffer
     assert caught.value is failure
-    assert qmp.groups == [BATCH_GROUPS[direction]] * 2
+    assert qmp.groups == [BATCH_GROUP] * 2
     assert_can_borrows_open(stream, qmp)
 
 

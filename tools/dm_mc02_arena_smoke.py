@@ -261,6 +261,9 @@ class Observation:
                     execution["last_execution"] = dict(value) if isinstance(value, dict) else value
                 elif name == "query-status":
                     execution["last_status"] = dict(value) if isinstance(value, dict) else value
+                elif name == "qom-get" and arguments.get("property") == "can-execution-state":
+                    execution["last_execution"] = dict(value["execution"])
+                    execution["last_status"] = dict(value["status"])
                 if name in ("cont", "stop", "system_reset", "quit") or first_run:
                     append_bounded(self.report, "qmp_events", {
                         "peer": index, "command": name, "result": value,
@@ -291,7 +294,8 @@ class Observation:
                 for (name, arguments), value in zip(requests, values, strict=True):
                     observe_value(name, arguments, value)
                 groups["completed"] += 1
-                groups["initial_groups" if len(requests) == 5 else "can_groups"] += 1
+                initial = execution["last_execution"]["state"] == "idle"
+                groups["initial_groups" if initial else "can_groups"] += 1
                 return values
 
             qmp.command, qmp.command_many = observed_command, observed_many

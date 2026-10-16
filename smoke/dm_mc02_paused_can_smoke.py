@@ -126,6 +126,10 @@ def run(binary, report):
 
     def observe_result(name, arguments, result):
         nonlocal last_tx, last_rx, first_input_rx
+        if name == "qom-get" and arguments.get("property") == "can-execution-state":
+            for prop in ("fdcan-tx-state", "fdcan-rx-state"):
+                observe_result("qom-get", {"property": prop}, result[prop])
+            return
         if name == "qom-get" and arguments.get("property") == "fdcan-tx-state":
             tx = result["controllers"]["dm-mc02.fdcan1"]
             last_tx = event("tx", timestamp_ns=result["timestamp_ns"], **tx)
@@ -570,10 +574,9 @@ def run(binary, report):
                     raise AssertionError("original EOF was accepted as input completion")
                 expect(qmp_groups["calls"] == qmp_groups["completed"],
                        "a native QMP observation group did not complete")
-                expect(qmp_groups["sizes"].get("5") == 2 and
-                       qmp_groups["phases"].get("initial_baseline") == 2,
-                       "initial helper did not use two fresh five-query groups")
-                expect(set(qmp_groups["sizes"]) == {"4", "5"} and
+                expect(qmp_groups["phases"].get("initial_baseline") == 2,
+                       "initial helper did not use two fresh observation groups")
+                expect(set(qmp_groups["sizes"]) == {"2"} and
                        all(qmp_groups["phases"].get(name, 0) > 0 for name in
                            ("drain", "input_suffix_wait", "input_fifo_full",
                             "original_peer_eof", "original_input_peer_eof")),

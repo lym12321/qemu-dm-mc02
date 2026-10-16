@@ -2082,11 +2082,13 @@ def test_arena_and_scenario_wire_public_batch_to_both_native_peers(environment, 
     assert {index for index, _ in environment.batch_calls} == {0, 1}
     for index, cpu in environment.cpus.items():
         assert {direction for direction, _ in cpu.groups} == {"initial", "output", "input"}
-        assert all(type(values) is tuple and len(values) == (5 if direction == "initial" else 4)
+        assert all(type(values) is tuple and len(values) == 2
                    for direction, values in cpu.groups)
         assert cpu.completed == len(cpu.receipts) == 8 and not cpu.partial
         assert b"".join(cpu.receipts) == environment.received_can(index)
-    assert all(arguments[1][0] == "query-status" and len(arguments) in (4, 5)
+    assert all(arguments == (
+        ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
+        ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
                for _, arguments in environment.batch_calls)
     assert all(row[2] != "qom-get" for row in environment.execution_events if row[0] == "qmp")
     assert not any(event.endswith(" cont") for event in environment.events)
@@ -2118,7 +2120,7 @@ def test_arena_requires_callable_batch_and_cleans_acquired_resources(environment
 def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(environment, violation):
     primary = OSError("native public batch failed")
     def invalidate(index, commands, values):
-        if index != 0 or not environment.native.steps or commands[-1][1].get("property") != "fdcan-rx-state":
+        if index != 0 or not environment.native.steps or not environment.cpus[0].receipts:
             return
         if violation == "deadline":
             environment.clock += 4

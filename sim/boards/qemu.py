@@ -159,14 +159,9 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
             return (_can_rx_state(query("qom-get", rx_arguments), controller,
                                   target_ns, direction),)
 
-        requests = (("x-query-virtual-execution", None), ("query-status", None),
+        requests = (("qom-get", {"path": "/machine",
+                                 "property": "can-execution-state"}),
                     ("qom-get", connection))
-        if initial:
-            requests += (("qom-get", tx_arguments), ("qom-get", rx_arguments))
-        elif direction == "output":
-            requests += (("qom-get", tx_arguments),)
-        else:
-            requests += (("qom-get", rx_arguments),)
         guard()
         values = command_many(requests)
         guard()
@@ -174,16 +169,27 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
             raise TypeError("QMP command_many result must be a plain tuple")
         if len(values) != len(requests):
             raise ValueError("QMP command_many result has wrong arity")
-        _can_execution_state(values[0], target_ns, direction, initial)
-        _can_paused_status(values[1], direction, initial)
-        _can_connection_state(values[2], direction)
+        state = _object(values[0], "can-execution-state")
+        schema = _field(state, "schema", "can-execution-state")
+        _integer(schema, "can-execution-state.schema", 1)
+        if schema != 1:
+            raise ValueError("unsupported can-execution-state schema")
+        _can_execution_state(_field(state, "execution", "can-execution-state"),
+                             target_ns, direction, initial)
+        _can_paused_status(_field(state, "status", "can-execution-state"),
+                           direction, initial)
+        _can_connection_state(values[1], direction)
         if initial:
-            tx = _can_tx_state(values[3], controller, target_ns, direction)
-            rx = _can_rx_state(values[4], controller, target_ns, direction)
+            tx = _can_tx_state(_field(state, "fdcan-tx-state", "can-execution-state"),
+                               controller, target_ns, direction)
+            rx = _can_rx_state(_field(state, "fdcan-rx-state", "can-execution-state"),
+                               controller, target_ns, direction)
             return tx, rx
         if direction == "output":
-            return (_can_tx_state(values[3], controller, target_ns, direction),)
-        return (_can_rx_state(values[3], controller, target_ns, direction),)
+            return (_can_tx_state(_field(state, "fdcan-tx-state", "can-execution-state"),
+                                  controller, target_ns, direction),)
+        return (_can_rx_state(_field(state, "fdcan-rx-state", "can-execution-state"),
+                              controller, target_ns, direction),)
 
     return guard, observe
 
