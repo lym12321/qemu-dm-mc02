@@ -1473,6 +1473,60 @@ class NativeCpuQmp:
                 "controllers": {"dm-mc02.fdcan1": controller}}
 
 
+class NativeCpuBatchQmp(NativeCpuQmp):
+    """Independent batch values; scalar calls only execute/poll the CPU.
+
+    Reuse the real peer receipt producer, never scalar command dispatch, for
+    each fresh native observation. These literal groups are the public wire
+    requests expected by the board adapter, not a copy of its validation.
+    """
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.groups = []
+        self.after_batch = lambda direction, values: None
+
+    def command(self, name, arguments=None):
+        assert name != "qom-get", "paused CAN observations must use public batch"
+        return super().command(name, arguments)
+
+    def command_many(self, commands):
+        fence = (("x-query-virtual-execution", None), ("query-status", None),
+                 ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
+        tx = ("qom-get", {"path": "/machine", "property": "fdcan-tx-state"})
+        rx = ("qom-get", {"path": "/machine", "property": "fdcan-rx-state"})
+        if commands == fence + (tx, rx):
+            direction = "initial"
+        elif commands == fence + (tx,):
+            direction = "output"
+        else:
+            assert commands == fence + (rx,), commands
+            direction = "input"
+        assert type(commands) is tuple
+        if direction in ("initial", "input"):
+            self._receive_input()
+            if self.on_rx is not None:
+                self.on_rx()
+        execution = {"state": self.state, "current-ns": self.current}
+        if self.target is not None:
+            execution["target-ns"] = self.target
+        values = (execution, {"running": False, "status": (
+            "prelaunch" if self.state == "idle" else "paused")}, True)
+        if direction in ("initial", "output"):
+            values += ({"schema": 1, "timestamp_ns": self.current, "controllers": {
+                "dm-mc02.fdcan1": {"pending_frames": 0, "pending_bytes": 0,
+                                  "tx_dropped": self.tx_dropped, "tx_short_writes": 0}}},)
+        if direction in ("initial", "input"):
+            count = self.completed if self.report_completed is None else self.report_completed(self.completed)
+            values += ({"schema": 1, "timestamp_ns": self.current, "controllers": {
+                "dm-mc02.fdcan1": {"completed_frames": count, "partial_bytes": len(self.partial),
+                                  "rx_dropped": self.rx_dropped}}},)
+        self.groups.append((direction, values))
+        self.events.append(("batch", self.index, direction))
+        self.after_batch(direction, values)
+        return values
+
+
 @pytest.fixture
 def exact_world_resources():
     """Keep the legacy shared/referee fixture's types and exported tuple intact."""
@@ -1763,4 +1817,137 @@ def test_exact_ack_service_never_ingests_can_outside_the_explicit_drain(exact_se
     assert native.steps == [1_000_000] and bindings[0].endpoint.bus.pending == 0
     assert not bindings[0].endpoint.stream.buffer
     assert bindings[0].endpoint.stream.sock.recv(84, socket.MSG_PEEK) == raw
+    assert_exact_frozen(runtime, native, cpus)
+
+
+@pytest.fixture
+def batch_exact_resources(exact_world_resources):
+    plant, boards, native, bindings, scalar_cpus, events, stack = exact_world_resources
+    cpus = tuple(NativeCpuBatchQmp(cpu.index, cpu.peer, cpu.current, native, events)
+                 for cpu in scalar_cpus)
+    bindings = tuple(replace(item, execution=replace(
+        item.execution, command=cpu.command, command_many=cpu.command_many))
+        for item, cpu in zip(bindings, cpus))
+    return plant, boards, native, bindings, cpus, events, stack
+
+
+@pytest.fixture
+def batch_exact_setup(batch_exact_resources):
+    plant, boards, native, bindings, cpus, events, stack = batch_exact_resources
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards)
+    stack.callback(runtime.close)
+    return runtime, boards, native, bindings, cpus, events
+
+
+@pytest.mark.parametrize("fragmented", [False, True])
+def test_exact_batch_keeps_real_receipts_and_fresh_groups_before_next_cpu(
+        batch_exact_setup, fragmented):
+    runtime, boards, native, bindings, cpus, events = batch_exact_setup
+    start(runtime)
+    if fragmented:
+        cpus[0].read_limits = [19, 0, 65]
+        cpus[0].on_rx = lambda: setattr(cpus[0], "rx_dropped", cpus[0].completed)
+    cpus[0].output[1] = can_wire(1001, "1000 0000 0000 0000")
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and native.efforts == [("j1", 0), ("j2", 0)]
+    assert runtime.can_input_states == (
+        {"completed_frames": 1, "partial_bytes": 0, "rx_dropped": int(fragmented)},
+        {"completed_frames": 1, "partial_bytes": 0, "rx_dropped": 0})
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    for cpu, origin in zip(cpus, boards.origins):
+        assert cpu.receipts == [struct.pack("<IIB3xQ64s", 0x201, 0, 8,
+                                            origin + 1_000_000, zero.ljust(64, b"\0"))]
+        groups = [values for direction, values in cpu.groups if direction == "input"]
+        assert groups[-1][-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
+        assert len(groups) >= 2 and groups[-1] is not groups[-2]
+        assert {direction for direction, _ in cpu.groups} == {"initial", "output", "input"}
+        cpu.on_run = lambda: all_receipts_before_run()
+    def all_receipts_before_run():
+        assert all(cpu.completed == 1 and not cpu.partial for cpu in cpus)
+        assert all(frames[-1].header.kind == codec.STEP and frames[-1].header.step_id == 1
+                   for frames in boards.frames)
+    if fragmented:
+        assert [len(row[2]) for row in events if row[:2] == ("receipt-bytes", 0)] == [19, 65]
+        first_input = next(values for direction, values in cpus[0].groups if direction == "input")
+        assert first_input[-1]["controllers"]["dm-mc02.fdcan1"] == {
+            "completed_frames": 0, "partial_bytes": 19, "rx_dropped": 0}
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000, 1_000_000] and all(cpu.completed == 2 for cpu in cpus)
+    assert [cpu.requests for cpu in cpus] == [[1_001_000, 2_001_000], [1_002_000, 2_002_000]]
+    assert all(row[2] in ("x-run-to-virtual-time", "x-query-virtual-execution", "query-status")
+               for row in events if row[0] == "qmp")
+    assert not runtime.failed and all(not item.endpoint.stream.buffer for item in bindings)
+
+
+def test_exact_batch_callable_admission_precedes_getters_ownership_and_io(batch_exact_resources):
+    plant, boards, native, bindings, _, events, _ = batch_exact_resources
+    bad = replace(bindings[1], execution=replace(bindings[1].execution, command_many=True))
+    with pytest.raises(TypeError, match="command_many"):
+        SharedWorldRuntime(plant, (bindings[0], bad), check_running=boards)
+    assert native.reads == native.steps == [] and native.resets == native.closed == 0
+    assert not plant.closed and boards.frames == [[], []] and events == []
+
+
+@pytest.mark.parametrize("direction", ["output", "input"])
+def test_exact_batch_failure_retains_effects_without_scalar_fallback_or_replay(batch_exact_setup, direction):
+    runtime, _, native, _, cpus, _ = batch_exact_setup
+    start(runtime)
+    primary = KeyboardInterrupt("borrowed native batch interrupted")
+    def fail(kind, values):
+        if kind == direction:
+            raise primary
+    cpus[1].after_batch = fail
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert caught.value is primary
+    assert native.steps == ([1_000_000] if direction == "input" else [])
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert all(len(cpu.receipts) == (1 if direction == "input" else 0) for cpu in cpus)
+    assert_exact_frozen(runtime, native, cpus)
+
+
+@pytest.mark.parametrize("violation", ["deadline", "liveness"])
+def test_exact_post_batch_guard_freezes_after_one_world_step(batch_exact_setup, monkeypatch, violation):
+    runtime, boards, native, _, cpus, _ = batch_exact_setup
+    start(runtime)
+    now, failed = [time.monotonic()], [False]
+    primary = OSError("board disappeared after native batch")
+    def check():
+        boards()
+        if failed[0]:
+            raise primary
+    monkeypatch.setattr(runtime, "_check_running", check)
+    monkeypatch.setattr(time, "monotonic", lambda: now[0])
+    def invalidate(direction, values):
+        if direction == "input":
+            if violation == "deadline":
+                now[0] += 2
+            else:
+                failed[0] = True
+    cpus[0].after_batch = invalidate
+    with pytest.raises(RuntimeError if violation == "deadline" else OSError) as caught:
+        runtime.step(1_000_000, deadline=now[0] + 1)
+    if violation == "liveness":
+        assert caught.value is primary
+    assert native.steps == [1_000_000] and len(cpus[0].receipts) == 1
+    assert [cpu.requests for cpu in cpus] == [[1_001_000], [1_002_000]]
+    assert_exact_frozen(runtime, native, cpus)
+
+
+def test_exact_batch_final_result_is_fresh_and_bad_count_freezes_completed_world(batch_exact_setup):
+    runtime, _, native, _, cpus, _ = batch_exact_setup
+    start(runtime)
+    inputs = []
+    def change_final(direction, values):
+        if direction == "input":
+            inputs.append(values)
+            if len(inputs) == 2:
+                values[-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] = 2
+    cpus[0].after_batch = change_final
+    with pytest.raises(RuntimeError, match="exceeds goal"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert len(inputs) == 2 and inputs[0] is not inputs[1]
+    assert inputs[0][-1]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
+    assert native.steps == [1_000_000] and len(cpus[0].receipts) == 1
+    assert runtime.can_input_states == ({"completed_frames": 0, "partial_bytes": 0, "rx_dropped": 0},) * 2
     assert_exact_frozen(runtime, native, cpus)

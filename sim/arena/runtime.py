@@ -197,6 +197,8 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     They split ticks at their exact deadlines and change subsequent admissions
     only, in caller order, after the completed step and before publication.
     Splitting changes native integration intervals and STEP observations.
+    Native public QMP batching bounds each fresh paused CAN observation; liveness
+    checks surround the whole group and cannot preempt a blocked callback.
     """
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
@@ -303,7 +305,10 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             qmp = QmpSession(str(owner.sockets["qmp"]), timeout=min(2., run.guard()),
                              connect_timeout=min(2., run.guard()), close_timeout=2.)
             resources.append((member.name + " QMP", qmp))
-            peer.qmp, peer.board = qmp, QemuBoard(qmp)
+            peer.qmp = qmp
+            if not callable(getattr(qmp, "command_many", None)):
+                raise TypeError("Arena QMP requires callable public command_many")
+            peer.board = QemuBoard(qmp)
             opened = {}
             for port in ("cosim", "can1", *uarts):
                 sock = connect_unix(str(owner.sockets[port]), min(2., run.guard()))
@@ -323,7 +328,9 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 peer.cosim, member.prefix[:-1], BoardExecution(
                     lambda name, arguments=None, peer=peer: run.call(
                         peer, lambda: peer.qmp.command(name, arguments)),
-                    "dm-mc02.fdcan1", "can1")))
+                    "dm-mc02.fdcan1", "can1",
+                    lambda requests, peer=peer: run.call(
+                        peer, lambda: peer.qmp.command_many(requests)))))
             for upper in member.robot.upper_computers:
                 run.guard()
                 process = subprocess.Popen(list(upper.command), cwd=upper.cwd, shell=False,

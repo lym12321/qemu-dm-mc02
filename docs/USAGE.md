@@ -2192,6 +2192,12 @@ finally:
 上例由调用方拥有 CPU 执行。需要运行时分段推进所有 CPU 时，为每个绑定增加
 `BoardExecution(bounded_command, "dm-mc02.fdcan1", "can1")`；必须全部提供或全部省略。
 `bounded_command(name, arguments=None)` 借用原生 QMP，并由调用方限制每条命令耗时。
+可用末尾关键字 `command_many=bounded_command_many` 提供公开批量查询；省略或为
+`None` 时保留逐条查询。批量 callable 借用同一 QMP 连接，须有自己的有限期限。
+运行时只合并每次暂停 CAN 观测中的独立查询，整组前后检查进程和期限；不会合并
+CPU 执行、收发或世界推进，也不缓存观测。批次失败直接终止，不重试或回退。
+Arena 始终通过原生 `QmpSession.command_many` 和既有 host deadline 执行这些查询；
+不提供该公开方法的 QMP 对象在取得连接后被拒绝并清理。
 QEMU 须以 `-S -accel tcg,thread=single -icount shift=0,align=off,sleep=off`
 启动。CAN 必须使用原始非阻塞 AF_UNIX socket 和标准 `CanStream`，运行时独占其
 读写；期间保持连接、配置、dispatch budget 和复位状态不变，回调不得直接提交 CAN。

@@ -45,11 +45,16 @@ class BoardExecution:
     The caller excludes reset, restore, rail/configuration changes, reconnect,
     extra CAN input and other CPU execution owners throughout the attempt.
     ``command(name, arguments=None)`` must have its own finite command bound.
+    Optional ``command_many(requests)`` must have its own finite group bound;
+    it is used only for one fresh independent CAN observation.
+    Guards surround each scalar call or whole group; they cannot preempt a
+    blocked borrowed callable.
     """
 
     command: Callable
     controller: str
     chardev: str
+    command_many: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -63,9 +68,10 @@ class BoardBinding:
 
 @dataclass(frozen=True)
 class _ExecutionCommands:
-    """Expose the guarded borrowed callable to the existing board helpers."""
+    """Expose guarded borrowed callables to the existing board helpers."""
 
     command: Callable
+    command_many: Callable | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,9 @@ class SharedWorldRuntime:
                     raise TypeError("board execution requires BoardExecution or None")
                 if not callable(item.execution.command):
                     raise TypeError("board execution command must be callable")
+                if (item.execution.command_many is not None and
+                        not callable(item.execution.command_many)):
+                    raise TypeError("board execution command_many must be callable or None")
                 for name in ("controller", "chardev"):
                     value = getattr(item.execution, name)
                     if (not isinstance(value, str) or
@@ -277,8 +286,16 @@ class SharedWorldRuntime:
             self._guard(deadline)
             return result
 
+        command_many = None
+        if item.execution.command_many is not None:
+            def command_many(requests):
+                self._guard(deadline)
+                result = item.execution.command_many(requests)
+                self._guard(deadline)
+                return result
+
         return {
-            "qmp": _ExecutionCommands(command), "stream": item.endpoint.stream,
+            "qmp": _ExecutionCommands(command, command_many), "stream": item.endpoint.stream,
             "controller": item.execution.controller, "chardev": item.execution.chardev,
             "deadline": deadline, "check": lambda: self._guard(deadline),
         }

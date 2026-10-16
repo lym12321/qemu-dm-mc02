@@ -39,7 +39,7 @@ from tools import dm_mc02_firmware_rtf as rtf
 from test_arena_manifest import ROBOT_DOCUMENT, referee_configuration, write_arena, write_executable
 from test_lab_runtime import snapshot
 from test_robot_runtime import Pipe
-from test_sim_shared_world import Boards, NativeCpuQmp, NativeStub, can_wire
+from test_sim_shared_world import Boards, NativeCpuBatchQmp, NativeStub, can_wire
 
 
 class Peer:
@@ -98,6 +98,8 @@ class Environment:
         self.world_close_failure = None
         self.pause_callback = lambda index: None
         self.qmp_callback = lambda index, name: None
+        self.batch_calls, self.qmp_timeouts = [], []
+        self.batch_after = lambda index, commands, values: None
         self.uart_chunks, self.uart_reads = [[], []], [0, 0]
         self.uart_port_chunks, self.uart_port_reads, self.uart_send_budget = {}, {}, {}
         self.can_commands = [None, None]
@@ -181,7 +183,8 @@ class Environment:
         if self.connection_failure == (index, "qmp"):
             raise OSError(f"peer{index} qmp connection failure")
         return SimpleNamespace(command=lambda name, arguments=None: self.command(index, name, arguments),
-                               settimeout=lambda value: None,
+                               command_many=lambda commands: self.command_many(index, commands),
+                               settimeout=lambda value: self.qmp_timeouts.append((index, value)),
                                close=lambda: self.close_qmp(index))
 
     def connect(self, path, timeout, *, wrapped_can=False):
@@ -198,7 +201,7 @@ class Environment:
         value = left if name == "can1" and not wrapped_can else Peer(self, index, name, left, right)
         self.sockets[index, name], self.producers[index, name] = value, right
         if name == "can1":
-            cpu = NativeCpuQmp(index, right, (1000, 2000)[index], self.native, self.execution_events)
+            cpu = NativeCpuBatchQmp(index, right, (1000, 2000)[index], self.native, self.execution_events)
             cpu.output = self.can_intervals[index]
             self.cpus[index] = cpu
             if self.can_commands[index] is not None:
@@ -226,6 +229,17 @@ class Environment:
             self.pause_callback(index)
             return
         return self.cpus[index].command(name, arguments)
+
+    def command_many(self, index, commands):
+        # The public batch uses the same acquired QMP session and deadline
+        # wrapper. It has an independent producer, never a scalar dispatch loop.
+        assert self.qmp_timeouts and self.qmp_timeouts[-1][0] == index
+        assert self.qmp_timeouts[-1][1] > 0
+        self.batch_calls.append((index, commands))
+        self.events.append(f"peer{index} command_many")
+        values = self.cpus[index].command_many(commands)
+        self.batch_after(index, commands, values)
+        return values
 
     def schedule_can(self, index, raw, *, interval=None):
         """The native producer emits these literal bytes inside one CPU run."""
@@ -2053,4 +2067,78 @@ def test_post_transfer_interrupt_preserves_nested_owned_cleanup_and_closes_every
     assert "endpoint0 nested release diagnosis" in notes and "engine1 nested release diagnosis" in notes
     assert all(environment.events.index(label + " close") < environment.events.index("peer0 uart7 close")
                for label in observed.closes)
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+
+
+@pytest.mark.parametrize("via_scenario", [False, True], ids=["arena", "scenario"])
+def test_arena_and_scenario_wire_public_batch_to_both_native_peers(environment, via_scenario):
+    if via_scenario:
+        manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 2_500_000, ())
+        result = scenario_runtime.run_manifest(manifest, qemu=environment.binary)
+    else:
+        result = environment.run()
+    environment.assert_clean()
+    assert result.steps == 3 and environment.native.steps == [1_000_000, 1_000_000, 500_000]
+    assert {index for index, _ in environment.batch_calls} == {0, 1}
+    for index, cpu in environment.cpus.items():
+        assert {direction for direction, _ in cpu.groups} == {"initial", "output", "input"}
+        assert all(type(values) is tuple and len(values) == (5 if direction == "initial" else 4)
+                   for direction, values in cpu.groups)
+        assert cpu.completed == len(cpu.receipts) == 8 and not cpu.partial
+        assert b"".join(cpu.receipts) == environment.received_can(index)
+    assert all(arguments[1][0] == "query-status" and len(arguments) in (4, 5)
+               for _, arguments in environment.batch_calls)
+    assert all(row[2] != "qom-get" for row in environment.execution_events if row[0] == "qmp")
+    assert not any(event.endswith(" cont") for event in environment.events)
+
+
+@pytest.mark.parametrize("capability", ["missing", None, True])
+def test_arena_requires_callable_batch_and_cleans_acquired_resources(environment, monkeypatch, capability):
+    connect = environment.connect_qmp
+    def unavailable(path, **kwargs):
+        qmp = connect(path, **kwargs)
+        if Path(path).parent.name == "peer1":
+            if capability == "missing":
+                del qmp.command_many
+            else:
+                qmp.command_many = capability
+        return qmp
+    monkeypatch.setattr(runtime, "QmpSession", unavailable)
+    with pytest.raises(TypeError, match="command_many"):
+        environment.run(environment.manifest(upper=True))
+    environment.assert_clean()
+    assert environment.native.resets == 0 and environment.native.steps == []
+    assert all(not cpu.requests and not cpu.receipts for cpu in environment.cpus.values())
+    assert environment.batch_calls == []
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+    assert all(f"peer{index} qmp close" in environment.events for index in range(2))
+
+
+@pytest.mark.parametrize("violation", ["deadline", "child_exit", "batch_error"])
+def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(environment, violation):
+    primary = OSError("native public batch failed")
+    def invalidate(index, commands, values):
+        if index != 0 or not environment.native.steps or commands[-1][1].get("property") != "fdcan-rx-state":
+            return
+        if violation == "deadline":
+            environment.clock += 4
+        elif violation == "child_exit":
+            environment.children[0].returncode = 0
+        else:
+            raise primary
+    environment.batch_after = invalidate
+    with pytest.raises((RuntimeError, TimeoutError, OSError)) as caught:
+        environment.run(environment.manifest(upper=True), startup_timeout=1, timeout=3)
+    if violation == "batch_error":
+        assert caught.value is primary
+    elif violation == "deadline":
+        assert type(caught.value) is rtf.StartupTimeoutError
+        assert str(caught.value) == "Arena exceeded startup timeout"
+    else:
+        assert "exited early (0)" in str(caught.value)
+    environment.assert_clean()
+    assert environment.native.steps == [1_000_000]
+    assert [cpu.requests for cpu in environment.cpus.values()] == [[1_001_000], [1_002_000]]
+    assert len(environment.cpus[0].receipts) == 4 and not environment.cpus[0].partial
+    assert environment.cpus[1].receipts == []
     assert all(process.returncode == -signal.SIGTERM for process in environment.children)

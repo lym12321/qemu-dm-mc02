@@ -239,21 +239,17 @@ class Observation:
         qmp = self.original_qmp(*args, **kwargs)
         try:
             self.qmps.append(qmp)
-            command = qmp.command
+            command, command_many = qmp.command, qmp.command_many
             index = len(self.qmps) - 1
             execution = {"peer": index, "successful_runs": 0,
                          "first_target_ns": None, "last_target_ns": None,
                          "last_execution": None, "last_status": None}
             self.report.setdefault("cpu_execution", []).append(execution)
+            groups = {"peer": index, "calls": 0, "completed": 0,
+                      "initial_groups": 0, "can_groups": 0}
+            self.report.setdefault("qmp_observation_groups", []).append(groups)
 
-            def observed_command(name, arguments=None):
-                try:
-                    value = command(name, arguments)
-                except BaseException as error:
-                    append_bounded(self.report, "qmp_events", {
-                        "peer": index, "command": name,
-                        "error": f"{type(error).__name__}: {error}"}, 16)
-                    raise
+            def observe_value(name, arguments, value):
                 first_run = name == "x-run-to-virtual-time" and not execution["successful_runs"]
                 if name == "x-run-to-virtual-time":
                     target = arguments["target-ns"]
@@ -271,7 +267,34 @@ class Observation:
                         **({"target_ns": target} if first_run else {})}, 16)
                 return value
 
-            qmp.command = observed_command
+            def observed_command(name, arguments=None):
+                try:
+                    value = command(name, arguments)
+                except BaseException as error:
+                    append_bounded(self.report, "qmp_events", {
+                        "peer": index, "command": name,
+                        "error": f"{type(error).__name__}: {error}"}, 16)
+                    raise
+                return observe_value(name, arguments, value)
+
+            def observed_many(requests):
+                groups["calls"] += 1
+                try:
+                    values = command_many(requests)
+                except BaseException as error:
+                    append_bounded(self.report, "qmp_events", {
+                        "peer": index, "command": "command_many",
+                        "error": f"{type(error).__name__}: {error}"}, 16)
+                    raise
+                # Values are observed after the entire native group returns;
+                # these are not individual reply-arrival timestamps.
+                for (name, arguments), value in zip(requests, values, strict=True):
+                    observe_value(name, arguments, value)
+                groups["completed"] += 1
+                groups["initial_groups" if len(requests) == 5 else "can_groups"] += 1
+                return values
+
+            qmp.command, qmp.command_many = observed_command, observed_many
             return qmp
         except BaseException as error:
             close_observation_failure(qmp, "QMP", error)
@@ -2091,7 +2114,10 @@ def main(args):
                     assert execution["last_execution"]["state"] == "cancelled"
                     assert execution["last_execution"]["target-ns"] == execution["last_target_ns"]
                     assert execution["last_status"]["running"] is False
-                    assert execution["last_status"]["status"] == "paused"
+                    # QEMU 8.2.2 system/runstate.c sets a stopped machine to
+                    # PRELAUNCH after system_reset. The batch observes that
+                    # fresh status; the old scalar fence failed before reading it.
+                    assert execution["last_status"]["status"] == "prelaunch"
                     report["reset_observation"] = "native_cancelled_before_next_cpu"
             elif args.mode == "peer-exit" and isinstance(primary, ExecInterruptedError):
                 # QEMU can disconnect this native QMP before its quit response
