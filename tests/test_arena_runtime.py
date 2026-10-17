@@ -404,6 +404,24 @@ def watch_can_delays(environment, monkeypatch):
     return observed
 
 
+def watch_motor_feedback(environment, monkeypatch):
+    """Record public decisions while preserving the lower dispatch owner."""
+    delays = watch_can_delays(environment, monkeypatch)
+    observed = SimpleNamespace(delays=delays, worlds=delays.worlds, calls=[], after_set=None)
+    setter = shared_world.SharedWorldRuntime.set_motor_feedback_enabled
+
+    def set_feedback(value, member, motor_id, enabled):
+        observed.calls.append((member, motor_id, enabled, value.t_sim_ns,
+                               tuple(environment.native.steps), tuple(environment.uart_reads)))
+        result = setter(value, member, motor_id, enabled)
+        if observed.after_set is not None:
+            observed.after_set(value, member, motor_id, enabled)
+        return result
+
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_motor_feedback_enabled", set_feedback)
+    return observed
+
+
 @pytest.fixture
 def arena_tool_observation(environment, monkeypatch):
     """Borrow the actual smoke observer over the existing eight-device fixture."""
@@ -1188,6 +1206,252 @@ def test_can_delay_schedule_is_completely_admitted_before_resources(environment,
         environment.run(manifest, can_delays=actions)
     assert environment.events == [] and environment.launches == [] and environment.owners == []
     assert environment.native.resets == 0 and environment.native.steps == []
+
+
+@pytest.mark.parametrize("invalid", ["outer_list", "outer_subclass", "entry_list", "entry_subclass",
+    "entry_shape", "offset_bool", "offset_negative", "offset_overflow", "offset_float",
+    "member_type", "member_subclass", "unknown_member", "unordered", "after_duration", "quota",
+    "motor_bool", "motor_subclass", "motor_zero", "motor_overflow", "motor_missing",
+    "enabled_int", "enabled_none", "duplicate_member", "missing_record", "duplicate_record",
+    "record_bool", "record_wrong_bus"])
+def test_motor_feedback_schedule_is_completely_admitted_before_resources(environment, monkeypatch, invalid):
+    manifest = environment.manifest()
+    first, last = (0, "east", 1, False), (1_000_000, "west", 1, True)
+    actions = (first, last)
+    if invalid == "outer_list":
+        actions = list(actions)
+    elif invalid == "outer_subclass":
+        actions = type("Actions", (tuple,), {})(actions)
+    elif invalid == "entry_list":
+        actions = (first, list(last))
+    elif invalid == "entry_subclass":
+        actions = (first, type("Action", (tuple,), {})(last))
+    elif invalid == "entry_shape":
+        actions = (first, last[:3])
+    elif invalid.startswith("offset_"):
+        offset = {"offset_bool": True, "offset_negative": -1,
+                  "offset_overflow": 1 << 64, "offset_float": 1.0}[invalid]
+        actions = (first, (offset, "west", 1, True))
+    elif invalid in ("member_type", "member_subclass", "unknown_member"):
+        member = {"member_type": None, "member_subclass": type("Member", (str,), {})("west"),
+                  "unknown_member": "missing"}[invalid]
+        actions = (first, (1_000_000, member, 1, True))
+    elif invalid == "unordered":
+        actions = (last, first)
+    elif invalid == "after_duration":
+        actions = (first, (2_500_001, "west", 1, True))
+    elif invalid == "quota":
+        actions = (first,) * 1025
+    elif invalid.startswith("motor_"):
+        motor_id = {"motor_bool": True, "motor_subclass": type("MotorId", (int,), {})(1),
+                    "motor_zero": 0, "motor_overflow": 9, "motor_missing": 5}[invalid]
+        actions = (first, (1_000_000, "west", motor_id, True))
+    elif invalid.startswith("enabled_"):
+        actions = (first, (1_000_000, "west", 1, 0 if invalid == "enabled_int" else None))
+    elif invalid == "duplicate_member":
+        manifest = replace(manifest, robots=(manifest.robots[0], replace(manifest.robots[1], name="east")))
+    else:
+        member = manifest.robots[1]
+        motors = member.robot.devices
+        selected = next(motor for motor in motors if motor.motor_id == 1)
+        if invalid == "missing_record":
+            motors = tuple(motor for motor in motors if motor is not selected)
+        elif invalid == "duplicate_record":
+            motors += (selected,)
+        else:
+            changed = replace(selected, **({"motor_id": True} if invalid == "record_bool"
+                                           else {"bus": "foreign_can"}))
+            motors = tuple(changed if motor is selected else motor for motor in motors)
+        member = replace(member, robot=replace(member.robot, devices=motors))
+        manifest = replace(manifest, robots=(manifest.robots[0], member))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid later motor feedback action reached resources or policy control")
+
+    for method in ("resolve_qemu", "regular_file", "create_arena_plant"):
+        monkeypatch.setattr(runtime, method, forbidden)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_motor_feedback_enabled", forbidden)
+    with pytest.raises((TypeError, ValueError)):
+        environment.run(manifest, motor_feedback=actions)
+    assert environment.events == [] and environment.launches == [] and environment.owners == []
+    assert environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_motor_feedback_full_independent_quota_keeps_equal_time_fifo(environment, monkeypatch):
+    observed = watch_motor_feedback(environment, monkeypatch)
+    actions = tuple((0, "east" if index % 2 else "west", 1, bool(index % 3))
+                    for index in range(1024))
+    delays = tuple((0, "east", 0) for _ in range(1024))
+    result = environment.run(duration=.001, motor_feedback=actions, can_delays=delays)
+    environment.assert_clean()
+    assert runtime.MAX_MOTOR_FEEDBACK_EVENTS == 1024
+    assert [(stamp, member, motor_id, enabled) for member, motor_id, enabled, stamp, *_
+            in observed.calls] == list(actions)
+    assert len(observed.delays.calls) == 1024
+    assert all(steps == () and reads == (0, 0) for *_, steps, reads in observed.calls)
+    assert result.steps == 1 and environment.native.steps == [1_000_000]
+    assert all(item.endpoint.bus.drop is None for item in observed.worlds[0].bindings)
+
+
+@pytest.mark.parametrize("delayed_ready", [False, True], ids=["reset", "startup"])
+def test_motor_feedback_off_grid_union_fifo_delay_priority_and_reset_origin(environment, monkeypatch, delayed_ready):
+    observed = watch_motor_feedback(environment, monkeypatch)
+    reset = 500 if delayed_ready else 0
+    if delayed_ready:
+        monkeypatch.setattr(runtime, "Session", lambda session_id: Session(session_id, reset))
+    environment.uart_chunks = [[b"", b"", b"", b"", b"READY"] if delayed_ready else [b"READY"], [b"READY"]]
+    order = []
+    observed.delays.after_set = lambda value, member, delay: order.append((value.t_sim_ns - reset, "delay", member))
+    observed.after_set = lambda value, member, motor_id, enabled: order.append((value.t_sim_ns - reset, "feedback", member))
+    actions = ((0, "west", 1, False), (0, "east", 1, False),
+               (500_000, "east", 1, True), (500_000, "east", 1, False),
+               (1_500_000, "west", 1, True), (2_500_000, "east", 1, True))
+    delays = ((0, "east", 0), (500_000, "west", 0), (1_000_000, "west", 0),
+              (1_500_000, "east", 0), (2_500_000, "west", 0))
+    result = environment.run(environment.manifest(ready=("READY", "READY")),
+                             motor_feedback=actions, can_delays=delays)
+    environment.assert_clean()
+    assert [(stamp - reset, member, motor_id, enabled) for member, motor_id, enabled, stamp, *_
+            in observed.calls] == list(actions)
+    assert order == [(0, "delay", "east"), (0, "feedback", "west"), (0, "feedback", "east"),
+        (500_000, "delay", "west"), (500_000, "feedback", "east"), (500_000, "feedback", "east"),
+        (1_000_000, "delay", "west"), (1_500_000, "delay", "east"), (1_500_000, "feedback", "west"),
+        (2_500_000, "delay", "west"), (2_500_000, "feedback", "east")]
+    assert [row[4] for row in observed.calls] == [(), (), (500_000,), (500_000,),
+        (500_000, 500_000, 500_000), (500_000, 500_000, 500_000, 1_000_000)]
+    steps = [500_000, 500_000, 500_000, 1_000_000] + ([1_000_000, 1_000_000, 500_000] if delayed_ready else [])
+    assert environment.native.steps == steps and result.steps == len(steps)
+    assert (result.origin_ns, result.end_ns) == ((2_500_500, 5_000_500) if delayed_ready else (0, 2_500_000))
+    assert environment.native.resets == 1 and [board.reset_qemu_ns for board in result.boards] == [1000, 2000]
+    assert all(row[5] == (0, 0) for row in observed.calls[:2])
+
+
+def test_motor_feedback_zero_follows_referee_queue_and_end_follows_completed_receipts(environment, monkeypatch):
+    referees = watch_referees(environment, monkeypatch)
+    observed = watch_motor_feedback(environment, monkeypatch)
+    environment.uart_chunks = [[b"READY"], [b"READY"]]
+    seen = []
+    def inspect(value, member, motor_id, enabled):
+        seen.append((value.t_sim_ns, len(referees.queues), tuple(environment.uart_reads),
+                     referees.engines[0].get_state().robot.current_hp,
+                     tuple(environment.cpus[index].completed for index in range(2)),
+                     len(referees.publications)))
+    observed.after_set = inspect
+    result = environment.run(environment.manifest(ready=("READY", "READY"),
+        referees={"east": referee_configuration()}), duration=.001, referee_period_ns=1_000_000,
+        referee_events=(("east", (ScriptEvent(0, Hit(10)),)),),
+        motor_feedback=((0, "east", 1, True), (1_000_000, "east", 1, False)))
+    environment.assert_clean()
+    assert seen == [(0, 1, (0, 0), 100, (0, 0), 0),
+                    (1_000_000, 1, (1, 1), 90, (4, 4), 1)]
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    # The action at T cannot retract feedback already delivered by that step.
+    for index in range(2):
+        assert environment.received_can(index) == b"".join(struct.pack(
+            "<IIB3xQ64s", 0x200 + motor_id, 0, 8, 1_001_000 + 1000 * index, zero.ljust(64, b"\0"))
+            for motor_id in range(1, 5))
+    assert [(name, stamp) for name, stamp, *_ in referees.publications] == [("east", 0), ("east", 1_000_000)]
+    assert result.end_ns == 1_000_000 and environment.native.steps == [1_000_000]
+    assert all(item.endpoint.bus.drop is None for item in observed.worlds[0].bindings)
+
+
+def test_motor_feedback_pending_dispatch_and_recovery_preserve_wire_commands_and_old_policy(environment, monkeypatch):
+    observed = watch_motor_feedback(environment, monkeypatch)
+    factory, deliveries, old_calls = environment.create_plant, ([], []), []
+    def original(source, destination, frame):
+        old_calls.append((source, destination, frame))
+        return False
+    def plant(manifest):
+        value = factory(manifest)
+        for index, bus in enumerate(dict.fromkeys(device.bus for device in value.devices)):
+            bus.log = deliveries[index].append
+            if index == 0:
+                bus.drop = original
+        return value
+    monkeypatch.setattr(runtime, "create_arena_plant", plant)
+    environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
+    result = environment.run(duration=.005, can_delays=((0, "east", 2_000_000), (1_000_000, "east", 0)),
+        motor_feedback=((1_000_000, "east", 1, False), (3_000_000, "east", 1, True)))
+    environment.assert_clean()
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    for index, groups in enumerate((
+            ((2_001_000, "0000", range(2, 5)), (3_001_000, "0000", range(2, 5)),
+             (3_001_000, "1000", range(2, 5)), (4_001_000, "1000", range(1, 5)),
+             (5_001_000, "1000", range(1, 5))),
+            tuple((stamp, "f000", range(1, 5)) for stamp in (1_002_000, 2_002_000, 3_002_000, 4_002_000, 5_002_000)))):
+        assert environment.received_can(index) == b"".join(struct.pack(
+            "<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+            (bytes.fromhex("0000 0000 " + current + " 19 00") if motor_id == 1 else zero).ljust(64, b"\0"))
+            for stamp, current, ids in groups for motor_id in ids)
+    assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
+            for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
+        (5, 2_000_000, 2_000_000, 2_000_000, True), (1, 1_000_000, 3_000_000, 3_000_000, True),
+        (9, 3_000_000, 3_000_000, 3_000_000, True), (13, 4_000_000, 4_000_000, 4_000_000, False),
+        (17, 5_000_000, 5_000_000, 5_000_000, False)]
+    assert [device.current_raw for device in environment.plant.devices] == [4096, 0, 0, 0, -4096, 0, 0, 0]
+    assert len(old_calls) == len(deliveries[0]) == 84
+    assert all(item.endpoint.bus.pending == 0 for item in observed.worlds[0].bindings)
+    assert [(row.frame.data, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
+            for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
+        (bytes.fromhex("1000 0000 0000 0000"), 0, 2_000_000, 2_000_000, False)]
+    ratio = 3591 / 187  # Fixed DJI specification, independent of production conversion.
+    for offset, currents in zip(range(0, 40, 8), ((0, -4096), (0, -4096),
+                                               (4096, -4096), (4096, -4096), (4096, -4096))):
+        group = environment.native.efforts[offset:offset + 8]
+        assert group[0][1] == pytest.approx(currents[0] * 20 / 16384 * .02 * ratio)
+        assert group[4][1] == pytest.approx(currents[1] * 20 / 16384 * .02 * ratio)
+        assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
+    assert [item.endpoint.bus.drop for item in observed.worlds[0].bindings] == [original, None]
+    assert environment.native.steps == [1_000_000] * 5 and result.steps == 5
+
+
+@pytest.mark.parametrize("violation", ["deadline", "child_exit"])
+def test_motor_feedback_post_setter_guard_stops_equal_time_suffix_and_restores_policies(environment, monkeypatch, violation):
+    observed = watch_motor_feedback(environment, monkeypatch)
+    def violate(value, member, motor_id, enabled):
+        if member == "west":
+            if violation == "deadline":
+                environment.clock += 4
+            else:
+                environment.children[0].returncode = 0
+    observed.after_set = violate
+    actions = ((0, "east", 1, False), (1_500_000, "west", 1, False), (1_500_000, "east", 1, True))
+    with pytest.raises((RuntimeError, TimeoutError), match="host deadline|exited early.*0"):
+        environment.run(environment.manifest(upper=True), motor_feedback=actions, startup_timeout=1, timeout=3)
+    environment.assert_clean()
+    assert [(name, motor_id, enabled, stamp) for name, motor_id, enabled, stamp, *_ in observed.calls] == [
+        ("east", 1, False, 0), ("west", 1, False, 1_500_000)]
+    assert environment.native.steps == [1_000_000, 500_000]
+    assert all(item.endpoint.bus.drop is None for item in observed.worlds[0].bindings)
+    assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+
+
+def test_motor_feedback_later_setter_primary_survives_owned_cleanup_and_restores_old_callback(environment, monkeypatch):
+    observed = watch_motor_feedback(environment, monkeypatch)
+    primary, factory = KeyboardInterrupt("feedback action interrupted"), environment.create_plant
+    original = lambda *args: False
+    def plant(manifest):
+        value = factory(manifest)
+        value.devices[0].bus.drop = original
+        return value
+    monkeypatch.setattr(runtime, "create_arena_plant", plant)
+    setter = shared_world.SharedWorldRuntime.set_motor_feedback_enabled
+    def reject(value, member, motor_id, enabled):
+        if member == "west":
+            raise primary
+        return setter(value, member, motor_id, enabled)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_motor_feedback_enabled", reject)
+    environment.world_close_failure = OSError("native feedback cleanup failed")
+    environment.world_close_failure.add_note("nested feedback cleanup diagnosis")
+    with pytest.raises(KeyboardInterrupt) as caught:
+        environment.run(environment.manifest(upper=True), motor_feedback=(
+            (0, "east", 1, False), (1_500_000, "west", 1, False), (1_500_000, "east", 1, True)))
+    assert caught.value is primary
+    environment.assert_clean()
+    assert [(name, motor_id, enabled, stamp) for name, motor_id, enabled, stamp, *_ in observed.calls] == [("east", 1, False, 0)]
+    assert environment.native.steps == [1_000_000, 500_000]
+    assert [item.endpoint.bus.drop for item in observed.worlds[0].bindings] == [original, None]
+    assert "nested feedback cleanup diagnosis" in "\n".join(primary.__notes__)
 
 
 def test_can_delay_full_quota_preserves_equal_time_caller_order(environment, monkeypatch):

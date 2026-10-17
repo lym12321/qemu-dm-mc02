@@ -15,9 +15,11 @@ from sim.boards import QemuBoard
 from sim.boards.channels import ChannelEvent, LabChannels
 from sim.boards.launch import UARTS, positive_seconds, qemu_command, regular_file, resolve_qemu
 from sim.core import Session
+from sim.devices.dji.protocol import validate_motor_id
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, validate_referee_events
 from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
 from sim.fabric.endpoints import QemuCanEndpoint
+from sim.fabric.can import check_can_time
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready
 from sim.robots.shared_world import (
@@ -34,6 +36,8 @@ from tools.dm_mc02_test_harness import running_qemu, stop
 from .manifest import (MAX_CAN_DELAY_EVENTS, ArenaManifest, ArenaReferee, ArenaRobot,
                        validate_can_delays)
 from .world import create_arena_plant
+
+MAX_MOTOR_FEEDBACK_EVENTS = 1024
 
 
 @dataclass(frozen=True)
@@ -183,7 +187,7 @@ class _Run:
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                  on_response=None, qemu=None, startup_timeout=10.0,
                  timeout=30.0, referee_period_ns=100_000_000,
-                 referee_events=(), can_delays=()) -> ArenaResult:
+                 referee_events=(), can_delays=(), motor_feedback=()) -> ArenaResult:
     """Consume admitted records and return only after all owners are released.
 
     Referees publish the latest completed snapshot when their local UART marker
@@ -196,6 +200,11 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     CAN delay actions are (reset-relative offset_ns, member, delay_ns) tuples.
     They split ticks at their exact deadlines and change subsequent admissions
     only, in caller order, after the completed step and before publication.
+    Motor feedback actions are (offset_ns, member, motor_id, enabled) tuples,
+    using the same reset origin and exact tick splitting. At equal times CAN
+    delays precede feedback actions; each schedule retains caller order.
+    Feedback actions affect subsequent dispatch, including pending frames;
+    feedback already delivered by the completed step cannot be retracted.
     Splitting changes native integration intervals and STEP observations.
     Native public QMP batching bounds each fresh paused CAN observation; liveness
     checks surround the whole group and cannot preempt a blocked callback.
@@ -260,6 +269,33 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     for _, member, _ in can_delays:
         if member not in members:
             raise ValueError("Arena CAN delay action must name a declared member")
+    if type(motor_feedback) is not tuple:
+        raise TypeError("Arena motor_feedback must be a plain immutable tuple")
+    if len(motor_feedback) > MAX_MOTOR_FEEDBACK_EVENTS:
+        raise ValueError(f"Arena motor feedback actions must not exceed {MAX_MOTOR_FEEDBACK_EVENTS}")
+    if motor_feedback and len(members) != len(manifest.robots):
+        raise ValueError("Arena motor feedback members must be unique")
+    previous_offset = None
+    for item in motor_feedback:
+        if type(item) is not tuple or len(item) != 4:
+            raise TypeError("Arena motor_feedback entries require (offset_ns, member, motor_id, enabled) tuples")
+        offset_ns, member, motor_id, enabled = item
+        check_can_time(offset_ns, previous_offset)
+        if offset_ns > duration_ns:
+            raise ValueError("Arena motor feedback action offset must not exceed duration")
+        if type(member) is not str:
+            raise ValueError("Arena motor feedback action requires a plain member string")
+        validate_motor_id(motor_id)
+        if type(enabled) is not bool:
+            raise TypeError("Arena motor feedback enabled must be a boolean")
+        if member not in members:
+            raise ValueError("Arena motor feedback action must name a declared member")
+        robot = members[member].robot
+        motors = [motor for motor in robot.devices if motor.motor_id == motor_id]
+        if (len(motors) != 1 or type(motors[0].motor_id) is not int
+                or motors[0].bus != robot.bus.name):
+            raise ValueError("Arena motor feedback action must name one declared motor on its member bus")
+        previous_offset = offset_ns
     startup_timeout, timeout = positive_seconds(startup_timeout), positive_seconds(timeout)
     if startup_timeout > timeout:
         raise ValueError("startup timeout must not exceed active host timeout")
@@ -351,8 +387,9 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             runtime.queue_referee_events(member, events, session_id=session.session_id)
             run.guard()
         can_delay_index = 0
-        def apply_can_delays():
-            nonlocal can_delay_index
+        motor_feedback_index = 0
+        def apply_can_actions():
+            nonlocal can_delay_index, motor_feedback_index
             while (can_delay_index < len(can_delays)
                    and session.t_sim_ns + can_delays[can_delay_index][0] <= runtime.t_sim_ns):
                 _, member, delay_ns = can_delays[can_delay_index]
@@ -360,14 +397,24 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 runtime.set_can_delay(member, delay_ns)
                 run.guard()
                 can_delay_index += 1
+            while (motor_feedback_index < len(motor_feedback)
+                   and session.t_sim_ns + motor_feedback[motor_feedback_index][0] <= runtime.t_sim_ns):
+                _, member, motor_id, enabled = motor_feedback[motor_feedback_index]
+                run.guard()
+                runtime.set_motor_feedback_enabled(member, motor_id, enabled)
+                run.guard()
+                motor_feedback_index += 1
         def advance(dt_ns, *, deadline):
-            apply_can_delays()
+            apply_can_actions()
             if can_delay_index < len(can_delays):
                 dt_ns = min(dt_ns, session.t_sim_ns + can_delays[can_delay_index][0]
                             - runtime.t_sim_ns)
+            if motor_feedback_index < len(motor_feedback):
+                dt_ns = min(dt_ns, session.t_sim_ns + motor_feedback[motor_feedback_index][0]
+                            - runtime.t_sim_ns)
             runtime.step(dt_ns, deadline=deadline)
-            apply_can_delays()
-        apply_can_delays()
+            apply_can_actions()
+        apply_can_actions()
         for peer, response in zip(run.peers, responses):
             peer.reset_qemu_ns = codec.decode_reset_ack_payload(response.payload).virtual_time_ns
             peer.last_ns = run.call(peer, peer.board.snapshot)["timestamp_ns"]
