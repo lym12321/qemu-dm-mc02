@@ -24,6 +24,10 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
+    if type(manifest.motor_feedback) is not tuple:
+        raise TypeError("Scenario motor_feedback require a plain immutable tuple")
+    if manifest.motor_feedback:
+        raise RuntimeError("Scenario motor feedback execution is not supported yet")
     if (type(manifest.can_delays) is not tuple
             or any(type(item) is not ScenarioCanDelay for item in manifest.can_delays)):
         raise TypeError("Scenario can_delays require a plain ScenarioCanDelay tuple")

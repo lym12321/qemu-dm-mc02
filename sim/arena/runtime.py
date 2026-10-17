@@ -33,11 +33,9 @@ from tools.dm_mc02_firmware_rtf import deadline_qmp_call
 from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_test_harness import running_qemu, stop
 
-from .manifest import (MAX_CAN_DELAY_EVENTS, ArenaManifest, ArenaReferee, ArenaRobot,
-                       validate_can_delays)
+from .manifest import (MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS,
+                       ArenaManifest, ArenaReferee, ArenaRobot, validate_can_delays)
 from .world import create_arena_plant
-
-MAX_MOTOR_FEEDBACK_EVENTS = 1024
 
 
 @dataclass(frozen=True)

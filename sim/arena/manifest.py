@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 _MODELS = Path(__file__).resolve().parents[2] / "models"
 _PREFIXES = ("alpha/", "bravo/")
 MAX_CAN_DELAY_EVENTS = 1024
+MAX_MOTOR_FEEDBACK_EVENTS = 1024
 
 
 @dataclass(frozen=True)

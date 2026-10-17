@@ -882,6 +882,147 @@ def test_scenario_can_delay_quota_is_independent_of_referee_quota(tmp_path):
                for item in result.can_delays)
 
 
+def test_scenario_motor_feedback_mixed_projection_is_pure_actual_named_and_frozen(tmp_path, monkeypatch):
+    from sim.scenario import ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback
+
+    documents = tuple(ROBOT_DOCUMENT.replace("chassis_can", bus).replace("  fl:", "  front-left:")
+                      .replace("  rr:", "  rear_right:") for bus in ("drive_left", "drive-right"))
+    arena_path = write_arena(tmp_path, robot_documents=documents)
+    path = tmp_path / "feedback.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "2ms", "events": [
+        {"at": "0ns", "action": "motor_feedback", "target": "west.rear_right", "value": False},
+        {"at": "0us", "action": "can_delay", "target": "east.drive_left", "value": "17ns"},
+        {"at": "500us", "action": "motor_feedback", "target": "east.front-left", "value": False},
+        {"at": "500000ns", "action": "motor_feedback", "target": "east.front-left", "value": True},
+        {"at": "500us", "action": "can_delay", "target": "west.drive-right", "value": "0ns"},
+        {"at": "2ms", "action": "motor_feedback", "target": "west.rear_right", "value": True},
+    ]}, sort_keys=False), encoding="utf-8")
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("pure motor feedback producer acquired a runtime resource")
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    original_import = builtins.__import__
+    def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
+        resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
+                    if level else name)
+        candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
+        for candidate in candidates:
+            if any(candidate == prefix or candidate.startswith(prefix + ".") for prefix in (
+                    "mujoco", "numpy", "sim.physics", "sim.devices", "sim.arena.runtime", "sim.robots.runtime",
+                    "sim.robots.shared_world", "sim.lab.runtime", "sim.boards", "tools")):
+                pytest.fail(f"motor feedback producer imported a runtime dependency: {candidate}")
+        return original_import(name, globals, locals, fromlist, level)
+    monkeypatch.setattr(builtins, "__import__", pure_import)
+    spec = importlib.util.spec_from_file_location("scenario_manifest_feedback_purity", ROOT / "sim/scenario/manifest.py")
+    scenario = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, scenario)
+    spec.loader.exec_module(scenario)
+    result = scenario.load_manifest(path)
+    assert (result.path, result.arena.path, result.duration_ns) == (path.resolve(), arena_path.resolve(), 2_000_000)
+    assert result.can_delays == (scenario.ScenarioCanDelay(0, "east", 17),
+                                 scenario.ScenarioCanDelay(500_000, "west", 0))
+    assert result.motor_feedback == (scenario.ScenarioMotorFeedback(0, "west", 4, False),
+        scenario.ScenarioMotorFeedback(500_000, "east", 1, False),
+        scenario.ScenarioMotorFeedback(500_000, "east", 1, True),
+        scenario.ScenarioMotorFeedback(2_000_000, "west", 4, True))
+    assert type(result.motor_feedback) is tuple and result.referees == ()
+    for record in (result, *result.motor_feedback):
+        with pytest.raises(FrozenInstanceError):
+            setattr(record, fields(record)[0].name, None)
+    assert ScenarioMotorFeedback(0, "east", 1, False).enabled is False
+    assert ScenarioManifest(path, result.arena, 1, ()).motor_feedback == ()
+    assert ScenarioManifest(path, result.arena, 1, (), (ScenarioCanDelay(0, "east", 0),)).motor_feedback == ()
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ns"}), encoding="utf-8")
+    assert scenario.load_manifest(path).motor_feedback == ()
+    document = yaml.safe_load(path.read_text())
+    document["events"] = []
+    path.write_text(yaml.safe_dump(document), encoding="utf-8")
+    assert scenario.load_manifest(path).motor_feedback == ()
+
+
+@pytest.mark.parametrize("invalid", ["value_int", "value_string", "value_null", "offline", "at_bool",
+    "at_fraction", "at_horizon", "target_type", "target_unscoped", "target_three_parts", "target_nul",
+    "shape", "extra", "missing", "mixed_order", "feedback_quota", "can_quota", "aggregate_quota"])
+def test_scenario_motor_feedback_complete_outer_rejection_precedes_child_reads(tmp_path, monkeypatch, invalid):
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path)
+    first = {"at": "0ns", "action": "can_delay", "target": "east.chassis_can", "value": "0ns"}
+    last = {"at": "1ms", "action": "motor_feedback", "target": "west.fl", "value": False}
+    actions = [first, last]
+    if invalid.startswith("value_"):
+        last["value"] = {"value_int": 0, "value_string": "false", "value_null": None}[invalid]
+    elif invalid == "offline":
+        last["action"] = "device_offline"
+    elif invalid.startswith("at_"):
+        last["at"] = {"at_bool": True, "at_fraction": "0.5ms", "at_horizon": "1000001ns"}[invalid]
+    elif invalid.startswith("target_"):
+        last["target"] = {"target_type": 1, "target_unscoped": "fl",
+                          "target_three_parts": "west.main.fl", "target_nul": "west.fl\0"}[invalid]
+    elif invalid == "shape":
+        actions[1] = False
+    elif invalid == "extra":
+        last["enabled"] = False
+    elif invalid == "missing":
+        del last["value"]
+    elif invalid == "mixed_order":
+        first["at"], last["at"] = "1ms", "0ns"
+    elif invalid == "feedback_quota":
+        actions = [dict(last) for _ in range(1025)]
+    elif invalid == "can_quota":
+        actions = [dict(first) for _ in range(1025)] + [last]
+    else:
+        actions = [dict(first) for _ in range(1024)] + [dict(last) for _ in range(1025)]
+    path = tmp_path / "feedback.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": actions},
+                                   sort_keys=False), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError, match="events"):
+        load_scenario(path)
+
+
+@pytest.mark.parametrize("action,target", [("motor_feedback", "missing.front-left"),
+    ("motor_feedback", "east.fl"), ("motor_feedback", "west.drive-right"),
+    ("can_delay", "west.drive_left")])
+def test_scenario_motor_feedback_target_rejection_preserves_original_mixed_index(tmp_path, action, target):
+    from sim.scenario import load_manifest as load_scenario
+
+    documents = tuple(ROBOT_DOCUMENT.replace("chassis_can", bus).replace("  fl:", "  front-left:")
+                      for bus in ("drive_left", "drive-right"))
+    write_arena(tmp_path, robot_documents=documents)
+    path = tmp_path / "feedback.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": [
+        {"at": "0ns", "action": "motor_feedback", "target": "east.front-left", "value": True},
+        {"at": "0ns", "action": "can_delay", "target": "west.drive-right", "value": "0ns"},
+        {"at": "1ms", "action": action, "target": target,
+         "value": False if action == "motor_feedback" else "0ns"}]}, sort_keys=False), encoding="utf-8")
+    with pytest.raises(ManifestError) as caught:
+        load_scenario(path)
+    assert "events[2].target" in str(caught.value) and target in str(caught.value)
+
+
+def test_scenario_motor_feedback_and_can_quotas_are_independent_at_inclusive_horizon(tmp_path):
+    from sim.arena.manifest import MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path, referees={"east": referee_configuration()})
+    actions = [row for index in range(1024) for row in (
+        {"at": "1ms", "action": "motor_feedback", "target": "east.fl", "value": bool(index % 2)},
+        {"at": "1ms", "action": "can_delay", "target": "west.chassis_can", "value": str(index) + "ns"})]
+    path = tmp_path / "feedback.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": actions,
+        "referee_events": {"east": [{"at": "1ms", "hit": {"damage_hp": 0}}]}}, sort_keys=False), encoding="utf-8")
+    result = load_scenario(path)
+    assert MAX_CAN_DELAY_EVENTS == MAX_MOTOR_FEEDBACK_EVENTS == 1024
+    assert len(result.motor_feedback) == len(result.can_delays) == 1024
+    assert [(row.offset_ns, row.member, row.motor_id, row.enabled) for row in result.motor_feedback] == [
+        (1_000_000, "east", 1, bool(index % 2)) for index in range(1024)]
+    assert [(row.offset_ns, row.member, row.delay_ns) for row in result.can_delays] == [
+        (1_000_000, "west", index) for index in range(1024)]
+    assert len(result.referees) == len(result.referees[0].events) == 1
+
+
 def test_public_can_delay_validator_is_pure_neutral_and_accepts_unsigned_horizon(monkeypatch):
     from sim.arena.manifest import MAX_CAN_DELAY_EVENTS, validate_can_delays
     from sim.fabric import CanBus

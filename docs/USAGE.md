@@ -453,7 +453,7 @@ events:
     value: 0ns
 ```
 
-每项必须且只能包含 `at/action/target/value`，当前只接受 `can_delay`。
+每项必须且只能包含 `at/action/target/value`；本例使用 `can_delay`。
 `target` 精确匹配 Arena 成员名与其 Robot 配置中的总线名，格式为 `成员.总线`；
 不接受未限定的总线名、板卡 FDCAN endpoint 或其它成员的总线名称。
 `at/value` 沿用整数 `ns/us/ms/s` 字符串，范围 0..3600 秒；
@@ -520,6 +520,15 @@ Arena Python 入口还接受 `motor_feedback=((offset_ns, member, motor_id, enab
 尚未 dispatch 的排队帧按新状态决定是否丢弃，恢复不会补发已丢弃帧。
 结束或失败清理时恢复原有总线丢弃回调。本动作目前仅用于 Python 入口，
 Scenario/YAML 调度及真实固件对反馈缺失的超时响应尚待验证。
+
+Scenario 加载器可解析 `action: motor_feedback`，`target` 使用准确的
+`成员名.电机名`（Robot 中的设备名称），`value` 必须为 YAML 布尔值。
+加载结果保存在不可变 `ScenarioMotorFeedback(offset_ns, member, motor_id, enabled)`
+元组中，默认 `motor_feedback=()`。混合 `events` 必须整体按时间非递减排列；
+CAN 延迟和反馈动作分别最多 1024 项，合计最多 2048 项。
+当前这一配置入口只完成解析验证；Scenario runtime/CLI 遇到非空反馈动作会明确拒绝执行，
+后续执行接线将复用 Arena 既有调度。同刻不同类型动作将按 CAN 延迟在前的规则执行，
+不能依赖它们在 YAML 中的交错顺序。
 
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。

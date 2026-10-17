@@ -1,4 +1,4 @@
-"""Pure Scenario admission for explicit scoped referee and CAN policy events.
+"""Pure Scenario admission for scoped referee, CAN and feedback policy events.
 
 Event times are relative to the shared host reset. Duration is the Arena active
 duration after requested ready markers; startup events may precede that origin.
@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sim.arena.manifest import (
-    MAX_CAN_DELAY_EVENTS, ArenaManifest, load_manifest as load_arena,
+    MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS,
+    ArenaManifest, load_manifest as load_arena,
     parse_referee_events, validate_can_delays,
 )
 from sim.manifest import (
@@ -38,42 +39,65 @@ class ScenarioCanDelay:
 
 
 @dataclass(frozen=True)
+class ScenarioMotorFeedback:
+    offset_ns: int
+    member: str
+    motor_id: int
+    enabled: bool
+
+
+@dataclass(frozen=True)
 class ScenarioManifest:
     path: Path
     arena: ArenaManifest
     duration_ns: int
     referees: tuple[ScenarioReferee, ...]
     can_delays: tuple[ScenarioCanDelay, ...] = ()
+    motor_feedback: tuple[ScenarioMotorFeedback, ...] = ()
 
 
-def _can_delays(value, duration_ns):
-    if type(value) is not list or len(value) > MAX_CAN_DELAY_EVENTS:
-        raise ManifestError(f"events must be a list with at most {MAX_CAN_DELAY_EVENTS} entries")
+def _events(value, duration_ns):
+    limit = MAX_CAN_DELAY_EVENTS + MAX_MOTOR_FEEDBACK_EVENTS
+    if type(value) is not list or len(value) > limit:
+        raise ManifestError(f"events must be a list with at most {limit} entries")
     if not value:
-        return (), ()
-    records, targets = [], []
+        return (), (), ()
+    records, targets, feedback = [], [], []
+    previous_offset = 0
     for index, configuration in enumerate(value):
         label = f"events[{index}]"
         required = ("at", "action", "target", "value")
         event = fields(configuration, required, required, label)
-        if type(event["action"]) is not str or event["action"] != "can_delay":
+        if type(event["action"]) is not str or event["action"] not in ("can_delay", "motor_feedback"):
             raise ManifestError(f"{label}.action unsupported: {event['action']!r}")
         target = event["target"]
         if type(target) is not str or target.count(".") != 1:
-            raise ManifestError(f"{label}.target must be a scoped member.bus name")
-        member, bus = target.split(".")
+            raise ManifestError(f"{label}.target must be a scoped member.endpoint name")
+        member, endpoint = target.split(".")
         identifier(member, label + ".target.member")
-        identifier(bus, label + ".target.bus")
-        records.append(ScenarioCanDelay(parse_time(event["at"], label + ".at"), member,
-                                        parse_time(event["value"], label + ".value")))
-        targets.append(target)
+        identifier(endpoint, label + ".target.endpoint")
+        offset = parse_time(event["at"], label + ".at")
+        if offset < previous_offset or offset > duration_ns:
+            raise ManifestError(f"{label}.at must be nondecreasing and not exceed duration")
+        previous_offset = offset
+        if event["action"] == "can_delay":
+            if len(records) >= MAX_CAN_DELAY_EVENTS:
+                raise ManifestError(f"events CAN delay actions must not exceed {MAX_CAN_DELAY_EVENTS}")
+            records.append(ScenarioCanDelay(offset, member, parse_time(event["value"], label + ".value")))
+            targets.append((index, target))
+        else:
+            if len(feedback) >= MAX_MOTOR_FEEDBACK_EVENTS:
+                raise ManifestError(f"events motor feedback actions must not exceed {MAX_MOTOR_FEEDBACK_EVENTS}")
+            if type(event["value"]) is not bool:
+                raise ManifestError(f"{label}.value must be a boolean")
+            feedback.append((index, offset, member, endpoint, event["value"]))
     records = tuple(records)
     try:
         validate_can_delays(tuple((item.offset_ns, item.member, item.delay_ns)
                                  for item in records), duration_ns=duration_ns)
     except (TypeError, ValueError) as error:
         raise ManifestError(f"events: {error}") from error
-    return records, tuple(targets)
+    return records, tuple(targets), tuple(feedback)
 
 
 def _referee_events(value, duration_ns):
@@ -116,7 +140,7 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
         raise ManifestError("unsupported Scenario schema; schema must be integer 1")
     duration_ns = parse_time(item["duration"], "duration", zero=False)
     events = _referee_events(item.get("referee_events", {}), duration_ns)
-    can_delays, targets = _can_delays(item.get("events", []), duration_ns)
+    can_delays, targets, feedback = _events(item.get("events", []), duration_ns)
     try:
         reference = file_path(item["arena"], manifest_path.parent, "scenario.arena")
         arena = load_arena(reference)
@@ -129,8 +153,17 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     referees = tuple(ScenarioReferee(item.member, events[item.member])
                      for item in arena.referees if item.member in events)
     robots = {item.name: item for item in arena.robots}
-    for index, (action, target) in enumerate(zip(can_delays, targets)):
+    for action, (index, target) in zip(can_delays, targets):
         if (action.member not in robots
                 or target != action.member + "." + robots[action.member].robot.bus.name):
             raise ManifestError(f"events[{index}].target {target!r} must name its Arena member's bus")
-    return ScenarioManifest(manifest_path, arena, duration_ns, referees, can_delays)
+    motor_feedback = []
+    for index, offset, member, name, enabled in feedback:
+        motors = (() if member not in robots else
+                  tuple(motor for motor in robots[member].robot.devices if motor.name == name))
+        if (len(motors) != 1 or type(motors[0].motor_id) is not int
+                or motors[0].bus != robots[member].robot.bus.name):
+            raise ManifestError(f"events[{index}].target {member + '.' + name!r} must name its Arena member's motor")
+        motor_feedback.append(ScenarioMotorFeedback(offset, member, motors[0].motor_id, enabled))
+    return ScenarioManifest(manifest_path, arena, duration_ns, referees, can_delays,
+                            tuple(motor_feedback))

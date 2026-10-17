@@ -869,6 +869,37 @@ def test_scenario_structure_rejects_before_lower_import_or_delegation(environmen
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
+@pytest.mark.parametrize("source", ["loaded", "forged", "empty_list", "tuple_subclass"])
+def test_scenario_motor_feedback_parse_only_refusal_precedes_runtime_import_and_effects(environment, monkeypatch, source):
+    from sim.scenario import ScenarioMotorFeedback
+
+    arena = environment.manifest()
+    if source == "loaded":
+        path = environment.directory / "feedback-scenario.yaml"
+        path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms", "events": [
+            {"at": "0ns", "action": "motor_feedback", "target": "east.fl", "value": False}]}), encoding="utf-8")
+        manifest = load_scenario(path)
+        assert manifest.motor_feedback == (ScenarioMotorFeedback(0, "east", 1, False),)
+    else:
+        class Foreign:
+            def __getattr__(self, name):
+                pytest.fail("parse-only runner inspected unsupported record fields")
+        actions = ((Foreign(),) if source == "forged" else [] if source == "empty_list"
+                   else type("Actions", (tuple,), {})(()))
+        manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (), (), actions)
+    original_import = builtins.__import__
+    def forbid_import(name, *args, **kwargs):
+        if name == "sim.arena.runtime":
+            pytest.fail("unsupported Scenario feedback reached lower runtime import")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", forbid_import)
+    with pytest.raises(TypeError if source in ("empty_list", "tuple_subclass") else RuntimeError,
+                       match="motor.feedback|motor_feedback"):
+        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
+    assert environment.events == [] and environment.owners == [] and environment.launches == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
 @pytest.fixture
 def admitted_can_delay_scenario(environment):
     """Real no-referee YAML input for the original Scenario execution consumer."""
