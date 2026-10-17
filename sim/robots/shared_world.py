@@ -25,8 +25,9 @@ from sim.boards import (
 from sim.core import Coordinator, Session
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
+from sim.devices.dji.protocol import validate_motor_id
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, ScriptEvent
-from sim.fabric import CanFrame
+from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import check_can_time
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.fabric.runtime import CanParticipant
@@ -79,6 +80,14 @@ class RefereeBinding:
     name: str
     engine: RefereeEngine
     endpoint: RefereeUartEndpoint
+
+
+@dataclass(frozen=True)
+class _MotorFeedbackPolicy:
+    bus: CanBus
+    original_drop: Callable | None
+    drop: Callable
+    blocked: set[int]
 
 
 def _finite_seconds(value, label):
@@ -232,6 +241,7 @@ class SharedWorldRuntime:
         self._can_wiring = can_wiring
         self._can_baselines = ()
         self._can_input_states = ()
+        self._motor_feedback_policies = {}
 
     @property
     def t_sim_ns(self):
@@ -268,6 +278,10 @@ class SharedWorldRuntime:
             raise RuntimeError("shared world host deadline expired")
 
     def _check_execution_wiring(self):
+        if self._motor_feedback_policies and any(
+                policy.bus.drop is not policy.drop
+                for policy in self._motor_feedback_policies.values()):
+            raise RuntimeError("shared world CAN feedback drop policy changed")
         if not self._exact_execution:
             return
         for item, (bus, stream, sock, budget) in zip(self.bindings, self._can_wiring):
@@ -622,6 +636,55 @@ class SharedWorldRuntime:
             raise ValueError(f"unknown board: {name!r}")
         item.endpoint.bus.delay_ns = delay_ns
 
+    def set_motor_feedback_enabled(self, name: str, motor_id: int,
+                                   enabled: bool) -> None:
+        """Allow or drop one actual motor's feedback to its board at dispatch.
+
+        This changes feedback reachability, not device power or command/plant
+        behavior. Queued frames retain their due times; dropped frames are never
+        replayed. Existing drop decisions run first and remain effective.
+        The caller must not replace an installed policy. Clearing the last block
+        or closing the runtime restores the original borrowed callback.
+        """
+        if self.closed or self._busy or self.failed:
+            raise RuntimeError("shared world requires a successful start and fresh runtime")
+        if type(name) is not str:
+            raise TypeError("board name must be a string")
+        validate_motor_id(motor_id)
+        if type(enabled) is not bool:
+            raise TypeError("enabled must be a boolean")
+        item = next((item for item in self.bindings if item.name == name), None)
+        if item is None:
+            raise ValueError(f"unknown board: {name!r}")
+        device = next((device for device in self.plant.devices
+                       if device.bus is item.endpoint.bus and device.motor_id == motor_id), None)
+        if device is None:
+            raise ValueError(f"unknown motor {motor_id} on board {name!r}")
+        self._check_execution_wiring()
+        policy = self._motor_feedback_policies.get(name)
+        if enabled:
+            if policy is not None:
+                policy.blocked.discard(id(device))
+                if not policy.blocked:
+                    policy.bus.drop = policy.original_drop
+                    del self._motor_feedback_policies[name]
+        elif policy is not None:
+            policy.blocked.add(id(device))
+        else:
+            bus, endpoint = item.endpoint.bus, item.endpoint
+            original = bus.drop
+            if original is not None and not callable(original):
+                raise TypeError("CAN drop must be callable or None")
+            blocked = {id(device)}
+
+            def drop(source, destination, frame):
+                inherited = bool(original and original(source, destination, frame))
+                return inherited or (destination is endpoint and id(source) in blocked)
+
+            bus.drop = drop
+            self._motor_feedback_policies[name] = _MotorFeedbackPolicy(
+                bus, original, drop, blocked)
+
     def step(self, dt_ns: int, *, deadline):
         """Advance the sole world once; return actual per-board STEP_ACKs."""
         self._enter()
@@ -721,6 +784,18 @@ class SharedWorldRuntime:
                     primary.add_note(f"shared world participants close failed: {type(exc).__name__}: {exc}")
                     for note in (() if exc is primary else tuple(getattr(exc, "__notes__", ()))):
                         primary.add_note(note)
+            for name, policy in reversed(tuple(self._motor_feedback_policies.items())):
+                try:
+                    if policy.bus.drop is not policy.drop:
+                        raise RuntimeError(f"CAN feedback drop policy changed for board {name!r}")
+                    policy.bus.drop = policy.original_drop
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        primary.add_note(f"CAN feedback policy cleanup failed: {type(exc).__name__}: {exc}")
+                # A replacement belongs to its caller; never overwrite it.
+            self._motor_feedback_policies.clear()
             if primary is not None:
                 raise primary
         finally:

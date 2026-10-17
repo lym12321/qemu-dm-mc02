@@ -2242,6 +2242,17 @@ IRQ/器件事件全部闭合，输入处理也不代表固件消费；此组合�
 关闭 owner 保留借用总线的配置。最大合法延迟可能使后续 step 的时间范围检查失败，
 该执行失败仍冻结 owner。此接口不提供 Scenario 动作调度或 QEMU CPU 时间屏障。
 
+`set_motor_feedback_enabled(name, motor_id, enabled)` 在 start 成功后控制一个成员、
+一个实际 M3508 到该板 CAN endpoint 的反馈投递；`enabled` 必须为布尔值。
+禁用期间命令、plant、器件超时、其它电机和其它目的端照常处理，因此这表示反馈不可达，
+不能用来模拟电机断电。总线在实际 dispatch 时决定是否丢弃，已排队帧保留字节、
+顺序和截止时间；恢复不补发已经丢弃的帧。
+既有 `CanBus.drop` 策略先执行，原有拒绝和异常仍生效。首个禁用安装临时组合回调，
+最后一个禁用解除或 owner 关闭时恢复原回调；即使 plant 清理失败也尝试恢复。
+调用方在临时策略生效时不得替换 `bus.drop`；后续反馈设置或运行检查会拒绝该替换，清理报告错误
+并保留调用方的新回调。无效身份或类型不改变策略及运行状态，执行和清理回调内拒绝调用。
+本接口不调度 Scenario 动作，也不证明固件已观察到反馈缺失。
+
 可传入 `check_running()` 检查调用方拥有的进程；
 `on_response(name, frame, decoded_payload)` 观察返回的 ACK 和闲置连接的回复，
 DONE 保留实际 status/consumed/missing。既有主动等待器会跳过部分 advisory

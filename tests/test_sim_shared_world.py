@@ -9,6 +9,7 @@ does not run QEMU or prove firmware readiness, consumption or CPU timing.
 from contextlib import ExitStack
 from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
+from types import SimpleNamespace
 import socket
 import struct
 import sys
@@ -25,7 +26,7 @@ from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot, decode_frame,
 )
-from sim.fabric import CanBus
+from sim.fabric import CanBus, CanFrame
 from sim.fabric.endpoints import QemuCanEndpoint
 from sim.physics import ImuSample, JointState
 from sim.robots.shared_world import (
@@ -136,12 +137,17 @@ class Boards:
 
 
 @pytest.fixture
-def world_resources():
+def world_resources(request):
     with ExitStack() as stack:
         native = NativeStub()
         buses = (CanBus(), CanBus())
-        devices = tuple(M3508Device(bus, 1) for bus in buses)
-        plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2"))), gear_ratio=2)
+        # Only the focused feedback consumers request the fixed four-per-bus
+        # profile; all existing users retain their original devices and joints.
+        count = getattr(request, "param", 1)
+        devices = tuple(M3508Device(bus, motor_id)
+                        for bus in buses for motor_id in range(1, count + 1))
+        joints = ("j1", "j2") if count == 1 else tuple(f"j{i}" for i in range(1, 9))
+        plant = M3508JointPlant(native, dict(zip(devices, joints)), gear_ratio=2)
         # A successful runtime owns the plant. Only a rejected construction
         # leaves this fixture responsible for its still-open resource.
         stack.callback(lambda: None if plant.closed else plant.close())
@@ -524,6 +530,275 @@ def test_scoped_can_delay_keeps_pending_command_and_feedback_due_with_independen
     assert [bus.delay_ns for bus in buses] == [17, 0] and native.closed == 1
     assert all(item.endpoint.stream.sock.fileno() >= 0 and item.cosim.sock.fileno() >= 0
                for item in bindings)
+
+
+@pytest.mark.parametrize("world_resources", [4], indirect=True)
+def test_motor_feedback_scope_recovery_preserves_eight_devices_and_other_destinations(setup):
+    runtime, boards, native, bindings, peers, _ = setup
+    bus = bindings[0].endpoint.bus
+    deliveries, tapped = [], []
+    bus.log = deliveries.append
+    tap = SimpleNamespace(receive=tapped.append)
+    bus.attach(tap, "tap")
+    start(runtime)
+    assert runtime.set_motor_feedback_enabled("left", 1, False) is None
+    # A different actual source using the same arbitration ID still reaches
+    # the board; the reachability policy must not parse CAN IDs or payloads.
+    bus.send(tap, CanFrame(0x201, 0, 8, bytes.fromhex("0102 0304 0506 0708"), 500))
+    for peer, origin, command in zip(peers, boards.origins,
+                                     ("1000 2000 3000 4000", "f000 e000 d000 c000")):
+        peer.send(can_wire(origin, command))
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [device.current_raw for device in runtime.plant.devices] == [
+        4096, 8192, 12288, 16384, -4096, -8192, -12288, -16384]
+    first = tuple(uart_received(peer) for peer in peers)
+    assert [(row.source, row.destination, row.frame.can_id) for row in deliveries if row.dropped] == [
+        ("m3508-1", "qemu", 0x201)]
+    assert [(frame.can_id, frame.data) for frame in tapped] == [
+        (0x200, bytes.fromhex("1000 2000 3000 4000")),
+        *[(0x201 + i, bytes.fromhex("0000 0000 " + value + " 19 00"))
+          for i, value in enumerate(("1000", "2000", "3000", "4000"))]]
+    assert runtime.set_motor_feedback_enabled("left", 1, True) is None and bus.drop is None
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    second = tuple(uart_received(peer) for peer in peers)
+    for index, currents in enumerate((("1000", "2000", "3000", "4000"),
+                                     ("f000", "e000", "d000", "c000"))):
+        for raw, stamp, ids in ((first[index], 1_001_000 + index * 1000,
+                                range(2 if index == 0 else 1, 5)),
+                               (second[index], 2_001_000 + index * 1000, range(1, 5))):
+            prefix = (struct.pack("<IIB3xQ64s", 0x201, 0, 8, 1000,
+                                  bytes.fromhex("0102 0304 0506 0708").ljust(64, b"\0"))
+                      if index == 0 and stamp == 1_001_000 else b"")
+            assert raw == prefix + b"".join(struct.pack(
+                "<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+                bytes.fromhex("0000 0000 " + currents[motor_id - 1] + " 19 00").ljust(64, b"\0"))
+                for motor_id in ids)
+    expected_efforts = list(zip((f"j{i}" for i in range(1, 9)),
+                               (.2, .4, .6, .8, -.2, -.4, -.6, -.8)))
+    assert native.efforts == expected_efforts * 2 and native.steps == [1_000_000] * 2
+    assert all(item.endpoint.bus.pending == 0 for item in bindings)
+    assert not runtime.failed and runtime.step_id == 2
+
+
+def test_motor_feedback_changes_only_dispatch_decisions_for_old_pending_frames(setup):
+    runtime, _, native, bindings, peers, _ = setup
+    bus, deliveries = bindings[0].endpoint.bus, []
+    bus.log = deliveries.append
+    start(runtime)
+    runtime.set_can_delay("left", 2_000_000)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert bus.pending == 1
+    runtime.set_motor_feedback_enabled("left", 1, False)
+    runtime.set_can_delay("left", 0)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert bus.pending == 1
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert bus.pending == 0 and uart_received(peers[0]) == b""
+    assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
+            for row in deliveries] == [
+        (1, 2_000_500, 2_000_500, 2_000_500, True),
+        (0, 1_000_500, 3_000_500, 3_000_500, True),
+        (2, 3_000_500, 3_000_500, 3_000_500, True)]
+    assert all(row.frame.data == bytes.fromhex("0000 0000 0000 19 00")
+               for row in deliveries)
+    runtime.set_motor_feedback_enabled("left", 1, True)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert uart_received(peers[0]) == struct.pack(
+        "<IIB3xQ64s", 0x201, 0, 8, 4_001_000,
+        bytes.fromhex("0000 0000 0000 19 00").ljust(64, b"\0"))
+    assert len(uart_received(peers[1])) == 4 * 84 and native.steps == [1_000_000] * 4
+    assert not runtime.failed and runtime.step_id == 4
+
+
+def test_motor_feedback_composes_old_drop_once_before_block_and_preserves_errors(setup):
+    runtime, _, native, bindings, peers, _ = setup
+    bus, calls, deliveries, tapped = bindings[0].endpoint.bus, [], [], []
+    tap = SimpleNamespace(receive=tapped.append)
+    bus.attach(tap, "tap")
+    primary = OSError("existing drop failed")
+    fail = False
+
+    def original(source, destination, frame):
+        calls.append((source, destination, frame))
+        if fail:
+            raise primary
+        return destination is tap
+
+    bus.drop, bus.log = original, deliveries.append
+    start(runtime)
+    runtime.set_motor_feedback_enabled("left", 1, False)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    device = runtime.plant.devices[0]
+    assert [(source, destination) for source, destination, _ in calls] == [
+        (device, bindings[0].endpoint), (device, tap)]
+    assert [(row.destination, row.dropped) for row in deliveries] == [("qemu", True), ("tap", True)]
+    assert not tapped and uart_received(peers[0]) == b""
+    fail = True
+    with pytest.raises(OSError) as caught:
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert caught.value is primary and len(calls) == 3 and len(deliveries) == 2
+    assert native.steps == [1_000_000] * 2 and runtime.failed
+    with pytest.raises(RuntimeError):
+        runtime.set_motor_feedback_enabled("left", 1, True)
+    runtime.close()
+    assert bus.drop is original and native.closed == 1
+
+
+@pytest.mark.parametrize("world_resources", [4], indirect=True)
+def test_motor_feedback_pure_admission_and_lazy_last_enable_restore(setup, monkeypatch):
+    runtime, boards, native, bindings, peers, _ = setup
+    start(runtime)
+    bus, other = (item.endpoint.bus for item in bindings)
+    original = lambda *args: False
+    bus.drop = original
+    peers[0].send(can_wire(1000, "1000 0000 0000 0000"))
+    before = (runtime.t_sim_ns, runtime.step_id, list(native.steps), list(native.reads),
+              [list(stream.endpoint.stream.reads) for stream in bindings],
+              [list(frames) for frames in boards.frames])
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("feedback policy admission performed IO or advanced the world")
+
+    class Alias(str):
+        pass
+
+    class MotorAlias(int):
+        pass
+
+    with monkeypatch.context() as admission:
+        admission.setattr(runtime, "_check_running", forbidden)
+        admission.setattr(time, "monotonic", forbidden)
+        for owner, methods in ((native, ("step", "reset", "get_imu", "get_joint_state")),
+                               (CanBus, ("send", "step", "reset")),
+                               (CanStream, ("receive", "send", "flush")),
+                               (StepFramedSocket, ("receive", "send", "flush"))):
+            for method in methods:
+                admission.setattr(owner, method, forbidden)
+        runtime.set_motor_feedback_enabled("left", 1, True)
+        assert bus.drop is original  # No wrapper on the default enabled path.
+        bus.drop = 3
+        with pytest.raises(TypeError):
+            runtime.set_motor_feedback_enabled("left", 1, False)
+        assert bus.drop == 3 and not runtime.failed
+        bus.drop = original
+        for name, motor_id, enabled, error in (
+                ("missing", 1, False, ValueError), (None, 1, False, TypeError),
+                (Alias("left"), 1, False, TypeError), ("left", 8, False, ValueError),
+                ("left", True, False, ValueError), ("left", MotorAlias(1), False, ValueError),
+                ("left", 0, False, ValueError), ("left", 9, False, ValueError),
+                ("left", 1, 0, TypeError), ("left", 1, None, TypeError)):
+            with pytest.raises(error):
+                runtime.set_motor_feedback_enabled(name, motor_id, enabled)
+            assert bus.drop is original and other.drop is None and not runtime.failed
+        runtime.set_motor_feedback_enabled("left", 1, False)
+        wrapper = bus.drop
+        runtime.set_motor_feedback_enabled("left", 1, False)
+        runtime.set_motor_feedback_enabled("left", 2, False)
+        runtime.set_motor_feedback_enabled("left", 1, True)
+        assert bus.drop is wrapper and other.drop is None
+        runtime.set_motor_feedback_enabled("left", 2, True)
+        assert bus.drop is original
+    assert (runtime.t_sim_ns, runtime.step_id, native.steps, native.reads,
+            [stream.endpoint.stream.reads for stream in bindings], boards.frames) == before
+    assert all(item.endpoint.bus.pending == 0 for item in bindings)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert runtime.plant.devices[0].current_raw == 4096 and not runtime.failed
+
+
+@pytest.mark.parametrize("state", ["prestart", "failed", "closed"])
+def test_motor_feedback_lifecycle_refusal_preserves_borrowed_policy(setup, state):
+    runtime, boards, native, bindings, _, _ = setup
+    if state != "prestart":
+        start(runtime)
+        if state == "failed":
+            boards.failure = OSError("board exited")
+            with pytest.raises(OSError):
+                runtime.service(deadline=time.monotonic() + 1)
+        else:
+            runtime.close()
+    before = (list(native.steps), native.closed, [item.endpoint.bus.drop for item in bindings])
+    with pytest.raises(RuntimeError, match="fresh runtime"):
+        runtime.set_motor_feedback_enabled("left", 1, False)
+    assert (native.steps, native.closed, [item.endpoint.bus.drop for item in bindings]) == before
+
+
+def test_motor_feedback_callback_reentry_refuses_other_board(referee_setup):
+    runtime, _, native, bindings, _, _, _, pairs = referee_setup
+    start(runtime)
+    calls = []
+
+    def reenter():
+        with pytest.raises(RuntimeError, match="fresh runtime"):
+            runtime.set_motor_feedback_enabled("right", 1, False)
+        calls.append("refused")
+
+    pairs[0][0].on_send = reenter
+    assert runtime.publish_referee("left", deadline=time.monotonic() + 1) == REFEREE_INITIAL_WIRE
+    assert calls == ["refused"] and uart_received(pairs[0][1]) == REFEREE_INITIAL_WIRE
+    assert all(item.endpoint.bus.drop is None for item in bindings)
+    assert not runtime.failed and native.steps == []
+
+
+def test_motor_feedback_external_replacement_refuses_then_freezes_before_io(setup):
+    runtime, boards, native, bindings, peers, _ = setup
+    start(runtime)
+    bus = bindings[0].endpoint.bus
+    runtime.set_motor_feedback_enabled("left", 1, False)
+    replacement = lambda *args: False
+    bus.drop = replacement
+    peers[0].send(can_wire(1000, "1000 0000 0000 0000"))
+    frames = [list(rows) for rows in boards.frames]
+    reads = [list(item.endpoint.stream.reads) for item in bindings]
+    for name, enabled in (("left", True), ("right", False)):
+        with pytest.raises(RuntimeError, match="policy changed"):
+            runtime.set_motor_feedback_enabled(name, 1, enabled)
+        assert not runtime.failed and bus.drop is replacement
+    with pytest.raises(RuntimeError, match="policy changed"):
+        runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert runtime.failed and native.steps == [] and boards.frames == frames
+    assert [item.endpoint.stream.reads for item in bindings] == reads
+    assert bindings[0].endpoint.stream.sock.recv(84, socket.MSG_PEEK) == can_wire(
+        1000, "1000 0000 0000 0000")
+    with pytest.raises(RuntimeError, match="policy changed"):
+        runtime.close()
+    assert runtime.closed and native.closed == 1 and bus.drop is replacement
+    assert all(device.closed for device in runtime.plant.devices)
+    runtime.close()
+
+
+@pytest.mark.parametrize("replace_policy", [False, True])
+def test_motor_feedback_cleanup_restores_both_policies_after_plant_error(setup, monkeypatch, replace_policy):
+    runtime, _, native, bindings, _, _ = setup
+    start(runtime)
+    original = lambda *args: False
+    bindings[0].endpoint.bus.drop = original
+    for item in bindings:
+        runtime.set_motor_feedback_enabled(item.name, 1, False)
+    replacement = lambda *args: True
+    if replace_policy:
+        bindings[0].endpoint.bus.drop = replacement
+    primary, original_close = KeyboardInterrupt("native close failed"), native.close
+
+    def close():
+        for item in bindings:
+            with pytest.raises(RuntimeError, match="fresh runtime"):
+                runtime.set_motor_feedback_enabled(item.name, 1, True)
+        original_close()
+        raise primary
+
+    monkeypatch.setattr(native, "close", close)
+    with pytest.raises(KeyboardInterrupt) as caught:
+        runtime.close()
+    assert caught.value is primary and native.closed == 1 and runtime.closed
+    assert [item.endpoint.bus.drop for item in bindings] == [replacement if replace_policy else original, None]
+    if replace_policy:
+        assert any("policy cleanup failed" in note and "policy changed" in note
+                   for note in caught.value.__notes__)
+    assert all(device.closed for device in runtime.plant.devices)
+    assert all(item.cosim.sock.fileno() >= 0 and item.endpoint.stream.sock.fileno() >= 0
+               for item in bindings)
+    runtime.close()
+    assert native.closed == 1
 
 
 def test_can_delay_maximum_is_admitted_then_existing_step_overflow_is_terminal(setup, monkeypatch):
@@ -1570,6 +1845,33 @@ def assert_exact_frozen(runtime, native, cpus):
         with pytest.raises(RuntimeError):
             action()
     assert (native.steps, tuple(tuple(cpu.requests) for cpu in cpus)) == before
+
+
+def test_motor_feedback_exact_socket_receipts_keep_missing_selected_and_recover_without_replay(exact_setup):
+    runtime, boards, native, bindings, cpus, _ = exact_setup
+    for cpu, origin, command in zip(cpus, boards.origins,
+                                     ("1000 0000 0000 0000", "f000 0000 0000 0000")):
+        cpu.output[1] = can_wire(origin, command)
+    start(runtime)
+    runtime.set_motor_feedback_enabled("left", 1, False)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [cpu.completed for cpu in cpus] == [0, 1]
+    assert [state["completed_frames"] for state in runtime.can_input_states] == [0, 1]
+    assert [device.current_raw for device in runtime.plant.devices] == [4096, -4096]
+    assert cpus[0].receipts == []
+    runtime.set_motor_feedback_enabled("left", 1, True)
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert [cpu.requests for cpu in cpus] == [[1_001_000, 2_001_000], [1_002_000, 2_002_000]]
+    for cpu, current, stamps in ((cpus[0], "1000", (2_001_000,)),
+                                 (cpus[1], "f000", (1_002_000, 2_002_000))):
+        assert cpu.receipts == [struct.pack(
+            "<IIB3xQ64s", 0x201, 0, 8, stamp,
+            bytes.fromhex("0000 0000 " + current + " 19 00").ljust(64, b"\0"))
+            for stamp in stamps]
+        assert not cpu.partial
+    assert [state["completed_frames"] for state in runtime.can_input_states] == [1, 2]
+    assert native.steps == [1_000_000] * 2 and native.efforts == [("j1", .2), ("j2", -.2)] * 2
+    assert not runtime.failed and all(item.endpoint.bus.pending == 0 for item in bindings)
 
 
 def test_exact_cpu_group_reaches_drains_and_receives_before_the_next_interval(exact_setup):
