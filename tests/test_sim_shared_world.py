@@ -1493,8 +1493,7 @@ class NativeCpuBatchQmp(NativeCpuQmp):
     def command_many(self, commands):
         assert type(commands) is tuple
         assert commands == (
-            ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
-            ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
+            ("qom-get", {"path": "/machine", "property": "can-execution-state"}),)
         # Every aggregate observes the real peer. Labels only describe the
         # existing CPU/world stages; they cannot select data or receive work.
         self._receive_input()
@@ -1509,12 +1508,14 @@ class NativeCpuBatchQmp(NativeCpuQmp):
         values = ({"schema": 1, "execution": execution,
                    "status": {"running": False, "status": (
                        "prelaunch" if self.state == "idle" else "paused"), "singlestep": False},
+                   "fdcan-transports": {"dm-mc02.fdcan1": {
+                       "path": "/chardevs/can1", "connected": True}},
                    "fdcan-tx-state": {"schema": 1, "timestamp_ns": self.current, "controllers": {
                 "dm-mc02.fdcan1": {"pending_frames": 0, "pending_bytes": 0,
                                   "tx_dropped": self.tx_dropped, "tx_short_writes": 0}}},
                    "fdcan-rx-state": {"schema": 1, "timestamp_ns": self.current, "controllers": {
                 "dm-mc02.fdcan1": {"completed_frames": count, "partial_bytes": len(self.partial),
-                                  "rx_dropped": self.rx_dropped}}}}, True)
+                                  "rx_dropped": self.rx_dropped}}}},)
         self.groups.append((direction, values))
         self.events.append(("batch", self.index, direction))
         self.after_batch(direction, values)
@@ -1929,7 +1930,8 @@ def test_exact_post_batch_guard_freezes_after_one_world_step(batch_exact_setup, 
     assert_exact_frozen(runtime, native, cpus)
 
 
-def test_exact_batch_final_result_is_fresh_and_bad_count_freezes_completed_world(batch_exact_setup):
+@pytest.mark.parametrize("mutation", ["count", "identity"])
+def test_exact_batch_final_result_is_fresh_and_change_freezes_completed_world(batch_exact_setup, mutation):
     runtime, _, native, _, cpus, _ = batch_exact_setup
     start(runtime)
     inputs = []
@@ -1937,12 +1939,17 @@ def test_exact_batch_final_result_is_fresh_and_bad_count_freezes_completed_world
         if native.steps and cpus[0].receipts:
             inputs.append(values)
             if len(inputs) == 2:
-                values[0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] = 2
+                if mutation == "count":
+                    values[0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] = 2
+                else:
+                    values[0]["fdcan-transports"]["dm-mc02.fdcan1"]["path"] = "/chardevs/replacement"
     cpus[0].after_batch = change_final
-    with pytest.raises(RuntimeError, match="exceeds goal"):
+    with pytest.raises(RuntimeError, match="exceeds goal" if mutation == "count" else "transport identity changed"):
         runtime.step(1_000_000, deadline=time.monotonic() + 1)
     assert len(inputs) == 2 and inputs[0] is not inputs[1]
     assert inputs[0][0]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"] == 1
+    assert inputs[0][0]["fdcan-transports"]["dm-mc02.fdcan1"] == {
+        "path": "/chardevs/can1", "connected": True}
     assert native.steps == [1_000_000] and len(cpus[0].receipts) == 1
     assert runtime.can_input_states == ({"completed_frames": 0, "partial_bytes": 0, "rx_dropped": 0},) * 2
     assert_exact_frozen(runtime, native, cpus)

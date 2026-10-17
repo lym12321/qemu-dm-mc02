@@ -234,7 +234,7 @@ def run(binary, report):
         report["image_directory"] = image_dir.name
         image = Path(image_dir.name) / "periodic.bin"
         image.write_bytes(GUEST)
-        sockets = ("qmp", "can1", "qtest")
+        sockets = ("qmp", "cosim", "can1", "qtest")
         argv = qemu_command(image, binary, sockets)
         argv[argv.index("-machine") + 1] += ",electrical-power=on"
         argv += ["-accel", "tcg,thread=single", "-icount", "shift=0,align=off,sleep=off",
@@ -257,11 +257,16 @@ def run(binary, report):
                 peers.append(("qtest", qtest))
                 qtest.settimeout(min(2.0, check()))
                 qtest.connect()
+                cosim_socket = connect_unix(str(owner.sockets["cosim"]),
+                                            min(2.0, check()))
+                peers.append(("co-sim", cosim_socket))
                 can_socket = connect_unix(str(owner.sockets["can1"]),
                                           min(2.0, check()))
                 peers.append(("original CAN", can_socket))
                 can = CanStream(can_socket)
                 connected(True)
+                while qom("/chardevs/cosim", "connected") is not True:
+                    check()
                 stopped(0, 0, "prelaunch")
 
                 phase = "setup"
@@ -290,6 +295,30 @@ def run(binary, report):
                 expect(tx_state(0)["pending_frames"] == 0, "unexpected initial backlog")
                 expect(rx_state(0) == {"completed_frames": 0, "partial_bytes": 0,
                                        "rx_dropped": 0}, "unexpected initial RX baseline")
+
+                phase = "wrong_transport_identity"
+                bound = qom("/machine", "can-execution-state")["fdcan-transports"][
+                    "dm-mc02.fdcan1"]
+                unrelated = qom("/chardevs/cosim", "connected")
+                expect(bound == {"path": "/chardevs/can1", "connected": True} and
+                       unrelated is True, "native connection identities are not established")
+                before_tx, before_rx = tx_state(0), rx_state(0)
+                try:
+                    observe_initial_paused_can(helper_qmp, can, timestamp_ns=0,
+                        controller="dm-mc02.fdcan1", chardev="cosim",
+                        deadline=deadline, check=check)
+                except RuntimeError as exc:
+                    expect("transport identity changed" in str(exc),
+                           f"wrong connection identity failed unexpectedly: {exc}")
+                    report["wrong_transport_identity"] = {
+                        "requested_chardev": "cosim", "actual_transport": bound,
+                        "unrelated_connected": unrelated, "error": str(exc)}
+                else:
+                    raise AssertionError("unrelated connected socket accepted as CAN transport")
+                expect(tx_state(0) == before_tx and rx_state(0) == before_rx and
+                       not can.buffer and not can.tx_pending,
+                       "identity rejection changed CAN state")
+                stopped(0, 0, "prelaunch")
 
                 phase = "initial_baseline"
                 initial = observe_initial_paused_can(
@@ -576,7 +605,9 @@ def run(binary, report):
                        "a native QMP observation group did not complete")
                 expect(qmp_groups["phases"].get("initial_baseline") == 2,
                        "initial helper did not use two fresh observation groups")
-                expect(set(qmp_groups["sizes"]) == {"2"} and
+                expect(qmp_groups["phases"].get("wrong_transport_identity") == 1,
+                       "identity rejection did not use one fresh observation group")
+                expect(set(qmp_groups["sizes"]) == {"1"} and
                        all(qmp_groups["phases"].get(name, 0) > 0 for name in
                            ("drain", "input_suffix_wait", "input_fifo_full",
                             "original_peer_eof", "original_input_peer_eof")),

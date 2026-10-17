@@ -160,8 +160,7 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
                                   target_ns, direction),)
 
         requests = (("qom-get", {"path": "/machine",
-                                 "property": "can-execution-state"}),
-                    ("qom-get", connection))
+                                 "property": "can-execution-state"}),)
         guard()
         values = command_many(requests)
         guard()
@@ -178,7 +177,13 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
                              target_ns, direction, initial)
         _can_paused_status(_field(state, "status", "can-execution-state"),
                            direction, initial)
-        _can_connection_state(values[1], direction)
+        transports = _object(_field(state, "fdcan-transports", "can-execution-state"),
+                             "fdcan-transports")
+        transport = _object(_field(transports, controller, "fdcan-transports"),
+                            f"fdcan-transports.{controller}")
+        if _field(transport, "path", "transport") != f"/chardevs/{chardev}":
+            raise RuntimeError(f"CAN {direction} transport identity changed")
+        _can_connection_state(_field(transport, "connected", "transport"), direction)
         if initial:
             tx = _can_tx_state(_field(state, "fdcan-tx-state", "can-execution-state"),
                                controller, target_ns, direction)

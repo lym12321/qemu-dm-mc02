@@ -933,7 +933,6 @@ def test_initial_can_does_not_weaken_reached_only_operations(initial_can):
 # command_many must never be implemented by calling the scalar test producer.
 BATCH_GROUP = (
     ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
-    ("qom-get", {"path": "/chardevs/can1", "property": "connected"}),
 )
 
 
@@ -942,7 +941,8 @@ class BatchPausedCanQmp:
         self.execution = {"state": "reached", "current-ns": 1000,
                           "target-ns": 1000}
         self.status = {"running": False, "status": "paused", "singlestep": False}
-        self.connected = True
+        self.transport = {"path": "/chardevs/can1", "connected": True,
+                          "native_extra": "retained"}
         self.tx = {"schema": 1, "timestamp_ns": 1000, "controllers": {
             "dm-mc02.fdcan1": {"pending_frames": 0, "pending_bytes": 0,
                               "tx_dropped": 0, "tx_short_writes": 0},
@@ -968,9 +968,11 @@ class BatchPausedCanQmp:
         self.on_group(self.direction)
         values = ({"schema": 1, "execution": deepcopy(self.execution),
                    "status": deepcopy(self.status),
+                   "fdcan-transports": {"dm-mc02.fdcan1": deepcopy(self.transport),
+                                        "extra-controller": {"path": None, "connected": None}},
                    "fdcan-tx-state": deepcopy(self.tx),
                    "fdcan-rx-state": deepcopy(self.rx),
-                   "native_extra": {"retained": True}}, self.connected)
+                   "native_extra": {"retained": True}},)
         return self.result(values)
 
     @property
@@ -1130,12 +1132,15 @@ def test_batch_input_flushes_real_queue_then_reobserves_exact_receipt(batch_can)
 @pytest.mark.parametrize("direction,section,field,value,error", [
     ("initial", "controller", "tx_dropped", 1, RuntimeError),
     ("initial", "rx_controller", "partial_bytes", 1, RuntimeError),
+    ("initial", "transport", "path", "/chardevs/replacement", RuntimeError),
     ("output", "execution", "state", "cancelled", RuntimeError),
     ("output", "status", "running", True, RuntimeError),
-    ("output", "connected", None, False, ConnectionError),
+    ("output", "transport", "connected", False, ConnectionError),
+    ("output", "transport", "path", None, RuntimeError),
     ("output", "controller", "tx_dropped", 1, RuntimeError),
     ("input", "execution", "current-ns", 1001, RuntimeError),
     ("input", "rx_controller", "partial_bytes", 1, RuntimeError),
+    ("input", "transport", "path", "/chardevs/replacement", RuntimeError),
 ])
 def test_batch_final_group_changes_are_rejected(
         batch_can, direction, section, field, value, error):
@@ -1156,8 +1161,11 @@ def test_batch_final_group_changes_are_rejected(
             getattr(qmp, section)[field] = value
 
     qmp.on_group = change
-    with pytest.raises(error):
+    with pytest.raises(error) as caught:
         batch_operation(direction, stream, qmp)
+    if section == "transport" and field == "path":
+        label = "initial-baseline" if direction == "initial" else direction
+        assert str(caught.value) == f"CAN {label} transport identity changed"
     assert qmp.groups == [BATCH_GROUP] * 2
     assert not stream.buffer and not stream.tx_pending
     assert_can_borrows_open(stream, qmp)
@@ -1221,7 +1229,7 @@ def test_batch_composed_schema_and_consumed_sections_reject_before_io(
     stream.receive = stream.flush = lambda: pytest.fail("invalid aggregate did IO")
 
     def malformed(values):
-        aggregate, connected = values
+        aggregate, = values
         if invalid == "object":
             aggregate = None
         elif invalid == "bool-schema":
@@ -1230,7 +1238,7 @@ def test_batch_composed_schema_and_consumed_sections_reject_before_io(
             aggregate["schema"] = 2
         else:
             del aggregate[invalid]
-        return aggregate, connected
+        return aggregate,
 
     qmp.result = malformed
     with pytest.raises(error, match="can-execution-state"):
@@ -1243,6 +1251,59 @@ def test_batch_composed_schema_and_consumed_sections_reject_before_io(
         with pytest.raises(BlockingIOError):
             peer.recv(84)
     assert not stream.buffer
+    assert_can_borrows_open(stream, qmp)
+
+
+@pytest.mark.parametrize("invalid,error,match", [
+    ("missing-map", ValueError, "fdcan-transports.*missing"),
+    ("null-map", TypeError, "fdcan-transports must be an object"),
+    ("list-map", TypeError, "fdcan-transports must be an object"),
+    ("missing-controller", ValueError, "fdcan1.*missing"),
+    ("null-controller", TypeError, "fdcan1 must be an object"),
+    ("list-controller", TypeError, "fdcan1 must be an object"),
+    ("missing-path", ValueError, "transport.path is missing"),
+    ("null-path", RuntimeError, "CAN output transport identity changed"),
+    ("nonstring-path", RuntimeError, "CAN output transport identity changed"),
+    ("wrong-path", RuntimeError, "CAN output transport identity changed"),
+    ("missing-connected", ValueError, "transport.connected is missing"),
+    ("null-connected", ConnectionError, "disconnected"),
+    ("disconnected", ConnectionError, "disconnected"),
+    ("truthy-connected", ConnectionError, "disconnected"),
+])
+def test_batch_requires_actual_bound_transport_before_can_io(batch_can, invalid, error, match):
+    stream, peer, qmp, _ = batch_can
+    assert peer.send(CAN_LITERAL) == 84
+    stream.receive = stream.flush = lambda: pytest.fail("invalid transport did IO")
+
+    def malformed(values):
+        state, = values
+        transports = state["fdcan-transports"]
+        transport = transports["dm-mc02.fdcan1"]
+        if invalid == "missing-map":
+            del state["fdcan-transports"]
+        elif invalid.endswith("-map"):
+            state["fdcan-transports"] = None if invalid == "null-map" else []
+        elif invalid == "missing-controller":
+            del transports["dm-mc02.fdcan1"]
+        elif invalid.endswith("-controller"):
+            transports["dm-mc02.fdcan1"] = None if invalid == "null-controller" else []
+        elif invalid.startswith("missing-"):
+            del transport[invalid.removeprefix("missing-")]
+        elif invalid.endswith("-path"):
+            transport["path"] = {"null-path": None, "nonstring-path": 7,
+                                 "wrong-path": "/chardevs/another-connected-peer"}[invalid]
+            assert transport["connected"] is True
+        else:
+            transport["connected"] = {"null-connected": None, "disconnected": False,
+                                      "truthy-connected": 1}[invalid]
+        return values
+
+    qmp.result = malformed
+    with pytest.raises(error, match=match):
+        run_paused_can(stream, qmp, lambda _: pytest.fail("unexpected sink"))
+    assert qmp.groups == [BATCH_GROUP]
+    assert stream.sock.recv(84, socket.MSG_PEEK) == CAN_LITERAL
+    assert not stream.buffer and not stream.tx_pending
     assert_can_borrows_open(stream, qmp)
 
 
@@ -1260,6 +1321,7 @@ def test_batch_validates_only_consumed_direction_and_tolerates_extra_fields(batc
 @pytest.mark.parametrize("first,error,match", [
     ("execution", RuntimeError, "not reached"),
     ("status", RuntimeError, "paused"),
+    ("identity", RuntimeError, "transport identity changed"),
     ("connection", ConnectionError, "disconnected"),
     ("shape", TypeError, "tuple"),
     ("schema", ValueError, "schema"),
@@ -1268,7 +1330,9 @@ def test_batch_errors_keep_input_order_and_shape_precedes_values(batch_can, firs
     stream, peer, qmp, _ = batch_can
     assert peer.send(CAN_LITERAL) == 84
     qmp.tx["schema"] = 2
-    qmp.connected = False
+    qmp.transport["connected"] = False
+    if first != "connection":
+        qmp.transport["path"] = "/chardevs/other-connected-peer"
     if first in ("execution", "status", "shape", "schema"):
         qmp.status["running"] = True
     if first in ("execution", "shape", "schema"):
@@ -1276,7 +1340,7 @@ def test_batch_errors_keep_input_order_and_shape_precedes_values(batch_can, firs
     if first == "shape":
         qmp.result = list
     elif first == "schema":
-        qmp.result = lambda values: ({**values[0], "schema": 2}, values[1])
+        qmp.result = lambda values: ({**values[0], "schema": 2},)
     with pytest.raises(error, match=match):
         run_paused_can(stream, qmp, lambda frame: pytest.fail("unexpected sink"))
     assert qmp.groups == [BATCH_GROUP]
@@ -1364,8 +1428,11 @@ def test_batch_guards_stop_before_receive_sink_or_flush(batch_can, direction, ph
     assert_can_borrows_open(stream, qmp)
 
 
-@pytest.mark.parametrize("direction", ["output", "input"])
-def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, direction):
+@pytest.mark.parametrize("direction,failure_kind", [
+    ("output", "exception"), ("input", "exception"),
+    ("output", "identity"), ("input", "identity"),
+])
+def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, direction, failure_kind):
     stream, peer, qmp, _ = batch_can
     qmp.direction = direction
     failure, seen = RuntimeError("later observation failed"), []
@@ -1373,7 +1440,9 @@ def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, 
     def fail_after_effect(kind):
         assert kind == direction
         if qmp.phase == "effect":
-            raise failure
+            if failure_kind == "exception":
+                raise failure
+            qmp.transport["path"] = "/chardevs/replacement"
 
     qmp.on_group = fail_after_effect
     if direction == "output":
@@ -1401,7 +1470,10 @@ def test_batch_later_failure_retains_completed_sink_or_flush_effects(batch_can, 
         assert not stream.tx_pending
         assert peer.recv(84) == CAN_LITERAL
         assert not stream.buffer
-    assert caught.value is failure
+    if failure_kind == "exception":
+        assert caught.value is failure
+    else:
+        assert str(caught.value) == f"CAN {direction} transport identity changed"
     assert qmp.groups == [BATCH_GROUP] * 2
     assert_can_borrows_open(stream, qmp)
 

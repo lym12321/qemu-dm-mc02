@@ -2082,13 +2082,12 @@ def test_arena_and_scenario_wire_public_batch_to_both_native_peers(environment, 
     assert {index for index, _ in environment.batch_calls} == {0, 1}
     for index, cpu in environment.cpus.items():
         assert {direction for direction, _ in cpu.groups} == {"initial", "output", "input"}
-        assert all(type(values) is tuple and len(values) == 2
+        assert all(type(values) is tuple and len(values) == 1
                    for direction, values in cpu.groups)
         assert cpu.completed == len(cpu.receipts) == 8 and not cpu.partial
         assert b"".join(cpu.receipts) == environment.received_can(index)
     assert all(arguments == (
-        ("qom-get", {"path": "/machine", "property": "can-execution-state"}),
-        ("qom-get", {"path": "/chardevs/can1", "property": "connected"}))
+        ("qom-get", {"path": "/machine", "property": "can-execution-state"}),)
                for _, arguments in environment.batch_calls)
     assert all(row[2] != "qom-get" for row in environment.execution_events if row[0] == "qmp")
     assert not any(event.endswith(" cont") for event in environment.events)
@@ -2116,7 +2115,7 @@ def test_arena_requires_callable_batch_and_cleans_acquired_resources(environment
     assert all(f"peer{index} qmp close" in environment.events for index in range(2))
 
 
-@pytest.mark.parametrize("violation", ["deadline", "child_exit", "batch_error"])
+@pytest.mark.parametrize("violation", ["deadline", "child_exit", "batch_error", "identity"])
 def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(environment, violation):
     primary = OSError("native public batch failed")
     def invalidate(index, commands, values):
@@ -2126,8 +2125,10 @@ def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(en
             environment.clock += 4
         elif violation == "child_exit":
             environment.children[0].returncode = 0
-        else:
+        elif violation == "batch_error":
             raise primary
+        else:
+            values[0]["fdcan-transports"]["dm-mc02.fdcan1"]["path"] = "/chardevs/replacement"
     environment.batch_after = invalidate
     with pytest.raises((RuntimeError, TimeoutError, OSError)) as caught:
         environment.run(environment.manifest(upper=True), startup_timeout=1, timeout=3)
@@ -2136,8 +2137,10 @@ def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(en
     elif violation == "deadline":
         assert type(caught.value) is rtf.StartupTimeoutError
         assert str(caught.value) == "Arena exceeded startup timeout"
-    else:
+    elif violation == "child_exit":
         assert "exited early (0)" in str(caught.value)
+    else:
+        assert str(caught.value) == "CAN input transport identity changed"
     environment.assert_clean()
     assert environment.native.steps == [1_000_000]
     assert [cpu.requests for cpu in environment.cpus.values()] == [[1_001_000], [1_002_000]]

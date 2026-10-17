@@ -1810,9 +1810,10 @@ timestamp_ns, controller, chardev, deadline, check)` 建立初始 CAN 基线。
 返回最后的 `{"tx": ..., "rx": ...}` 控制器字典。期限、唯一 reader/writer 和排除
 复位、断电、配置、重连等条件与上述函数相同。此操作只建立启动基线，不推进时间。
 
-这三个 CAN 函数在借用对象提供 `command_many` 时，每次观察查询 `can-execution-state`
-和实际 chardev 的 `connected`，共两项。整组返回后依次校验执行状态、暂停状态、连接
-及本次所需的 TX/RX 统计，初始观察校验两个方向。它们要求 QEMU 提供上述组合属性。
+这三个 CAN 函数在借用对象提供 `command_many` 时，每次观察只查询 `can-execution-state`。
+返回后依次校验执行状态、暂停状态、实际绑定的 chardev 路径与调用方身份一致、连接状态
+及本次所需的 TX/RX 统计，初始观察校验两个方向。它们要求 QEMU 提供包含
+`fdcan-transports` 的上述组合属性；另一个已连接的 socket 不能代替实际 CAN 连接。
 组调用前后检查存活和期限；读取、逐帧 sink、发送刷新及最终复核仍各自保留检查。
 结果只用于当前观察，不跨这些 I/O 边界复用，也不是原子快照。批量调用失败直接终止，
 不会退回逐命令重发。没有该方法或显式为 `None` 的借用对象继续使用原逐命令路径。
