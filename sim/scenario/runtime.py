@@ -6,7 +6,9 @@ from typing import TYPE_CHECKING
 
 from sim.arena.manifest import ArenaManifest
 from sim.manifest import MAX_TIME_NS
-from sim.scenario.manifest import ScenarioCanDelay, ScenarioManifest, ScenarioReferee
+from sim.scenario.manifest import (
+    ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback, ScenarioReferee,
+)
 
 if TYPE_CHECKING:
     from sim.arena.runtime import ArenaResult
@@ -24,10 +26,14 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
-    if type(manifest.motor_feedback) is not tuple:
-        raise TypeError("Scenario motor_feedback require a plain immutable tuple")
-    if manifest.motor_feedback:
-        raise RuntimeError("Scenario motor feedback execution is not supported yet")
+    if (type(manifest.motor_feedback) is not tuple
+            or any(type(item) is not ScenarioMotorFeedback for item in manifest.motor_feedback)):
+        raise TypeError("Scenario motor_feedback require a plain ScenarioMotorFeedback tuple")
+    if any(type(item.offset_ns) is not int or type(item.member) is not str
+           or type(item.motor_id) is not int or type(item.enabled) is not bool
+           for item in manifest.motor_feedback):
+        raise TypeError("Scenario motor_feedback require plain integer times and motor IDs, "
+                        "member strings and boolean enabled values")
     if (type(manifest.can_delays) is not tuple
             or any(type(item) is not ScenarioCanDelay for item in manifest.can_delays)):
         raise TypeError("Scenario can_delays require a plain ScenarioCanDelay tuple")
@@ -50,6 +56,10 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     actions = tuple((item.offset_ns, item.member, item.delay_ns)
                     for item in manifest.can_delays)
     can_options = {"can_delays": actions} if actions else {}
+    feedback = tuple((item.offset_ns, item.member, item.motor_id, item.enabled)
+                     for item in manifest.motor_feedback)
+    if feedback:
+        can_options["motor_feedback"] = feedback
 
     from sim.arena.runtime import run_manifest as run_arena
 

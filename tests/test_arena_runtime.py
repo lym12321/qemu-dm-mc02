@@ -869,35 +869,269 @@ def test_scenario_structure_rejects_before_lower_import_or_delegation(environmen
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
-@pytest.mark.parametrize("source", ["loaded", "forged", "empty_list", "tuple_subclass"])
-def test_scenario_motor_feedback_parse_only_refusal_precedes_runtime_import_and_effects(environment, monkeypatch, source):
+@pytest.mark.parametrize("invalid", ["outer_list", "outer_subclass", "foreign_record", "record_subclass",
+    "offset_bool", "offset_subclass", "motor_bool", "motor_subclass", "member_type", "member_subclass",
+    "enabled_int", "enabled_none"])
+def test_scenario_motor_feedback_structure_rejects_before_runtime_import_and_effects(environment, monkeypatch, invalid):
     from sim.scenario import ScenarioMotorFeedback
 
-    arena = environment.manifest()
-    if source == "loaded":
-        path = environment.directory / "feedback-scenario.yaml"
-        path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms", "events": [
-            {"at": "0ns", "action": "motor_feedback", "target": "east.fl", "value": False}]}), encoding="utf-8")
-        manifest = load_scenario(path)
-        assert manifest.motor_feedback == (ScenarioMotorFeedback(0, "east", 1, False),)
-    else:
+    first, last = ScenarioMotorFeedback(0, "east", 1, False), ScenarioMotorFeedback(1, "west", 1, True)
+    actions = (first, last)
+    if invalid == "outer_list":
+        actions = []
+    elif invalid == "outer_subclass":
+        actions = type("Actions", (tuple,), {})(())
+    elif invalid == "foreign_record":
         class Foreign:
             def __getattr__(self, name):
-                pytest.fail("parse-only runner inspected unsupported record fields")
-        actions = ((Foreign(),) if source == "forged" else [] if source == "empty_list"
-                   else type("Actions", (tuple,), {})(()))
-        manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (), (), actions)
+                pytest.fail("foreign feedback fields were read before complete record identity admission")
+        actions = (first, Foreign())
+    elif invalid == "record_subclass":
+        actions = (first, type("Feedback", (ScenarioMotorFeedback,), {})(1, "west", 1, True))
+    else:
+        field = invalid.split("_")[0]
+        value = {"offset_bool": True, "offset_subclass": type("Time", (int,), {})(1),
+                 "motor_bool": True, "motor_subclass": type("MotorId", (int,), {})(1),
+                 "member_type": None, "member_subclass": type("Member", (str,), {})("west"),
+                 "enabled_int": 0, "enabled_none": None}[invalid]
+        actions = (first, replace(last, **{("motor_id" if field == "motor" else
+                                          "offset_ns" if field == "offset" else field): value}))
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+                                1_000_000, (), (), actions)
     original_import = builtins.__import__
     def forbid_import(name, *args, **kwargs):
         if name == "sim.arena.runtime":
-            pytest.fail("unsupported Scenario feedback reached lower runtime import")
+            pytest.fail("invalid Scenario feedback reached lower runtime import")
         return original_import(name, *args, **kwargs)
     monkeypatch.setattr(builtins, "__import__", forbid_import)
-    with pytest.raises(TypeError if source in ("empty_list", "tuple_subclass") else RuntimeError,
-                       match="motor.feedback|motor_feedback"):
+    with pytest.raises(TypeError, match="motor.feedback|motor_feedback"):
         scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
     assert environment.events == [] and environment.owners == [] and environment.launches == []
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
+@pytest.mark.parametrize("numeric", [False, True], ids=["typed_order", "lower_owns_numeric_policy"])
+def test_scenario_motor_feedback_delegates_once_with_original_metadata_and_error_identity(environment, monkeypatch, numeric):
+    from sim.scenario import ScenarioMotorFeedback
+
+    arena = environment.manifest()
+    events = (ScriptEvent(0, Hit(1)),)
+    actions = (ScenarioMotorFeedback(0, "west", 1, False), ScenarioMotorFeedback(0, "east", 2, True),
+               ScenarioMotorFeedback(1_234_567, "east", 1, False))
+    if numeric:
+        actions = (ScenarioMotorFeedback(1 << 64, "unresolved", 9, False), *actions)
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_234_567,
+        (ScenarioReferee("east", events),), (ScenarioCanDelay(0, "west", 17),), actions)
+    calls, result, primary = [], object(), OSError("lower feedback rejected")
+    def delegate(actual, **options):
+        calls.append((actual, options))
+        if numeric:
+            raise primary
+        return result
+    monkeypatch.setattr(runtime, "run_manifest", delegate)
+    emit, observe = lambda event: None, lambda *items: None
+    options = dict(emit=emit, on_response=observe, qemu=environment.binary,
+                   startup_timeout=3., timeout=7., referee_period_ns=2_000_000)
+    if numeric:
+        with pytest.raises(OSError) as caught:
+            scenario_runtime.run_manifest(manifest, **options)
+        assert caught.value is primary
+    else:
+        assert scenario_runtime.run_manifest(manifest, **options) is result
+    assert len(calls) == 1 and calls[0][0] is arena
+    assert calls[0][1] == dict(options, duration=.001234567, referee_events=(("east", events),),
+        can_delays=((0, "west", 17),), motor_feedback=tuple(
+            (item.offset_ns, item.member, item.motor_id, item.enabled) for item in actions))
+    assert calls[0][1]["referee_events"][0][1] is events
+    assert calls[0][1]["emit"] is emit and calls[0][1]["on_response"] is observe
+    assert manifest.motor_feedback is actions and not environment.events
+
+
+@pytest.mark.parametrize("invalid", ["offset_overflow", "motor_range", "order", "quota", "topology"])
+def test_scenario_motor_feedback_numeric_policy_reaches_arena_before_resources(environment, monkeypatch, invalid):
+    from sim.scenario import ScenarioMotorFeedback
+
+    first, last = ScenarioMotorFeedback(0, "east", 1, False), ScenarioMotorFeedback(1_000_000, "west", 1, True)
+    actions = (first, last)
+    if invalid == "offset_overflow":
+        actions = (first, replace(last, offset_ns=1 << 64))
+    elif invalid == "motor_range":
+        actions = (first, replace(last, motor_id=9))
+    elif invalid == "order":
+        actions = (last, first)
+    elif invalid == "quota":
+        actions = (first,) * 1025
+    else:
+        actions = (first, replace(last, motor_id=5))
+    arena, calls = environment.manifest(), []
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (), (), actions)
+    lower = runtime.run_manifest
+    def delegate(actual, **options):
+        calls.append((actual, options["motor_feedback"]))
+        return lower(actual, **options)
+    monkeypatch.setattr(runtime, "run_manifest", delegate)
+    def forbidden(*args, **kwargs):
+        pytest.fail("invalid typed feedback reached resources or policy effects")
+    for method in ("resolve_qemu", "regular_file", "create_arena_plant"):
+        monkeypatch.setattr(runtime, method, forbidden)
+    monkeypatch.setattr(shared_world.SharedWorldRuntime, "set_motor_feedback_enabled", forbidden)
+    with pytest.raises(ValueError):
+        scenario_runtime.run_manifest(manifest, qemu=environment.binary)
+    assert len(calls) == 1 and calls[0][0] is arena
+    assert calls[0][1] == tuple((item.offset_ns, item.member, item.motor_id, item.enabled) for item in actions)
+    assert not environment.events and not environment.owners and not environment.launches
+    assert environment.plant is None and environment.native.resets == 0
+
+
+@pytest.fixture
+def admitted_motor_feedback_scenario(environment):
+    documents = tuple(ROBOT_DOCUMENT.replace("chassis_can", bus).replace("  fl:", "  front-left:")
+                      for bus in ("drive_left", "drive-right"))
+    arena = load_manifest(write_arena(environment.directory, robot_documents=documents))
+    path = environment.directory / "motor-feedback.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "4500us", "events": [
+        {"at": "0ns", "action": "motor_feedback", "target": "east.front-left", "value": False},
+        {"at": "0ns", "action": "can_delay", "target": "east.drive_left", "value": "2ms"},
+        {"at": "1ms", "action": "can_delay", "target": "east.drive_left", "value": "0ns"},
+        {"at": "1500us", "action": "motor_feedback", "target": "east.front-left", "value": True},
+        {"at": "1500us", "action": "motor_feedback", "target": "east.front-left", "value": False},
+        {"at": "3500us", "action": "motor_feedback", "target": "east.front-left", "value": True},
+        {"at": "4500us", "action": "motor_feedback", "target": "east.front-left", "value": False},
+    ]}, sort_keys=False), encoding="utf-8")
+    return load_scenario(path)
+
+
+@pytest.mark.parametrize("via_cli", [False, True], ids=["api", "cli"])
+def test_loaded_scenario_motor_feedback_uses_actual_socket_dispatch_without_rereading(
+        environment, monkeypatch, admitted_motor_feedback_scenario, via_cli, capsys):
+    scenario = admitted_motor_feedback_scenario
+    observed = watch_motor_feedback(environment, monkeypatch)
+    monkeypatch.setattr(runtime, "Session", lambda session_id: Session(session_id, 500))
+    deliveries, order, old_calls = ([], []), [], []
+    factory = environment.create_plant
+    def original(source, destination, frame):
+        old_calls.append((source, destination, frame))
+        return False
+    def plant(manifest):
+        value = factory(manifest)
+        for index, bus in enumerate(dict.fromkeys(device.bus for device in value.devices)):
+            bus.log = deliveries[index].append
+            if index == 0:
+                bus.drop = original
+        return value
+    monkeypatch.setattr(runtime, "create_arena_plant", plant)
+    observed.delays.after_set = lambda value, member, delay: order.append((value.t_sim_ns, "delay", delay))
+    observed.after_set = lambda value, member, motor_id, enabled: order.append((value.t_sim_ns, "feedback", enabled))
+    environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
+    if via_cli:
+        from sim import cli
+        results, calls = [], []
+        run = scenario_runtime.run_manifest
+        def execute(actual, **options):
+            calls.append(actual)
+            assert actual == scenario
+            actual.path.unlink()
+            actual.arena.path.unlink()
+            result = run(actual, **options)
+            results.append(result)
+            return result
+        monkeypatch.setattr(scenario_runtime, "run_manifest", execute)
+        report, write = environment.directory / "feedback-report.json", Path.write_text
+        def after_cleanup(path, *args, **kwargs):
+            if path == report:
+                environment.assert_clean()
+                environment.events.append("feedback report write")
+            return write(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "write_text", after_cleanup)
+        assert cli.main(["scenario", "run", str(scenario.path), "--qemu", str(environment.binary),
+                         "--report", str(report)]) == 0
+        result, = results
+        assert len(calls) == 1 and calls[0] is not scenario
+        payload = json.loads(report.read_text())
+        assert payload["status"] == "passed" and payload["result"]["steps"] == 5
+        assert environment.events[-1] == "feedback report write"
+        output = capsys.readouterr()
+        assert "passed" in output.out and output.err == ""
+    else:
+        scenario.path.unlink()
+        scenario.arena.path.unlink()
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    environment.assert_clean()
+    assert order == [(500, "delay", 2_000_000), (500, "feedback", False),
+        (1_000_500, "delay", 0), (1_500_500, "feedback", True), (1_500_500, "feedback", False),
+        (3_500_500, "feedback", True), (4_500_500, "feedback", False)]
+    assert (result.origin_ns, result.end_ns, result.steps) == (500, 4_500_500, 5)
+    assert environment.native.resets == 1 and environment.native.steps == [1_000_000, 500_000] + [1_000_000] * 3
+    zero = bytes.fromhex("0000 0000 0000 19 00")
+    feedback = (((2_501_000, "0000", range(2, 5)), (3_501_000, "0000", range(2, 5)),
+                 (3_501_000, "1000", range(2, 5)), (4_501_000, "1000", range(1, 5))),
+                tuple((stamp, "f000", range(1, 5)) for stamp in (1_002_000, 2_502_000, 3_502_000, 4_502_000)))
+    for index, groups in enumerate(feedback):
+        assert environment.received_can(index) == b"".join(struct.pack(
+            "<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
+            (bytes.fromhex("0000 0000 " + current + " 19 00") if motor_id == 1 else zero).ljust(64, b"\0"))
+            for stamp, current, ids in groups for motor_id in ids)
+    assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
+            for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
+        (5, 2_500_500, 2_500_500, 2_500_500, True), (1, 1_000_500, 3_000_500, 3_500_500, True),
+        (9, 3_500_500, 3_500_500, 3_500_500, True), (13, 4_500_500, 4_500_500, 4_500_500, False)]
+    assert [(row.frame.data, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
+            for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
+        (bytes.fromhex("1000 0000 0000 0000"), 500, 2_000_500, 2_500_500, False)]
+    assert [device.current_raw for device in environment.plant.devices] == [4096, 0, 0, 0, -4096, 0, 0, 0]
+    ratio = 3591 / 187  # Fixed DJI specification, not a production conversion helper.
+    for offset, current in zip(range(0, 40, 8), (0, 0, 0, 4096, 4096)):
+        group = environment.native.efforts[offset:offset + 8]
+        assert group[0][1] == pytest.approx(current * 20 / 16384 * .02 * ratio)
+        assert group[4][1] == pytest.approx(-4096 * 20 / 16384 * .02 * ratio)
+        assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
+    assert len(old_calls) == len(deliveries[0]) == 68
+    world, = observed.worlds
+    assert world.closed and all(item.endpoint.bus.pending == 0 for item in world.bindings)
+    assert [item.endpoint.bus.drop for item in world.bindings] == [original, None]
+
+
+@pytest.mark.parametrize("failure", ["reset", "eof", "interrupt"])
+def test_loaded_scenario_motor_feedback_terminal_failure_keeps_partial_effects_and_cleanup(
+        environment, monkeypatch, admitted_motor_feedback_scenario, failure):
+    scenario = admitted_motor_feedback_scenario
+    observed = watch_motor_feedback(environment, monkeypatch)
+    primary = KeyboardInterrupt("feedback control interrupted")
+    factory, original = environment.create_plant, lambda *args: False
+    def plant(manifest):
+        value = factory(manifest)
+        value.devices[0].bus.drop = original
+        return value
+    monkeypatch.setattr(runtime, "create_arena_plant", plant)
+    def fail(value, member, motor_id, enabled):
+        if value.t_sim_ns != 1_500_000 or not enabled:
+            return
+        if failure == "interrupt":
+            raise primary
+        peer = environment.producers[0, "cosim"]
+        if failure == "eof":
+            peer.shutdown(socket.SHUT_WR)
+        else:
+            body = struct.pack("<IHHIQQQI", 0x32434D44, 2, 1, 0, 0, 9000, 0, 73)
+            peer.send(struct.pack("<I", len(body)) + body)
+    observed.after_set = fail
+    environment.world_close_failure = OSError("feedback native cleanup failed")
+    environment.world_close_failure.add_note("nested feedback cleanup diagnosis")
+    scenario.path.unlink()
+    scenario.arena.path.unlink()
+    with pytest.raises({"reset": cosim.V2SessionReset, "eof": ConnectionError,
+                        "interrupt": KeyboardInterrupt}[failure]) as caught:
+        scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    if failure == "interrupt":
+        assert caught.value is primary
+    elif failure == "reset":
+        assert (caught.value.step_id, caught.value.t_sim_ns, caught.value.session_id) == (0, 9000, 73)
+    environment.assert_clean()
+    assert environment.native.resets == 1 and environment.native.steps == [1_000_000, 500_000]
+    assert [row[3] for row in observed.calls] == ([0, 1_500_000] if failure == "interrupt" else
+                                               [0, 1_500_000, 1_500_000])
+    assert [item.endpoint.bus.drop for item in observed.worlds[0].bindings] == [original, None]
+    assert "nested feedback cleanup diagnosis" in "\n".join(caught.value.__notes__)
 
 
 @pytest.fixture

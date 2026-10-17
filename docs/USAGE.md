@@ -478,7 +478,7 @@ uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report
 `--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
 默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
 字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
-或暂停参数。CAN 延迟动作支持加载和执行；其它故障注入、assertions 和 replay 尚未支持。
+或暂停参数。CAN 延迟及电机反馈可达性动作支持加载和执行；其它故障注入、assertions 和 replay 尚未支持。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
@@ -518,17 +518,25 @@ Arena Python 入口还接受 `motor_feedback=((offset_ns, member, motor_id, enab
 动作沿用上述 RESET 原点及准确步进拆分；同刻先执行 CAN 延迟动作，再按输入顺序
 执行反馈动作。截止时间动作在该步反馈交付完成后执行，不能撤回已交付字节；
 尚未 dispatch 的排队帧按新状态决定是否丢弃，恢复不会补发已丢弃帧。
-结束或失败清理时恢复原有总线丢弃回调。本动作目前仅用于 Python 入口，
-Scenario/YAML 调度及真实固件对反馈缺失的超时响应尚待验证。
+结束或失败清理时恢复原有总线丢弃回调。Python、Scenario/YAML 和 CLI 共用这套调度；
+真实固件对反馈缺失的超时响应尚待验证。
 
 Scenario 加载器可解析 `action: motor_feedback`，`target` 使用准确的
 `成员名.电机名`（Robot 中的设备名称），`value` 必须为 YAML 布尔值。
 加载结果保存在不可变 `ScenarioMotorFeedback(offset_ns, member, motor_id, enabled)`
 元组中，默认 `motor_feedback=()`。混合 `events` 必须整体按时间非递减排列；
 CAN 延迟和反馈动作分别最多 1024 项，合计最多 2048 项。
-当前这一配置入口只完成解析验证；Scenario runtime/CLI 遇到非空反馈动作会明确拒绝执行，
-后续执行接线将复用 Arena 既有调度。同刻不同类型动作将按 CAN 延迟在前的规则执行，
-不能依赖它们在 YAML 中的交错顺序。
+Scenario runtime 将类型化动作按原顺序交给 Arena，完整准入后再创建资源和执行。
+同刻不同类型动作按 CAN 延迟在前的规则执行，不能依赖它们在 YAML 中的交错顺序。
+
+```yaml
+events:
+  - {at: 0ns, action: motor_feedback, target: east.fl, value: false}
+  - {at: 100ms, action: motor_feedback, target: east.fl, value: true}
+```
+
+上例要求 `east` 的 Robot 声明了名为 `fl` 的电机，且 Scenario 时长至少为 100 ms。
+关闭期间仍接收命令并推进 plant；恢复后只交付后续反馈，不补发已丢弃的帧。
 
 快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
 发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
