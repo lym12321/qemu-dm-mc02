@@ -99,6 +99,14 @@ void dm_mc02_fdcan_set_host_ack(DmMc02Fdcan *state, bool enabled);
 void dm_mc02_fdcan_reset(DmMc02Fdcan *state);
 
 /*
+ * Borrow the actual frontend's chardev, or NULL if unbound/cleaned up.
+ * No reference, IO or runtime projection is performed. The caller must
+ * serialize with mutation and must not retain the borrow past cleanup.
+ * FDCAN does not support backend hot swap (its change handler is NULL).
+ */
+Chardev *dm_mc02_fdcan_get_chardev(DmMc02Fdcan *state);
+
+/*
  * Copy host-wire queue observations without IO or runtime projection.
  * pending_bytes counts only the remaining suffixes of active records.
  * Counters retain their existing aggregate/reset semantics. Neither an empty

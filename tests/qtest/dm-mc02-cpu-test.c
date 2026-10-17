@@ -127,6 +127,32 @@ static QDict *execution_query(QTestState *qts)
     return result;
 }
 
+static void execution_can_transport(QDict *snapshot, const char *route,
+                                     const char *path, int connected)
+{
+    QDict *transports = qdict_get_qdict(snapshot, "fdcan-transports");
+    QDict *transport;
+
+    g_assert_nonnull(transports);
+    transport = qdict_get_qdict(transports, route);
+    g_assert_nonnull(transport);
+    g_assert_cmpuint(qdict_size(transport), ==, 2);
+    g_assert_nonnull(qdict_get(transport, "path"));
+    g_assert_nonnull(qdict_get(transport, "connected"));
+    if (path) {
+        g_assert_cmpstr(qdict_get_str(transport, "path"), ==, path);
+    } else {
+        g_assert_cmpint(qobject_type(qdict_get(transport, "path")),
+                        ==, QTYPE_QNULL);
+    }
+    if (connected < 0) {
+        g_assert_cmpint(qobject_type(qdict_get(transport, "connected")),
+                        ==, QTYPE_QNULL);
+    } else {
+        g_assert_cmpint(qdict_get_bool(transport, "connected"), ==, connected);
+    }
+}
+
 /* Only call at stopped, stable IO points; this is not an atomic snapshot. */
 static QDict *execution_can_snapshot(QTestState *qts, const char *state,
                                      int64_t current, bool has_target,
@@ -142,10 +168,11 @@ static QDict *execution_can_snapshot(QTestState *qts, const char *state,
         "{'execute':'qom-get','arguments':{'path':'/machine',"
         "'property':'can-execution-state'}}");
     QDict *snapshot = qdict_get_qdict(response, "return");
-    QDict *execution, *status;
+    QDict *execution, *status, *transports, *controllers;
+    const QDictEntry *entry;
 
     g_assert_nonnull(snapshot);
-    g_assert_cmpuint(qdict_size(snapshot), ==, 5);
+    g_assert_cmpuint(qdict_size(snapshot), ==, 6);
     g_assert_cmpint(qdict_get_int(snapshot, "schema"), ==, 1);
     execution = qdict_get_qdict(snapshot, "execution");
     g_assert_nonnull(execution);
@@ -184,6 +211,41 @@ static QDict *execution_can_snapshot(QTestState *qts, const char *state,
         g_assert_true(qobject_is_equal(qdict_get(snapshot, fields[i]),
                                       qdict_get(separate, "return")));
         qobject_unref(separate);
+    }
+    transports = qdict_get_qdict(snapshot, "fdcan-transports");
+    controllers = qdict_get_qdict(qdict_get_qdict(snapshot, "fdcan-tx-state"),
+                                   "controllers");
+    g_assert_nonnull(transports);
+    g_assert_cmpuint(qdict_size(transports), ==, qdict_size(controllers));
+    for (entry = qdict_first(controllers); entry;
+         entry = qdict_next(controllers, entry)) {
+        QDict *transport = qdict_get_qdict(transports, qdict_entry_key(entry));
+        QObject *path, *connected;
+
+        g_assert_nonnull(transport);
+        g_assert_cmpuint(qdict_size(transport), ==, 2);
+        path = qdict_get(transport, "path");
+        connected = qdict_get(transport, "connected");
+        g_assert_nonnull(path);
+        g_assert_nonnull(connected);
+        if (qobject_type(path) == QTYPE_QNULL) {
+            g_assert_cmpint(qobject_type(connected), ==, QTYPE_QNULL);
+        } else {
+            g_assert_cmpint(qobject_type(path), ==, QTYPE_QSTRING);
+            if (qobject_type(connected) != QTYPE_QNULL) {
+                QDict *separate;
+
+                g_assert_cmpint(qobject_type(connected), ==, QTYPE_QBOOL);
+                separate = qtest_qmp(qts,
+                    "{'execute':'qom-get','arguments':{'path':%s,"
+                    "'property':'connected'}}", qdict_get_str(transport,
+                                                               "path"));
+                g_assert_nonnull(qdict_get(separate, "return"));
+                g_assert_true(qobject_is_equal(connected,
+                                              qdict_get(separate, "return")));
+                qobject_unref(separate);
+            }
+        }
     }
     qobject_ref(snapshot);
     qobject_unref(response);
@@ -390,7 +452,7 @@ static void test_execution_can_snapshot_compat(void)
     QDict *original = qdict_get_qdict(separate, "return");
 
     g_assert_nonnull(snapshot);
-    g_assert_cmpuint(qdict_size(snapshot), ==, 5);
+    g_assert_cmpuint(qdict_size(snapshot), ==, 6);
     g_assert_cmpint(qdict_get_int(snapshot, "schema"), ==, 1);
     status = qdict_get_qdict(snapshot, "status");
     g_assert_nonnull(status);
@@ -401,8 +463,40 @@ static void test_execution_can_snapshot_compat(void)
     g_assert_false(qdict_get_bool(status, "running"));
     g_assert_cmpstr(qdict_get_str(status, "status"), ==, "prelaunch");
     g_assert_true(qobject_is_equal(QOBJECT(status), QOBJECT(original)));
+    g_assert_cmpuint(qdict_size(qdict_get_qdict(snapshot, "fdcan-transports")),
+                     ==, 3);
+    execution_can_transport(snapshot, "dm-mc02.fdcan1", NULL, -1);
+    execution_can_transport(snapshot, "dm-mc02.fdcan2", NULL, -1);
+    execution_can_transport(snapshot, "dm-mc02.fdcan3", NULL, -1);
     qobject_unref(separate);
     qobject_unref(response);
+    qtest_quit(qts);
+
+    /* A bound null backend has identity, but no connected property. */
+    qts = execution_guest("dm-mc02", 0x08000000, false,
+        "-chardev null,id=fdcan-null-test "
+        "-serial none -serial none -serial none -serial none "
+        "-serial none -serial none -serial none "
+        "-serial chardev:fdcan-null-test");
+    qtest_writel(qts, EXECUTION_COUNTER, EXECUTION_SENTINEL);
+    snapshot = execution_can_snapshot(qts, "idle", 0, false, 0, "prelaunch");
+    execution_can_transport(snapshot, "dm-mc02.fdcan1",
+                             "/chardevs/fdcan-null-test", -1);
+    qobject_unref(qtest_qmp_assert_failure_ref(qts,
+        "{'execute':'qom-get','arguments':{'path':'/chardevs/fdcan-null-test',"
+        "'property':'connected'}}"));
+    execution_can_transport(snapshot, "dm-mc02.fdcan2", NULL, -1);
+    execution_can_transport(snapshot, "dm-mc02.fdcan3", NULL, -1);
+    for (unsigned repeat = 0; repeat < 2; repeat++) {
+        QDict *after = execution_can_snapshot(qts, "idle", 0, false, 0,
+                                              "prelaunch");
+
+        g_assert_true(qobject_is_equal(QOBJECT(snapshot), QOBJECT(after)));
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==,
+                        EXECUTION_SENTINEL);
+        qobject_unref(after);
+    }
+    qobject_unref(snapshot);
     qtest_quit(qts);
 }
 
@@ -908,6 +1002,10 @@ static void execution_can_empty_readonly(QTestState *qts, bool eval,
         QDict *snapshot = execution_can_snapshot(qts, "idle", 0, false, 0,
                                                  "prelaunch");
 
+        if (eval) {
+            execution_can_transport(snapshot, "stm32h723-eval.fdcan1",
+                                     NULL, -1);
+        }
         if (!repeat) {
             snapshot_before = snapshot;
             qobject_ref(snapshot_before);
@@ -1046,6 +1144,7 @@ static void execution_can_rx_snapshot_readonly(QTestState *qts,
                                                uint64_t completed,
                                                unsigned partial,
                                                uint64_t dropped,
+                                               bool connected,
                                                int64_t deadline)
 {
     uint8_t before[16], after[16];
@@ -1067,6 +1166,10 @@ static void execution_can_rx_snapshot_readonly(QTestState *qts,
                          ==, partial);
         g_assert_cmpuint(execution_can_uint(controller, "rx_dropped"),
                          ==, dropped);
+        execution_can_transport(snapshot, "dm-mc02.fdcan1",
+                                 "/chardevs/arena-can-peer", connected);
+        execution_can_transport(snapshot, "dm-mc02.fdcan2", NULL, -1);
+        execution_can_transport(snapshot, "dm-mc02.fdcan3", NULL, -1);
         qobject_unref(snapshot);
         g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==,
                         EXECUTION_SENTINEL);
@@ -1100,6 +1203,7 @@ static void test_execution_paused_can_receipt(void)
     g_autofree char *quoted_path = NULL;
     g_autofree char *extra_args = NULL;
     ExecutionCanCleanup cleanup = { .fd = -1 };
+    QDict *snapshot;
     QTestState *qts = qtest_init(
         "-machine dm-mc02,board-profile=STM32H723-EVAL -S");
     int64_t deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
@@ -1131,18 +1235,22 @@ static void test_execution_paused_can_receipt(void)
     path = g_build_filename(directory, "can.sock", NULL);
     quoted_path = g_shell_quote(path);
     extra_args = g_strdup_printf(
-        "-chardev socket,id=can1,path=%s,server=on,wait=off "
+        "-chardev socket,id=arena-can-peer,path=%s,server=on,wait=off "
         "-serial none -serial none -serial none -serial none "
-        "-serial none -serial none -serial none -serial chardev:can1",
+        "-serial none -serial none -serial none -serial chardev:arena-can-peer",
         quoted_path);
     cleanup.path = path;
     cleanup.directory = directory;
     qtest_add_abrt_handler(execution_can_abort_cleanup, &cleanup);
     qts = execution_start_image("dm-mc02", image, sizeof(image), extra_args);
     execution_can_rx_empty_readonly(qts, false, deadline);
+    snapshot = execution_can_snapshot(qts, "idle", 0, false, 0, "prelaunch");
+    execution_can_transport(snapshot, "dm-mc02.fdcan1",
+                             "/chardevs/arena-can-peer", false);
+    qobject_unref(snapshot);
     cleanup.fd = unix_connect(path, NULL);
     g_assert_cmpint(cleanup.fd, >=, 0);
-    while (!qtest_qom_get_bool(qts, "/chardevs/can1", "connected")) {
+    while (!qtest_qom_get_bool(qts, "/chardevs/arena-can-peer", "connected")) {
         execution_can_check(qts, deadline);
     }
     g_assert_true(qtest_qom_get_bool(qts, "/machine", "system-5v-good"));
@@ -1161,7 +1269,7 @@ static void test_execution_paused_can_receipt(void)
     execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
     g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 0);
     g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 0);
-    execution_can_rx_snapshot_readonly(qts, 0, 83, 0, deadline);
+    execution_can_rx_snapshot_readonly(qts, 0, 83, 0, true, deadline);
     g_assert_cmpint(send(cleanup.fd, wire + 83, 1, MSG_DONTWAIT), ==, 1);
     execution_can_rx_wait(qts, 1, 0, 0, deadline);
     execution_assert_stable(qts, 100, EXECUTION_SENTINEL);
@@ -1172,7 +1280,7 @@ static void test_execution_paused_can_receipt(void)
     g_assert_cmphex(ldl_le_p(ram), ==, 0x0c840000); /* ID0x321 << 18 */
     g_assert_cmphex(ldl_le_p(ram + 4) & 0x800f0000, ==, 0x80080000);
     g_assert_cmpmem(ram + 8, 8, wire + 20, 8);
-    execution_can_rx_snapshot_readonly(qts, 1, 0, 0, deadline);
+    execution_can_rx_snapshot_readonly(qts, 1, 0, 0, true, deadline);
 
     /* Unknown wire flag is processed, but cannot publish another FIFO slot. */
     memcpy(malformed, wire, sizeof(malformed));
@@ -1186,7 +1294,21 @@ static void test_execution_paused_can_receipt(void)
     g_assert_cmphex(qtest_readl(qts, 0x4000a0a4) & 0x7f, ==, 1);
     g_assert_cmphex(qtest_readl(qts, 0x4000a050), ==, 1);
     g_assert_cmphex(qtest_readl(qts, 0x4000ac08), ==, 0x44332211);
-    execution_can_rx_snapshot_readonly(qts, 2, 0, 1, deadline);
+    execution_can_rx_snapshot_readonly(qts, 2, 0, 1, true, deadline);
+
+    /* Connection is native backend state, independent of buffered MCU data. */
+    g_assert_cmpint(close(cleanup.fd), ==, 0);
+    cleanup.fd = -1;
+    while (qtest_qom_get_bool(qts, "/chardevs/arena-can-peer", "connected")) {
+        execution_can_check(qts, deadline);
+    }
+    execution_can_rx_snapshot_readonly(qts, 2, 0, 1, false, deadline);
+    cleanup.fd = unix_connect(path, NULL);
+    g_assert_cmpint(cleanup.fd, >=, 0);
+    while (!qtest_qom_get_bool(qts, "/chardevs/arena-can-peer", "connected")) {
+        execution_can_check(qts, deadline);
+    }
+    execution_can_rx_snapshot_readonly(qts, 2, 0, 1, true, deadline);
 
     /* Receipt at100ns is independent of this later real guest read/store. */
     execution_run_to(qts, 200);

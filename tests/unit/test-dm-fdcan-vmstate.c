@@ -1419,12 +1419,20 @@ static void test_rx_state_observation(void)
     const int results[] = { 17 };
     uint8_t ram[16], ram_before[16];
     DmMc02Fdcan fdcan, before;
+    DmMc02Fdcan unbound;
     TxCaptureChardev *capture = init_tx_fixture(&fdcan, ram, results, 1);
     TxCaptureChardev capture_before;
     IrqCapture irq_capture = { 0 }, irq_before;
     qemu_irq irq = qemu_allocate_irq(capture_irq, &irq_capture, 0);
     int64_t timer_expire;
 
+    g_assert_null(dm_mc02_fdcan_get_chardev(NULL));
+    g_assert_true(dm_mc02_fdcan_init(&unbound, NULL, "test-fdcan-unbound",
+                                     DM_MC02_FDCAN_REGION_SIZE, ram,
+                                     sizeof(ram), NULL, &error_abort));
+    g_assert_null(dm_mc02_fdcan_get_chardev(&unbound));
+    dm_mc02_fdcan_cleanup(&unbound);
+    g_assert_null(dm_mc02_fdcan_get_chardev(&unbound));
     dm_mc02_fdcan_set_irq(&fdcan, 0, irq);
     fdcan.iomem.ops->write(&fdcan, FDCAN_IE, 1u << 9, 4);
     fdcan.iomem.ops->write(&fdcan, FDCAN_ILE, 1, 4);
@@ -1440,6 +1448,8 @@ static void test_rx_state_observation(void)
     timer_expire = timer_expire_time_ns(fdcan.tx_timer);
 
     for (unsigned query = 0; query < 3; ++query) {
+        /* Borrowed identity must not ref the backend or service either IO. */
+        g_assert_true(dm_mc02_fdcan_get_chardev(&fdcan) == CHARDEV(capture));
         assert_rx_state(&fdcan, 0, 17, 0);
     }
     g_assert_false(dm_mc02_fdcan_get_rx_state(&fdcan, NULL));
@@ -1453,6 +1463,7 @@ static void test_rx_state_observation(void)
     g_assert_cmpint(timer_expire_time_ns(fdcan.tx_timer), ==, timer_expire);
     g_assert_cmpint(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), ==, 1000);
     cleanup_tx_fixture(&fdcan, capture);
+    g_assert_null(dm_mc02_fdcan_get_chardev(&fdcan));
     qemu_free_irq(irq);
 }
 

@@ -2692,9 +2692,11 @@ static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
                                            const char *name, void *opaque,
                                            Error **errp)
 {
+    DmMc02MachineState *s = DM_MC02_MACHINE(obj);
     g_autoptr(VirtualExecutionInfo) execution = NULL;
     g_autoptr(StatusInfo) status = NULL;
-    QObject *tx, *rx, *result = NULL;
+    QObject *tx, *rx, *transports = NULL, *result = NULL;
+    QDict *controllers;
     Visitor *output;
     uint32_t schema = 1;
 
@@ -2715,6 +2717,35 @@ static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
         goto out;
     }
 
+    controllers = qdict_new();
+    transports = QOBJECT(controllers);
+    for (size_t i = 0; i < s->initialized_fdcan_count; ++i) {
+        Chardev *chr = dm_mc02_fdcan_get_chardev(&s->fdcan[i]);
+        g_autofree char *path = chr ?
+            object_get_canonical_path(OBJECT(chr)) : NULL;
+        QDict *values = qdict_new();
+
+        qdict_put(controllers, s->board->fdcans[i].name, values);
+        if (path) {
+            qdict_put_str(values, "path", path);
+        } else {
+            qdict_put_null(values, "path");
+        }
+        if (chr && object_property_find(OBJECT(chr), "connected")) {
+            Error *local_err = NULL;
+            bool connected = object_property_get_bool(OBJECT(chr), "connected",
+                                                       &local_err);
+
+            if (local_err) {
+                error_propagate(errp, local_err);
+                goto out;
+            }
+            qdict_put_bool(values, "connected", connected);
+        } else {
+            qdict_put_null(values, "connected");
+        }
+    }
+
     /* Generated output visitors preserve the original QMP field semantics. */
     output = qobject_output_visitor_new_qmp(&result);
     visit_start_struct(output, NULL, NULL, 0, &error_abort);
@@ -2724,6 +2755,7 @@ static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
     visit_type_StatusInfo(output, "status", &status, &error_abort);
     visit_type_any(output, "fdcan-tx-state", &tx, &error_abort);
     visit_type_any(output, "fdcan-rx-state", &rx, &error_abort);
+    visit_type_any(output, "fdcan-transports", &transports, &error_abort);
     visit_end_struct(output, NULL);
     visit_complete(output, &result);
     visit_free(output);
@@ -2732,6 +2764,7 @@ static void dm_mc02_get_can_execution_state(Object *obj, Visitor *v,
 out:
     qobject_unref(tx);
     qobject_unref(rx);
+    qobject_unref(transports);
     qobject_unref(result);
 }
 

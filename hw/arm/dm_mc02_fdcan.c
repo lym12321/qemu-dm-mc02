@@ -1541,6 +1541,11 @@ static bool fdcan_tx_queue_bytes(const DmMc02Fdcan *s, uint32_t *pending_bytes)
     return true;
 }
 
+Chardev *dm_mc02_fdcan_get_chardev(DmMc02Fdcan *s)
+{
+    return s && s->chr_enabled ? qemu_chr_fe_get_driver(&s->chr) : NULL;
+}
+
 bool dm_mc02_fdcan_get_tx_state(const DmMc02Fdcan *s, DmMc02FdcanTxState *out)
 {
     uint32_t pending_bytes;
