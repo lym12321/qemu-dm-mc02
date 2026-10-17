@@ -1762,9 +1762,13 @@ FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发�
 
 返回 `schema: 1`，以及 `execution`、`status`、`fdcan-tx-state`、`fdcan-rx-state`。
 这四项分别沿用 `x-query-virtual-execution`、`query-status` 和上述两个属性的完整返回值。
+附加的 `fdcan-transports` 按控制器名称返回实际绑定的 chardev，例如
+`{"dm-mc02.fdcan1":{"path":"/chardevs/can1","connected":true}}`。
+`path` 是原生 QOM 路径；未绑定时为 `null`。`connected` 读取该对象原生的同名属性，
+没有此属性的后端返回 `null`；后端存在不代表已经连接。调用方应核对路径与预期的连接身份。
 查询不停止 CPU、不排空队列、不推进虚拟时间；任一子查询失败则整次读取失败。
 各项依次取样，运行中的 CPU 或主机输入仍可改变状态，不能将它作为原子快照或时间屏障。
-连接状态仍须通过实际 transport 对应的 `/chardevs/<id>` 的 `connected` 属性另行查询。
+也可单独读取实际 transport 对应的 `/chardevs/<id>` 的 `connected` 属性进行核对。
 
 共享 chardev 发送 helper 在已写出部分字节后遇到阻塞或错误时，返回已写出的长度，
 调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
