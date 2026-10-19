@@ -105,6 +105,14 @@ def _parser() -> argparse.ArgumentParser:
                      help="YAML Scenario manifest; Arena reference is relative to its directory")
     _runtime_options(run, timeout=30.0, debug=False)
     run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
+    replay = scenarios.add_parser("replay", help="reevaluate assertions from a completed observation trace")
+    replay.add_argument("manifest", type=Path, metavar="MANIFEST",
+                        help="original YAML Scenario manifest")
+    replay.add_argument("trace", type=Path, metavar="TRACE", help="completed MCAP observation file")
+    replay.add_argument("--clock", action="append", required=True, metavar="MEMBER=EPOCH",
+                        help="original member clock/epoch; repeat for every Arena member")
+    replay.add_argument("--report", type=Path, metavar="NEW_PATH",
+                        help="create a new JSON result file, including failures")
     return parser
 
 
@@ -129,10 +137,14 @@ def _emit_arena(event) -> None:
     _emit(event.event, member=event.name)
 
 
-def _write_report(path: Path, payload: dict) -> None:
+def _write_report(path: Path, payload: dict, *, exclusive=False) -> None:
     text = json.dumps(payload, indent=2, ensure_ascii=True) + "\n"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
+    if exclusive:
+        with path.open("x", encoding="utf-8") as output:
+            output.write(text)
+    else:
+        path.write_text(text, encoding="utf-8")
 
 
 def _diagnose(error: BaseException) -> None:
@@ -267,6 +279,61 @@ def _run_arena(args) -> int:
     return code
 
 
+def _run_scenario_replay(args) -> int:
+    try:
+        from sim.arena.trace import validate_clocks
+        from sim.boards.launch import regular_file
+        from sim.scenario.manifest import load_manifest
+        from sim.scenario.replay import replay_assertions
+
+        clocks = {}
+        for value in args.clock:
+            member, separator, epoch = value.partition("=")
+            if not separator or not member or not epoch:
+                raise ValueError("--clock requires MEMBER=EPOCH with nonempty values")
+            if member in clocks:
+                raise ValueError(f"duplicate --clock member: {member}")
+            clocks[member] = epoch
+        clocks = validate_clocks(clocks)
+        manifest = load_manifest(args.manifest)
+        trace_path = regular_file(args.trace, "Scenario replay trace")
+        source = trace_path.open("rb")
+        primary = None
+        try:
+            result = replay_assertions(source, manifest, clocks=clocks)
+        except BaseException as error:
+            primary = error
+            raise
+        finally:
+            try:
+                source.close()
+            except BaseException as error:
+                if primary is None:
+                    raise
+                BaseException.add_note(primary, f"Scenario replay source close failed: {error}")
+        payload = {"status": "passed" if result.passed else "failed",
+                   "result": asdict(result)}
+        code = 0 if result.passed else 1
+        for failure in result.failures:
+            print(f"assertion failed: {failure}", file=sys.stderr)
+    except (Exception, KeyboardInterrupt) as error:
+        _diagnose(error)
+        payload = {"status": "failed", "error": str(error),
+                   "error_type": type(error).__name__,
+                   "notes": list(getattr(error, "__notes__", ()))}
+        code = 130 if isinstance(error, KeyboardInterrupt) else 1
+    if args.report is not None:
+        try:
+            _write_report(args.report, payload, exclusive=True)
+        except (Exception, KeyboardInterrupt) as error:
+            _diagnose(error)
+            return 130 if code == 130 or isinstance(error, KeyboardInterrupt) else 1
+    if "result" in payload:
+        print(f"Scenario replay: {payload['status']} "
+              f"({len(result.status)} assertions)", flush=True)
+    return code
+
+
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
     # The existing native launcher owns all board option admission. Preserve
@@ -284,6 +351,8 @@ def main(argv=None) -> int:
     try:
         if args.group == "robot":
             return _run_robot(args)
+        if args.group == "scenario" and args.action == "replay":
+            return _run_scenario_replay(args)
         if args.group in ("arena", "scenario"):
             return _run_arena(args)
         return _run_lab(args) if args.action == "run" else _run_interactive(args)

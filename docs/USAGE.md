@@ -948,6 +948,25 @@ RESET 下界和实验时长均须一致，包括没有断言的成员。每个 U
 记录，不认证两遍的字节身份。调用者负责配置、固件和模型与录制来源的对应关系。该入口
 只重新判断观察断言，不执行 Scenario 输入动作、固件或物理仿真，不提供硬件回放。
 
+命令行可以直接使用同一离线回放入口：
+
+```bash
+tools/sim scenario replay scenario.yaml observations.mcap \
+  --clock east=qemu:east:run1:reset0 \
+  --clock west=qemu:west:run1:reset0 \
+  --report replay-result.json
+```
+
+每个成员必须提供一次 `--clock MEMBER=EPOCH`，标签须与录制时一致且彼此不同；
+只在第一个 `=` 处分割，epoch 可以包含 `=`。使用原始 Scenario 文件及其引用的配置，
+录制文件须为可读普通文件。该命令关闭输入文件后才发布结果，不启动 QEMU、物理后端或
+上层进程，也不接受运行时启动选项；`python -m sim scenario replay` 使用同一入口。
+
+全部断言通过时退出码为 `0`；断言未满足、配置/容器损坏或文件错误为 `1`，
+中断或 SIGTERM 为 `130`。可选报告保留逐断言状态、成员完成元数据或失败诊断。
+`--report` 必须指向新文件，已有文件或符号链接会被拒绝；写入失败可能留下部分新文件，
+不会重试。输入关闭或报告失败时不输出通过结果。回放不核实配置、固件或模型的来源身份。
+
 ## Contents
 
 - [项目范围](#project-scope)

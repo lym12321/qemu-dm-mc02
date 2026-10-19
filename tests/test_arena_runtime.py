@@ -3765,3 +3765,51 @@ def test_offline_replay_rejects_actual_failure_diagnostics_without_completion(en
     assert not output.closed
     assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
     environment.assert_clean()
+
+
+def test_offline_replay_cli_consumes_actual_socket_capture_after_cleanup(environment, monkeypatch, capsys):
+    from sim import cli
+    from sim.arena.trace import ArenaTrace
+    from sim.trace import TraceWriter
+
+    arena = environment.manifest()
+    path = environment.directory / "original-replay.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "2500us",
+        "assertions": [
+            {"member": "west", "before": "2ms", "uart_contains": {"endpoint": "uart1", "text": "hello"}},
+            {"member": "east", "before": "2ms", "uart_contains": {"endpoint": "uart1", "text": "hello"}},
+        ]}), encoding="utf-8")
+    original = load_scenario(path)
+    environment.uart_chunks = [[b"hel", b"lo"], [b"hello"]]
+    clocks = {"east": "qemu:east:run15", "west": "qemu:west:run15"}
+    trace = environment.directory / "actual-capture.mcap"
+    with trace.open("xb") as output:
+        writer = TraceWriter(output)
+        capture = ArenaTrace(writer, clocks=clocks)
+        result = environment.run(original.arena, on_observation=capture)
+        environment.assert_clean()
+        capture.complete(result)
+        writer.finish()
+    history = list(environment.events)
+    protected = path.read_bytes(), arena.path.read_bytes(), trace.read_bytes()
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline CLI acquired another live runtime")
+    monkeypatch.setattr(runtime, "running_qemu", forbidden)
+    monkeypatch.setattr(runtime, "create_arena_plant", forbidden)
+    monkeypatch.setattr(scenario_runtime, "run_manifest", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    report = environment.directory / "replayed.json"
+    arguments = ["scenario", "replay", str(path), str(trace), "--report", str(report)]
+    for member, epoch in clocks.items():
+        arguments += ["--clock", f"{member}={epoch}"]
+    assert cli.main(arguments) == 0
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "passed" and payload["result"]["status"] == ["pass", "pass"]
+    assert [(item["name"], item["reset_qemu_ns"], item["end_qemu_ns"], item["observation_batches"])
+            for item in payload["result"]["completions"]] == [
+        (board.name, board.reset_qemu_ns, board.end_qemu_ns, board.observation_batches)
+        for board in result.boards]
+    assert "Scenario replay: passed" in capsys.readouterr().out
+    assert environment.events == history
+    assert (path.read_bytes(), arena.path.read_bytes(), trace.read_bytes()) == protected
+    environment.assert_clean()
