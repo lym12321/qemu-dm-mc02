@@ -863,7 +863,7 @@ poll 时间不代表字节实际到达时刻；CAN 原始帧时间与 Fabric 投
 ```python
 from sim.arena.manifest import load_manifest
 from sim.arena.runtime import run_manifest
-from sim.arena.trace import ArenaTrace, decode_observation
+from sim.arena.trace import ArenaTrace, decode_completion, decode_observation
 from sim.trace import TraceWriter, iter_events
 
 arena = load_manifest("arena.yaml")
@@ -871,13 +871,20 @@ arena = load_manifest("arena.yaml")
 clocks = {member.name: f"qemu:{member.name}:run1:reset0" for member in arena.robots}
 with open("observations.mcap", "xb") as output:
     trace = TraceWriter(output)
-    result = run_manifest(arena, on_observation=ArenaTrace(trace, clocks=clocks))
+    capture = ArenaTrace(trace, clocks=clocks)
+    result = run_manifest(arena, on_observation=capture)
+    capture.complete(result)  # 使用成功返回的实际原点、最后时间和批次数
     trace.finish()  # runtime 成功且清理完成后，再完成文件
 
 # 仅适合可装入内存的小文件；完整读取成功后，再交给观察消费者。
 with open("observations.mcap", "rb") as source:
     stored = list(iter_events(source))
-observations = [decode_observation(event, clocks=clocks) for event in stored]
+observations, completions = [], []
+for event in stored:
+    if event.event_type == "arena.observation/1":
+        observations.append(decode_observation(event, clocks=clocks))
+    else:
+        completions.append(decode_completion(event, clocks=clocks))
 ```
 
 每次回调保存一条 `arena.observation/1` 事件，source 是成员名，endpoint 为
@@ -892,8 +899,20 @@ epoch 的真实性。它不查询 manifest、不推断 RESET 原点，也不排�
 回调失败会冻结适配器并由 Arena 执行原有清理；已消耗的观察和已写字节不能重试或回滚。
 调用者拥有 writer 和文件。文件完成只说明容器完整，不证明应用断言成功。
 
+`complete()` 核对全部成员的批次数和首尾时间，再按返回结果中的成员顺序追加
+`arena.completion/1` 记录。记录保留原始 RESET_ACK 的 `reset_qemu_ns`、
+`observation_batches`，事件时间为实际 `end_qemu_ns`；`decode_completion()`
+返回不可变的 `ArenaTraceCompletion`。原点来自运行结果，不取 ready 或首次轮询时间。
+成功后不再接受观察或再次完成；调用失败会冻结适配器，部分元数据和输出副作用保留。
+若运行或清理失败，不能调用 `complete()`。仍可仅使用观察回调，生成没有完成元数据的文件。
+
+完整记录每成员增加一个 channel identity，因此最多容纳 128 个成员，且共享 writer 的
+其余 channel 和 sequence 仍可能耗尽。完成记录只核对调用者传入结果与采集边界的一致性；
+它不认证结果来源，也不代替完整文件中每成员的顺序、计数和结束状态校验。上面的例子只
+展示解码，尚未执行这些整段回放校验。
+
 这是 Arena 实际已打开 UART 与板级快照的观察记录；CAN、world、输入动作和 RESET_ACK
-不在其中。离线断言仍需另行保留原始 RESET_ACK 原点与实验配置。当前没有 Scenario/CLI
+原始帧不在其中。离线断言仍需另行保留实验配置。当前没有 Scenario/CLI
 自动记录、完整系统 trace 或硬件回放调度器。
 
 ## Contents

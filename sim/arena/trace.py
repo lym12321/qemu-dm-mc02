@@ -7,6 +7,7 @@ by the caller and are never converted to shared world time.
 """
 
 import base64
+from dataclasses import dataclass
 import json
 
 from sim.boards import validate_snapshot
@@ -15,12 +16,32 @@ from sim.boards.launch import UARTS
 from sim.trace import TraceEvent, TraceWriter
 from sim.trace.storage import MAX_CHANNELS, MAX_PAYLOAD_BYTES
 
-from .runtime import ArenaObservation
+from .runtime import ArenaBoardResult, ArenaObservation, ArenaResult
 
 
 ENDPOINT = "observation"
 EVENT_TYPE = "arena.observation/1"
+COMPLETION_TYPE = "arena.completion/1"
 _JSON = json.JSONEncoder(ensure_ascii=True, allow_nan=False, separators=(",", ":"))
+
+
+@dataclass(frozen=True)
+class ArenaTraceCompletion:
+    """One member's decoded original RESET origin and final capture boundary."""
+
+    name: str
+    clock: str
+    reset_qemu_ns: int
+    end_qemu_ns: int
+    observation_batches: int
+
+
+def _uint(value, name: str, maximum=0xFFFFFFFFFFFFFFFF) -> int:
+    if type(value) is not int:
+        raise TypeError(f"Arena trace {name} must be an integer")
+    if not 0 <= value <= maximum:
+        raise ValueError(f"Arena trace {name} is out of range")
+    return value
 
 
 def _clocks(value) -> dict[str, str]:
@@ -98,6 +119,11 @@ class ArenaTrace:
     Any callback failure freezes this adapter: observations already consumed by
     Arena cannot be retried. Complete admission precedes the single append,
     whose IO effects cannot be rolled back. Caller owns finish/files/cleanup.
+
+    Optionally call complete with the actual result returned after successful
+    Arena cleanup. Its original RESET origins and final bounds/counts are checked
+    against capture before metadata is appended. These checks do not authenticate
+    the caller or validate every intermediate timestamp in a forged history.
     """
 
     def __init__(self, writer: TraceWriter, *, clocks: dict[str, str]):
@@ -106,10 +132,17 @@ class ArenaTrace:
         self._clocks = _clocks(clocks)
         self._writer = writer
         self._failed = False
+        self._completed = False
+        self._observed: dict[str, tuple[int, int, int]] = {}
 
-    def __call__(self, item: ArenaObservation) -> None:
+    def _active(self) -> None:
         if self._failed:
             raise RuntimeError("Arena trace failed; observations cannot be retried")
+        if self._completed:
+            raise RuntimeError("Arena trace is complete")
+
+    def __call__(self, item: ArenaObservation) -> None:
+        self._active()
         try:
             _validate(item)
             if type(item.name) is not str or item.name not in self._clocks:
@@ -123,6 +156,50 @@ class ArenaTrace:
             payload = _payload(document)
             self._writer.append(TraceEvent(event.timestamp_ns, event.source,
                                 event.endpoint, event.event_type, payload, event.clock))
+            count, first, _ = self._observed.get(item.name, (0, event.timestamp_ns, 0))
+            self._observed[item.name] = (count + 1, first, event.timestamp_ns)
+        except BaseException:
+            self._failed = True
+            raise
+
+    def complete(self, result: ArenaResult) -> None:
+        """Append final metadata once, using the actual post-cleanup result.
+
+        All result admission precedes the first append. Completion adds one
+        channel identity per member, so at most 128 members can fit a lifecycle.
+        Existing writer channels/sequence may still exhaust capacity. Any error
+        freezes this adapter; partial metadata/IO is retained, never retried.
+        This neither finishes the borrowed writer nor closes its output.
+        """
+        self._active()
+        try:
+            if type(result) is not ArenaResult:
+                raise TypeError("Arena trace completion requires an ArenaResult")
+            if (type(result.boards) is not tuple or
+                    any(type(board) is not ArenaBoardResult for board in result.boards)):
+                raise TypeError("Arena trace completion requires an ArenaBoardResult tuple")
+            if any(type(board.name) is not str for board in result.boards):
+                raise TypeError("Arena trace completion member names must be strings")
+            names = [board.name for board in result.boards]
+            if (len(set(names)) != len(names) or set(names) != self._clocks.keys()
+                    or self._observed.keys() != self._clocks.keys()):
+                raise ValueError("Arena trace completion members differ from configured capture")
+            if 2 * len(names) > MAX_CHANNELS:
+                raise BufferError("Arena trace lifecycle exceeds channel capacity")
+            events = []
+            for board in result.boards:
+                reset = _uint(board.reset_qemu_ns, "reset_qemu_ns")
+                end = _uint(board.end_qemu_ns, "end_qemu_ns")
+                count = _uint(board.observation_batches, "observation_batches", 0xFFFFFFFF)
+                observed, first, last = self._observed[board.name]
+                if not count or count != observed or not reset <= first <= end or last != end:
+                    raise ValueError("Arena trace completion differs from captured bounds/count")
+                payload = _payload({"reset_qemu_ns": reset, "observation_batches": count})
+                events.append(TraceEvent(end, board.name, ENDPOINT, COMPLETION_TYPE,
+                                         payload, self._clocks[board.name]))
+            for event in events:
+                self._writer.append(event)
+            self._completed = True
         except BaseException:
             self._failed = True
             raise
@@ -166,3 +243,28 @@ def decode_observation(event: TraceEvent, *, clocks: dict[str, str]) -> ArenaObs
     item = ArenaObservation(event.source, state, events)
     _validate(item)
     return item
+
+
+def decode_completion(event: TraceEvent, *, clocks: dict[str, str]) -> ArenaTraceCompletion:
+    """Decode pure per-member metadata; full run validation belongs to replay.
+
+    A complete MCAP container and this record alone do not prove that all
+    members/batches exist in order or that the caller supplied a genuine result.
+    """
+    clocks = _clocks(clocks)
+    if type(event) is not TraceEvent:
+        raise TypeError("Arena completion decode requires a TraceEvent")
+    if (event.endpoint != ENDPOINT or event.event_type != COMPLETION_TYPE or
+            event.source not in clocks or event.clock != clocks[event.source]):
+        raise ValueError("unexpected Arena completion profile, member or clock/epoch")
+    document = json.loads(event.payload)
+    if (type(document) is not dict or
+            set(document) != {"reset_qemu_ns", "observation_batches"}):
+        raise ValueError("Arena completion payload requires reset_qemu_ns and observation_batches")
+    if _payload(document) != event.payload:
+        raise ValueError("Arena completion payload is not compact canonical JSON")
+    reset = _uint(document["reset_qemu_ns"], "reset_qemu_ns")
+    count = _uint(document["observation_batches"], "observation_batches", 0xFFFFFFFF)
+    if not count or reset > event.timestamp_ns:
+        raise ValueError("Arena completion has invalid reset/count bounds")
+    return ArenaTraceCompletion(event.source, event.clock, reset, event.timestamp_ns, count)

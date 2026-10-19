@@ -292,3 +292,232 @@ def test_independent_literal_json_decodes_empty_batch_and_all_byte_values():
     assert result == observation(events=[ChannelEvent("uart7", 0, b"\0\1\2\3\xfe\xff")])
     empty = decode_observation(trace_event(body=json_bytes(payload(events=[]))), clocks=CLOCKS)
     assert empty.events == [] and empty.snapshot == snapshot(23) and empty.name == "east"
+
+
+def completion_result():
+    from sim.arena.runtime import ArenaBoardResult, ArenaResult
+    # Result order deliberately differs from capture/mapping order.
+    return ArenaResult("fixture", 0, 120, 2, (
+        ArenaBoardResult("west", "b_", "omitted", None, 120, 100, 1),
+        ArenaBoardResult("east", "a_", "observed", 25, 30, 10, 2)), ())
+
+
+def completion_capture(output=None):
+    output = BytesIO() if output is None else output
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks=CLOCKS)
+    for item in (observation(timestamp=20, events=[]),
+                 observation(name="west", timestamp=120, events=[]),
+                 observation(timestamp=30, events=[])):
+        sink(item)
+    return output, writer, sink
+
+
+def test_completion_native_metadata_uses_actual_result_order_origin_and_completed_state():
+    from dataclasses import FrozenInstanceError
+    from sim.arena.trace import ArenaTraceCompletion, decode_completion
+    output, writer, sink = completion_capture()
+    result = completion_result()
+    before = deepcopy(result)
+    sink.complete(result)
+    assert result == before
+    stopped = output.getvalue()
+    with pytest.raises(RuntimeError):
+        sink(observation(timestamp=30, events=[]))
+    with pytest.raises(RuntimeError):
+        sink.complete(result)
+    assert output.getvalue() == stopped and not output.closed
+    writer.finish()
+    native = list(StreamReader(BytesIO(output.getvalue()), validate_crcs=True).records)
+    channels = {record.id: record for record in native if isinstance(record, Channel)}
+    messages = [record for record in native if isinstance(record, Message)]
+    assert [(channels[item.channel_id].metadata, item.sequence, item.log_time,
+             item.publish_time, item.data) for item in messages[-2:]] == [
+        ({"source": "west", "event_type": "arena.completion/1", "clock": CLOCKS["west"]},
+         3, 120, 120, b'{"reset_qemu_ns":100,"observation_batches":1}'),
+        ({"source": "east", "event_type": "arena.completion/1", "clock": CLOCKS["east"]},
+         4, 30, 30, b'{"reset_qemu_ns":10,"observation_batches":2}'),
+    ]
+    recorded = list(iter_events(BytesIO(output.getvalue())))
+    complete = [decode_completion(event, clocks=CLOCKS) for event in recorded[-2:]]
+    assert complete == [ArenaTraceCompletion("west", CLOCKS["west"], 100, 120, 1),
+                        ArenaTraceCompletion("east", CLOCKS["east"], 10, 30, 2)]
+    with pytest.raises(FrozenInstanceError):
+        complete[0].reset_qemu_ns = 120
+
+
+@pytest.mark.parametrize("invalid", [
+    "result-type", "board-type", "board-list", "duplicate", "unknown-member",
+    "count", "count-zero", "count-overflow", "reset-after-first", "negative-reset",
+    "last-end", "bool-end", "end-overflow",
+])
+def test_completion_admits_all_result_boards_before_first_append_and_freezes(invalid):
+    result = completion_result()
+    west, east = result.boards
+    if invalid == "result-type":
+        result = object()
+    elif invalid == "board-type":
+        result = replace(result, boards=(west, object()))
+    elif invalid == "board-list":
+        result = replace(result, boards=list(result.boards))
+    elif invalid == "duplicate":
+        result = replace(result, boards=(west, west))
+    else:
+        changes = {"unknown-member": {"name": "absent"}, "count": {"observation_batches": 1},
+                   "count-zero": {"observation_batches": 0},
+                   "count-overflow": {"observation_batches": 2**32},
+                   "reset-after-first": {"reset_qemu_ns": 21},
+                   "negative-reset": {"reset_qemu_ns": -1},
+                   "last-end": {"end_qemu_ns": 31}, "bool-end": {"end_qemu_ns": True},
+                   "end-overflow": {"end_qemu_ns": 2**64}}[invalid]
+        result = replace(result, boards=(west, replace(east, **changes)))
+    output, writer, sink = completion_capture()
+    before = output.getvalue()
+    with pytest.raises((TypeError, ValueError)):
+        sink.complete(result)
+    assert output.getvalue() == before
+    for action in (lambda: sink.complete(completion_result()),
+                   lambda: sink(observation(timestamp=30, events=[]))):
+        with pytest.raises(RuntimeError):
+            action()
+    assert output.getvalue() == before
+    writer.finish()
+    assert len(list(iter_events(BytesIO(output.getvalue())))) == 3
+
+
+@pytest.mark.parametrize("captured", [0, 1])
+def test_completion_requires_exact_configured_and_observed_member_coverage(captured):
+    output = BytesIO()
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks=CLOCKS)
+    if captured:
+        sink(observation(timestamp=30, events=[]))
+    before = output.getvalue()
+    with pytest.raises(ValueError):
+        sink.complete(completion_result())
+    assert output.getvalue() == before
+
+
+@pytest.mark.parametrize("members", [128, 129])
+def test_completion_channel_capacity_is_preflighted_without_restricting_observation_capture(members):
+    from sim.arena.runtime import ArenaBoardResult, ArenaResult
+    clocks = {f"member{index}": f"qemu:member{index}:epoch0" for index in range(members)}
+    output = BytesIO()
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks=clocks)
+    for name in clocks:
+        sink(observation(name=name, timestamp=0, events=[]))
+    result = ArenaResult("fixture", 0, 0, 0, tuple(
+        ArenaBoardResult(name, name + "_", "omitted", None, 0, 0, 1) for name in clocks), ())
+    before = output.getvalue()
+    if members == 129:
+        with pytest.raises((ValueError, BufferError)):
+            sink.complete(result)
+        assert output.getvalue() == before
+    else:
+        sink.complete(result)
+    writer.finish()
+    events = list(iter_events(BytesIO(output.getvalue())))
+    assert len(events) == (256 if members == 128 else 129)
+    assert sum(event.event_type == "arena.completion/1" for event in events) == (128 if members == 128 else 0)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_completion_partial_output_preserves_primary_and_never_retries(interrupt):
+    primary = KeyboardInterrupt("completion interrupted") if interrupt else OSError("completion failed")
+    class Output(BytesIO):
+        armed = False
+        writes = 0
+        def write(self, data):
+            self.writes += 1
+            if self.armed and b'{"reset_qemu_ns":10,"observation_batches":2}' in data:
+                super().write(data[:len(data) // 2])
+                raise primary
+            return super().write(data)
+    output, writer, sink = completion_capture(Output())
+    before = output.getvalue()
+    output.armed = True
+    with pytest.raises(type(primary)) as caught:
+        sink.complete(completion_result())
+    assert caught.value is primary
+    assert output.getvalue().startswith(before) and len(output.getvalue()) > len(before)
+    provisional = iter_events(BytesIO(output.getvalue()))
+    first = [next(provisional) for _ in range(4)]
+    assert first[-1].event_type == "arena.completion/1" and first[-1].source == "west"
+    stopped = output.getvalue(), output.writes
+    output.armed = False
+    with pytest.raises(RuntimeError):
+        sink.complete(completion_result())
+    with pytest.raises(RuntimeError):
+        sink(observation(timestamp=30, events=[]))
+    with pytest.raises(RuntimeError):
+        writer.finish()
+    assert (output.getvalue(), output.writes) == stopped and not output.closed
+
+
+@pytest.mark.parametrize("limit", ["channels", "sequence"])
+def test_completion_existing_writer_capacity_can_leave_partial_metadata_and_freezes(limit):
+    output, writer, sink = completion_capture()
+    if limit == "channels":
+        for index in range(253):
+            writer.append(TraceEvent(0, f"unrelated{index}", "x", "x", b"", "other:epoch"))
+    else:
+        # Exercise the actual storage ordinal boundary without billions of appends.
+        writer._sequence = 2**32 - 1
+    with pytest.raises(BufferError if limit == "channels" else OverflowError):
+        sink.complete(completion_result())
+    stopped = output.getvalue()
+    with pytest.raises(RuntimeError):
+        sink.complete(completion_result())
+    assert output.getvalue() == stopped
+    writer.finish()
+    if limit == "channels":
+        events = list(iter_events(BytesIO(output.getvalue())))
+        assert [(event.source, event.event_type) for event in events if event.event_type == "arena.completion/1"] == [
+            ("west", "arena.completion/1")]
+    else:
+        # Deliberately seeded ordinals cannot be read as a contiguous run.
+        messages = [record for record in StreamReader(BytesIO(output.getvalue())).records
+                    if isinstance(record, Message)]
+        assert messages[-1].sequence == 2**32 - 1
+        assert messages[-1].data == b'{"reset_qemu_ns":100,"observation_batches":1}'
+
+
+def test_completion_decoder_independent_literal_uint_boundaries_and_frozen_record():
+    from sim.arena.trace import ArenaTraceCompletion, decode_completion
+    event = trace_event(event_type="arena.completion/1", timestamp_ns=2**64 - 1,
+                        body=b'{"reset_qemu_ns":0,"observation_batches":4294967295}')
+    assert decode_completion(event, clocks=CLOCKS) == ArenaTraceCompletion(
+        "east", CLOCKS["east"], 0, 2**64 - 1, 2**32 - 1)
+
+
+@pytest.mark.parametrize("invalid", [
+    "source", "clock", "type", "endpoint", "whitespace", "duplicate-key", "missing-field",
+    "extra-field", "bool-reset", "future-reset", "count-zero", "count-overflow",
+])
+def test_completion_decoder_rejects_wrong_profile_noncanonical_and_out_of_range_fields(invalid):
+    from sim.arena.trace import decode_completion
+    changes, body = {}, b'{"reset_qemu_ns":10,"observation_batches":2}'
+    if invalid in ("source", "clock", "type", "endpoint"):
+        changes = {"source": {"source": "unknown"}, "clock": {"clock": "different:epoch"},
+                   "type": {"event_type": "arena.observation/1"},
+                   "endpoint": {"endpoint": "uart1"}}[invalid]
+    elif invalid == "whitespace":
+        body = b" " + body
+    elif invalid == "duplicate-key":
+        body = b'{"reset_qemu_ns":10,"observation_batches":2,"observation_batches":2}'
+    elif invalid == "missing-field":
+        body = b'{"reset_qemu_ns":10}'
+    elif invalid == "extra-field":
+        body = b'{"reset_qemu_ns":10,"observation_batches":2,"world_time":0}'
+    elif invalid == "bool-reset":
+        body = b'{"reset_qemu_ns":true,"observation_batches":2}'
+    elif invalid == "future-reset":
+        body = b'{"reset_qemu_ns":24,"observation_batches":2}'
+    elif invalid == "count-zero":
+        body = b'{"reset_qemu_ns":10,"observation_batches":0}'
+    else:
+        body = b'{"reset_qemu_ns":10,"observation_batches":4294967296}'
+    changes.setdefault("event_type", "arena.completion/1")
+    with pytest.raises((TypeError, ValueError)):
+        decode_completion(trace_event(body=body, **changes), clocks=CLOCKS)

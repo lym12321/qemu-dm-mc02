@@ -3544,3 +3544,78 @@ def test_arena_trace_actual_output_failure_keeps_primary_cleans_all_and_never_re
     with pytest.raises(RuntimeError):
         sink(runtime.ArenaObservation("east", snapshot(1000), []))
     assert (output.getvalue(), output.writes) == stopped and not output.closed
+
+
+def test_arena_trace_completion_actual_result_matches_original_reset_ack_and_captured_batches(environment):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace, decode_completion, decode_observation
+    from sim.trace import TraceWriter, iter_events
+
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"))
+    environment.uart_chunks = [[b"RE", b"ADYhel", b"lo"], [b"READYlo", b"hel"]]
+    clocks = {"east": "qemu:east:run13", "west": "qemu:west:run13"}
+    output, origins, history = BytesIO(), {}, {"east": [], "west": []}
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks=clocks)
+    def response(name, frame, decoded):
+        if frame.header.kind == runtime.codec.RESET_ACK:
+            assert name not in origins
+            origins[name] = decoded.virtual_time_ns
+    def capture(item):
+        sink(item)
+        history[item.name].append(item)
+    result = environment.run(arena, on_response=response, on_observation=capture)
+    environment.assert_clean()
+    sink.complete(result)  # The real result is available only after all cleanup.
+    writer.finish()
+    recorded = list(iter_events(BytesIO(output.getvalue())))
+    complete = [decode_completion(event, clocks=clocks) for event in recorded[-2:]]
+    observations = [decode_observation(event, clocks=clocks) for event in recorded[:-2]]
+    assert origins == {"east": 1000, "west": 2000}
+    assert [(item.name, item.snapshot["timestamp_ns"], tuple(event.data for event in item.events))
+            for item in observations[:4]] == [
+        ("east", 1000, (b"RE",)), ("west", 2000, (b"READYlo",)),
+        ("east", 1_001_000, (b"ADYhel",)), ("west", 1_002_000, (b"hel",))]
+    assert [item.name for item in complete] == [board.name for board in result.boards]
+    for board, metadata in zip(result.boards, complete, strict=True):
+        captured = history[board.name]
+        assert [item for item in observations if item.name == board.name] == captured
+        assert metadata.name == board.name and metadata.clock == clocks[board.name]
+        assert metadata.reset_qemu_ns == board.reset_qemu_ns == origins[board.name]
+        assert metadata.end_qemu_ns == board.end_qemu_ns == captured[-1].snapshot["timestamp_ns"]
+        assert metadata.observation_batches == board.observation_batches == len(captured)
+        assert captured[0].snapshot["timestamp_ns"] == origins[board.name]
+        assert any(not item.events for item in captured)
+    assert result.boards[0].ready_qemu_ns > origins["east"]
+    assert [event.data for item in history["east"] for event in item.events] == [b"RE", b"ADYhel", b"lo"]
+    assert not output.closed
+
+
+@pytest.mark.parametrize("failure", ["runtime", "cleanup"])
+def test_arena_trace_completion_caller_cannot_publish_after_real_run_or_cleanup_failure(environment, failure):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace
+    from sim.trace import TraceWriter, iter_events
+
+    primary = OSError(f"completion {failure} failure")
+    if failure == "runtime":
+        def fail_after_step(index, name):
+            if name == "qom-get" and environment.native.steps:
+                raise primary
+        environment.qmp_callback = fail_after_step
+    else:
+        environment.world_close_failure = primary
+    environment.uart_chunks = [[b"one"], [b"two"]]
+    output = BytesIO()
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks={"east": "qemu:east:run13", "west": "qemu:west:run13"})
+    result = None
+    with pytest.raises(OSError) as caught:
+        result = environment.run(environment.manifest(upper=True), on_observation=sink)
+        sink.complete(result)
+    assert caught.value is primary and result is None
+    environment.assert_clean()
+    writer.finish()
+    recorded = list(iter_events(BytesIO(output.getvalue())))
+    assert recorded and all(event.event_type == "arena.observation/1" for event in recorded)
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
