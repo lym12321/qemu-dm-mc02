@@ -322,6 +322,17 @@ ready 读取后时间上界和最后观察时间，不能将这些时间与共�
 `emit` 可接收带成员标签的 `ArenaEvent`，`on_response` 可观察实际 co-sim 响应；
 响应观察不构成完整 wire trace，也不保证每步样本消费。
 
+Python 入口还接受 `on_observation` 回调，每次成员轮询在原有 `emit` 和 ready
+处理后交付一个 `ArenaObservation(name, snapshot, events)`，没有事件时也交付。
+`snapshot` 是该次读取后取得的实际板卡快照，`events` 是同次串口读取返回的原列表；
+不额外查询 QMP。UART 事件的 `timestamp_ns` 保留读取前轮询样本，严格截止时间判断
+应使用 `snapshot["timestamp_ns"]` 作为读取后上界，时间属于该成员自身的 QEMU epoch。
+调用者须只读使用借用的字典和列表，不得在回调中重入 runtime；外层记录冻结并不冻结
+内部对象。回调异常会终止本次运行并沿用现有清理规则，不重放批次。
+
+这些批次包含原有已打开 UART 的字节和数字板卡快照。CAN 仍由 SharedWorld 独占，
+不通过此接口交付；接口也不增加 UART 端口、全局时间屏障、完整 trace 或 Scenario 断言。
+
 配置裁判时，对应子 Robot 必须声明实际应用 `ready` 标记；该标记应由固件在
 UART7 接收初始化后输出。每个成员匹配自己的标记后，发布裁判的最新完成状态，
 随后默认每 100 ms 共享逻辑时间发布一批四命令快照。Python 调用可用

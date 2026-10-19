@@ -26,11 +26,14 @@ from sim import processes
 from sim.arena import runtime
 from sim.arena.manifest import load_manifest
 from sim.boards import qemu as board_qmp
+from sim.boards.channels import ChannelEvent
 from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
 from sim.fabric.endpoints import QemuCanEndpoint
+from sim.lab.experiment import LabExperiment
+from sim.lab.manifest import Assertion, LabManifest, Ready
 from sim.robots import shared_world
 from sim.scenario import ScenarioCanDelay, ScenarioManifest, ScenarioReferee, load_manifest as load_scenario
 from sim.scenario import runtime as scenario_runtime
@@ -1310,6 +1313,7 @@ def test_scenario_typed_can_values_reach_arena_preflight_before_resources(
     {"duration": float("nan")}, {"duration": True}, {"duration": 1e-10},
     {"duration": 3601}, {"timeout": float("inf")},
     {"startup_timeout": 3, "timeout": 2}, {"emit": 1}, {"on_response": 1},
+    {"on_observation": 1},
     {"referee_period_ns": True}, {"referee_period_ns": 1_000_000.0},
     {"referee_period_ns": 999_999}, {"referee_period_ns": 60_000_000_001},
 ])
@@ -2676,3 +2680,229 @@ def test_arena_post_batch_failure_stops_before_next_cpu_and_preserves_cleanup(en
     assert len(environment.cpus[0].receipts) == 4 and not environment.cpus[0].partial
     assert environment.cpus[1].receipts == []
     assert all(process.returncode == -signal.SIGTERM for process in environment.children)
+
+
+@pytest.mark.parametrize("configured", [False, True], ids=["default", "observation_sink"])
+def test_arena_observation_borrows_postread_objects_after_emit_and_ready(environment, configured):
+    trace, observations, snapshots, batches, timeouts = [], [], {}, {}, []
+    run = runtime._Run(101, 102, None)
+    guard, guards = run.guard, []
+    def guarded():
+        guards.append(None)
+        return guard()
+    run.guard = guarded
+    for name, origin in (("east", 1000), ("west", 2000)):
+        states = [snapshot(origin + offset) for offset in (1, 2, 3, 4)]
+        events = ([ChannelEvent("uart1", origin + 1, b"RE"),
+                   ChannelEvent("uart1", origin + 1, b"ADY")] if name == "east" else
+                  [ChannelEvent("uart1", origin + 1, b"READY")])
+        snapshots[name], batches[name] = states[:], [events, []]
+        pending_states, pending_batches = iter(states), iter(batches[name])
+        def read_state(name=name, states=pending_states):
+            value = next(states)
+            trace.append((name, "snapshot", value["timestamp_ns"]))
+            return value
+        def service(timestamp_ns, *, flush_uart, name=name, values=pending_batches):
+            trace.append((name, "service", timestamp_ns, flush_uart))
+            return next(values)
+        member = SimpleNamespace(name=name, robot=SimpleNamespace(ready=Ready("main.uart1", b"READY")))
+        run.peers.append(runtime._Peer(member, SimpleNamespace(process=SimpleNamespace(poll=lambda: None)),
+            SimpleNamespace(settimeout=timeouts.append), SimpleNamespace(snapshot=read_state),
+            SimpleNamespace(service=service), None, None, last_ns=origin))
+    def emit(item):
+        peer = next(peer for peer in run.peers if peer.member.name == item.name)
+        trace.append((item.name, "emit", item.event.data, peer.ready_qemu_ns))
+    def observe(item):
+        peer = next(peer for peer in run.peers if peer.member.name == item.name)
+        trace.append((item.name, "observe", item.snapshot["timestamp_ns"], peer.ready_qemu_ns))
+        observations.append(item)
+    run.emit, run.on_observation = emit, observe if configured else None
+    assert run.pump() is True and run.pump() is True
+    expected = []
+    for batch in range(2):
+        for name, origin in (("east", 1000), ("west", 2000)):
+            before, after = origin + 1 + 2 * batch, origin + 2 + 2 * batch
+            expected.extend([(name, "snapshot", before), (name, "service", before, False),
+                             (name, "snapshot", after)])
+            expected.extend((name, "emit", event.data, None) for event in batches[name][batch])
+            if configured:
+                expected.append((name, "observe", after, origin + 2))
+    assert trace == expected
+    assert len(timeouts) == 8 and len(guards) == (33 if configured else 25)
+    assert [peer.batches for peer in run.peers] == [2, 2]
+    assert [peer.last_ns for peer in run.peers] == [1004, 2004]
+    assert [peer.ready_qemu_ns for peer in run.peers] == [1002, 2002]
+    assert len(observations) == (4 if configured else 0)
+    for index, item in enumerate(observations):
+        name, batch = ("east", "west")[index % 2], index // 2
+        assert type(item) is runtime.ArenaObservation and item.name == name
+        assert item.snapshot is snapshots[name][1 + 2 * batch]
+        assert item.snapshot is not snapshots[name][2 * batch]
+        assert item.events is batches[name][batch]
+        assert item.snapshot == snapshot((1000 if name == "east" else 2000) + 2 + 2 * batch)
+        with pytest.raises(FrozenInstanceError):
+            item.name = "replacement"
+
+
+@pytest.mark.parametrize("invalid", ["backward", "malformed"])
+def test_arena_observation_bad_postread_never_emits_or_calls_sink(environment, monkeypatch, invalid):
+    command, calls, emitted = environment.command, [], []
+    def postread(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get" and index == 0 and len(environment.snapshots[0]) == 3:
+            if invalid == "backward":
+                value["timestamp_ns"] = 999
+            else:
+                value["gpio"]["A"]["sampled"] = -1
+        return value
+    monkeypatch.setattr(environment, "command", postread)
+    environment.uart_chunks[0] = [b"not published"]
+    with pytest.raises((ValueError, RuntimeError), match="backwards|sampled"):
+        environment.run(environment.manifest(upper=True), emit=emitted.append, on_observation=calls.append)
+    assert calls == emitted == [] and environment.uart_reads == [1, 0]
+    assert environment.native.resets == 1 and environment.native.steps == []
+    environment.assert_clean()
+
+
+def observation_experiments(arena, assertions):
+    """Use the public Lab consumer with explicit independent QEMU origins."""
+    return {member.name: LabExperiment(LabManifest(
+                arena.path, member.name, "dm-mc02", member.robot.board.firmware,
+                2_500_000, (), assertions), origin)
+            for member, origin in zip(arena.robots, (1000, 2000), strict=True)}
+
+
+def test_arena_observation_actual_socket_split_uart_member_and_endpoint_isolation(environment):
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"),
+                                 referees={"east": referee_configuration()})
+    environment.uart_port_chunks = {
+        (0, "uart1"): [b"READYhel", b"lo"], (0, "uart7"): [b"lo"],
+        (1, "uart1"): [b"READYlo", b"hel"],
+    }
+    experiments = observation_experiments(arena, (Assertion(1_500_000, "uart1", "uart_contains", b"hello"),))
+    history, emitted = [], []
+    def observe(item):
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"], experiment.status,
+                        [(event.endpoint, event.data) for event in item.events]))
+    result = environment.run(arena, emit=emitted.append, on_observation=observe)
+    environment.assert_clean()
+    assert history[:4] == [
+        ("east", 1000, ("pending",), [("uart1", b"READYhel"), ("uart7", b"lo")]),
+        ("west", 2000, ("pending",), [("uart1", b"READYlo")]),
+        ("east", 1_001_000, ("pass",), [("uart1", b"lo")]),
+        ("west", 1_002_000, ("pending",), [("uart1", b"hel")]),
+    ]
+    assert [experiments[name].status for name in ("east", "west")] == [("pass",), ("fail",)]
+    assert len(history) == sum(board.observation_batches for board in result.boards)
+    assert [name for name, *_ in history] == ["east", "west"] * 5
+    assert [(item.name, item.event.endpoint, item.event.data) for item in emitted] == [
+        ("east", "uart1", b"READYhel"), ("east", "uart7", b"lo"),
+        ("west", "uart1", b"READYlo"), ("east", "uart1", b"lo"),
+        ("west", "uart1", b"hel")]
+    assert [board.ready_qemu_ns for board in result.boards] == [1000, 2000]
+    assert environment.native.steps == [1_000_000, 1_000_000, 500_000]
+
+
+def test_arena_observation_actual_postread_deadline_rejects_earlier_poll_bytes(environment, monkeypatch):
+    arena = environment.manifest()
+    experiments = observation_experiments(arena, (Assertion(50, "uart1", "uart_contains", b"OK"),))
+    environment.uart_chunks = [[b"OK"], [b"OK"]]
+    command, history = environment.command, []
+    def postread(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get" and environment.uart_reads[index]:
+            value["timestamp_ns"] += 50
+        return value
+    monkeypatch.setattr(environment, "command", postread)
+    def observe(item):
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"],
+                        [(event.timestamp_ns, event.data) for event in item.events], experiment.status))
+    environment.run(arena, on_observation=observe)
+    environment.assert_clean()
+    assert history[:2] == [("east", 1050, [(1000, b"OK")], ("fail",)),
+                           ("west", 2050, [(2000, b"OK")], ("fail",))]
+    assert all(row[-1] == ("fail",) for row in history)
+
+
+def test_arena_observation_empty_batch_expires_terminally_and_uses_sampled_gpio(environment, monkeypatch):
+    arena = environment.manifest()
+    assertions = (Assertion(1_000_000, "uart1", "uart_contains", b"hello"),
+                  Assertion(1_000_000, "gpio.A0", "digital_equals", 1))
+    experiments = observation_experiments(arena, assertions)
+    environment.uart_chunks = [[b"hel", b"", b"hello"], [b"hello"]]
+    command, history = environment.command, []
+    def digital_state(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get":
+            value["gpio"]["A"].update(sampled=index, odr=1 - index, output_mask=1)
+        return value
+    monkeypatch.setattr(environment, "command", digital_state)
+    def observe(item):
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"], experiment.status,
+                        tuple(event.data for event in item.events)))
+    result = environment.run(arena, on_observation=observe)
+    environment.assert_clean()
+    assert history[:6] == [
+        ("east", 1000, ("pending", "pending"), (b"hel",)),
+        ("west", 2000, ("pass", "pass"), (b"hello",)),
+        ("east", 1_001_000, ("fail", "fail"), ()),
+        ("west", 1_002_000, ("pass", "pass"), ()),
+        ("east", 2_001_000, ("fail", "fail"), (b"hello",)),
+        ("west", 2_002_000, ("pass", "pass"), ()),
+    ]
+    for board in result.boards:
+        assert experiments[board.name].finish(board.end_qemu_ns) == experiments[board.name].status
+    assert len(experiments["east"].failures) == 2 and experiments["west"].all_passed
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["error", "interrupt"])
+def test_arena_observation_sink_failure_preserves_identity_without_replay_and_cleans_all(environment, interrupt):
+    primary = KeyboardInterrupt("observation interrupted") if interrupt else OSError("observation failed")
+    environment.world_close_failure = OSError("observation world cleanup failed")
+    environment.world_close_failure.add_note("nested observation release evidence")
+    environment.close_failures = {"peer0 uart1", "peer1 qmp"}
+    environment.owner_failures = {0: OSError("first observation harness cleanup failed")}
+    environment.uart_chunks = [[b"one"], [b"two"]]
+    calls, emitted = [], []
+    def observe(item):
+        calls.append(item)
+        raise primary
+    with pytest.raises(type(primary)) as caught:
+        environment.run(environment.manifest(upper=True), emit=emitted.append, on_observation=observe)
+    assert caught.value is primary
+    assert len(calls) == 1 and calls[0].name == "east" and calls[0].events[0].data == b"one"
+    assert [(item.name, item.event.data) for item in emitted] == [("east", b"one")]
+    assert environment.uart_reads == [1, 0] and environment.native.steps == []
+    assert all(not cpu.requests for cpu in environment.cpus.values())
+    notes = "\n".join(primary.__notes__)
+    for label in ("world cleanup", "nested observation release", "uart1", "qmp", "harness cleanup"):
+        assert label in notes
+    environment.assert_clean()
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
+
+
+@pytest.mark.parametrize("violation", ["deadline", "qemu_exit", "upper_exit"])
+def test_arena_observation_postcallback_guard_stops_before_later_peer_and_world_step(environment, violation):
+    calls = []
+    def observe(item):
+        calls.append(item)
+        if violation == "deadline":
+            environment.clock += 4
+        elif violation == "qemu_exit":
+            environment.owners[0][0].process.returncode = 0
+        else:
+            environment.children[0].returncode = 0
+    with pytest.raises(TimeoutError if violation == "deadline" else RuntimeError,
+                       match="startup deadline expired|exited early \\(0\\)"):
+        environment.run(environment.manifest(upper=True), on_observation=observe,
+                        startup_timeout=1, timeout=3)
+    assert len(calls) == 1 and calls[0].name == "east" and calls[0].events == []
+    assert environment.uart_reads == [1, 0] and environment.native.steps == []
+    assert all(not cpu.requests for cpu in environment.cpus.values())
+    environment.assert_clean()

@@ -45,6 +45,20 @@ class ArenaEvent:
 
 
 @dataclass(frozen=True)
+class ArenaObservation:
+    """Borrowed post-read board snapshot and exact channel batch for one peer.
+
+    The frozen wrapper is shallow. Consumers must treat snapshot/events as
+    read-only and must not reenter the runtime. UART event times remain polling
+    samples; snapshot["timestamp_ns"] is their actual post-read QEMU bound.
+    """
+
+    name: str
+    snapshot: dict
+    events: list[ChannelEvent]
+
+
+@dataclass(frozen=True)
 class ArenaBoardResult:
     name: str
     prefix: str
@@ -114,9 +128,10 @@ class _Peer:
 
 
 class _Run:
-    def __init__(self, startup_deadline, deadline, emit):
+    def __init__(self, startup_deadline, deadline, emit, on_observation=None):
         self.startup_deadline, self.deadline = startup_deadline, deadline
         self.emit = emit
+        self.on_observation = on_observation
         self.startup = True
         self.peers, self.children, self.readers = [], [], []
 
@@ -157,7 +172,8 @@ class _Run:
                 raise RuntimeError(f"Arena QEMU {peer.member.name} virtual time moved backwards")
             events = peer.channels.service(before, flush_uart=False)
             self.guard()
-            after = self.call(peer, peer.board.snapshot)["timestamp_ns"]
+            snapshot = self.call(peer, peer.board.snapshot)
+            after = snapshot["timestamp_ns"]
             if after < before:
                 raise RuntimeError(f"Arena QEMU {peer.member.name} virtual time moved backwards")
             peer.last_ns = after
@@ -173,6 +189,10 @@ class _Run:
                     if ready.text in combined:
                         peer.ready_qemu_ns = after
                     peer.tail = combined[-(len(ready.text) - 1):] if len(ready.text) > 1 else b""
+            if self.on_observation is not None:
+                self.guard()
+                self.on_observation(ArenaObservation(peer.member.name, snapshot, events))
+                self.guard()
         return all(peer.member.robot.ready is None or peer.ready_qemu_ns is not None
                    for peer in self.peers)
 
@@ -183,7 +203,7 @@ class _Run:
 
 
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
-                 on_response=None, qemu=None, startup_timeout=10.0,
+                 on_response=None, on_observation=None, qemu=None, startup_timeout=10.0,
                  timeout=30.0, referee_period_ns=100_000_000,
                  referee_events=(), can_delays=(), motor_feedback=()) -> ArenaResult:
     """Consume admitted records and return only after all owners are released.
@@ -206,6 +226,10 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     Splitting changes native integration intervals and STEP observations.
     Native public QMP batching bounds each fresh paused CAN observation; liveness
     checks surround the whole group and cannot preempt a blocked callback.
+    on_observation receives each peer's actual post-read snapshot and original
+    UART event list, including empty batches, after emit and readiness handling.
+    It borrows these objects read-only and must not reenter the runtime. A
+    callback failure terminates the run without replaying observations.
     """
     if not isinstance(manifest, ArenaManifest):
         raise TypeError("ArenaManifest is required")
@@ -235,7 +259,8 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
         raise TypeError("referee_period_ns must be an integer")
     if not 1_000_000 <= referee_period_ns <= 60_000_000_000:
         raise ValueError("referee_period_ns must be in 1ms..60s")
-    for callback, label in ((emit, "output sink"), (on_response, "response observer")):
+    for callback, label in ((emit, "output sink"), (on_response, "response observer"),
+                            (on_observation, "observation sink")):
         if callback is not None and not callable(callback):
             raise TypeError(f"Arena {label} must be callable")
     duration = positive_seconds(duration)
@@ -325,7 +350,7 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
                 referees.append(_Referee(item, engine))
         plant = create_arena_plant(manifest)
         started = time.monotonic()
-        run = _Run(started + startup_timeout, started + timeout, emit)
+        run = _Run(started + startup_timeout, started + timeout, emit, on_observation)
         offset = 0
         bindings = []
         for member, uarts, sockets, command in commands:
