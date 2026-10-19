@@ -131,7 +131,7 @@ class Environment:
                                 monotonic_ns=lambda: round(self.clock * 1e9))
         for module in (runtime, shared_world, board_qmp, cosim, rtf):
             monkeypatch.setattr(module, "time", clock)
-        monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select))
+        monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select), raising=False)
 
     def create_plant(self, manifest):
         self.events.append("plant acquire")
@@ -2301,15 +2301,23 @@ def test_absolute_startup_budget_includes_later_launch_connect_and_spawn(environ
 
 
 def test_missing_ready_uses_one_startup_deadline_while_world_continues(environment):
+    def elapsed_qmp(index, name):
+        if name == "qom-get":
+            environment.clock += .0001
+    environment.qmp_callback = elapsed_qmp
     with pytest.raises((TimeoutError, RuntimeError), match="startup|deadline|timeout"):
         environment.run(environment.manifest(ready=("NEVER", None)),
                         startup_timeout=.003, timeout=.01)
     environment.assert_clean()
     assert environment.native.resets == 1 and environment.native.steps
-    assert environment.waits and all(0 < value <= .001 for value in environment.waits)
+    assert environment.waits == []
 
 
 def test_active_deadline_is_not_restarted_after_ready(environment):
+    def elapsed_qmp(index, name):
+        if name == "qom-get":
+            environment.clock += .0001
+    environment.qmp_callback = elapsed_qmp
     environment.uart_chunks = [[b"not yet", b"READY"], []]
     with pytest.raises((TimeoutError, RuntimeError), match="host|deadline|timeout"):
         environment.run(environment.manifest(ready=("READY", None)), duration=.1,
@@ -2317,6 +2325,88 @@ def test_active_deadline_is_not_restarted_after_ready(environment):
     environment.assert_clean()
     assert environment.native.resets == 1 and environment.native.steps
     assert sum(environment.native.steps) < 100_000_000
+
+
+def test_completed_paused_cuts_pump_delayed_uart_and_bounded_child_pipes_without_idle_wait(
+        environment, monkeypatch):
+    environment.uart_chunks = [[b"not", b"RE", b"AD", b"Y"], [b"READY"]]
+    pumps, reads, children, descriptors = [], [], [], {}
+    popen, pump, read = environment.popen, processes.ChildProcess.pump, os.read
+    payload = b"x" * 4096 + b"\xff" + b"tail" * 475
+    def launch(*args, **kwargs):
+        process = popen(*args, **kwargs)
+        for name in ("stdout", "stderr"):
+            pipe = getattr(process, name)
+            descriptors[pipe.fileno()] = len(environment.children) - 1, name
+            assert os.write(pipe.writer, payload) == len(payload)
+            os.close(pipe.writer)
+            pipe.writer = os.open(os.devnull, os.O_WRONLY)
+        return process
+    def bounded_read(fd, maximum):
+        if fd in descriptors:
+            reads.append((descriptors[fd], maximum))
+        return read(fd, maximum)
+    def pump_child(value):
+        before = len(reads)
+        result = pump(value)
+        children.append((value.label, len(reads) - before, frozenset(value.eof)))
+        return result
+    def forbidden_idle(*args):
+        pytest.fail("Arena waited after a completed paused CPU cut")
+    original_pump = runtime._Run.pump
+    def pump_iteration(value):
+        before = tuple(environment.uart_reads), len(children)
+        ready = original_pump(value)
+        pumps.append((tuple(environment.native.steps), before,
+                      tuple(environment.uart_reads), len(children)))
+        assert all(cpu.state in ("idle", "reached") for cpu in environment.cpus.values())
+        return ready
+    monkeypatch.setattr(runtime.subprocess, "Popen", launch)
+    monkeypatch.setattr(processes.os, "read", bounded_read)
+    monkeypatch.setattr(processes.ChildProcess, "pump", pump_child)
+    monkeypatch.setattr(runtime._Run, "pump", pump_iteration)
+    monkeypatch.setattr(runtime, "select", SimpleNamespace(select=forbidden_idle))
+    result = environment.run(environment.manifest(ready=("READY", "READY"), upper=True))
+    environment.assert_clean()
+    assert (result.origin_ns, result.end_ns, result.steps) == (3_000_000, 5_500_000, 6)
+    assert environment.native.steps == [1_000_000] * 5 + [500_000]
+    assert len(pumps) == 8 and environment.uart_reads == [8, 8] and environment.waits == []
+    assert all(after_reads == tuple(count + 1 for count in before[0])
+               and after_children == before[1] + 2
+               for _, before, after_reads, after_children in pumps)
+    for index, child in enumerate(result.children):
+        assert child["stdout"] == child["stderr"] == payload.decode("utf-8", errors="replace")
+        rows = [row for row in children if row[0] == ("east", "west")[index] + "/upper:vision"]
+        assert [row[1] for row in rows] == [2, 2, 2, 0, 0, 0, 0, 0]
+        assert rows[2][2] == frozenset(("stdout", "stderr"))
+    assert len(reads) == 12 and all(maximum == 4096 for _, maximum in reads)
+
+
+@pytest.mark.parametrize("failure", ["child_exit", "uart_eof", "interrupt"])
+def test_completed_paused_cut_next_pump_preserves_terminal_io_and_cleanup(environment, failure):
+    environment.uart_chunks = [[b"waiting"], [b"READY"]]
+    primary = KeyboardInterrupt("next paused-cut observation interrupted")
+    def after_cut(index, name):
+        if index != 0 or name != "qom-get" or not environment.native.steps:
+            return
+        assert all(cpu.state == "reached" for cpu in environment.cpus.values())
+        if failure == "child_exit":
+            environment.children[0].returncode = 0
+        elif failure == "uart_eof":
+            environment.producers[0, "uart7"].shutdown(socket.SHUT_WR)
+        else:
+            raise primary
+    environment.qmp_callback = after_cut
+    with pytest.raises({"child_exit": RuntimeError, "uart_eof": ConnectionError,
+                        "interrupt": KeyboardInterrupt}[failure]) as caught:
+        environment.run(environment.manifest(ready=("READY", "READY"), upper=True))
+    if failure == "interrupt":
+        assert caught.value is primary
+    elif failure == "child_exit":
+        assert "exited early (0)" in str(caught.value)
+    environment.assert_clean()
+    assert environment.native.steps == [1_000_000] and environment.waits == []
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
 
 
 @pytest.mark.parametrize("resource", ["qemu", "upper"])

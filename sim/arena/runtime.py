@@ -7,7 +7,6 @@ establish wall-clock pacing. Any failure requires recreation of the complete run
 """
 
 from dataclasses import dataclass
-import select
 import subprocess
 import time
 
@@ -134,7 +133,7 @@ class _Run:
         self.emit = emit
         self.on_observation = on_observation
         self.startup = True
-        self.peers, self.children, self.readers = [], [], []
+        self.peers, self.children = [], []
 
     def guard(self):
         for child in self.children:
@@ -196,11 +195,6 @@ class _Run:
                 self.guard()
         return all(peer.member.robot.ready is None or peer.ready_qemu_ns is not None
                    for peer in self.peers)
-
-    def wait(self):
-        readers = [*self.readers, *(pipe for child in self.children for pipe in child.readers())]
-        select.select(readers, [], [], min(.001, self.guard()))
-        self.guard()
 
 
 def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
@@ -372,7 +366,6 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             for port in ("cosim", "can1", *uarts):
                 sock = connect_unix(str(owner.sockets[port]), min(2., run.guard()))
                 resources.append((member.name + " " + port, sock))
-                run.readers.append(sock)
                 opened[port] = sock
                 run.guard()
             peer.cosim, peer.can = StepFramedSocket(opened["cosim"]), CanStream(opened["can1"])
@@ -463,15 +456,12 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
             return ready
         while not pump():
             advance(1_000_000, deadline=run.startup_deadline)
-            run.wait()
         origin = runtime.t_sim_ns
         run.startup = False
         target = origin + duration_ns
         while runtime.t_sim_ns < target:
             advance(min(1_000_000, target - runtime.t_sim_ns), deadline=run.deadline)
             pump()
-            if runtime.t_sim_ns < target:
-                run.wait()
         for peer in run.peers:
             run.call(peer, peer.board.pause)
         runtime.service(deadline=run.deadline)
