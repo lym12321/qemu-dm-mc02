@@ -820,6 +820,44 @@ east 的完整改变报告后，通过既有应用握手验证两次原状态刷
 该选项仅用于 Scenario 测试，沿用相同事件、固件及清理检查；入口在测试进程中
 受观测，独立启动的 `python -m sim` 仍按前述普通使用命令运行。
 
+## Trace event storage
+
+`sim.trace` 提供独立的事件文件读写，依赖由 `uv sync --frozen` 安装的 MCAP 1.5.0。
+`TraceEvent` 包含 `timestamp_ns`、`source`、`endpoint`、`event_type`、原始 `payload`
+字节，以及必填的 `clock` 标签。调用者用标签区分 QEMU reset epoch、worker、Fabric
+或 UART 轮询时钟；文件保留追加顺序，允许时间数值下降，不进行跨时钟排序或换算。
+
+```python
+from sim.trace import TraceEvent, TraceWriter, iter_events
+
+with open("events.mcap", "xb") as output:
+    trace = TraceWriter(output)
+    trace.append(TraceEvent(17, "west", "uart7", "uart.rx", b"READY\x00\n",
+                            "qemu:west:reset0:poll"))
+    trace.finish()
+
+with open("events.mcap", "rb") as source:
+    count = sum(1 for _ in iter_events(source))  # 完整遍历才验证文件结尾
+```
+
+当前 `robot-sim/trace/1` profile 只接受无压缩、无 chunk、无索引/summary 的小事件。
+每个非空标签最多 255 UTF-8 字节且不能含 NUL；单事件 payload 最多 65536 字节，
+每文件最多 256 个 `(source, endpoint, event_type, clock)` 组合和 `2**32` 个事件。
+时间使用无符号 64 位纳秒。MCAP topic 是 endpoint，channel metadata 保存其余三个
+标签；message sequence 是从零开始的全局追加序号，log/publish time 均保存原时间。
+这些文件可由标准 MCAP 读取器读取；本读取入口只接受上述 profile。
+依赖包仍会安装锁定的 lz4/zstandard，本 profile 不执行解压缩。
+
+读写器借用 blocking binary stream，不关闭调用者的文件。输入每次读取必须返回所请求的
+完整字节；截断、未知记录、非规范编码、资源超限、尾部多余数据与已提供 CRC 的错误会失败。
+写入器启用 data CRC；按 MCAP 约定，读取时 CRC 值为零表示未提供校验，不能据此验证完整性。
+任何输出或最终 flush 失败后，写入器冻结，不能重试或回滚已写内容；参数拒绝没有输出副作用。
+`finish()` 成功后可重复调用，失败文件由调用者处理。
+
+读取器在完整遍历结束前返回的事件均为暂定结果；后续回放必须先验证整个文件再产生外部副作用。
+此入口尚未自动采集 Arena、Scenario 或固件，也不负责硬件输入回放或调度。UART 事件的
+poll 时间不代表字节实际到达时刻；CAN 原始帧时间与 Fabric 投递时间仍需分别保留。
+
 ## Contents
 
 - [项目范围](#project-scope)
@@ -830,6 +868,7 @@ east 的完整改变报告后，通过既有应用握手验证两次原状态刷
 - [运行固件](#run-firmware)
 - [Robot 配置](#robot-manifest)
 - [裁判帧封装](#referee-protocol)
+- [Trace 事件文件](#trace-event-storage)
 - [Flash 镜像](#flash-images)
 - [串口、QMP 与 GDB](#serial-qmp-and-gdb)
 - [外部仿真 worker](#external-simulation-worker)
