@@ -3359,3 +3359,188 @@ def test_scenario_assertion_observation_cannot_substitute_a_missing_reset_ack(en
         scenario_runtime.run_manifest(scenario, qemu=environment.binary)
     assert environment.native.steps == [] and environment.uart_reads == [1, 0]
     environment.assert_clean()
+
+
+def test_arena_trace_actual_socket_batches_reproduce_member_endpoint_and_split_byte_scope(environment):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace, decode_observation
+    from sim.trace import TraceWriter, iter_events
+
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"),
+                                 referees={"east": referee_configuration()})
+    environment.uart_port_chunks = {
+        (0, "uart1"): [b"READYhel", b"lo"], (0, "uart7"): [b"lo"],
+        (1, "uart1"): [b"READYlo", b"hel"],
+    }
+    clocks = {"east": "qemu:east:run7", "west": "qemu:west:run2"}
+    output, origins, original = BytesIO(), {}, []
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks=clocks)
+    def response(name, frame, decoded):
+        if frame.header.kind == runtime.codec.RESET_ACK:
+            assert name not in origins
+            origins[name] = decoded.virtual_time_ns
+    def observe(item):
+        sink(item)
+        original.append(item)
+    result = environment.run(arena, on_response=response, on_observation=observe)
+    environment.assert_clean()
+    assert origins == {"east": 1000, "west": 2000}
+    writer.finish()  # Caller finishes only after successful Arena cleanup.
+    recorded = list(iter_events(BytesIO(output.getvalue())))  # Validate EOF before replay.
+    batches = [decode_observation(event, clocks=clocks) for event in recorded]
+    assert batches == original
+    assert len(batches) == sum(board.observation_batches for board in result.boards)
+    assert [event.source for event in recorded] == ["east", "west"] * 5
+    assert [event.clock for event in recorded] == [clocks["east"], clocks["west"]] * 5
+    experiments = {member.name: LabExperiment(LabManifest(
+        arena.path, member.name, "dm-mc02", member.robot.board.firmware, 2_500_000, (),
+        (Assertion(1_500_000, "uart1", "uart_contains", b"hello"),)), origins[member.name])
+        for member in arena.robots}
+    history = []
+    for item in batches:
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"], experiment.status,
+                        [(event.endpoint, event.timestamp_ns, event.data) for event in item.events]))
+    assert history[:4] == [
+        ("east", 1000, ("pending",), [("uart1", 1000, b"READYhel"), ("uart7", 1000, b"lo")]),
+        ("west", 2000, ("pending",), [("uart1", 2000, b"READYlo")]),
+        ("east", 1_001_000, ("pass",), [("uart1", 1_001_000, b"lo")]),
+        ("west", 1_002_000, ("pending",), [("uart1", 1_002_000, b"hel")]),
+    ]
+    for board in result.boards:
+        experiments[board.name].finish(board.end_qemu_ns)
+    assert experiments["east"].all_passed and experiments["west"].status == ("fail",)
+    assert any(not item.events for item in batches) and not output.closed
+
+
+def test_arena_trace_preserves_actual_postread_upper_bound_separate_from_poll(environment, monkeypatch):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace, decode_observation
+    from sim.trace import TraceWriter, iter_events
+
+    arena = environment.manifest()
+    environment.uart_chunks = [[b"OK"], [b"OK"]]
+    command = environment.command
+    def postread(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get" and environment.uart_reads[index]:
+            value["timestamp_ns"] += 50
+        return value
+    monkeypatch.setattr(environment, "command", postread)
+    clocks = {"east": "qemu:east:run0", "west": "qemu:west:run0"}
+    output, origins = BytesIO(), {}
+    writer = TraceWriter(output)
+    def response(name, frame, decoded):
+        if frame.header.kind == runtime.codec.RESET_ACK:
+            origins[name] = decoded.virtual_time_ns
+    environment.run(arena, on_response=response,
+                    on_observation=ArenaTrace(writer, clocks=clocks))
+    environment.assert_clean()
+    writer.finish()
+    recorded = list(iter_events(BytesIO(output.getvalue())))
+    batches = [decode_observation(event, clocks=clocks) for event in recorded]
+    assert [(item.name, item.snapshot["timestamp_ns"],
+             [(event.timestamp_ns, event.data) for event in item.events]) for item in batches[:2]] == [
+        ("east", 1050, [(1000, b"OK")]), ("west", 2050, [(2000, b"OK")])]
+    experiments = {member.name: LabExperiment(LabManifest(
+        arena.path, member.name, "dm-mc02", member.robot.board.firmware, 2_500_000, (),
+        (Assertion(50, "uart1", "uart_contains", b"OK"),)), origins[member.name])
+        for member in arena.robots}
+    for item in batches:
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        assert experiment.status == ("fail",)  # Poll is before deadline; actual bound is at it.
+
+
+def test_arena_trace_empty_batches_preserve_terminal_expiry_and_sampled_gpio(environment, monkeypatch):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace, decode_observation
+    from sim.trace import TraceWriter, iter_events
+
+    arena = environment.manifest()
+    environment.uart_chunks = [[b"hel", b"", b"hello"], [b"hello"]]
+    command = environment.command
+    def digital_state(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get":
+            value["gpio"]["A"].update(sampled=index, odr=1 - index, output_mask=1)
+        return value
+    monkeypatch.setattr(environment, "command", digital_state)
+    clocks = {"east": "qemu:east:reset0", "west": "qemu:west:reset0"}
+    output, origins = BytesIO(), {}
+    writer = TraceWriter(output)
+    def response(name, frame, decoded):
+        if frame.header.kind == runtime.codec.RESET_ACK:
+            origins[name] = decoded.virtual_time_ns
+    result = environment.run(arena, on_response=response,
+                             on_observation=ArenaTrace(writer, clocks=clocks))
+    environment.assert_clean()
+    writer.finish()
+    recorded = list(iter_events(BytesIO(output.getvalue())))
+    batches = [decode_observation(event, clocks=clocks) for event in recorded]
+    experiments = {member.name: LabExperiment(LabManifest(
+        arena.path, member.name, "dm-mc02", member.robot.board.firmware, 2_500_000, (),
+        (Assertion(1_000_000, "uart1", "uart_contains", b"hello"),
+         Assertion(1_000_000, "gpio.A0", "digital_equals", 1))), origins[member.name])
+        for member in arena.robots}
+    history = []
+    for item in batches:
+        experiment = experiments[item.name]
+        experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"], experiment.status,
+                        tuple(event.data for event in item.events)))
+    assert history[:6] == [
+        ("east", 1000, ("pending", "pending"), (b"hel",)),
+        ("west", 2000, ("pass", "pass"), (b"hello",)),
+        ("east", 1_001_000, ("fail", "fail"), ()),
+        ("west", 1_002_000, ("pass", "pass"), ()),
+        ("east", 2_001_000, ("fail", "fail"), (b"hello",)),
+        ("west", 2_002_000, ("pass", "pass"), ()),
+    ]
+    assert batches[0].snapshot["gpio"]["A"] == {
+        "moder": 0, "sampled": 0, "odr": 1, "output_mask": 1}
+    for board in result.boards:
+        assert experiments[board.name].finish(board.end_qemu_ns) == experiments[board.name].status
+    assert len(experiments["east"].failures) == 2 and experiments["west"].all_passed
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["output-error", "output-interrupt"])
+def test_arena_trace_actual_output_failure_keeps_primary_cleans_all_and_never_replays(environment, interrupt):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace
+    from sim.trace import TraceWriter
+
+    primary = KeyboardInterrupt("trace sink interrupted") if interrupt else OSError("trace sink failed")
+    class Output(BytesIO):
+        failure = False
+        writes = 0
+        def write(self, data):
+            self.writes += 1
+            if self.failure:
+                raise primary
+            return super().write(data)
+    output = Output()
+    writer = TraceWriter(output)
+    sink = ArenaTrace(writer, clocks={"east": "qemu:east:run0", "west": "qemu:west:run0"})
+    output.failure = True
+    environment.uart_chunks = [[b"one"], [b"two"]]
+    environment.world_close_failure = OSError("trace world cleanup failed")
+    environment.close_failures = {"peer0 uart1", "peer1 qmp"}
+    emitted = []
+    with pytest.raises(type(primary)) as caught:
+        environment.run(environment.manifest(upper=True), emit=emitted.append, on_observation=sink)
+    assert caught.value is primary
+    assert [(item.name, item.event.data) for item in emitted] == [("east", b"one")]
+    assert environment.uart_reads == [1, 0] and environment.native.steps == []
+    assert all(not cpu.requests for cpu in environment.cpus.values())
+    notes = "\n".join(primary.__notes__)
+    assert all(label in notes for label in ("world cleanup", "uart1", "qmp"))
+    environment.assert_clean()
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
+    stopped = output.getvalue(), output.writes
+    output.failure = False
+    with pytest.raises(RuntimeError):
+        sink(runtime.ArenaObservation("east", snapshot(1000), []))
+    assert (output.getvalue(), output.writes) == stopped and not output.closed

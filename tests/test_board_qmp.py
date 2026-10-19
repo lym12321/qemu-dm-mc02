@@ -11,7 +11,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim.boards import (
     QemuBoard, drain_paused_can, observe_initial_paused_can, validate_gpio_pin,
-    wait_paused_can_input,
+    validate_snapshot, wait_paused_can_input,
 )
 from sim.transports.can_stream import CanStream
 
@@ -59,6 +59,8 @@ def test_literal_snapshot_and_digital_aliases_preserve_native_fields():
     qmp = Qmp()
     board = QemuBoard(qmp)
     before = deepcopy(qmp.value)
+    assert validate_snapshot(qmp.value) is qmp.value
+    assert qmp.commands == []
     state = board.snapshot()
     assert state is qmp.value
     assert state == before
@@ -144,6 +146,8 @@ def test_missing_native_field_and_supplied_snapshot_are_validated():
     board = QemuBoard(qmp)
     state = native_state()
     del state["gpio"]["B"]["sampled"]
+    with pytest.raises(ValueError, match="gpio.B.sampled"):
+        validate_snapshot(state)
     with pytest.raises(ValueError, match="gpio.B.sampled"):
         board.digital("gpio.B0", state)
     assert qmp.commands == []

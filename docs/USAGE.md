@@ -855,8 +855,46 @@ with open("events.mcap", "rb") as source:
 `finish()` 成功后可重复调用，失败文件由调用者处理。
 
 读取器在完整遍历结束前返回的事件均为暂定结果；后续回放必须先验证整个文件再产生外部副作用。
-此入口尚未自动采集 Arena、Scenario 或固件，也不负责硬件输入回放或调度。UART 事件的
+存储层不负责硬件输入回放或调度。UART 事件的
 poll 时间不代表字节实际到达时刻；CAN 原始帧时间与 Fabric 投递时间仍需分别保留。
+
+可把 `ArenaTrace` 接到 Arena 的现有观察回调，记录实际快照及 UART 批次：
+
+```python
+from sim.arena.manifest import load_manifest
+from sim.arena.runtime import run_manifest
+from sim.arena.trace import ArenaTrace, decode_observation
+from sim.trace import TraceWriter, iter_events
+
+arena = load_manifest("arena.yaml")
+# 为实际 manifest 的所有成员填写独立的 QEMU clock/epoch 标签。
+clocks = {member.name: f"qemu:{member.name}:run1:reset0" for member in arena.robots}
+with open("observations.mcap", "xb") as output:
+    trace = TraceWriter(output)
+    result = run_manifest(arena, on_observation=ArenaTrace(trace, clocks=clocks))
+    trace.finish()  # runtime 成功且清理完成后，再完成文件
+
+# 仅适合可装入内存的小文件；完整读取成功后，再交给观察消费者。
+with open("observations.mcap", "rb") as source:
+    stored = list(iter_events(source))
+observations = [decode_observation(event, clocks=clocks) for event in stored]
+```
+
+每次回调保存一条 `arena.observation/1` 事件，source 是成员名，endpoint 为
+`observation`，时间是实际读后快照的 QEMU 时间。payload 使用紧凑 ASCII JSON，
+包含完整 `snapshot` 和有序 `events`；每项保存 `endpoint`、轮询 `timestamp_ns`
+及标准 base64 `data_base64`。原生 JSON 扩展字段保留，空批次也保存，便于重现断言到期。
+单批最多包含六个不同的受支持 UART，每项 1–4096 字节，完整 payload 不超过 65536
+字节。解码入口验证该紧凑表示、快照、时间和 UART 数据；它不接受任意 JSON 表示。
+
+适配器复制并校验非空成员到时钟的字典，要求各标签不同；调用者负责成员覆盖及 reset
+epoch 的真实性。它不查询 manifest、不推断 RESET 原点，也不排序或换算时钟。任何
+回调失败会冻结适配器并由 Arena 执行原有清理；已消耗的观察和已写字节不能重试或回滚。
+调用者拥有 writer 和文件。文件完成只说明容器完整，不证明应用断言成功。
+
+这是 Arena 实际已打开 UART 与板级快照的观察记录；CAN、world、输入动作和 RESET_ACK
+不在其中。离线断言仍需另行保留原始 RESET_ACK 原点与实验配置。当前没有 Scenario/CLI
+自动记录、完整系统 trace 或硬件回放调度器。
 
 ## Contents
 

@@ -37,7 +37,7 @@ def _field(value: dict, name: str, path: str):
     return value[name]
 
 
-def _snapshot(value) -> dict:
+def validate_snapshot(value) -> dict:
     """Validate schema 1 in place; preserve the native object and extra fields."""
     state = _object(value, "board-state")
     schema = _field(state, "schema", "board-state")
@@ -86,7 +86,7 @@ def _digital_pin(endpoint: str) -> str | None:
 def digital_level(endpoint: str, snapshot: dict) -> int:
     """Project an admitted native snapshot without QMP or hardware state."""
     pin = _digital_pin(endpoint)
-    state = _snapshot(snapshot)
+    state = validate_snapshot(snapshot)
     if pin is not None:
         return (state["gpio"][pin[0]]["sampled"] >> int(pin[1:])) & 1
     if endpoint == "key":
@@ -430,7 +430,7 @@ class QemuBoard:
 
     def snapshot(self) -> dict:
         """Return the validated native board-state object without caching it."""
-        return _snapshot(self._command("qom-get", {
+        return validate_snapshot(self._command("qom-get", {
             "path": "/machine", "property": "board-state",
         }))
 
