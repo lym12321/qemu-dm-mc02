@@ -7,8 +7,8 @@ from typing import TYPE_CHECKING
 from sim.arena.manifest import ArenaManifest
 from sim.manifest import MAX_TIME_NS
 from sim.scenario.manifest import (
-    ScenarioAssertion, ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback,
-    ScenarioReferee,
+    ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback,
+    ScenarioReferee, validate_assertions,
 )
 
 if TYPE_CHECKING:
@@ -24,16 +24,12 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     requested ready markers, exactly as in the referenced Arena.
     Typed records are projected in caller order; Arena owns their numeric and
     topology admission, scheduling, and all resource effects.
-    Nonempty assertions require a later execution boundary and are explicitly
-    refused before importing the Arena runtime or acquiring resources.
+    Scoped assertions reuse LabExperiment with each member's actual initial
+    RESET_ACK time. Startup and empty post-read observation batches count;
+    success requires all assertions and the original Arena cleanup to complete.
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
-    if (type(manifest.assertions) is not tuple
-            or any(type(item) is not ScenarioAssertion for item in manifest.assertions)):
-        raise TypeError("Scenario assertions require a plain ScenarioAssertion tuple")
-    if manifest.assertions:
-        raise NotImplementedError("Scenario assertions are admitted but execution is not supported yet")
     if (type(manifest.motor_feedback) is not tuple
             or any(type(item) is not ScenarioMotorFeedback for item in manifest.motor_feedback)):
         raise TypeError("Scenario motor_feedback require a plain ScenarioMotorFeedback tuple")
@@ -54,6 +50,7 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
         raise TypeError("Scenario duration_ns must be a plain integer")
     if not 1 <= manifest.duration_ns <= MAX_TIME_NS:
         raise ValueError("Scenario duration_ns must be in 1ns..3600s")
+    validate_assertions(manifest.assertions, arena=manifest.arena, duration_ns=manifest.duration_ns)
     if (type(manifest.referees) is not tuple
             or any(type(item) is not ScenarioReferee for item in manifest.referees)):
         raise TypeError("Scenario referees require a plain ScenarioReferee tuple")
@@ -69,11 +66,63 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     if feedback:
         can_options["motor_feedback"] = feedback
 
+    experiments = {}
+    if manifest.assertions:
+        # Do not hide an invalid caller callback behind the response wrapper.
+        for callback, label in ((emit, "output sink"), (on_response, "response observer")):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"Arena {label} must be callable")
+
+        from sim.lab.experiment import LabExperiment
+        from sim.lab.manifest import LabManifest
+        from sim.transports import step_codec as codec
+
+        grouped = {}
+        for item in manifest.assertions:
+            grouped.setdefault(item.member, []).append(item.assertion)
+        labs = {member.name: LabManifest(manifest.path, member.name, "dm-mc02",
+                    member.robot.board.firmware, manifest.duration_ns, (), tuple(grouped[member.name]))
+                for member in manifest.arena.robots if member.name in grouped}
+
+        def response(name, frame, decoded):
+            if name in labs and frame.header.kind == codec.RESET_ACK:
+                if name in experiments:
+                    raise RuntimeError(f"Scenario member {name!r} received another RESET_ACK")
+                experiments[name] = LabExperiment(labs[name], decoded.virtual_time_ns)
+            if on_response is not None:
+                on_response(name, frame, decoded)
+
+        def observe(item):
+            if item.name not in labs:
+                return
+            if item.name not in experiments:
+                raise RuntimeError(f"Scenario member {item.name!r} has no RESET_ACK origin")
+            experiment = experiments[item.name]
+            experiment.observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+            if experiment.failures:
+                raise RuntimeError(f"Scenario member {item.name!r}: " + "; ".join(experiment.failures))
+
+        can_options["on_observation"] = observe
+
     from sim.arena.runtime import run_manifest as run_arena
 
     # The bounded binary64 round trip has <0.000472ns error; Arena's existing
     # round(seconds * 1e9) recovers every admitted integer nanosecond duration.
-    return run_arena(manifest.arena, duration=manifest.duration_ns / 1_000_000_000,
-        referee_events=batches, emit=emit, on_response=on_response, qemu=qemu,
+    result = run_arena(manifest.arena, duration=manifest.duration_ns / 1_000_000_000,
+        referee_events=batches, emit=emit,
+        on_response=response if manifest.assertions else on_response, qemu=qemu,
         startup_timeout=startup_timeout, timeout=timeout,
         referee_period_ns=referee_period_ns, **can_options)
+    if manifest.assertions:
+        boards = {board.name: board for board in result.boards}
+        for name in labs:
+            if name not in experiments or name not in boards:
+                raise RuntimeError(f"Scenario member {name!r} lacks final assertion observations")
+            experiment = experiments[name]
+            if (boards[name].reset_qemu_ns != experiment.origin_ns
+                    or not boards[name].observation_batches):
+                raise RuntimeError(f"Scenario member {name!r} has inconsistent assertion observations")
+            experiment.finish(boards[name].end_qemu_ns)
+            if not experiment.all_passed:
+                raise RuntimeError(f"Scenario member {name!r}: " + "; ".join(experiment.failures))
+    return result

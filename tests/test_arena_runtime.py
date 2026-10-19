@@ -913,18 +913,17 @@ def test_scenario_motor_feedback_structure_rejects_before_runtime_import_and_eff
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
-@pytest.mark.parametrize("kind", ["typed", "list", "tuple-subclass", "foreign-record", "record-subclass"])
-def test_scenario_assertions_refuse_before_runtime_import_or_resource_effects(environment, monkeypatch, kind):
+@pytest.mark.parametrize("kind", ["list", "tuple-subclass", "foreign-record", "record-subclass",
+    "foreign-assertion", "member-subclass", "deadline-bool", "deadline-zero", "after-duration",
+    "uart-encoding", "uart-empty", "uart-limit", "digital-bool", "can-kind", "unknown-member",
+    "unopened-uart", "quota", "emit", "on_response"])
+def test_scenario_assertion_preflight_rejects_before_runtime_import_or_resource_effects(environment, monkeypatch, kind):
     from sim.scenario import ScenarioAssertion
 
     arena = environment.manifest()
-    path = environment.directory / "assertions.yaml"
-    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms", "assertions": [
-        {"member": "west", "before": "1ms", "uart_contains": {"endpoint": "uart1", "text": "READY"}}]}),
-        encoding="utf-8")
-    manifest = load_scenario(path)
-    entry, = manifest.assertions
-    assertions = manifest.assertions
+    entry = ScenarioAssertion("west", Assertion(1_000_000, "uart1", "uart_contains", b"READY"))
+    assertions = (entry,)
+    options = {}
     if kind == "list":
         assertions = []
     elif kind == "tuple-subclass":
@@ -936,20 +935,66 @@ def test_scenario_assertions_refuse_before_runtime_import_or_resource_effects(en
         assertions = (entry, Foreign())
     elif kind == "record-subclass":
         assertions = (type("AssertionSubclass", (ScenarioAssertion,), {})(entry.member, entry.assertion),)
-    manifest = replace(manifest, assertions=assertions)
+    elif kind == "foreign-assertion":
+        assertions = (replace(entry, assertion=SimpleNamespace(**vars(entry.assertion))),)
+    elif kind == "member-subclass":
+        assertions = (replace(entry, member=type("Member", (str,), {})("west")),)
+    elif kind.startswith("deadline-") or kind == "after-duration":
+        assertions = (replace(entry, assertion=replace(entry.assertion, before_ns={
+            "deadline-bool": True, "deadline-zero": 0, "after-duration": 1_000_001}[kind])),)
+    elif kind.startswith("uart-"):
+        assertions = (replace(entry, assertion=replace(entry.assertion, value={
+            "uart-encoding": b"\xff", "uart-empty": b"", "uart-limit": b"x" * 4097}[kind])),)
+    elif kind == "digital-bool":
+        assertions = (replace(entry, assertion=Assertion(1, "gpio.A0", "digital_equals", True)),)
+    elif kind == "can-kind":
+        assertions = (replace(entry, assertion=Assertion(1, "can1", "can_seen", object())),)
+    elif kind == "unknown-member":
+        assertions = (replace(entry, member="missing"),)
+    elif kind == "unopened-uart":
+        assertions = (replace(entry, assertion=replace(entry.assertion, endpoint="uart7")),)
+    elif kind == "quota":
+        assertions *= 1025
+    else:
+        options[kind] = 1
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (),
+                                assertions=assertions)
     original_import = builtins.__import__
     def forbid_import(name, *args, **kwargs):
         if name == "sim.arena.runtime":
-            pytest.fail("admission-only assertions reached the Arena runtime import")
+            pytest.fail("invalid assertion input reached the Arena runtime import")
         return original_import(name, *args, **kwargs)
     monkeypatch.setattr(builtins, "__import__", forbid_import)
-    error = NotImplementedError if kind == "typed" else TypeError
-    message = ("Scenario assertions are admitted but execution is not supported yet"
-               if kind == "typed" else "Scenario assertions require a plain ScenarioAssertion tuple")
-    with pytest.raises(error, match=message):
-        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
+    with pytest.raises((TypeError, ValueError)):
+        scenario_runtime.run_manifest(manifest, qemu=object(), **options)
     assert environment.events == [] and environment.owners == [] and environment.launches == []
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_scenario_assertion_typed_validator_reuses_pure_lab_parser_without_changing_records(environment, monkeypatch):
+    from sim.lab import parse_assertion
+    from sim.scenario import ScenarioAssertion
+    from sim.scenario import manifest as scenario
+
+    arena = environment.manifest()
+    records = (ScenarioAssertion("east", Assertion(1_000_000, "uart1", "uart_contains", b"\xc3\xa9" * 2048)),
+               ScenarioAssertion("west", Assertion(1, "gpio.H15", "digital_equals", 1)))
+    assert scenario_runtime.validate_assertions is scenario.validate_assertions
+    calls = []
+    def parse(value, index):
+        calls.append((index, value))
+        return parse_assertion(value, index)
+    def forbidden(*args, **kwargs):
+        pytest.fail("typed assertion validation acquired IO")
+    monkeypatch.setattr(scenario, "parse_assertion", parse)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(Path, "open", forbidden)
+    assert scenario.validate_assertions(records, arena=arena, duration_ns=1_000_000) is None
+    assert calls == [(0, {"before": "1000000ns", "uart_contains": {"endpoint": "uart1", "text": "é" * 2048}}),
+                     (1, {"before": "1ns", "digital_equals": {"endpoint": "gpio.H15", "value": 1}})]
+    assert records[0].assertion.value == b"\xc3\xa9" * 2048 and records[1].assertion.before_ns == 1
+    assert environment.events == [] and environment.plant is None
 
 
 def test_arena_launch_borrows_the_public_member_uart_profile(environment, monkeypatch):
@@ -2969,4 +3014,258 @@ def test_arena_observation_postcallback_guard_stops_before_later_peer_and_world_
     assert len(calls) == 1 and calls[0].name == "east" and calls[0].events == []
     assert environment.uart_reads == [1, 0] and environment.native.steps == []
     assert all(not cpu.requests for cpu in environment.cpus.values())
+    environment.assert_clean()
+
+
+@pytest.fixture
+def admitted_assertion_scenario(environment):
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"))
+    path = environment.directory / "assertions.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "2500us", "assertions": [
+        {"member": "west", "before": "1500us", "uart_contains": {"endpoint": "uart1", "text": "world"}},
+        {"member": "east", "before": "1500us", "uart_contains": {"endpoint": "uart1", "text": "hello"}},
+        {"member": "east", "before": "1ns", "digital_equals": {"endpoint": "gpio.A0", "value": 1}}]}),
+        encoding="utf-8")
+    return load_scenario(path)
+
+
+@pytest.mark.parametrize("via_cli", [False, True], ids=["api", "cli"])
+def test_loaded_scenario_assertions_use_reset_epochs_and_actual_startup_batches(
+        environment, monkeypatch, admitted_assertion_scenario, via_cli, capsys):
+    scenario = admitted_assertion_scenario
+    environment.uart_chunks = [[b"he", b"llo", b"READY"], [b"wo", b"rld", b"READY"]]
+    monkeypatch.setattr(runtime, "Session", lambda session_id: Session(session_id, 500))
+    command = environment.command
+    def digital_state(index, name, arguments=None):
+        state = command(index, name, arguments)
+        if name == "qom-get" and arguments.get("property") == "board-state":
+            state["gpio"]["A"].update(sampled=1, odr=0, output_mask=1)
+        return state
+    monkeypatch.setattr(environment, "command", digital_state)
+    experiments, observations, finishes, responses, results = {}, [], [], [], []
+    current = None
+    initialize, observe, finish = LabExperiment.__init__, LabExperiment.observe, LabExperiment.finish
+    def initialize_lab(value, manifest, origin_ns):
+        initialize(value, manifest, origin_ns)
+        assert manifest.stimulus == ()
+        experiments[origin_ns] = value
+    def observe_lab(value, state, events, upper_bound):
+        assert current is not None and state is current.snapshot and events is current.events
+        assert upper_bound == state["timestamp_ns"]
+        observe(value, state, events, upper_bound)
+        observations.append((current.name, upper_bound, value.status, tuple(event.data for event in events)))
+    def finish_lab(value, timestamp):
+        environment.assert_clean()
+        finishes.append((value.origin_ns, timestamp))
+        return finish(value, timestamp)
+    monkeypatch.setattr(LabExperiment, "__init__", initialize_lab)
+    monkeypatch.setattr(LabExperiment, "observe", observe_lab)
+    monkeypatch.setattr(LabExperiment, "finish", finish_lab)
+    run_arena = runtime.run_manifest
+    def lower(actual, **options):
+        nonlocal current
+        response, observation = options["on_response"], options["on_observation"]
+        def on_response(*item):
+            responses.append(item)
+            response(*item)
+        def on_observation(item):
+            nonlocal current
+            current = item
+            observation(item)
+        options.update(on_response=on_response, on_observation=on_observation)
+        result = run_arena(actual, **options)
+        results.append(result)
+        return result
+    monkeypatch.setattr(runtime, "run_manifest", lower)
+    if via_cli:
+        from sim import cli
+        report, write = environment.directory / "assertion-report.json", Path.write_text
+        def report_after_cleanup(path, *args, **kwargs):
+            if path == report:
+                environment.assert_clean()
+                assert len(finishes) == 2
+                environment.events.append("assertion report write")
+            return write(path, *args, **kwargs)
+        monkeypatch.setattr(Path, "write_text", report_after_cleanup)
+        assert cli.main(["scenario", "run", str(scenario.path), "--qemu", str(environment.binary),
+                         "--report", str(report)]) == 0
+        assert json.loads(report.read_text())["status"] == "passed"
+        assert environment.events[-1] == "assertion report write"
+        assert "passed" in capsys.readouterr().out
+        result, = results
+    else:
+        seen = []
+        scenario.path.unlink()
+        scenario.arena.path.unlink()
+        result = scenario_runtime.run_manifest(scenario, qemu=environment.binary,
+                                               on_response=lambda *items: seen.append(items))
+        assert result is results[0] and len(seen) == len(responses)
+        assert all(all(left is right for left, right in zip(a, b)) for a, b in zip(seen, responses))
+    environment.assert_clean()
+    assert sorted(experiments) == [1000, 2000]
+    assert all(value.all_passed for value in experiments.values())
+    assert [(name, decoded.virtual_time_ns) for name, frame, decoded in responses if frame.header.kind == 5] == [
+        ("east", 1000), ("west", 2000)]
+    assert [board.ready_qemu_ns for board in result.boards] == [2_001_000, 2_002_000]
+    assert observations[:4] == [("east", 1000, ("pending", "pass"), (b"he",)),
+                                ("west", 2000, ("pending",), (b"wo",)),
+                                ("east", 1_001_000, ("pass", "pass"), (b"llo",)),
+                                ("west", 1_002_000, ("pass",), (b"rld",))]
+    assert any(not events for _, _, _, events in observations)
+    assert len(observations) == sum(board.observation_batches for board in result.boards)
+    assert sorted(finishes) == [(1000, 4_501_000), (2000, 4_502_000)]
+    assert (result.origin_ns, result.end_ns, result.steps) == (2_000_500, 4_500_500, 5)
+
+
+@pytest.mark.parametrize("failure", ["postread", "empty", "scope", "endpoint", "gpio"])
+def test_scenario_assertion_failure_stops_at_first_real_boundary_and_cleans(
+        environment, monkeypatch, failure):
+    from sim.scenario import ScenarioAssertion
+
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"),
+                                 referees={"east": referee_configuration()})
+    environment.uart_port_chunks = {(0, "uart1"): [b"READY"], (0, "uart7"): [], (1, "uart1"): [b"READY"]}
+    entry = ScenarioAssertion("west" if failure == "scope" else "east",
+        Assertion(50 if failure == "postread" else 1_000_000, "uart1", "uart_contains", b"OK"))
+    if failure == "postread":
+        environment.uart_port_chunks[0, "uart1"] = [b"READYOK"]
+    elif failure == "scope":
+        environment.uart_port_chunks[0, "uart1"] = [b"READYOK"]
+    elif failure == "endpoint":
+        environment.uart_port_chunks[0, "uart7"] = [b"OK"]
+    elif failure == "gpio":
+        entry = replace(entry, assertion=Assertion(1_000_000, "gpio.A0", "digital_equals", 1))
+    command = environment.command
+    def state(index, name, arguments=None):
+        value = command(index, name, arguments)
+        if name == "qom-get" and arguments.get("property") == "board-state":
+            if failure == "postread" and environment.uart_reads[index]:
+                value["timestamp_ns"] += 50
+            if failure == "gpio":
+                value["gpio"]["A"].update(sampled=0, odr=1, output_mask=1)
+        return value
+    monkeypatch.setattr(environment, "command", state)
+    scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 2_500_000, (), assertions=(entry,))
+    with pytest.raises(RuntimeError, match=entry.member + ".*did not match before"):
+        scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    environment.assert_clean()
+    assert environment.native.steps == ([] if failure == "postread" else [1_000_000])
+    if failure == "postread":
+        assert environment.snapshots[0][-1][0] == 1000
+        assert environment.uart_port_reads == {(0, "uart1"): 1, (0, "uart7"): 1}
+    else:
+        assert environment.uart_port_reads == {(0, "uart1"): 2, (0, "uart7"): 2,
+                                               (1, "uart1"): 2 if failure == "scope" else 1}
+
+
+@pytest.mark.parametrize("callback,interrupt", [("emit", False), ("on_response", True)])
+def test_scenario_assertion_callback_primary_survives_independent_cleanup(
+        environment, admitted_assertion_scenario, callback, interrupt):
+    primary = KeyboardInterrupt("assertion response interrupted") if interrupt else OSError("assertion emit failed")
+    environment.world_close_failure = OSError("assertion world cleanup failed")
+    environment.close_failures = {"peer0 uart1", "peer1 qmp"}
+    environment.owner_failures = {0: OSError("assertion harness cleanup failed")}
+    environment.uart_chunks = [[b"helloREADY"], [b"worldREADY"]]
+    calls = []
+    def failed(*items):
+        calls.append(items)
+        raise primary
+    with pytest.raises(type(primary)) as caught:
+        scenario_runtime.run_manifest(admitted_assertion_scenario, qemu=environment.binary, **{callback: failed})
+    assert caught.value is primary and len(calls) == 1
+    assert environment.native.steps == []
+    environment.assert_clean()
+    notes = "\n".join(primary.__notes__)
+    assert all(label in notes for label in ("world cleanup", "uart1", "qmp", "harness cleanup"))
+
+
+@pytest.mark.parametrize("violation", ["deadline", "child_exit"])
+def test_scenario_assertion_callback_guard_stops_before_observation_or_world_step(
+        environment, violation):
+    from sim.scenario import ScenarioAssertion
+
+    arena = environment.manifest(upper=True)
+    scenario = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (), assertions=(
+        ScenarioAssertion("east", Assertion(1_000_000, "uart1", "uart_contains", b"OK")),))
+    environment.uart_chunks = [[b"OK"], []]
+    calls = []
+    def emit(item):
+        calls.append(item)
+        if violation == "deadline":
+            environment.clock += 4
+        else:
+            environment.children[0].returncode = 0
+    with pytest.raises(TimeoutError if violation == "deadline" else RuntimeError,
+                       match="startup deadline expired|exited early \\(0\\)"):
+        scenario_runtime.run_manifest(scenario, qemu=environment.binary, emit=emit, startup_timeout=1, timeout=3)
+    assert len(calls) == 1 and environment.uart_reads == [1, 0] and environment.native.steps == []
+    environment.assert_clean()
+
+
+def test_scenario_assertion_cli_reports_failure_only_after_cleanup(environment, monkeypatch, capsys):
+    from sim import cli
+
+    arena = environment.manifest()
+    path, report = environment.directory / "failure.yaml", environment.directory / "failure-report.json"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms", "assertions": [
+        {"member": "east", "before": "1ms", "uart_contains": {"endpoint": "uart1", "text": "missing"}}]}),
+        encoding="utf-8")
+    write = Path.write_text
+    def after_cleanup(path, *args, **kwargs):
+        if path == report:
+            environment.assert_clean()
+            environment.events.append("failed assertion report write")
+        return write(path, *args, **kwargs)
+    monkeypatch.setattr(Path, "write_text", after_cleanup)
+    assert cli.main(["scenario", "run", str(path), "--qemu", str(environment.binary), "--report", str(report)]) == 1
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed" and payload["error_type"] == "RuntimeError"
+    assert "east" in payload["error"] and "did not match before" in payload["error"]
+    assert environment.events[-1] == "failed assertion report write"
+    output = capsys.readouterr()
+    assert "passed" not in output.out and "did not match before" in output.err
+
+
+@pytest.mark.parametrize("missing", ["board", "reset", "batch", "duration"])
+def test_scenario_assertion_final_gate_requires_real_completed_board_evidence(environment, monkeypatch, missing):
+    from sim.scenario import ScenarioAssertion
+
+    environment.uart_chunks = [[b"OK"], []]
+    scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 1_000_000, (),
+        assertions=(ScenarioAssertion("east", Assertion(1_000_000, "uart1", "uart_contains", b"OK")),))
+    run_arena, results = runtime.run_manifest, []
+    def lower(actual, **options):
+        result = run_arena(actual, **options)
+        environment.assert_clean()
+        results.append(result)
+        east, west = result.boards
+        if missing == "board":
+            return replace(result, boards=(west,))
+        change = {"reset": {"reset_qemu_ns": 1001}, "batch": {"observation_batches": 0},
+                  "duration": {"end_qemu_ns": 1000}}[missing]
+        return replace(result, boards=(replace(east, **change), west))
+    monkeypatch.setattr(runtime, "run_manifest", lower)
+    message = "simulation time must not decrease" if missing == "duration" else "lacks final|inconsistent"
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    assert len(results) == 1 and environment.native.steps == [1_000_000]
+    environment.assert_clean()
+
+
+def test_scenario_assertion_observation_cannot_substitute_a_missing_reset_ack(environment, monkeypatch):
+    from sim.scenario import ScenarioAssertion
+
+    environment.uart_chunks = [[b"OK"], []]
+    scenario = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(), 1_000_000, (),
+        assertions=(ScenarioAssertion("east", Assertion(1_000_000, "uart1", "uart_contains", b"OK")),))
+    run_arena = runtime.run_manifest
+    def lower(actual, **options):
+        response = options["on_response"]
+        options["on_response"] = lambda name, frame, decoded: (
+            None if name == "east" and frame.header.kind == 5 else response(name, frame, decoded))
+        return run_arena(actual, **options)
+    monkeypatch.setattr(runtime, "run_manifest", lower)
+    with pytest.raises(RuntimeError, match="east.*no RESET_ACK origin"):
+        scenario_runtime.run_manifest(scenario, qemu=environment.binary)
+    assert environment.native.steps == [] and environment.uart_reads == [1, 0]
     environment.assert_clean()

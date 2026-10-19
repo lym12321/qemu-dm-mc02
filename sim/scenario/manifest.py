@@ -3,8 +3,8 @@
 Event times are relative to the shared host reset. Duration is the Arena active
 duration after requested ready markers; startup events may precede that origin.
 The runner delegates referee and CAN policy execution to the existing Arena
-owner. Assertions currently support admission only. This module reads
-configuration only.
+owner. Assertions consume actual per-member QEMU observations. This module
+reads configuration only.
 """
 
 from __future__ import annotations
@@ -79,6 +79,63 @@ def _assertions(value, duration_ns):
             raise ManifestError(f"{label}.before must not exceed duration")
         records.append(ScenarioAssertion(member, assertion))
     return tuple(records)
+
+
+def _assertion_members(assertions, arena):
+    robots = {item.name: item for item in arena.robots}
+    members = {item.member for item in arena.referees}
+    if assertions and len(robots) != len(arena.robots):
+        raise ManifestError("Scenario assertion members must be unique")
+    for index, entry in enumerate(assertions):
+        label = f"assertions[{index}]"
+        if entry.member not in robots:
+            raise ManifestError(f"{label}.member {entry.member!r} must name an Arena member")
+        if (entry.assertion.kind == "uart_contains"
+                and entry.assertion.endpoint not in member_uarts(
+                    robots[entry.member], referee=entry.member in members)):
+            raise ManifestError(f"{label} UART endpoint {entry.assertion.endpoint!r} "
+                                f"is not configured for Arena member {entry.member!r}")
+
+
+def validate_assertions(assertions, *, arena: ArenaManifest, duration_ns: int) -> None:
+    """Admit typed conditions and their actual observable member endpoints.
+
+    Frozen records can be constructed directly. Round-trip their plain values
+    through the same public Lab parser, retaining the original records and order.
+    No files, runtime modules or resources are accessed here.
+    """
+    if (type(assertions) is not tuple
+            or any(type(item) is not ScenarioAssertion for item in assertions)):
+        raise TypeError("Scenario assertions require a plain ScenarioAssertion tuple")
+    if len(assertions) > MAX_ITEMS:
+        raise ManifestError(f"assertions must have at most {MAX_ITEMS} entries")
+    if not assertions:
+        return
+    for index, entry in enumerate(assertions):
+        label = f"assertions[{index}]"
+        identifier(entry.member, label + ".member")
+        assertion = entry.assertion
+        if type(assertion) is not Assertion:
+            raise TypeError(f"{label} requires a plain Lab Assertion")
+        if (type(assertion.before_ns) is not int
+                or type(assertion.endpoint) is not str or type(assertion.kind) is not str):
+            raise TypeError(f"{label} requires a plain integer deadline and string endpoint/kind")
+        if not 1 <= assertion.before_ns <= duration_ns:
+            raise ManifestError(f"{label}.before must be positive and not exceed duration")
+        condition = {"endpoint": assertion.endpoint}
+        if assertion.kind == "uart_contains":
+            if type(assertion.value) is not bytes:
+                raise TypeError(f"{label} UART text must be plain bytes")
+            try:
+                condition["text"] = assertion.value.decode("utf-8")
+            except UnicodeError as error:
+                raise ManifestError(f"{label} UART text must be valid UTF-8") from error
+        elif assertion.kind == "digital_equals":
+            condition["value"] = assertion.value
+        else:
+            raise ManifestError(f"{label} unsupported assertion kind: {assertion.kind!r}")
+        parse_assertion({"before": f"{assertion.before_ns}ns", assertion.kind: condition}, index)
+    _assertion_members(assertions, arena)
 
 
 def _events(value, duration_ns):
@@ -180,15 +237,7 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     referees = tuple(ScenarioReferee(item.member, events[item.member])
                      for item in arena.referees if item.member in events)
     robots = {item.name: item for item in arena.robots}
-    for index, entry in enumerate(assertions):
-        label = f"assertions[{index}]"
-        if entry.member not in robots:
-            raise ManifestError(f"{label}.member {entry.member!r} must name an Arena member")
-        if (entry.assertion.kind == "uart_contains"
-                and entry.assertion.endpoint not in member_uarts(
-                    robots[entry.member], referee=entry.member in members)):
-            raise ManifestError(f"{label} UART endpoint {entry.assertion.endpoint!r} "
-                                f"is not configured for Arena member {entry.member!r}")
+    _assertion_members(assertions, arena)
     for action, (index, target) in zip(can_delays, targets):
         if (action.member not in robots
                 or target != action.member + "." + robots[action.member].robot.bus.name):

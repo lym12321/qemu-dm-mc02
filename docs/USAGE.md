@@ -495,8 +495,7 @@ uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report
 字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
 或暂停参数。CAN 延迟及电机反馈可达性动作支持加载和执行；其它故障注入和 replay 尚未支持。
 
-Scenario 也可通过 `load_manifest` 校验以下断言配置。目前这部分仅支持准入；
-运行含非空 `assertions` 的 Scenario 会在创建资源前明确报错，执行接线尚未实现。
+Scenario 支持以下成员断言，加载时和运行前均校验完整配置。
 省略或使用空列表保持原有执行行为。
 
 ```yaml
@@ -515,6 +514,12 @@ assertions:
 UART 只能选该成员已配置的端口：默认 `uart1`，显式 ready 改用其端口；有 referee
 时另加 `uart7`。数字端点支持 `key`、`led`、`gpio.A0` 至 `gpio.H15`。
 CAN 仍由 SharedWorld 独占，本配置不接受 `can_seen`，也不支持表达式语言。
+
+`before` 从各成员实际初始 RESET_ACK 的 QEMU 虚拟时间起算，包含等待 ready 的启动阶段；
+与 `ArenaResult.origin_ns` 的活动世界时长原点不同。UART 使用实际读后快照时间作上界，
+支持跨批次匹配，必须严格早于截止时间；数字断言使用该快照的实际采样值。
+空批次也推进截止时间，失败立即终止并清理整个运行，不重试。全部断言通过且资源清理成功后
+才返回原有 `ArenaResult` 或发布 CLI 成功报告；这些观测不建立 CPU 与世界的全局时间屏障。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
