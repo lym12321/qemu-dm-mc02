@@ -3619,3 +3619,149 @@ def test_arena_trace_completion_caller_cannot_publish_after_real_run_or_cleanup_
     recorded = list(iter_events(BytesIO(output.getvalue())))
     assert recorded and all(event.event_type == "arena.observation/1" for event in recorded)
     assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
+
+
+def test_offline_replay_actual_socket_capture_matches_live_experiments_and_original_scenario(
+        environment, monkeypatch):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace
+    from sim.scenario import ScenarioAssertion
+    from sim.scenario.replay import replay_assertions
+    from sim.trace import TraceWriter
+
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"))
+    environment.uart_chunks = [[b"RE", b"ADYhel", b"lo"], [b"READYhe", b"llo"]]
+    command = environment.command
+    def sampled_state(index, name, arguments=None):
+        state = command(index, name, arguments)
+        if name == "qom-get":
+            state["gpio"]["A"].update(sampled=index, odr=1 - index, output_mask=1)
+        return state
+    monkeypatch.setattr(environment, "command", sampled_state)
+    assertions = (
+        ScenarioAssertion("west", Assertion(2_000_000, "uart1", "uart_contains", b"hello")),
+        ScenarioAssertion("east", Assertion(500_000, "uart1", "uart_contains", b"RE")),
+        ScenarioAssertion("east", Assertion(2_500_000, "uart1", "uart_contains", b"hello")),
+        ScenarioAssertion("west", Assertion(1_000_000, "uart1", "uart_contains", b"llo")),
+        ScenarioAssertion("east", Assertion(1_000_000, "gpio.A0", "digital_equals", 1)),
+        ScenarioAssertion("west", Assertion(1_000_000, "gpio.A0", "digital_equals", 1)),
+        ScenarioAssertion("east", Assertion(2_500_000, "uart1", "uart_contains", b"missing")),
+    )
+    scenario = ScenarioManifest(environment.directory / "original-scenario.yaml", arena, 2_500_000, (),
+                                assertions=assertions)
+    clocks = {"east": "qemu:east:run14", "west": "qemu:west:run14"}
+    output, origins, live, history = BytesIO(), {}, {}, []
+    writer = TraceWriter(output)
+    capture = ArenaTrace(writer, clocks=clocks)
+    def response(name, frame, decoded):
+        if frame.header.kind == runtime.codec.RESET_ACK:
+            assert name not in origins
+            origins[name] = decoded.virtual_time_ns
+            member = next(member for member in arena.robots if member.name == name)
+            live[name] = LabExperiment(LabManifest(scenario.path, name, "dm-mc02",
+                member.robot.board.firmware, scenario.duration_ns, (),
+                tuple(item.assertion for item in assertions if item.member == name)), origins[name])
+    def observe(item):
+        capture(item)
+        live[item.name].observe(item.snapshot, item.events, item.snapshot["timestamp_ns"])
+        history.append((item.name, item.snapshot["timestamp_ns"], tuple(event.data for event in item.events)))
+    result = environment.run(arena, on_response=response, on_observation=observe)
+    environment.assert_clean()
+    capture.complete(result)
+    writer.finish()
+    assert origins == {"east": 1000, "west": 2000}
+    assert result.boards[0].ready_qemu_ns > origins["east"]
+    assert history[:4] == [("east", 1000, (b"RE",)), ("west", 2000, (b"READYhe",)),
+                          ("east", 1_001_000, (b"ADYhel",)), ("west", 1_002_000, (b"llo",))]
+    assert any(not batch for _, _, batch in history)
+    for board in result.boards:
+        live[board.name].finish(board.end_qemu_ns)
+    # This independent literal verdict also checks that the real live consumer
+    # received startup, split, empty, GPIO and exact-deadline observations.
+    assert live["east"].status == ("pass", "pass", "fail", "fail")
+    assert live["west"].status == ("pass", "fail", "pass")
+    output.seek(0)
+    replayed = replay_assertions(output, scenario, clocks=clocks)
+    assert replayed.status == ("pass", "pass", "pass", "fail", "fail", "pass", "fail")
+    assert len(replayed.failures) == 3 and not replayed.passed
+    assert {item.name: item.reset_qemu_ns for item in replayed.completions} == origins
+    assert {item.name: item.end_qemu_ns for item in replayed.completions} == {
+        item.name: item.end_qemu_ns for item in result.boards}
+    assert output.tell() == len(output.getvalue()) and not output.closed
+    environment.assert_clean()
+
+
+def test_offline_replay_actual_uart_uses_postread_snapshot_upper_bound(environment, monkeypatch):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace
+    from sim.scenario import ScenarioAssertion
+    from sim.scenario.replay import replay_assertions
+    from sim.trace import TraceWriter
+
+    arena = environment.manifest()
+    environment.uart_chunks = [[b"OK"], [b"OK"]]
+    command = environment.command
+    def postread(index, name, arguments=None):
+        state = command(index, name, arguments)
+        if name == "qom-get" and environment.uart_reads[index]:
+            state["timestamp_ns"] += 50
+        return state
+    monkeypatch.setattr(environment, "command", postread)
+    assertions = tuple(ScenarioAssertion(name, Assertion(50, "uart1", "uart_contains", b"OK"))
+                       for name in ("west", "east"))
+    scenario = ScenarioManifest(environment.directory / "original-scenario.yaml", arena, 2_500_000, (),
+                                assertions=assertions)
+    clocks = {"east": "qemu:east:run14", "west": "qemu:west:run14"}
+    output, batches = BytesIO(), []
+    writer = TraceWriter(output)
+    capture = ArenaTrace(writer, clocks=clocks)
+    def observe(item):
+        capture(item)
+        batches.append(item)
+    result = environment.run(arena, on_observation=observe)
+    environment.assert_clean()
+    capture.complete(result)
+    writer.finish()
+    assert [(item.name, item.snapshot["timestamp_ns"], item.events[0].timestamp_ns)
+            for item in batches[:2]] == [("east", 1050, 1000), ("west", 2050, 2000)]
+    output.seek(0)
+    replayed = replay_assertions(output, scenario, clocks=clocks)
+    assert replayed.status == ("fail", "fail") and not replayed.passed
+    assert len(replayed.failures) == 2 and not output.closed
+    environment.assert_clean()
+
+
+@pytest.mark.parametrize("failure", ["runtime", "cleanup"])
+def test_offline_replay_rejects_actual_failure_diagnostics_without_completion(environment, failure):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace
+    from sim.scenario.replay import replay_assertions
+    from sim.trace import TraceWriter
+
+    arena = environment.manifest(upper=True)
+    primary = OSError(f"offline diagnostic {failure}")
+    if failure == "runtime":
+        def fail_after_step(index, name):
+            if name == "qom-get" and environment.native.steps:
+                raise primary
+        environment.qmp_callback = fail_after_step
+    else:
+        environment.world_close_failure = primary
+    environment.uart_chunks = [[b"one"], [b"two"]]
+    clocks = {"east": "qemu:east:run14", "west": "qemu:west:run14"}
+    output = BytesIO()
+    writer = TraceWriter(output)
+    capture = ArenaTrace(writer, clocks=clocks)
+    with pytest.raises(OSError) as caught:
+        result = environment.run(arena, on_observation=capture)
+        capture.complete(result)
+    assert caught.value is primary
+    environment.assert_clean()
+    writer.finish()  # Retain a complete diagnostic container, not a completed run.
+    output.seek(0)
+    scenario = ScenarioManifest(environment.directory / "original-scenario.yaml", arena, 2_500_000, ())
+    with pytest.raises(ValueError, match="coverage|completion"):
+        replay_assertions(output, scenario, clocks=clocks)
+    assert not output.closed
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
+    environment.assert_clean()

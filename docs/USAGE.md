@@ -915,6 +915,39 @@ epoch 的真实性。它不查询 manifest、不推断 RESET 原点，也不排�
 原始帧不在其中。离线断言仍需另行保留实验配置。当前没有 Scenario/CLI
 自动记录、完整系统 trace 或硬件回放调度器。
 
+已完成的观察文件可以用原始 Scenario 配置离线重新判断 UART/数字断言：
+
+```python
+from sim.scenario.manifest import load_manifest
+from sim.scenario.replay import replay_assertions
+
+scenario = load_manifest("scenario.yaml")
+# 使用录制时相同的成员名和真实 epoch 标签。
+clocks = {member.name: f"qemu:{member.name}:run1:reset0"
+          for member in scenario.arena.robots}
+with open("observations.mcap", "rb") as source:
+    report = replay_assertions(source, scenario, clocks=clocks)
+print(report.passed, report.status, report.failures)
+```
+
+`status` 按 Scenario 的原始断言顺序返回 `pass`/`fail`；`failures` 标明全局断言序号和
+成员，`completions` 按 Arena 成员顺序保留原点、结束时间和批次数。结果不可变。有效记录中
+未满足的断言返回 `fail`；配置不符、记录缺失、损坏或 I/O 错误会抛出异常。
+
+输入须为从字节零开始的可回卷阻塞二进制流。函数完整读取两次：首遍取得尾部原点，
+回卷后用同一个 LabExperiment 判断第二遍记录，并重新校验全部成员、顺序、元数据和
+容器 EOF 后才返回。内存不随观察批次数增长；文件完整性验证失败时不会返回部分结果。
+函数借用输入，不关闭、不重试或恢复位置，成功后留在 EOF。不支持不可回卷流。
+
+每个成员都必须有观察和恰好一条完成记录，全部观察位于完成记录之前。批次数、最终时间、
+RESET 下界和实验时长均须一致，包括没有断言的成员。每个 UART 必须是该成员实际配置的
+端口；逐成员的快照和 UART poll 不得早于上一 post-read 快照，首批也不得早于 RESET。
+不同成员的数值时间可交错下降。严格截止时间、空批次过期和 GPIO 判断沿用 LabExperiment。
+
+调用期间须保持输入及配置不变。两遍的完成元数据必须一致；函数判断完整验证后的第二遍
+记录，不认证两遍的字节身份。调用者负责配置、固件和模型与录制来源的对应关系。该入口
+只重新判断观察断言，不执行 Scenario 输入动作、固件或物理仿真，不提供硬件回放。
+
 ## Contents
 
 - [项目范围](#project-scope)

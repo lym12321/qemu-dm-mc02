@@ -521,3 +521,291 @@ def test_completion_decoder_rejects_wrong_profile_noncanonical_and_out_of_range_
     changes.setdefault("event_type", "arena.completion/1")
     with pytest.raises((TypeError, ValueError)):
         decode_completion(trace_event(body=body, **changes), clocks=CLOCKS)
+
+
+@pytest.fixture
+def offline_replay_scenario(tmp_path):
+    from sim.arena.manifest import load_manifest
+    from sim.lab.manifest import Assertion
+    from sim.scenario import ScenarioAssertion, ScenarioManifest
+    from test_arena_manifest import write_arena
+
+    arena = load_manifest(write_arena(tmp_path))
+    # Global assertion order deliberately alternates independently clocked members.
+    assertions = (
+        ScenarioAssertion("west", Assertion(20, "uart1", "uart_contains", b"hello")),
+        ScenarioAssertion("east", Assertion(20, "uart1", "uart_contains", b"hello")),
+        ScenarioAssertion("west", Assertion(20, "gpio.A0", "digital_equals", 1)),
+        ScenarioAssertion("east", Assertion(20, "uart1", "uart_contains", b"LATE")),
+        ScenarioAssertion("east", Assertion(6, "gpio.A0", "digital_equals", 1)),
+        ScenarioAssertion("west", Assertion(20, "uart1", "uart_contains", b"missing")),
+    )
+    return ScenarioManifest(tmp_path / "original-unread.yaml", arena, 100, (), assertions=assertions)
+
+
+def offline_replay_observation(name, stamp, *, poll=None, text=None, endpoint="uart1", sampled=0):
+    import base64
+    state = snapshot(stamp)
+    state["gpio"]["A"].update(sampled=sampled, odr=1 - sampled, output_mask=1)
+    events = [] if text is None else [{"endpoint": endpoint,
+        "timestamp_ns": stamp if poll is None else poll,
+        "data_base64": base64.b64encode(text).decode("ascii")}]
+    # Literal public format, independent of ArenaTrace/decode/replay helpers.
+    return TraceEvent(stamp, name, "observation", "arena.observation/1",
+                      json_bytes({"snapshot": state, "events": events}), CLOCKS[name])
+
+
+def offline_replay_completion(name, stamp, reset, count):
+    return TraceEvent(stamp, name, "observation", "arena.completion/1",
+        json_bytes({"reset_qemu_ns": reset, "observation_batches": count}), CLOCKS[name])
+
+
+def offline_replay_records():
+    return [
+        offline_replay_observation("east", 1005, poll=1001, text=b"he", sampled=1),
+        offline_replay_observation("west", 10, text=b"hello"),
+        offline_replay_observation("east", 1019, poll=1018, text=b"llo", sampled=1),
+        offline_replay_observation("west", 30),  # Empty batch expires unmet conditions.
+        offline_replay_observation("east", 1020, poll=1019, text=b"LATE", sampled=1),
+        offline_replay_observation("east", 1100),
+        offline_replay_observation("west", 110),
+        offline_replay_completion("west", 110, 10, 3),
+        offline_replay_completion("east", 1100, 1000, 4),
+    ]
+
+
+def offline_replay_bytes(records=None):
+    output = BytesIO()
+    writer = TraceWriter(output)
+    for event in offline_replay_records() if records is None else records:
+        writer.append(event)
+    writer.finish()
+    return output.getvalue()
+
+
+class OfflineReplayInput(BytesIO):
+    """Observe the borrowed stream boundary, optionally changing pass two."""
+
+    def __init__(self, data, second=None, *, failure=None):
+        super().__init__(data)
+        self.second, self.failure = second, failure
+        self.rewinds, self.eofs, self.reads = [], [], 0
+
+    def seek(self, offset, whence=0):
+        self.rewinds.append((self.tell(), offset, whence))
+        if self.failure is not None and self.failure[0] == "seek":
+            raise self.failure[1]
+        if self.second is not None:
+            BytesIO.__init__(self, self.second)
+        return super().seek(offset, whence)
+
+    def read(self, size=-1):
+        self.reads += 1
+        if (self.rewinds and self.failure is not None and self.failure[0] == "read"
+                and self.tell() >= len(self.getvalue()) - 8):
+            raise self.failure[1]
+        value = super().read(size)
+        if not value:
+            self.eofs.append((len(self.rewinds), self.tell()))
+        return value
+
+
+def test_offline_replay_two_full_passes_original_origins_global_status_and_borrowed_lifetime(
+        offline_replay_scenario, monkeypatch):
+    from dataclasses import FrozenInstanceError
+    from sim.scenario.replay import replay_assertions
+
+    raw = offline_replay_bytes()
+    source = OfflineReplayInput(raw)
+    def no_config_reads(*args, **kwargs):
+        pytest.fail("offline evaluation reopened a configuration or firmware path")
+    monkeypatch.setattr(Path, "read_bytes", no_config_reads)
+    monkeypatch.setattr(Path, "read_text", no_config_reads)
+    result = replay_assertions(source, offline_replay_scenario, clocks=CLOCKS)
+    assert result.status == ("pass", "pass", "fail", "fail", "pass", "fail")
+    assert not result.passed and len(result.failures) == 3
+    for text, member, ordinal in zip(result.failures, ("west", "east", "west"), (3, 4, 6), strict=True):
+        assert member in text and f"assertion[{ordinal}]" in text
+    assert tuple(item.name for item in result.completions) == tuple(
+        item.name for item in offline_replay_scenario.arena.robots)
+    assert {item.name: (item.reset_qemu_ns, item.end_qemu_ns, item.observation_batches)
+            for item in result.completions} == {"east": (1000, 1100, 4), "west": (10, 110, 3)}
+    assert source.rewinds == [(len(raw), 0, 0)]
+    assert source.eofs == [(0, len(raw)), (1, len(raw))]
+    assert source.tell() == len(raw) and not source.closed
+    with pytest.raises(FrozenInstanceError):
+        result.status = ()
+
+
+@pytest.mark.parametrize("invalid", [
+    "scenario-type", "arena-type", "members-list", "member-type", "robot-type",
+    "board-type", "ready-type", "ready-endpoint", "ready-text", "duplicate-member",
+    "referee-type", "referee-member", "duration", "assertion-type", "clocks",
+])
+def test_offline_replay_typed_admission_precedes_input_reads(offline_replay_scenario, invalid):
+    from sim.arena.manifest import ArenaReferee
+    from sim.robots.manifest import Ready
+    from sim.scenario.replay import replay_assertions
+
+    scenario, clocks = offline_replay_scenario, CLOCKS
+    arena = scenario.arena
+    first, second = arena.robots
+    if invalid == "scenario-type":
+        scenario = object()
+    elif invalid == "arena-type":
+        scenario = replace(scenario, arena=object())
+    elif invalid == "members-list":
+        scenario = replace(scenario, arena=replace(arena, robots=list(arena.robots)))
+    elif invalid in ("member-type", "robot-type", "board-type", "ready-type", "ready-endpoint", "ready-text"):
+        if invalid == "member-type":
+            first = object()
+        elif invalid == "robot-type":
+            first = replace(first, robot=object())
+        elif invalid == "board-type":
+            first = replace(first, robot=replace(first.robot, board=object()))
+        else:
+            ready = {"ready-type": object(), "ready-endpoint": Ready("other.uart1", b"ready"),
+                     "ready-text": Ready("main.uart1", b"")}[invalid]
+            first = replace(first, robot=replace(first.robot, ready=ready))
+        scenario = replace(scenario, arena=replace(arena, robots=(first, second)))
+    elif invalid == "duplicate-member":
+        scenario = replace(scenario, arena=replace(arena, robots=(first, replace(second, name=first.name))))
+    elif invalid in ("referee-type", "referee-member"):
+        entry = object() if invalid == "referee-type" else ArenaReferee("absent", "uart7", None, None, (), 0)
+        scenario = replace(scenario, arena=replace(arena, referees=(entry,)))
+    elif invalid == "duration":
+        scenario = replace(scenario, duration_ns=True)
+    elif invalid == "assertion-type":
+        scenario = replace(scenario, assertions=(object(),))
+    else:
+        clocks = {"east": CLOCKS["east"]}
+    source = OfflineReplayInput(offline_replay_bytes())
+    with pytest.raises((TypeError, ValueError)):
+        replay_assertions(source, scenario, clocks=clocks)
+    assert source.reads == 0 and source.tell() == 0 and not source.closed
+
+
+@pytest.mark.parametrize("invalid", [
+    "missing-completion", "duplicate-completion", "post-completion-observation", "missing-member-batches",
+    "unknown-member", "wrong-epoch", "unknown-type", "wrong-topic", "postread-decrease",
+    "poll-before-previous", "first-before-reset", "first-poll-before-reset", "wrong-count",
+    "wrong-end", "unopened-uart", "unasserted-short-duration", "unasserted-overflow",
+])
+def test_offline_replay_validates_whole_member_lifecycle_even_without_assertions(
+        offline_replay_scenario, invalid):
+    from sim.scenario.replay import replay_assertions
+
+    records = offline_replay_records()
+    scenario = replace(offline_replay_scenario, assertions=())
+    if invalid == "missing-completion":
+        records.pop()
+    elif invalid == "duplicate-completion":
+        records.append(records[-1])
+    elif invalid == "post-completion-observation":
+        records.append(offline_replay_observation("east", 1100))
+    elif invalid == "missing-member-batches":
+        records = [item for item in records if item.source != "west" or item.event_type == "arena.completion/1"]
+    elif invalid in ("unknown-member", "wrong-epoch", "unknown-type", "wrong-topic"):
+        fields = {"unknown-member": {"source": "absent"}, "wrong-epoch": {"clock": "qemu:east:wrong"},
+                  "unknown-type": {"event_type": "unknown/1"}, "wrong-topic": {"endpoint": "uart1"}}[invalid]
+        records[0] = replace(records[0], **fields)
+    elif invalid == "postread-decrease":
+        records[2] = offline_replay_observation("east", 1004)
+    elif invalid == "poll-before-previous":
+        records[2] = offline_replay_observation("east", 1019, poll=1004, text=b"llo")
+    elif invalid == "first-before-reset":
+        records[0] = offline_replay_observation("east", 999)
+    elif invalid == "first-poll-before-reset":
+        records[0] = offline_replay_observation("east", 1005, poll=999, text=b"he")
+    elif invalid == "wrong-count":
+        records[-1] = offline_replay_completion("east", 1100, 1000, 3)
+    elif invalid == "wrong-end":
+        records[-1] = offline_replay_completion("east", 1101, 1000, 4)
+    elif invalid == "unopened-uart":
+        records[0] = offline_replay_observation("east", 1005, text=b"he", endpoint="uart7")
+    elif invalid == "unasserted-short-duration":
+        scenario = replace(scenario, duration_ns=101)
+    else:
+        top = 2**64 - 1
+        records = [offline_replay_observation("east", top), offline_replay_observation("west", 110),
+                   offline_replay_completion("west", 110, 10, 1),
+                   offline_replay_completion("east", top, top - 50, 1)]
+    source = OfflineReplayInput(offline_replay_bytes(records))
+    with pytest.raises((TypeError, ValueError)):
+        replay_assertions(source, scenario, clocks=CLOCKS)
+    assert not source.closed
+
+
+def test_offline_replay_empty_assertion_run_still_requires_duration_and_can_pass(offline_replay_scenario):
+    from sim.scenario.replay import replay_assertions
+    source = OfflineReplayInput(offline_replay_bytes())
+    result = replay_assertions(source, replace(offline_replay_scenario, assertions=()), clocks=CLOCKS)
+    assert result.status == result.failures == () and result.passed
+    assert len(result.completions) == 2 and len(source.eofs) == 2
+
+
+@pytest.mark.parametrize("invalid", ["nonseekable", "offset", "bool-position"])
+def test_offline_replay_requires_caller_owned_input_at_zero(offline_replay_scenario, invalid):
+    from sim.scenario.replay import replay_assertions
+    source = OfflineReplayInput(offline_replay_bytes())
+    if invalid == "nonseekable":
+        source.seek = None
+    elif invalid == "offset":
+        BytesIO.seek(source, 1)
+    else:
+        source.tell = lambda: False
+    with pytest.raises((TypeError, ValueError)):
+        replay_assertions(source, offline_replay_scenario, clocks=CLOCKS)
+    assert source.reads == 0 and not source.closed
+
+
+@pytest.mark.parametrize("failure", ["trailer", "crc", "io", "interrupt", "seek"])
+def test_offline_replay_late_second_pass_failure_overrides_prior_assertion_failures(
+        offline_replay_scenario, failure):
+    from sim.scenario.replay import replay_assertions
+
+    raw = offline_replay_bytes()
+    changed, primary = raw, None
+    if failure == "trailer":
+        changed = raw[:-1]
+    elif failure == "crc":
+        # Alter only an observation's otherwise valid literal bytes, preserving
+        # all lengths. The native MCAP DataEnd checksum must catch this late.
+        assert raw.count(b'aGVsbG8=') == 1
+        changed = raw.replace(b'aGVsbG8=', b'aGVsbG4=')
+    else:
+        primary = KeyboardInterrupt("offline interrupted") if failure == "interrupt" else OSError("offline failed")
+    source = OfflineReplayInput(raw, changed,
+        failure=None if primary is None else ("seek" if failure == "seek" else "read", primary))
+    result = None
+    with pytest.raises(type(primary) if primary is not None else Exception) as caught:
+        result = replay_assertions(source, offline_replay_scenario, clocks=CLOCKS)
+    assert result is None and not source.closed and len(source.rewinds) == 1
+    if primary is not None:
+        assert caught.value is primary
+    elif failure == "crc":
+        from mcap.stream_reader import CRCValidationError
+        assert isinstance(caught.value, CRCValidationError)
+    else:
+        assert isinstance(caught.value, ValueError)
+
+
+@pytest.mark.parametrize("change", ["observations", "completion"])
+def test_offline_replay_revalidates_second_pass_and_evaluates_its_actual_bytes(
+        offline_replay_scenario, change):
+    from sim.scenario.replay import replay_assertions
+    records = offline_replay_records()
+    if change == "observations":
+        records[0] = offline_replay_observation("east", 1005, poll=1001, text=b"XX", sampled=1)
+        records[2] = offline_replay_observation("east", 1019, poll=1018, text=b"YYY", sampled=1)
+    else:
+        records[-1] = offline_replay_completion("east", 1100, 999, 4)
+    source = OfflineReplayInput(offline_replay_bytes(), offline_replay_bytes(records))
+    if change == "completion":
+        with pytest.raises(ValueError):
+            replay_assertions(source, offline_replay_scenario, clocks=CLOCKS)
+    else:
+        result = replay_assertions(source, offline_replay_scenario, clocks=CLOCKS)
+        assert result.status == ("pass", "fail", "fail", "fail", "pass", "fail")
+        assert source.eofs == [(0, len(offline_replay_bytes())), (1, len(source.getvalue()))]
+    assert len(source.rewinds) == 1 and not source.closed

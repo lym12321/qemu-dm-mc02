@@ -44,7 +44,8 @@ def _uint(value, name: str, maximum=0xFFFFFFFFFFFFFFFF) -> int:
     return value
 
 
-def _clocks(value) -> dict[str, str]:
+def validate_clocks(value) -> dict[str, str]:
+    """Admit and copy explicit distinct member/epoch labels without IO."""
     if type(value) is not dict:
         raise TypeError("Arena trace clocks must be a plain member-to-clock dictionary")
     if not 1 <= len(value) <= MAX_CHANNELS:
@@ -129,7 +130,7 @@ class ArenaTrace:
     def __init__(self, writer: TraceWriter, *, clocks: dict[str, str]):
         if type(writer) is not TraceWriter:
             raise TypeError("Arena trace requires a TraceWriter")
-        self._clocks = _clocks(clocks)
+        self._clocks = validate_clocks(clocks)
         self._writer = writer
         self._failed = False
         self._completed = False
@@ -212,7 +213,7 @@ def decode_observation(event: TraceEvent, *, clocks: dict[str, str]) -> ArenaObs
     CRC/footer/EOF failure can follow a yielded event. This function does not
     validate a complete run, RESET origin, cross-batch order or replay schedule.
     """
-    clocks = _clocks(clocks)
+    clocks = validate_clocks(clocks)
     if type(event) is not TraceEvent:
         raise TypeError("Arena observation decode requires a TraceEvent")
     if (event.endpoint != ENDPOINT or event.event_type != EVENT_TYPE or
@@ -251,7 +252,7 @@ def decode_completion(event: TraceEvent, *, clocks: dict[str, str]) -> ArenaTrac
     A complete MCAP container and this record alone do not prove that all
     members/batches exist in order or that the caller supplied a genuine result.
     """
-    clocks = _clocks(clocks)
+    clocks = validate_clocks(clocks)
     if type(event) is not TraceEvent:
         raise TypeError("Arena completion decode requires a TraceEvent")
     if (event.endpoint != ENDPOINT or event.event_type != COMPLETION_TYPE or
