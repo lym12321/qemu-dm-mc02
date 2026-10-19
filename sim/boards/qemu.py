@@ -15,15 +15,7 @@ import socket
 import time
 
 from sim.transports.can_stream import CanStream
-
-
-def validate_gpio_pin(pin: str) -> str:
-    """Accept the public GPIO spelling A0 through H15 without normalization."""
-    if not isinstance(pin, str):
-        raise TypeError("GPIO pin must be a string")
-    if re.fullmatch(r"[A-H](?:[0-9]|1[0-5])", pin) is None:
-        raise ValueError("GPIO pin must be A0 through H15")
-    return pin
+from sim.gpio import validate_gpio_pin
 
 
 def _integer(value, name: str, maximum: int | None = None) -> None:

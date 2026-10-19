@@ -15,7 +15,7 @@ from sim.manifest import (MAX_FILE_BYTES, MAX_TIME_NS, ManifestError, fields as 
                           load_document, parse_time as _time, readable_file as _readable_file,
                           text_bytes as _text)
 
-from sim.boards import validate_gpio_pin
+from sim.gpio import validate_gpio_pin
 from sim.fabric import CanFrame
 from sim.fabric.frame import CAN_EFF_MASK, CAN_SFF_MASK, WIRE_EXTENDED, WIRE_FD
 
@@ -160,7 +160,12 @@ def _stimulus(value, index: int) -> Stimulus:
     return Stimulus(at_ns, endpoint, "gpio", _integer(item["value"], 1, label + ".value"))
 
 
-def _assertion(value, index: int) -> Assertion:
+def parse_assertion(value, index: int) -> Assertion:
+    """Admit one Lab condition without reading files or importing runtime IO.
+
+    ``index`` is its zero-based position for contextual diagnostics. The caller
+    owns list quotas, duration limits and which endpoints its runtime observes.
+    """
     label = f"assertions[{index}]"
     kinds = ("uart_contains", "digital_equals", "can_seen")
     item = _fields(value, ("before", *kinds), ("before",), label)
@@ -210,7 +215,7 @@ def load_manifest(path: str | Path) -> LabManifest:
     firmware = _readable_file(manifest_path.parent / item["firmware"], "firmware")
     stimuli = tuple(_stimulus(entry, index) for index, entry in enumerate(
         _items(item.get("stimulus", []), "stimulus")))
-    assertions = tuple(_assertion(entry, index) for index, entry in enumerate(
+    assertions = tuple(parse_assertion(entry, index) for index, entry in enumerate(
         _items(item.get("assertions", []), "assertions")))
     latest_ns = max((*(entry.at_ns for entry in stimuli),
                      *(entry.before_ns for entry in assertions)), default=0)

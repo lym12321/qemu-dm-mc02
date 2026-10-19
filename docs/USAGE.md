@@ -55,6 +55,10 @@ Lab 配置使用锁定的 PyYAML 6.0.3；运行 Python 工具前执行 `uv sync 
 配置文件最多 1 MiB，stimulus/assertions 各最多 1024 条，文本最多 4096 UTF-8 字节，
 虚拟时间最多 3600 秒。`at=duration` 可做最终发送，响应没有额外等待窗口。
 
+Python 调用者可用 `sim.lab.parse_assertion(value, index)` 单独解析一个同格式的断言，
+返回冻结的 `Assertion`；`index` 为诊断使用的零基位置。解析不读取文件或导入板卡运行层。
+调用者负责列表配额、总时长以及实际可观测端点的准入；该函数不运行或裁决断言。
+
 `LabExperiment` 只消费实际数字快照、UART 字节与 CAN 帧；`before` 为严格截止时间。
 UART 判断用读取后 QMP 上界，CAN 用原始 wire 时间，数字用快照时间；观测较晚可能保守失败，
 失败后不会被迟到数据改成通过。串口匹配只保留最小尾部，不缓存完整运行记录。

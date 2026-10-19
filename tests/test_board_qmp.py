@@ -93,6 +93,10 @@ def test_input_admission_precedes_qmp_command(method, args):
 
 
 def test_native_producer_values_and_borrowed_connection():
+    from sim.boards.qemu import validate_gpio_pin as board_validator
+    from sim.gpio import validate_gpio_pin as pure_validator
+
+    assert validate_gpio_pin is board_validator is pure_validator
     qmp = Qmp()
     board = QemuBoard(qmp)
     assert validate_gpio_pin("H15") == "H15"
