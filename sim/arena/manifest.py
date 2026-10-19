@@ -53,6 +53,12 @@ class ArenaManifest:
     referees: tuple[ArenaReferee, ...] = ()
 
 
+def member_uarts(member: ArenaRobot, *, referee: bool) -> tuple[str, ...]:
+    """UARTs opened for an admitted member, in existing launch order."""
+    uart = member.robot.ready.endpoint.split(".", 1)[1] if member.robot.ready else "uart1"
+    return tuple(dict.fromkeys((uart, "uart7") if referee else (uart,)))
+
+
 def validate_can_delays(can_delays, *, duration_ns: int) -> None:
     """Admit immutable CAN policy values without topology or runtime effects.
 

@@ -731,8 +731,10 @@ def test_scenario_absent_events_and_valid_empty_target_have_explicit_defaults(tm
     result = load_scenario(path)
     assert result.duration_ns == 1
     assert result.can_delays == ()
+    assert result.assertions == ()
     assert [(item.member, item.events) for item in result.referees] == ([] if not referees else [("east", ())])
     document["events"] = []
+    document["assertions"] = []
     path.write_text(yaml.safe_dump(document), encoding="utf-8")
     assert load_scenario(path) == result
 
@@ -1002,7 +1004,7 @@ def test_scenario_motor_feedback_target_rejection_preserves_original_mixed_index
     assert "events[2].target" in str(caught.value) and target in str(caught.value)
 
 
-def test_scenario_motor_feedback_and_can_quotas_are_independent_at_inclusive_horizon(tmp_path):
+def test_scenario_motor_feedback_and_can_quotas_are_independent_at_inclusive_horizon(tmp_path, monkeypatch):
     from sim.arena.manifest import MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS
     from sim.scenario import load_manifest as load_scenario
 
@@ -1010,9 +1012,13 @@ def test_scenario_motor_feedback_and_can_quotas_are_independent_at_inclusive_hor
     actions = [row for index in range(1024) for row in (
         {"at": "1ms", "action": "motor_feedback", "target": "east.fl", "value": bool(index % 2)},
         {"at": "1ms", "action": "can_delay", "target": "west.chassis_can", "value": str(index) + "ns"})]
+    assertions = [{"member": "west" if index % 2 else "east", "before": "1ms",
+                   "digital_equals": {"endpoint": "gpio.H15", "value": index % 2}}
+                  for index in range(1024)]
     path = tmp_path / "feedback.yaml"
-    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": actions,
-        "referee_events": {"east": [{"at": "1ms", "hit": {"damage_hp": 0}}]}}, sort_keys=False), encoding="utf-8")
+    document = {"schema": 1, "arena": "arena.yaml", "duration": "1ms", "events": actions,
+        "assertions": assertions, "referee_events": {"east": [{"at": "1ms", "hit": {"damage_hp": 0}}]}}
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
     result = load_scenario(path)
     assert MAX_CAN_DELAY_EVENTS == MAX_MOTOR_FEEDBACK_EVENTS == 1024
     assert len(result.motor_feedback) == len(result.can_delays) == 1024
@@ -1021,6 +1027,16 @@ def test_scenario_motor_feedback_and_can_quotas_are_independent_at_inclusive_hor
     assert [(row.offset_ns, row.member, row.delay_ns) for row in result.can_delays] == [
         (1_000_000, "west", index) for index in range(1024)]
     assert len(result.referees) == len(result.referees[0].events) == 1
+    assert [(entry.member, entry.assertion.before_ns, entry.assertion.endpoint, entry.assertion.value)
+            for entry in result.assertions] == [
+        ("west" if index % 2 else "east", 1_000_000, "gpio.H15", index % 2)
+        for index in range(1024)]
+    assertions.append({"member": "west", "before": "1ms",
+                       "digital_equals": {"endpoint": "gpio.H15", "value": 1}})
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError, match="assertions.*1024"):
+        load_scenario(path)
 
 
 def test_public_can_delay_validator_is_pure_neutral_and_accepts_unsigned_horizon(monkeypatch):
@@ -1060,7 +1076,7 @@ def test_public_can_delay_validator_refuses_invalid_neutral_input(actions, horiz
     (("duration",), 1),
     (("duration",), "3601s"),
     (("actions",), []),
-    (("assertions",), []),
+    (("assertions",), {}),
     (("step",), "1ms"),
     (("referee_events",), []),
     (("referee_events",), {"bad\0name": []}),
@@ -1071,7 +1087,7 @@ def test_public_can_delay_validator_refuses_invalid_neutral_input(actions, horiz
                                      {"at": "0s", "hit": {"damage_hp": 0}}]),
     (("referee_events", "east"), [{"at": "0s", "hit": {"damage_hp": True}}]),
 ], ids=["schema-type", "required-arena", "nul-path", "zero-duration", "duration-type", "duration-limit",
-        "unsupported-actions", "unsupported-assertions", "unsupported-step", "events-mapping", "nul-target",
+        "unsupported-actions", "assertions-mapping", "unsupported-step", "events-mapping", "nul-target",
         "required-at", "unknown-offset", "after-duration", "unordered-events", "wire-range"])
 def test_scenario_complete_outer_admission_rejects_before_referenced_arena_read(
         tmp_path, monkeypatch, location, replacement):
@@ -1144,3 +1160,141 @@ def test_scenario_preserves_context_for_referenced_arena_rejection(tmp_path):
     with pytest.raises(ManifestError) as caught:
         load_scenario(path)
     assert "'arena.yaml'" in str(caught.value) and isinstance(caught.value.__cause__, ManifestError)
+
+
+def test_scenario_assertions_reuse_pure_lab_parser_and_original_frozen_records(tmp_path, monkeypatch):
+    from sim.lab import Assertion, parse_assertion
+    from sim.scenario import ScenarioAssertion, ScenarioManifest
+    from sim.scenario.manifest import ScenarioAssertion as canonical
+
+    assert ScenarioAssertion is canonical
+    write_arena(tmp_path)
+    raw = [
+        {"member": "west", "before": "2ms", "digital_equals": {"endpoint": "gpio.H15", "value": 1}},
+        {"member": "east", "before": "1ms", "uart_contains": {"endpoint": "uart1", "text": "é\0"}},
+        {"member": "west", "before": "2ms", "digital_equals": {"endpoint": "gpio.H15", "value": 1}},
+    ]
+    path = tmp_path / "assertions.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "2ms",
+                                    "assertions": raw}, sort_keys=False), encoding="utf-8")
+    def forbidden(*args, **kwargs):
+        pytest.fail("Scenario assertion admission acquired runtime resources")
+    monkeypatch.setattr(subprocess, "Popen", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    original_import = builtins.__import__
+    def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
+        resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
+                    if level else name)
+        candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
+        for candidate in candidates:
+            if any(candidate == prefix or candidate.startswith(prefix + ".") for prefix in (
+                    "mujoco", "numpy", "sim.physics", "sim.devices", "sim.arena.runtime", "sim.robots.runtime",
+                    "sim.robots.shared_world", "sim.lab.runtime", "sim.boards", "sim.transports", "tools")):
+                pytest.fail(f"Scenario assertions imported a runtime dependency: {candidate}")
+        return original_import(name, globals, locals, fromlist, level)
+    monkeypatch.setattr(builtins, "__import__", pure_import)
+    spec = importlib.util.spec_from_file_location("scenario_manifest_assertion_purity", ROOT / "sim/scenario/manifest.py")
+    scenario = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, scenario)
+    spec.loader.exec_module(scenario)
+    assert scenario.parse_assertion is parse_assertion
+    original_open, reads, calls = Path.open, [], []
+    def open_file(value, *args, **kwargs):
+        if value.name in ("arena.yaml", "robot.yaml"):
+            reads.append(value.resolve())
+        return original_open(value, *args, **kwargs)
+    def parse(value, index):
+        result = parse_assertion(value, index)
+        calls.append((index, value, result, tuple(reads)))
+        return result
+    monkeypatch.setattr(Path, "open", open_file)
+    monkeypatch.setattr(scenario, "parse_assertion", parse)
+    result = scenario.load_manifest(path)
+    assert type(result.assertions) is tuple and reads
+    assert [(entry.member, entry.assertion) for entry in result.assertions] == [
+        ("west", Assertion(2_000_000, "gpio.H15", "digital_equals", 1)),
+        ("east", Assertion(1_000_000, "uart1", "uart_contains", b"\xc3\xa9\0")),
+        ("west", Assertion(2_000_000, "gpio.H15", "digital_equals", 1))]
+    assert [(index, value, reads) for index, value, _, reads in calls] == [
+        (index, {key: value for key, value in raw[index].items() if key != "member"}, ())
+        for index in range(3)]
+    assert all(entry.assertion is calls[index][2] for index, entry in enumerate(result.assertions))
+    for entry in result.assertions:
+        for record, attribute in ((entry, "member"), (entry.assertion, "value")):
+            with pytest.raises(FrozenInstanceError):
+                setattr(record, attribute, None)
+    raw[0]["digital_equals"]["value"] = 0
+    assert result.assertions[0].assertion.value == 1
+    for tail in ((), ((),), ((), ())):
+        assert ScenarioManifest(path, result.arena, 1, (), *tail).assertions == ()
+
+
+@pytest.mark.parametrize("suffix", [
+    None,
+    {"member": "east", "before": "1ms"},
+    {"member": "east", "before": "0ns", "digital_equals": {"endpoint": "key", "value": 0}},
+    {"member": "east", "before": "2ms", "digital_equals": {"endpoint": "key", "value": 0}},
+    {"member": "east", "before": "1ms", "digital_equals": {"endpoint": "key", "value": True}},
+    {"member": "east", "before": "1ms", "can_seen": {"endpoint": "can1", "id": 1}},
+    {"member": "east\0", "before": "1ms", "digital_equals": {"endpoint": "key", "value": 0}},
+    {"before": "1ms", "digital_equals": {"endpoint": "key", "value": 0}},
+], ids=["shape", "kind", "zero-deadline", "after-duration", "bool-value", "unsupported-can",
+        "member-nul", "member-required"])
+def test_scenario_assertion_bad_suffix_rejects_before_any_referenced_read(tmp_path, monkeypatch, suffix):
+    from sim.scenario import load_manifest as load_scenario
+
+    write_arena(tmp_path)
+    path = tmp_path / "assertions.yaml"
+    prefix = [{"member": member, "before": "1ms", "digital_equals": {"endpoint": "key", "value": 0}}
+              for member in ("west", "east")]
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms",
+                                    "assertions": [*prefix, suffix]}), encoding="utf-8")
+    forbid_child_reads(tmp_path, monkeypatch, include_arena=True)
+    with pytest.raises(ManifestError, match=r"assertions\[2\]"):
+        load_scenario(path)
+
+
+@pytest.mark.parametrize("ready,referee,endpoint,member,expected,accepted", [
+    (None, False, "uart1", "blue-team", ("uart1",), True),
+    ("uart2", False, "uart2", "blue-team", ("uart2",), True),
+    ("uart2", False, "uart1", "blue-team", ("uart2",), False),
+    ("uart2", True, "uart7", "blue-team", ("uart2", "uart7"), True),
+    ("uart7", True, "uart7", "blue-team", ("uart7",), True),
+    (None, False, "uart7", "blue-team", ("uart1",), False),
+    (None, False, "uart1", "east", ("uart1",), False),
+], ids=["default", "ready", "ready-excludes-default", "referee-adds-uart7", "deduplicated",
+        "unopened-uart7", "actual-member-name"])
+def test_scenario_assertions_associate_named_members_with_shared_uart_profile(
+        tmp_path, monkeypatch, ready, referee, endpoint, member, expected, accepted):
+    from sim.arena.manifest import member_uarts
+    from sim.scenario import manifest as scenario
+
+    document = ROBOT_DOCUMENT
+    if ready is not None:
+        document += yaml.safe_dump({"ready": {"endpoint": "main." + ready, "text": "READY"}})
+    members = {"green_team": {"manifest": "robots/bravo/robot.yaml", "prefix": "bravo/", "physics": "shared-world"},
+               "blue-team": {"manifest": "robots/alpha/robot.yaml", "prefix": "alpha/", "physics": "shared-world"}}
+    arena_path = write_arena(tmp_path, robot_documents=(document, ROBOT_DOCUMENT), members=members,
+                            referees={"blue-team": referee_configuration()} if referee else None)
+    arena = load_manifest(arena_path)
+    blue = next(item for item in arena.robots if item.name == "blue-team")
+    assert member_uarts(blue, referee=referee) == expected
+    assert scenario.member_uarts is member_uarts
+    calls = []
+    def uarts(value, *, referee):
+        calls.append((value.name, referee))
+        return member_uarts(value, referee=referee)
+    monkeypatch.setattr(scenario, "member_uarts", uarts)
+    path = tmp_path / "assertions.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": "arena.yaml", "duration": "1ms", "assertions": [
+        {"member": "green_team", "before": "1ms", "digital_equals": {"endpoint": "gpio.H15", "value": 1}},
+        {"member": member, "before": "1ms", "uart_contains": {"endpoint": endpoint, "text": "ready"}}]}),
+        encoding="utf-8")
+    if accepted:
+        result = scenario.load_manifest(path)
+        assert [(entry.member, entry.assertion.endpoint) for entry in result.assertions] == [
+            ("green_team", "gpio.H15"), ("blue-team", endpoint)]
+    else:
+        with pytest.raises(ManifestError, match=r"assertions\[1\]"):
+            scenario.load_manifest(path)
+    assert calls == ([] if member == "east" else [("blue-team", referee)])

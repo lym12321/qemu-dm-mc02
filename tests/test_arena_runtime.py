@@ -913,6 +913,68 @@ def test_scenario_motor_feedback_structure_rejects_before_runtime_import_and_eff
     assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
 
 
+@pytest.mark.parametrize("kind", ["typed", "list", "tuple-subclass", "foreign-record", "record-subclass"])
+def test_scenario_assertions_refuse_before_runtime_import_or_resource_effects(environment, monkeypatch, kind):
+    from sim.scenario import ScenarioAssertion
+
+    arena = environment.manifest()
+    path = environment.directory / "assertions.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "1ms", "assertions": [
+        {"member": "west", "before": "1ms", "uart_contains": {"endpoint": "uart1", "text": "READY"}}]}),
+        encoding="utf-8")
+    manifest = load_scenario(path)
+    entry, = manifest.assertions
+    assertions = manifest.assertions
+    if kind == "list":
+        assertions = []
+    elif kind == "tuple-subclass":
+        assertions = type("Assertions", (tuple,), {})(())
+    elif kind == "foreign-record":
+        class Foreign:
+            def __getattr__(self, name):
+                pytest.fail("foreign assertion fields read before complete record admission")
+        assertions = (entry, Foreign())
+    elif kind == "record-subclass":
+        assertions = (type("AssertionSubclass", (ScenarioAssertion,), {})(entry.member, entry.assertion),)
+    manifest = replace(manifest, assertions=assertions)
+    original_import = builtins.__import__
+    def forbid_import(name, *args, **kwargs):
+        if name == "sim.arena.runtime":
+            pytest.fail("admission-only assertions reached the Arena runtime import")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", forbid_import)
+    error = NotImplementedError if kind == "typed" else TypeError
+    message = ("Scenario assertions are admitted but execution is not supported yet"
+               if kind == "typed" else "Scenario assertions require a plain ScenarioAssertion tuple")
+    with pytest.raises(error, match=message):
+        scenario_runtime.run_manifest(manifest, qemu=object(), startup_timeout=0)
+    assert environment.events == [] and environment.owners == [] and environment.launches == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_arena_launch_borrows_the_public_member_uart_profile(environment, monkeypatch):
+    from sim.arena.manifest import member_uarts
+
+    assert runtime.member_uarts is member_uarts
+    observed = watch_referees(environment, monkeypatch)
+    environment.uart_chunks = [[b"READY"], [b"READY"]]
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart2", "uart7"),
+                                 referees={"west": referee_configuration()})
+    calls = []
+    def uarts(member, *, referee):
+        result = member_uarts(member, referee=referee)
+        calls.append((member, referee, result))
+        return result
+    monkeypatch.setattr(runtime, "member_uarts", uarts)
+    result = environment.run(arena, duration=.001)
+    environment.assert_clean()
+    assert calls == [(arena.robots[0], False, ("uart2",)), (arena.robots[1], True, ("uart7",))]
+    assert {(index, name) for index, name in environment.sockets if name.startswith("uart")} == {
+        (0, "uart2"), (1, "uart7")}
+    assert len(observed.channels) == 2 and len(observed.endpoints) == 1
+    assert result.end_ns - result.origin_ns == 1_000_000
+
+
 @pytest.mark.parametrize("numeric", [False, True], ids=["typed_order", "lower_owns_numeric_policy"])
 def test_scenario_motor_feedback_delegates_once_with_original_metadata_and_error_identity(environment, monkeypatch, numeric):
     from sim.scenario import ScenarioMotorFeedback
@@ -1229,6 +1291,8 @@ def test_scenario_delegates_once_with_original_order_options_and_exact_duration(
     first, second = (ScriptEvent(0, Hit(1)),), ()
     manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, duration_ns,
                                 (ScenarioReferee("west", first), ScenarioReferee("east", second)))
+    assert manifest.assertions == ()
+    manifest = replace(manifest, assertions=())
     if scheduled:
         manifest = replace(manifest, can_delays=(ScenarioCanDelay(0, "west", 11),
             ScenarioCanDelay(0, "east", 7), ScenarioCanDelay(1_234_567, "east", 0),

@@ -34,7 +34,8 @@ from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_test_harness import running_qemu, stop
 
 from .manifest import (MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS,
-                       ArenaManifest, ArenaReferee, ArenaRobot, validate_can_delays)
+                       ArenaManifest, ArenaReferee, ArenaRobot, member_uarts,
+                       validate_can_delays)
 from .world import create_arena_plant
 
 
@@ -327,8 +328,7 @@ def run_manifest(manifest: ArenaManifest, *, duration=5.0, emit=None,
     commands = []
     for member in manifest.robots:
         firmware = regular_file(member.robot.board.firmware, "firmware")
-        uart = member.robot.ready.endpoint.split(".", 1)[1] if member.robot.ready else "uart1"
-        uarts = tuple(dict.fromkeys((uart, "uart7") if member.name in configured else (uart,)))
+        uarts = member_uarts(member, referee=member.name in configured)
         sockets = ("qmp", "cosim", "can1", *uarts)
         command = qemu_command(firmware, binary, sockets)
         command += ["-accel", "tcg,thread=single", "-icount", "shift=0,align=off,sleep=off"]

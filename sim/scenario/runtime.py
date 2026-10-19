@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING
 from sim.arena.manifest import ArenaManifest
 from sim.manifest import MAX_TIME_NS
 from sim.scenario.manifest import (
-    ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback, ScenarioReferee,
+    ScenarioAssertion, ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback,
+    ScenarioReferee,
 )
 
 if TYPE_CHECKING:
@@ -23,9 +24,16 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     requested ready markers, exactly as in the referenced Arena.
     Typed records are projected in caller order; Arena owns their numeric and
     topology admission, scheduling, and all resource effects.
+    Nonempty assertions require a later execution boundary and are explicitly
+    refused before importing the Arena runtime or acquiring resources.
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
+    if (type(manifest.assertions) is not tuple
+            or any(type(item) is not ScenarioAssertion for item in manifest.assertions)):
+        raise TypeError("Scenario assertions require a plain ScenarioAssertion tuple")
+    if manifest.assertions:
+        raise NotImplementedError("Scenario assertions are admitted but execution is not supported yet")
     if (type(manifest.motor_feedback) is not tuple
             or any(type(item) is not ScenarioMotorFeedback for item in manifest.motor_feedback)):
         raise TypeError("Scenario motor_feedback require a plain ScenarioMotorFeedback tuple")

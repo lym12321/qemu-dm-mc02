@@ -1,9 +1,10 @@
-"""Pure Scenario admission for scoped referee, CAN and feedback policy events.
+"""Pure Scenario admission for scoped inputs and observation assertions.
 
 Event times are relative to the shared host reset. Duration is the Arena active
 duration after requested ready markers; startup events may precede that origin.
 The runner delegates referee and CAN policy execution to the existing Arena
-owner. This module reads configuration only.
+owner. Assertions currently support admission only. This module reads
+configuration only.
 """
 
 from __future__ import annotations
@@ -15,8 +16,9 @@ from typing import TYPE_CHECKING
 from sim.arena.manifest import (
     MAX_CAN_DELAY_EVENTS, MAX_MOTOR_FEEDBACK_EVENTS,
     ArenaManifest, load_manifest as load_arena,
-    parse_referee_events, validate_can_delays,
+    member_uarts, parse_referee_events, validate_can_delays,
 )
+from sim.lab.manifest import Assertion, MAX_ITEMS, parse_assertion
 from sim.manifest import (
     ManifestError, fields, file_path, identifier, load_document, parse_time,
 )
@@ -47,6 +49,12 @@ class ScenarioMotorFeedback:
 
 
 @dataclass(frozen=True)
+class ScenarioAssertion:
+    member: str
+    assertion: Assertion
+
+
+@dataclass(frozen=True)
 class ScenarioManifest:
     path: Path
     arena: ArenaManifest
@@ -54,6 +62,23 @@ class ScenarioManifest:
     referees: tuple[ScenarioReferee, ...]
     can_delays: tuple[ScenarioCanDelay, ...] = ()
     motor_feedback: tuple[ScenarioMotorFeedback, ...] = ()
+    assertions: tuple[ScenarioAssertion, ...] = ()
+
+
+def _assertions(value, duration_ns):
+    if type(value) is not list or len(value) > MAX_ITEMS:
+        raise ManifestError(f"assertions must be a list with at most {MAX_ITEMS} entries")
+    records = []
+    for index, configuration in enumerate(value):
+        label = f"assertions[{index}]"
+        item = fields(configuration, ("member", "before", "uart_contains", "digital_equals"),
+                      ("member", "before"), label)
+        member = identifier(item["member"], label + ".member")
+        assertion = parse_assertion({key: val for key, val in item.items() if key != "member"}, index)
+        if assertion.before_ns > duration_ns:
+            raise ManifestError(f"{label}.before must not exceed duration")
+        records.append(ScenarioAssertion(member, assertion))
+    return tuple(records)
 
 
 def _events(value, duration_ns):
@@ -135,12 +160,14 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     """Return immutable inputs without acquiring or executing simulation owners."""
     manifest_path, document = load_document(path)
     required = ("schema", "arena", "duration")
-    item = fields(document, (*required, "referee_events", "events"), required, "scenario manifest")
+    item = fields(document, (*required, "referee_events", "events", "assertions"),
+                  required, "scenario manifest")
     if type(item["schema"]) is not int or item["schema"] != 1:
         raise ManifestError("unsupported Scenario schema; schema must be integer 1")
     duration_ns = parse_time(item["duration"], "duration", zero=False)
     events = _referee_events(item.get("referee_events", {}), duration_ns)
     can_delays, targets, feedback = _events(item.get("events", []), duration_ns)
+    assertions = _assertions(item.get("assertions", []), duration_ns)
     try:
         reference = file_path(item["arena"], manifest_path.parent, "scenario.arena")
         arena = load_arena(reference)
@@ -153,6 +180,15 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
     referees = tuple(ScenarioReferee(item.member, events[item.member])
                      for item in arena.referees if item.member in events)
     robots = {item.name: item for item in arena.robots}
+    for index, entry in enumerate(assertions):
+        label = f"assertions[{index}]"
+        if entry.member not in robots:
+            raise ManifestError(f"{label}.member {entry.member!r} must name an Arena member")
+        if (entry.assertion.kind == "uart_contains"
+                and entry.assertion.endpoint not in member_uarts(
+                    robots[entry.member], referee=entry.member in members)):
+            raise ManifestError(f"{label} UART endpoint {entry.assertion.endpoint!r} "
+                                f"is not configured for Arena member {entry.member!r}")
     for action, (index, target) in zip(can_delays, targets):
         if (action.member not in robots
                 or target != action.member + "." + robots[action.member].robot.bus.name):
@@ -166,4 +202,4 @@ def load_manifest(path: str | Path) -> ScenarioManifest:
             raise ManifestError(f"events[{index}].target {member + '.' + name!r} must name its Arena member's motor")
         motor_feedback.append(ScenarioMotorFeedback(offset, member, motors[0].motor_id, enabled))
     return ScenarioManifest(manifest_path, arena, duration_ns, referees, can_delays,
-                            tuple(motor_feedback))
+                            tuple(motor_feedback), assertions)

@@ -493,7 +493,28 @@ uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report
 `--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
 默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
 字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
-或暂停参数。CAN 延迟及电机反馈可达性动作支持加载和执行；其它故障注入、assertions 和 replay 尚未支持。
+或暂停参数。CAN 延迟及电机反馈可达性动作支持加载和执行；其它故障注入和 replay 尚未支持。
+
+Scenario 也可通过 `load_manifest` 校验以下断言配置。目前这部分仅支持准入；
+运行含非空 `assertions` 的 Scenario 会在创建资源前明确报错，执行接线尚未实现。
+省略或使用空列表保持原有执行行为。
+
+```yaml
+assertions:
+  - member: east
+    before: 300ms
+    uart_contains: {endpoint: uart1, text: "ready"}
+  - member: west
+    before: 500ms
+    digital_equals: {endpoint: gpio.A0, value: 1}
+```
+
+`member` 必须是该 Arena 的实际成员名；其余字段复用 Lab 单条断言格式，返回冻结的
+`ScenarioAssertion(member, assertion)`，保留列表顺序和重复项。合计最多 1024 条，
+额度独立于其它事件；`before` 必须为正且不超过 Scenario 的 `duration`。
+UART 只能选该成员已配置的端口：默认 `uart1`，显式 ready 改用其端口；有 referee
+时另加 `uart7`。数字端点支持 `key`、`led`、`gpio.A0` 至 `gpio.H15`。
+CAN 仍由 SharedWorld 独占，本配置不接受 `can_seen`，也不支持表达式语言。
 
 Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
 整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
