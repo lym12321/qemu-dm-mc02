@@ -396,6 +396,17 @@ def run(qmp_path: str, uart_path: str, can_path: str, elf: str, qemu: str,
 
 
 def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--feedback-scenario":
+        import argparse
+        from tools.dm_mc02_arena_smoke import run_dji_feedback_scenario
+        parser = argparse.ArgumentParser(description="Actual dual-QEMU DJI feedback timeout consumer")
+        parser.add_argument("--feedback-scenario", action="store_true")
+        parser.add_argument("elf")
+        parser.add_argument("output")
+        parser.add_argument("firmware")
+        parser.add_argument("--qemu")
+        args = parser.parse_args()
+        return run_dji_feedback_scenario(args.elf, args.output, args.firmware, qemu=args.qemu)
     if len(sys.argv) > 1 and sys.argv[1] == "--scenario":
         import argparse
         from tools.dm_mc02_arena_smoke import run_dji_scenario

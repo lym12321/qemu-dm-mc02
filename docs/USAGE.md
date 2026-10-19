@@ -519,7 +519,7 @@ Arena Python 入口还接受 `motor_feedback=((offset_ns, member, motor_id, enab
 执行反馈动作。截止时间动作在该步反馈交付完成后执行，不能撤回已交付字节；
 尚未 dispatch 的排队帧按新状态决定是否丢弃，恢复不会补发已丢弃帧。
 结束或失败清理时恢复原有总线丢弃回调。Python、Scenario/YAML 和 CLI 共用这套调度；
-真实固件对反馈缺失的超时响应尚待验证。
+下文专用 `DjiFeedbackTest` 已验证固定反馈缺失下的超时与恢复，其它固件配置需独立验证。
 
 Scenario 加载器可解析 `action: motor_feedback`，`target` 使用准确的
 `成员名.电机名`（Robot 中的设备名称），`value` 必须为 YAML 布尔值。
@@ -2390,8 +2390,8 @@ plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续
 
 Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
 
-历史 Debug/Release 原生场景门因 CPU 与共享世界推进失配、周期命令积压而失败。
-Arena 现已接入分段 CPU 执行；该专用固件场景的重新验证尚未完成，原失败报告保留。
+该固定场景的 Debug 门已通过；最新 Release 复测在原 20 秒 host 期限内只完成
+1090 步，最终暂停 watchdog 观察缺失，仍按失败保留。期限稳定性尚未解决。
 
 ```bash
 cd ../trobot
@@ -2417,3 +2417,27 @@ RESET 相对 0ms 设置 5ms 入队延迟，在 250ms 恢复零延迟，west 保�
 结果目录必须不存在。缺失样本、FAIL、发送或清理失败、输入变化均保留失败报告。
 该门不证明动态延迟下的 50ms 超时、物理 CAN 时序、CPU/plant 全局锁步或实时性能；
 物理校准保持显式 SKIP。旧 ID1/ID5 独立掉线测试沿用上述入口。
+
+反馈丢失的固件消费者使用独立、默认关闭的 `DjiFeedbackTestDebug/Release`，
+与 `DjiScenarioTest` 互斥：
+
+```bash
+cd ../trobot
+cmake --preset DjiFeedbackTestRelease
+cmake --build --preset DjiFeedbackTestRelease --clean-first
+cd ../dm-mc02-qemu
+.venv/bin/python tools/dm_mc02_dji_test.py --feedback-scenario \
+  ../trobot/build/DjiFeedbackTestRelease/trobot.elf \
+  build/test-results/dji-feedback-release ../trobot \
+  --qemu build/qemu/qemu-system-arm
+```
+
+新结果目录必须不存在。固定场景在 RESET 后 200 ms 屏蔽两成员各自 ID1 的反馈，
+350 ms 恢复，实际 ready 后运行 400 ms；启动期限 10 秒、host 总期限 20 秒。
+固件持续请求 ID1/2 电流 `64/-64`，检查反馈时间戳冻结、年龄超过配置的 50 ms、
+应用非零命令仍新鲜时驱动任务清零输出，以及恢复后新反馈和非零输出。
+ID2 是各成员的持续在线对照。主机还检查真实 CAN 命令、器件来源、丢弃范围、
+物理发送完成及最终 watchdog，清理和输入哈希核验完成后才发布通过。
+
+这是反馈不可达测试；50 ms 是该驱动的应用配置，不能据此声明电机断电、精确中断
+时刻、全局锁步或实时性能。物理校准保留 SKIP；本门不替代上面的固定 Release 场景门。

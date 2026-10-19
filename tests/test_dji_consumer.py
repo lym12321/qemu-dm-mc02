@@ -967,3 +967,367 @@ def test_dji_scenario_cli_refuses_profile_overrides_before_execution(monkeypatch
     with pytest.raises(SystemExit) as caught:
         module.main()
     assert caught.value.code == 2
+
+
+def feedback_case_rows():
+    """Literal copied-field receipts, independent of the host's validators."""
+    values = (("control.rx", 0, 0), ("reset.poweron", 0x800000, 0x800000),
+        ("bsp.init", 0, 0), ("task.stack", 96, 64),
+        ("dji.feedback.baseline.id1", 110, 0), ("dji.feedback.baseline.id2", 110, 0),
+        ("dji.feedback.loss.frozen", 200, 200), ("dji.feedback.loss.age", 54, 51),
+        ("dji.feedback.loss.app_age", 3, 50), ("dji.feedback.loss.output", 0, 0),
+        ("dji.feedback.loss.id2", 257, 254), ("dji.feedback.recover.id1", 360, 200),
+        ("dji.feedback.recover.id2", 360, 0), ("dji.feedback.stop", 0, 0),
+        ("dji.feedback.can", 0, 0))
+    return [dict(status="PASS", name=name, actual=actual, expected=expected)
+            for name, actual, expected in values] + [
+        dict(status="SKIP", name="plant.physics", actual=0, expected=0)]
+
+
+def feedback_empty_report():
+    report = scenario_empty_report()
+    report.update(feedback_dispatches=[], physical_can_suffixes=[],
+        feedback_observation=dict(shared_start=None, actions=[], cases={name: {} for name in ("east", "west")}))
+    for group in ("commands", "command_wire", "command_deliveries"):
+        for summary in report[group].values():
+            summary.update(loss_count=0, witnesses={})
+    return report
+
+
+def feedback_completed_report():
+    """Completed verification input, without emulating firmware or scheduling."""
+    from test_referee_consumer import arena_response_summary
+    report = feedback_empty_report()
+    evidence = report["feedback_observation"]
+    evidence["shared_start"] = dict(session_id=1, origin_ns=0, wire_sessions=[1, 2], accepted=True)
+    evidence["actions"] = [dict(logical_ns=stamp, member=name, motor_id=1, enabled=enabled, accepted=True)
+        for stamp, enabled in ((200_000_000, False), (350_000_000, True)) for name in ("east", "west")]
+    for peer, name in enumerate(("east", "west")):
+        epoch = (1000, 2000)[peer]
+        report["cases"][name] = feedback_case_rows()
+        report["summaries"][name] = [{"kind": kind, "values": [15, 0, 1]} for kind in ("PHASE", "DONE")]
+        response = report["responses"][name] = arena_response_summary(peer + 1, epoch)
+        response["step_ack_count"] = 400
+        response["last_step_ack"]["header"].update(step_id=400, t_sim_ns=400_000_000)
+        report["ready"][name] = dict(logical_ns=0, poll_sample_qemu_ns=epoch)
+        report["watchdogs"][name] = {stage: dict(timeouts=0, diagnostics="window-violations=0")
+                                     for stage in ("done", "paused")}
+        for case in report["cases"][name]:
+            label = case["name"]
+            if not label.startswith("dji.feedback."):
+                continue
+            stamp = 20_000_000 if ".baseline." in label else 260_000_000 if ".loss." in label else (
+                360_000_000 if ".recover." in label else 390_000_000)
+            evidence["cases"][name][label] = dict(logical_ns=stamp, poll_sample_qemu_ns=epoch + stamp)
+        for group in ("commands", "command_wire", "command_deliveries"):
+            rows = [dict(peer=peer, can_id=0x200, flags=0, dlc=8, qemu_ns=epoch + stamp, data_hex=raw)
+                for stamp, raw in ((0, "0040ffc000000000"), (260_000_000, "0000ffc000000000"),
+                                   (360_000_000, "0040ffc000000000"), (380_000_000, "0000000000000000"))]
+            for row in rows:
+                if group == "command_wire":
+                    row["wire_hex"] = struct.pack("<IIB3xQ64s", 0x200, 0, 8, row["qemu_ns"],
+                        bytes.fromhex(row["data_hex"]).ljust(64, b"\0")).hex()
+                elif group == "command_deliveries":
+                    stamp = row["qemu_ns"] - epoch
+                    row.update(mapped_qemu_ns=row.pop("qemu_ns"), source_world_ns=stamp,
+                               due_ns=stamp, delivered_ns=stamp, destination="m3508-1")
+            report[group][name] = dict(count=4, active_count=2, loss_count=1, zero_count=1,
+                transition_count=4, first=rows[0], last=rows[-1], transitions=rows,
+                witnesses=dict(zip(("baseline", "late_loss", "recovery", "stop"), rows)))
+        for identifier in (1, 2, 3, 4):
+            raw = {1: "0000000000401900", 2: "00000000ffc01900"}.get(identifier, "0000000000001900")
+            for stamp in (100_000_000, 260_000_000, 360_000_000):
+                dropped = identifier == 1 and stamp == 260_000_000
+                report["feedback_dispatches"].append(dict(peer=peer, motor_id=identifier,
+                    source=f"m3508-{identifier}", destination="qemu", world_ns=stamp, due_ns=stamp,
+                    delivered_ns=stamp, sequence=identifier, data_hex=raw, dropped=dropped))
+                if not dropped:
+                    wire = struct.pack("<IIB3xQ64s", 0x200 + identifier, 0, 8, epoch + stamp,
+                                       bytes.fromhex(raw).ljust(64, b"\0"))
+                    report["feedback"].append(dict(peer=peer, can_id=0x200 + identifier, accepted=True,
+                        world_ns=stamp, due_ns=stamp, delivered_ns=stamp, qemu_ns=epoch + stamp,
+                        data_hex=raw, physical_complete=True, physical_wire_hex=wire.hex()))
+    report["native_calls"] = dict(reset=1, step_ns=[1_000_000] * 400, close=1)
+    return report
+
+
+def test_dji_feedback_fixed_profile_is_pure_same_elf_and_reset_relative(tmp_path, monkeypatch):
+    elf = tmp_path / "same.elf"
+    elf.write_bytes(b"fixed firmware")
+    def forbidden(*args, **options):
+        pytest.fail("pure feedback profile reached resource acquisition")
+    for method in ("resolve_qemu", "create_arena_plant", "running_qemu", "connect_unix"):
+        monkeypatch.setattr(arena_module.arena, method, forbidden)
+    scenario = arena_module.write_dji_feedback_manifest(tmp_path, (elf, elf))
+    assert load_scenario(scenario.path) == scenario
+    assert scenario.duration_ns == 400_000_000 and scenario.can_delays == scenario.referees == ()
+    assert [(row.offset_ns, row.member, row.motor_id, row.enabled) for row in scenario.motor_feedback] == [
+        (200_000_000, "east", 1, False), (200_000_000, "west", 1, False),
+        (350_000_000, "east", 1, True), (350_000_000, "west", 1, True)]
+    assert [row.name for row in scenario.arena.robots] == ["east", "west"]
+    assert all(row.robot.board.firmware == elf.resolve() and not row.robot.upper_computers and
+               row.robot.ready.endpoint == "mcu.uart1" and
+               row.robot.ready.text == b"TTEST READY dji.feedback.ready 0 0\n" and
+               [(device.motor_id, device.joint) for device in row.robot.devices] ==
+               [(1, "wheel_fl"), (2, "wheel_fr"), (3, "wheel_rl"), (4, "wheel_rr")]
+               for row in scenario.arena.robots)
+
+
+def test_dji_feedback_literal_case_coverage_and_new_timestamp_history():
+    rows = feedback_case_rows()
+    required = {row["name"] for row in rows if row["status"] == "PASS"}
+    assert arena_module.DJI_FEEDBACK_REQUIRED == required and len(required) == 15
+    arena_module.check_dji_feedback_coverage(rows, [{"kind": kind, "values": [15, 0, 1]}
+                                                  for kind in ("PHASE", "DONE")])
+
+
+@pytest.mark.parametrize("label,field,value", [
+    ("dji.feedback.loss.age", "actual", 50), ("dji.feedback.loss.age", "expected", 50),
+    ("dji.feedback.loss.app_age", "actual", 50), ("dji.feedback.loss.output", "actual", 64),
+    ("dji.feedback.loss.frozen", "actual", 199), ("dji.feedback.loss.frozen", "actual", 0),
+    ("dji.feedback.loss.id2", "actual", 254), ("dji.feedback.recover.id1", "actual", 200),
+    ("dji.feedback.baseline.id1", "actual", 0), ("dji.feedback.can", "actual", 1),
+    ("task.stack", "actual", 63), ("control.rx", "actual", True),
+    ("control.rx", "expected", -1), ("control.rx", "actual", 1 << 32)])
+def test_dji_feedback_case_rejects_stale_or_nonliteral_unsigned_fields(label, field, value):
+    row = next(row for row in feedback_case_rows() if row["name"] == label)
+    with pytest.raises((TypeError, ValueError)):
+        arena_module.check_dji_feedback_case(dict(row, **{field: value}))
+
+
+@pytest.mark.parametrize("corruption", ["missing", "duplicate", "skip", "summary", "frozen-baseline",
+                                        "recovery-origin", "stale-control"])
+def test_dji_feedback_coverage_requires_complete_reports_and_distinct_history(corruption):
+    rows = feedback_case_rows()
+    summaries = [{"kind": kind, "values": [15, 0, 1]} for kind in ("PHASE", "DONE")]
+    values = {row["name"]: row for row in rows}
+    if corruption == "missing":
+        rows.pop(0)
+    elif corruption == "duplicate":
+        rows.append(rows[0])
+    elif corruption == "skip":
+        rows[-1]["name"] = "hardware.calibration"
+    elif corruption == "summary":
+        summaries[-1]["values"] = [14, 0, 1]
+    elif corruption == "frozen-baseline":
+        values["dji.feedback.baseline.id1"]["actual"] = 200
+    elif corruption == "recovery-origin":
+        values["dji.feedback.recover.id1"]["expected"] = 199
+    else:
+        values["dji.feedback.recover.id2"]["actual"] = 110
+    with pytest.raises((TypeError, ValueError)):
+        arena_module.check_dji_feedback_coverage(rows, summaries)
+
+
+@pytest.fixture
+def dji_feedback_observation(tmp_path, monkeypatch):
+    """Borrow the original core/plant/socket consumer; isolate native acquisition."""
+    environment = Environment(tmp_path, monkeypatch)
+    elf = tmp_path / "same.elf"
+    elf.write_bytes(b"fixed input")
+    scenario = arena_module.write_dji_feedback_manifest(tmp_path, (elf, elf))
+    report = feedback_empty_report()
+    observer = arena_module.DjiFeedbackObservation(report, scenario.arena)
+    for original, method in (("create_arena_plant", "world"), ("CanStream", "can"),
+                             ("SharedWorldRuntime", "shared"), ("LabChannels", "channels")):
+        setattr(observer, "original_" + method, getattr(arena_module.arena, original))
+        monkeypatch.setattr(arena_module.arena, original, getattr(observer, method))
+    observer.watchdog = lambda index, name, stage: report["watchdogs"].setdefault(name, {}).update(
+        {stage: dict(timeouts=0, diagnostics="window-violations=0")})
+    try:
+        yield SimpleNamespace(environment=environment, scenario=scenario, report=report, observer=observer)
+    finally:
+        environment.release()
+
+
+def test_dji_feedback_actual_four_hundred_ms_socket_consumer_has_scoped_drop_and_fresh_recovery(
+        dji_feedback_observation):
+    fixture = dji_feedback_observation
+    environment, observer, report = fixture.environment, fixture.observer, fixture.report
+    environment.can_commands = ["0040ffc000000000"] * 2
+    environment.uart_chunks = [[b"TTEST READY dji.feedback.ready 0 0\n"] for _ in range(2)]
+    for index, epoch in enumerate((1000, 2000)):
+        for stamp, raw in ((260_000_000, "0000ffc000000000"), (360_000_000, "0040ffc000000000"),
+                           (380_000_000, "0000000000000000")):
+            environment.schedule_can(index, can_wire(epoch + stamp, raw), interval=stamp // 1_000_000 + 1)
+    published = set()
+    def service(index, operation):
+        if operation != "qom-get":
+            return
+        now = sum(environment.native.steps)
+        if now not in (20_000_000, 260_000_000, 360_000_000, 390_000_000) or (index, now) in published:
+            return
+        published.add((index, now))
+        rows = [row for row in feedback_case_rows() if (
+            now == 20_000_000 and (not row["name"].startswith("dji.feedback.") and row["status"] == "PASS"
+                                  or ".baseline." in row["name"]) or
+            now == 260_000_000 and ".loss." in row["name"] or
+            now == 360_000_000 and ".recover." in row["name"] or
+            now == 390_000_000 and row["name"] in ("dji.feedback.stop", "dji.feedback.can", "plant.physics"))]
+        suffix = b"TTEST PHASE 15 0 1\nTTEST DONE 15 0 1\n" if now == 390_000_000 else b""
+        environment.uart_chunks[index].append(scenario_uart_rows(rows) + suffix)
+    environment.qmp_callback = service
+    result = scenario_runtime.run_manifest(fixture.scenario, qemu=environment.binary,
+        startup_timeout=10., timeout=20., emit=observer.emit, on_response=observer.response)
+    environment.assert_clean()
+    report["physical_can_suffixes"] = [dict(peer=row.peer, suffix_hex=row.suffix.hex()) for row in observer.written]
+    for name in ("east", "west"):
+        arena_module.check_dji_feedback_coverage(report["cases"][name], report["summaries"][name])
+    arena_module.check_dji_feedback_observations(report)
+    assert (result.origin_ns, result.end_ns, result.steps) == (0, 400_000_000, 400)
+    assert report["native_calls"] == dict(reset=1, step_ns=[1_000_000] * 400, close=1)
+    assert observer.runtime.closed and observer.plant.closed and len(observer.plant.devices) == 8
+    assert all(not sources for sources in observer.feedback_sources.values())
+    for peer, name in enumerate(("east", "west")):
+        epoch = (1000, 2000)[peer]
+        dispatches = [row for row in report["feedback_dispatches"] if row["peer"] == peer]
+        assert len(dispatches) == 1600
+        dropped = [row for row in dispatches if row["dropped"]]
+        assert [(row["motor_id"], row["delivered_ns"]) for row in dropped] == [
+            (1, stamp) for stamp in range(201_000_000, 351_000_000, 1_000_000)]
+        accepted = [row for row in report["feedback"] if row["peer"] == peer]
+        expected = b"".join(struct.pack("<IIB3xQ64s", row["can_id"], 0, 8, epoch + row["delivered_ns"],
+            bytes.fromhex(row["data_hex"]).ljust(64, b"\0")) for row in accepted)
+        cpu = environment.cpus[peer]
+        assert len(accepted) == cpu.completed == len(cpu.receipts) == 1450 and not cpu.partial
+        assert bytes(cpu.received) == b"".join(cpu.receipts) == expected
+        assert all(bytes.fromhex(row["physical_wire_hex"]) == expected[offset * 84:(offset + 1) * 84]
+                   for offset, row in enumerate(accepted))
+        assert all(row["world_ns"] == row["due_ns"] == row["delivered_ns"] and row["qemu_ns"] == epoch + row["world_ns"]
+                   for row in accepted)
+        for group in ("commands", "command_wire", "command_deliveries"):
+            summary = report[group][name]
+            multiple = 4 if group == "command_deliveries" else 1
+            assert [summary[key] for key in ("count", "active_count", "loss_count", "zero_count")] == [
+                4 * multiple, 2 * multiple, multiple, multiple]
+            assert [row["data_hex"] for row in summary["transitions"]] == [
+                "0040ffc000000000", "0000ffc000000000", "0040ffc000000000", "0000000000000000"]
+
+
+@pytest.mark.parametrize("corruption", ["action", "late-baseline", "early-loss", "early-recovery",
+    "early-zero", "wrong-command", "other-motor-drop", "missing-other-motor", "no-recovery-source",
+    "wrong-epoch", "physical-prefix", "physical-suffix"])
+def test_dji_feedback_observation_rejects_scope_command_time_and_physical_failures(corruption):
+    report = feedback_completed_report()
+    arena_module.check_dji_feedback_observations(report)
+    evidence = report["feedback_observation"]
+    if corruption == "action":
+        evidence["actions"][0]["motor_id"] = 2
+    elif corruption in ("late-baseline", "early-loss", "early-recovery"):
+        label, stamp = {"late-baseline": ("baseline.id1", 200_000_000),
+            "early-loss": ("loss.age", 251_000_000), "early-recovery": ("recover.id1", 350_000_000)}[corruption]
+        evidence["cases"]["west"]["dji.feedback." + label]["logical_ns"] = stamp
+    elif corruption == "early-zero":
+        report["command_wire"]["west"]["witnesses"]["late_loss"]["qemu_ns"] = 2000 + 251_000_000
+    elif corruption == "wrong-command":
+        report["command_deliveries"]["west"]["witnesses"]["recovery"]["data_hex"] = "0040000000000000"
+    elif corruption == "other-motor-drop":
+        next(row for row in report["feedback_dispatches"] if row["motor_id"] == 2)["dropped"] = True
+    elif corruption == "missing-other-motor":
+        report["feedback_dispatches"] = [row for row in report["feedback_dispatches"] if row["motor_id"] != 4]
+    elif corruption == "no-recovery-source":
+        report["feedback"] = [row for row in report["feedback"] if not (
+            row["can_id"] == 0x201 and row["delivered_ns"] > 350_000_000)]
+    elif corruption == "wrong-epoch":
+        report["feedback"][0]["qemu_ns"] += 1
+    elif corruption == "physical-prefix":
+        report["feedback"][0]["physical_complete"] = False
+    else:
+        report["physical_can_suffixes"] = [dict(peer=0, suffix_hex="0102")]
+    with pytest.raises(ValueError, match="DJI feedback"):
+        arena_module.check_dji_feedback_observations(report)
+
+
+@pytest.mark.parametrize("mode", ["success", "missing-case", "cleanup", "interrupt"])
+def test_dji_feedback_runner_verifies_cleanup_and_preserves_failed_primary(
+        dji_scenario_completed_owner, tmp_path, monkeypatch, mode):
+    from tools import dm_mc02_dji_test as dji_sources
+    from tools import dm_mc02_referee_test as referee_sources
+    owner, cleanup_report = dji_scenario_completed_owner
+    elf = tmp_path / "firmware.elf"
+    elf.write_bytes(b"fixed input")
+    for relative in ("app/selftest/dji_feedback.cc", "Core/Src/fdcan.c",
+        "Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_fdcan.c",
+        "Middlewares/Third_Party/FreeRTOS/Source/tasks.c",
+        "Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c"):
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"fixed dependency")
+    inputs = lambda *args: {str(elf): hashlib.sha256(elf.read_bytes()).hexdigest()}
+    monkeypatch.setattr(dji_sources, "source_snapshot", inputs)
+    monkeypatch.setattr(referee_sources, "source_snapshot", inputs)
+    monkeypatch.setattr(referee_sources, "checkout_snapshot", lambda firmware: {})
+    monkeypatch.setattr(arena_module, "source_origins", lambda: {"sim.core": "fixed"})
+    calls, events = [], []
+    write_json = referee_sources.write_json
+    def write(path, report):
+        if report["result"] == "passed":
+            events.append("published passed")
+        write_json(path, report)
+    monkeypatch.setattr(referee_sources, "write_json", write)
+    primary = KeyboardInterrupt("original feedback interruption")
+    def completed(manifest, **options):
+        calls.append((manifest, options))
+        assert options["motor_feedback"] == ((200_000_000, "east", 1, False),
+            (200_000_000, "west", 1, False), (350_000_000, "east", 1, True), (350_000_000, "west", 1, True))
+        assert "can_delays" not in options
+        observer = options["on_response"].__self__
+        for key in ("owners", "children", "sockets", "controls", "plant", "runtime"):
+            setattr(observer, key, getattr(owner, key))
+        observer.report.update(feedback_completed_report(), **deepcopy(cleanup_report))
+        if mode == "missing-case":
+            observer.report["cases"]["west"].pop(0)
+        if mode in ("cleanup", "interrupt"):
+            observer.report["qmp_cleanup"][1]["completed"] = False
+        if mode == "interrupt":
+            elf.write_bytes(b"changed after consumer")
+        events.append("runtime cleanup completed")
+        if mode == "interrupt":
+            raise primary
+        boards = tuple(arena_module.arena.ArenaBoardResult(name, prefix, "uart_marker", epoch + 100,
+            epoch + 400_000_000, epoch, 400) for name, prefix, epoch in
+            (("east", "alpha/", 1000), ("west", "bravo/", 2000)))
+        return arena_module.arena.ArenaResult(manifest.name, 0, 400_000_000, 400, boards, ())
+    monkeypatch.setattr(arena_module.arena, "run_manifest", completed)
+    output = tmp_path / "result"
+    saved_signal = signal.getsignal(signal.SIGTERM)
+    assert arena_module.run_dji_feedback_scenario(elf, output, tmp_path, qemu=sys.executable) == (
+        0 if mode == "success" else 130 if mode == "interrupt" else 1)
+    assert signal.getsignal(signal.SIGTERM) == saved_signal and len(calls) == 1
+    assert [calls[0][1][key] for key in ("duration", "startup_timeout", "timeout")] == [.4, 10., 20.]
+    report = json.loads((output / "report.json").read_text())
+    assert report["feedback_scenario"] and report["scenario_input"]["duration_ns"] == 400_000_000
+    if mode == "success":
+        assert report["result"] == "passed" and report["cleanup_verified"] and report["source_preserved"]
+        assert report["missing"] == {"east": [], "west": []}
+        assert events == ["runtime cleanup completed", "published passed"]
+    else:
+        assert report["result"] == "failed" and "published passed" not in events
+        if mode == "missing-case":
+            assert report["missing"]["west"] == ["control.rx"]
+        if mode == "interrupt":
+            assert report["errors"][0] == "KeyboardInterrupt: original feedback interruption"
+            assert report["notes"] == primary.__notes__
+            assert "cleanup incomplete" in "\n".join(report["notes"])
+            assert "source state changed" in "\n".join(report["notes"])
+    saved = (output / "report.json").read_bytes()
+    with pytest.raises(ValueError, match="refusing to overwrite"):
+        arena_module.run_dji_feedback_scenario(elf, output, tmp_path, qemu=sys.executable)
+    assert (output / "report.json").read_bytes() == saved and len(calls) == 1
+
+
+def test_dji_feedback_cli_dispatches_only_dedicated_literal_consumer(monkeypatch):
+    calls = []
+    monkeypatch.setattr(arena_module, "run_dji_feedback_scenario", lambda *args, **options: calls.append((args, options)) or 7)
+    monkeypatch.setattr(sys, "argv", ["dji", "--feedback-scenario", "same.elf", "output path", "firmware", "--qemu", "qemu path"])
+    assert module.main() == 7
+    assert calls == [(("same.elf", "output path", "firmware"), {"qemu": "qemu path"})]
+
+
+@pytest.mark.parametrize("extra", [["--duration", "1s"], ["--scenario"], ["--timeout", "30"]])
+def test_dji_feedback_cli_refuses_profile_and_deadline_overrides(monkeypatch, extra):
+    monkeypatch.setattr(arena_module, "run_dji_feedback_scenario", lambda *args, **options: pytest.fail("unadmitted execution"))
+    monkeypatch.setattr(sys, "argv", ["dji", "--feedback-scenario", "same.elf", "result", "firmware", *extra])
+    with pytest.raises(SystemExit) as caught:
+        module.main()
+    assert caught.value.code == 2

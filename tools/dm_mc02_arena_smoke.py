@@ -1819,6 +1819,422 @@ def run_dji_scenario(elf, output, firmware, *, qemu=None):
     return 0 if primary is None else 130 if isinstance(primary, KeyboardInterrupt) else 1
 
 
+DJI_FEEDBACK_LOSS_NS = 200_000_000
+DJI_FEEDBACK_RECOVERY_NS = 350_000_000
+DJI_FEEDBACK_REQUIRED = frozenset(("control.rx", "reset.poweron", "bsp.init", "task.stack",
+    "dji.feedback.baseline.id1", "dji.feedback.baseline.id2", "dji.feedback.loss.frozen",
+    "dji.feedback.loss.age", "dji.feedback.loss.app_age", "dji.feedback.loss.output",
+    "dji.feedback.loss.id2", "dji.feedback.recover.id1", "dji.feedback.recover.id2",
+    "dji.feedback.stop", "dji.feedback.can"))
+
+
+def write_dji_feedback_manifest(directory, firmwares):
+    from sim.scenario.manifest import load_manifest as load_scenario
+    manifest = write_manifests(directory, firmwares, dji_scenario=True)
+    for member in manifest.robots:
+        path = member.robot.path
+        document = json.loads(path.read_text())
+        document["ready"]["text"] = "TTEST READY dji.feedback.ready 0 0\n"
+        path.write_text(json.dumps(document))
+    document = {"schema": 1, "arena": manifest.path.name, "duration": "400ms", "events": [
+        {"at": at, "action": "motor_feedback", "target": name + ".motor_fl", "value": enabled}
+        for at, enabled in (("200ms", False), ("350ms", True))
+        for name in DJI_SCENARIO_MEMBERS]}
+    path = directory / "scenario.yaml"
+    path.write_text(json.dumps(document))
+    return load_scenario(path)
+
+
+def check_dji_feedback_case(row):
+    if type(row) is not dict or set(row) != {"status", "name", "actual", "expected"}:
+        raise ValueError("DJI feedback firmware case requires exact fields")
+    status, name, actual, expected = (row[key] for key in ("status", "name", "actual", "expected"))
+    if any(type(value) is not int or not 0 <= value <= 0xffffffff for value in (actual, expected)):
+        raise ValueError("DJI feedback firmware report requires uint32 fields")
+    if status == "SKIP" and name == "plant.physics" and actual == expected == 0:
+        return
+    if status != "PASS" or name not in DJI_FEEDBACK_REQUIRED:
+        raise ValueError("failed or unexpected DJI feedback firmware case: " + name)
+    if name == "task.stack":
+        valid = actual >= 64 and expected == 64
+    elif name == "reset.poweron":
+        valid = actual == expected == 0x800000
+    elif name == "dji.feedback.loss.age":
+        valid = actual > 50 and expected == 51
+    elif name == "dji.feedback.loss.app_age":
+        valid = actual < 50 and expected == 50
+    elif name == "dji.feedback.loss.frozen":
+        valid = actual == expected != 0
+    elif name in ("dji.feedback.loss.id2", "dji.feedback.recover.id1"):
+        valid = actual != 0 and expected != 0 and actual != expected
+    elif name.startswith("dji.feedback.baseline.") or name == "dji.feedback.recover.id2":
+        valid = actual != 0 and expected == 0
+    else:
+        valid = actual == expected == 0
+    if not valid:
+        raise ValueError("DJI feedback firmware fields disagree: " + name)
+
+
+def check_dji_feedback_coverage(rows, summaries):
+    for row in rows:
+        check_dji_feedback_case(row)
+    if (Counter(row["name"] for row in rows if row["status"] == "PASS") !=
+            Counter({name: 1 for name in DJI_FEEDBACK_REQUIRED})
+            or [row["name"] for row in rows if row["status"] == "SKIP"] != ["plant.physics"]
+            or summaries != [{"kind": kind, "values": [15, 0, 1]} for kind in ("PHASE", "DONE")]):
+        raise ValueError("missing/duplicate DJI feedback firmware coverage or summaries")
+    values = {row["name"]: row for row in rows}
+    baseline = values["dji.feedback.baseline.id1"]["actual"]
+    frozen = values["dji.feedback.loss.frozen"]["actual"]
+    if (frozen == baseline or values["dji.feedback.recover.id1"]["expected"] != frozen
+            or values["dji.feedback.recover.id2"]["actual"] ==
+               values["dji.feedback.baseline.id2"]["actual"]):
+        raise ValueError("DJI feedback timestamp history disagrees")
+
+
+class DjiFeedbackObservation(DjiScenarioObservation):
+    """Observe the sole Scenario schedule and the real firmware timeout response."""
+
+    consumer_label = "DJI feedback Scenario"
+
+    def _record_command(self, group, name, layer, row):
+        data = row["data_hex"]
+        if ((row["can_id"], row["flags"], row["dlc"]) != (0x200, 0, 8)
+                or data not in ("0040ffc000000000", "0000ffc000000000", "0000000000000000")):
+            error = ValueError("DJI feedback command differs from literal CURRENT profile: " + repr(row))
+            self._reject_command(name, layer, row, "literal_profile", error)
+            raise error
+        summary = self.report[group][name]
+        if summary["count"] >= 10000:
+            raise BufferError("DJI feedback command observation exhausted")
+        summary["count"] += 1
+        counter = {"0040ffc000000000": "active_count", "0000ffc000000000": "loss_count",
+                   "0000000000000000": "zero_count"}[data]
+        summary[counter] += 1
+        if summary["first"] is None:
+            summary["first"] = row
+        if summary["last"] is None or summary["last"]["data_hex"] != data:
+            summary["transition_count"] += 1
+            if len(summary["transitions"]) < 8:
+                summary["transitions"].append(row)
+        summary["last"] = row
+        reset = self.report["responses"][name]["reset"]
+        if reset is None:
+            raise ValueError("DJI feedback command preceded actual RESET epoch")
+        stamp = row.get("qemu_ns", row.get("mapped_qemu_ns")) - reset["decoded"]["virtual_time_ns"]
+        witnesses = summary["witnesses"]
+        if data == "0040ffc000000000" and stamp < DJI_FEEDBACK_LOSS_NS:
+            witnesses.setdefault("baseline", row)
+        elif data == "0000ffc000000000" and 251_000_000 < stamp < DJI_FEEDBACK_RECOVERY_NS:
+            witnesses.setdefault("late_loss", row)
+        elif data == "0040ffc000000000" and stamp > DJI_FEEDBACK_RECOVERY_NS:
+            witnesses.setdefault("recovery", row)
+        elif data == "0000000000000000" and "recovery" in witnesses:
+            witnesses.setdefault("stop", row)
+
+    def world(self, manifest):
+        plant = super().world(manifest)
+        try:
+            for peer, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
+                log = bus.log
+                def observed_dispatch(delivery, peer=peer, log=log):
+                    log(delivery)
+                    if delivery.destination != "qemu" or not 0x201 <= delivery.frame.can_id <= 0x204:
+                        return
+                    index = peer * 4 + delivery.frame.can_id - 0x201
+                    source = self.feedback_sources[index].get(delivery.timestamp_ns)
+                    if source is None:
+                        raise ValueError("DJI feedback dispatch has no completed producer source")
+                    row = {"peer": peer, "motor_id": delivery.frame.can_id - 0x200,
+                        "source": delivery.source, "destination": delivery.destination,
+                        "world_ns": delivery.timestamp_ns, "due_ns": delivery.due_ns,
+                        "delivered_ns": delivery.delivered_ns, "sequence": delivery.sequence,
+                        "data_hex": delivery.frame.data.hex(), "dropped": delivery.dropped}
+                    if (plant.devices[index].motor_id != row["motor_id"]
+                            or row["source"] != "m3508-" + str(row["motor_id"])
+                            or row["data_hex"] != source["data_hex"]):
+                        raise ValueError("DJI feedback dispatch differs from actual device source")
+                    append_bounded(self.report, "feedback_dispatches", row, self.feedback_bound)
+                    if delivery.dropped:
+                        del self.feedback_sources[index][delivery.timestamp_ns]
+                bus.log = observed_dispatch
+            return plant
+        except BaseException as error:
+            close_observation_failure(plant, "world", error)
+            raise
+
+    def shared(self, *args, **options):
+        runtime = FirmwareObservation.shared(self, *args, **options)
+        try:
+            start, setter = runtime.start, runtime.set_motor_feedback_enabled
+            evidence = self.report["feedback_observation"]
+            def observed_start(session, wire_sessions, *, deadline):
+                if evidence["shared_start"] is not None:
+                    raise ValueError("duplicate DJI feedback shared start")
+                row = evidence["shared_start"] = {"session_id": session.session_id,
+                    "origin_ns": session.t_sim_ns, "wire_sessions": list(wire_sessions), "accepted": False}
+                result = start(session, wire_sessions, deadline=deadline)
+                row["accepted"] = True
+                return result
+            def observed_setter(name, motor_id, enabled):
+                row = {"logical_ns": runtime.t_sim_ns, "member": name, "motor_id": motor_id,
+                       "enabled": enabled, "accepted": False}
+                append_bounded(evidence, "actions", row, 4)
+                result = setter(name, motor_id, enabled)
+                row["accepted"] = True
+                return result
+            runtime.start, runtime.set_motor_feedback_enabled = observed_start, observed_setter
+            return runtime
+        except BaseException as error:
+            close_observation_failure(runtime, "shared world", error)
+            raise
+
+    def check_cont(self):
+        start = self.report["feedback_observation"]["shared_start"]
+        if start is None or not start["accepted"]:
+            raise ValueError("DJI feedback execution preceded actual shared reset")
+
+    def service_control(self):
+        pass
+
+    def emit(self, event):
+        if event.event.endpoint != "uart1":
+            raise ValueError("unexpected DJI feedback guest UART output")
+        index = [member.name for member in self.manifest.robots].index(event.name)
+        text = event.event.data.decode("ascii")
+        if len(self.report["uart"][index]) + len(text) > 12000:
+            raise BufferError("DJI feedback UART observation exhausted")
+        self.report["uart"][index] += text
+        buffer = self.buffers[event.name]
+        if len(buffer) + len(event.event.data) > 12000:
+            raise BufferError("DJI feedback UART line buffer exhausted")
+        buffer.extend(event.event.data)
+        while b"\n" in buffer:
+            raw, _, suffix = buffer.partition(b"\n")
+            buffer[:] = suffix
+            fields = raw.decode("ascii").strip().split()
+            if not fields or fields[0] != "TTEST":
+                continue
+            if len(fields) != 5:
+                raise ValueError("invalid DJI feedback firmware report")
+            if fields[1] in ("PHASE", "DONE"):
+                append_bounded(self.report["summaries"], event.name,
+                    {"kind": fields[1], "values": list(map(int, fields[2:]))}, 2)
+                if fields[1] == "DONE":
+                    check_dji_feedback_coverage(self.report["cases"][event.name], self.report["summaries"][event.name])
+                    self.watchdog(index, event.name, "done")
+                continue
+            row = {"status": fields[1], "name": fields[2], "actual": int(fields[3]), "expected": int(fields[4])}
+            marker = {"logical_ns": self.runtime.t_sim_ns, "poll_sample_qemu_ns": event.event.timestamp_ns}
+            if row["status"] == "READY":
+                if (row["name"] != "dji.feedback.ready" or row["actual"] != 0 or row["expected"] != 0
+                        or event.name in self.report["ready"]):
+                    raise ValueError("unexpected DJI feedback ready marker")
+                self.report["ready"][event.name] = marker
+            else:
+                append_bounded(self.report["cases"], event.name, row, 16)
+                check_dji_feedback_case(row)
+                if row["name"].startswith("dji.feedback."):
+                    if event.name not in self.report["ready"]:
+                        raise ValueError("DJI feedback sample preceded actual UART ready")
+                    self.report["feedback_observation"]["cases"][event.name][row["name"]] = marker
+
+
+def check_dji_feedback_observations(report):
+    evidence = report["feedback_observation"]
+    if evidence["shared_start"] != {"session_id": 1, "origin_ns": 0,
+                                     "wire_sessions": [1, 2], "accepted": True}:
+        raise ValueError("DJI feedback shared reset observation disagrees")
+    expected = [(stamp, name, 1, enabled) for stamp, enabled in
+                ((DJI_FEEDBACK_LOSS_NS, False), (DJI_FEEDBACK_RECOVERY_NS, True))
+                for name in DJI_SCENARIO_MEMBERS]
+    actions = evidence["actions"]
+    if ([(row["logical_ns"], row["member"], row["motor_id"], row["enabled"]) for row in actions] != expected
+            or any(not row["accepted"] for row in actions)):
+        raise ValueError("DJI feedback original reset-relative actions disagree")
+    if any(row["suffix_hex"] for row in report["physical_can_suffixes"]):
+        raise ValueError("DJI feedback physical CAN suffix remains incomplete")
+    for peer, name in enumerate(DJI_SCENARIO_MEMBERS):
+        cases = evidence["cases"][name]
+        baseline = [cases["dji.feedback.baseline.id" + str(i)]["logical_ns"] for i in (1, 2)]
+        loss = [value["logical_ns"] for label, value in cases.items() if label.startswith("dji.feedback.loss.")]
+        recovery = [cases["dji.feedback.recover.id" + str(i)]["logical_ns"] for i in (1, 2)]
+        if (max(baseline) >= DJI_FEEDBACK_LOSS_NS or min(loss) <= 251_000_000
+                or max(loss) >= DJI_FEEDBACK_RECOVERY_NS or min(recovery) <= DJI_FEEDBACK_RECOVERY_NS
+                or cases["dji.feedback.stop"]["logical_ns"] < max(recovery)):
+            raise ValueError("DJI feedback firmware baseline/loss/recovery order disagrees")
+        for group in ("commands", "command_wire", "command_deliveries"):
+            summary = report[group][name]
+            if (set(summary["witnesses"]) != {"baseline", "late_loss", "recovery", "stop"}
+                    or any(summary[key] <= 0 for key in ("active_count", "loss_count", "zero_count"))
+                    or not 0 < summary["transition_count"] <= summary["count"] <= 10000
+                    or len(summary["transitions"]) != min(summary["transition_count"], 8)):
+                raise ValueError("DJI feedback actual command witnesses incomplete: " + group)
+            epoch = report["responses"][name]["reset"]["decoded"]["virtual_time_ns"]
+            witnesses = summary["witnesses"]
+            stamps = {}
+            for phase, data in (("baseline", "0040ffc000000000"), ("late_loss", "0000ffc000000000"),
+                                ("recovery", "0040ffc000000000"), ("stop", "0000000000000000")):
+                row = witnesses[phase]
+                if (row["peer"], row["can_id"], row["flags"], row["dlc"], row["data_hex"]) != (peer, 0x200, 0, 8, data):
+                    raise ValueError("DJI feedback command witness differs from literal: " + phase)
+                stamps[phase] = row.get("qemu_ns", row.get("mapped_qemu_ns")) - epoch
+            if not (0 <= stamps["baseline"] < DJI_FEEDBACK_LOSS_NS
+                    and 251_000_000 < stamps["late_loss"] < DJI_FEEDBACK_RECOVERY_NS
+                    < stamps["recovery"] <= stamps["stop"]):
+                raise ValueError("DJI feedback command witness time disagrees")
+        dispatches = [row for row in report["feedback_dispatches"] if row["peer"] == peer]
+        for row in dispatches:
+            denied = row["motor_id"] == 1 and DJI_FEEDBACK_LOSS_NS < row["delivered_ns"] <= DJI_FEEDBACK_RECOVERY_NS
+            if row["dropped"] != denied or row["due_ns"] != row["world_ns"]:
+                raise ValueError("DJI feedback dispatch scope/original due disagrees")
+        for identifier in (1, 2, 3, 4):
+            if not any(row["motor_id"] == identifier and DJI_FEEDBACK_LOSS_NS < row["delivered_ns"] <
+                       DJI_FEEDBACK_RECOVERY_NS for row in dispatches):
+                raise ValueError("DJI feedback loss interval lacks motor dispatch evidence")
+        accepted = [row for row in report["feedback"] if row["peer"] == peer and row["accepted"]]
+        if not any(row["can_id"] == 0x201 and row["delivered_ns"] > DJI_FEEDBACK_RECOVERY_NS for row in accepted):
+            raise ValueError("DJI feedback fresh recovery has no admitted source")
+        epoch = report["responses"][name]["reset"]["decoded"]["virtual_time_ns"]
+        for row in accepted:
+            if (row["qemu_ns"] != epoch + row["delivered_ns"] or not row.get("physical_complete")
+                    or not row.get("physical_wire_hex")):
+                raise ValueError("DJI feedback epoch/physical receipt incomplete")
+
+
+def run_dji_feedback_scenario(elf, output, firmware, *, qemu=None):
+    """Use the production Scenario once; retain every failed consumer/cleanup gate."""
+    from tools.dm_mc02_dji_test import source_snapshot as dji_sources
+    from tools.dm_mc02_referee_test import source_snapshot, checkout_snapshot, write_json
+    from sim.scenario import runtime as scenario_runtime
+    output = Path(output).resolve()
+    if output.exists():
+        raise ValueError("refusing to overwrite existing DJI feedback result directory")
+    output.mkdir(parents=True)
+    report = {"result": "failed", "arena": True, "scenario": True, "feedback_scenario": True,
+        "errors": [], "notes": [], "cleanup": [], "qmp_events": [], "qmp_cleanup": [], "uart": ["", ""],
+        "cases": {name: [] for name in DJI_SCENARIO_MEMBERS},
+        "summaries": {name: [] for name in DJI_SCENARIO_MEMBERS}, "ready": {}, "watchdogs": {},
+        "responses": {name: {"count": 0, "first": None, "last": None, "reset": None,
+            "step_ack_count": 0, "first_step_ack": None, "last_step_ack": None,
+            "done_count": 0, "last_done": None} for name in DJI_SCENARIO_MEMBERS},
+        "native_calls": {"reset": 0, "step_ns": [], "close": 0}, "feedback": [], "feedback_dispatches": [],
+        **{group: {name: dict(_dji_command_summary(), loss_count=0, witnesses={})
+                   for name in DJI_SCENARIO_MEMBERS}
+           for group in ("commands", "command_wire", "command_deliveries")},
+        "can_receive_errors": [], "feedback_observation": {"shared_start": None, "actions": [],
+            "cases": {name: {} for name in DJI_SCENARIO_MEMBERS}},
+        "missing": {name: sorted(DJI_FEEDBACK_REQUIRED) for name in DJI_SCENARIO_MEMBERS},
+        "skips": {name: [] for name in DJI_SCENARIO_MEMBERS},
+        "missing_skips": {name: ["plant.physics"] for name in DJI_SCENARIO_MEMBERS},
+        "observation_bounds": {"feedback": 10000, "steps": 1250, "pending_per_device": 256,
+            "commands_per_peer": 10000, "sampled_command_transitions_per_peer": 8},
+        "limitations": ["Fixed two-board IDs1/2 CURRENT64/-64; both ID1 feedback paths denied200..350ms; ID2 is the live control.",
+            "Actual commands are checked/counted; first8 transitions and four witnesses are bounded observations, not a full trace.",
+            "BSP sample time, source/due/dispatch, QEMU wire and UART poll times are separate observations; repeated bytes cannot identify a unique callback.",
+            "Feedback unreachability is not motor poweroff; no physical calibration, silicon timing, CPU/global barrier, RTF, replay or mixed fidelity claim.",
+            "Original fixed DJI Scenario Release20s failure remains unresolved; this separately named gate does not clear it.",
+            "Firmware plant.physics remains an explicit SKIP."]}
+    write_json(output / "report.json", report)
+    observer = primary = binary = manifest = scenario_manifest = None
+    previous_signal = signal.getsignal(signal.SIGTERM)
+    def interrupted(signum, _frame):
+        raise KeyboardInterrupt(f"DJI feedback Scenario interrupted by signal {signum}")
+    signal.signal(signal.SIGTERM, interrupted)
+    def inputs():
+        result = source_snapshot(elf, binary, firmware)
+        result["dji_consumer"] = dji_sources(elf, binary, firmware)
+        result["feedback_firmware"] = sha(firmware / "app/selftest/dji_feedback.cc")
+        paths = [ROOT / name for name in ("models/two_four_wheel.xml", "models/four_wheel.xml",
+            "models/mujoco-LICENSE.txt", "flake.lock", "tools/dm_mc02_arena_smoke.py",
+            "tools/dm_mc02_shared_world_smoke.py")]
+        paths += [firmware / name for name in ("Core/Src/fdcan.c",
+            "Drivers/STM32H7xx_HAL_Driver/Src/stm32h7xx_hal_fdcan.c",
+            "Middlewares/Third_Party/FreeRTOS/Source/tasks.c",
+            "Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F/port.c")]
+        if manifest is not None:
+            paths += [manifest.path, *(item.robot.path for item in manifest.robots)]
+        if scenario_manifest is not None:
+            paths.append(scenario_manifest.path)
+        result.update({str(path): sha(path) for path in paths})
+        return result
+    try:
+        elf = arena.regular_file(elf, "DjiFeedbackTest ELF")
+        binary = arena.resolve_qemu(qemu)
+        firmware = Path(firmware).resolve()
+        if not firmware.is_dir():
+            raise ValueError("firmware source tree is not a directory")
+        directory = output / "arena"
+        directory.mkdir()
+        scenario_manifest = write_dji_feedback_manifest(directory, (elf, elf))
+        manifest = scenario_manifest.arena
+        report["scenario_input"] = {"path": str(scenario_manifest.path),
+            "duration_ns": scenario_manifest.duration_ns,
+            "can_delays": [asdict(item) for item in scenario_manifest.can_delays],
+            "motor_feedback": [asdict(item) for item in scenario_manifest.motor_feedback]}
+        report["inputs_before"], report["checkout_before"] = inputs(), checkout_snapshot(firmware)
+        report["actual_sources_before"] = source_origins()
+        observer = DjiFeedbackObservation(report, manifest)
+        overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
+            "connect_unix": "connect", "SharedWorldRuntime": "shared", "LabChannels": "channels", "CanStream": "can"}
+        for original, replacement in overrides.items():
+            setattr(observer, "original_" + replacement, getattr(arena, original))
+        with patch.multiple(arena, **{name: getattr(observer, method) for name, method in overrides.items()}):
+            result = scenario_runtime.run_manifest(scenario_manifest, qemu=binary,
+                startup_timeout=10., timeout=20., emit=observer.emit, on_response=observer.response)
+        report["runtime_result"] = asdict(result)
+        calls = report["native_calls"]
+        if (result.end_ns - result.origin_ns != 400_000_000 or result.origin_ns >= DJI_FEEDBACK_LOSS_NS
+                or calls["reset"] != 1 or calls["close"] != 1 or len(calls["step_ns"]) != result.steps
+                or sum(calls["step_ns"]) != result.end_ns or set(calls["step_ns"]) != {1_000_000}
+                or len(result.boards) != 2 or result.referees or result.children):
+            raise ValueError("DJI feedback world/result scope disagrees")
+        for wire_session, board in enumerate(result.boards, 1):
+            if board.ready != "uart_marker" or board.ready_qemu_ns is None:
+                raise ValueError("DJI feedback actual UART ready missing")
+            report["ready"][board.name]["post_read_qemu_ns"] = board.ready_qemu_ns
+            check_referee_responses(report["responses"][board.name], wire_session,
+                result.steps, result.end_ns, board.reset_qemu_ns)
+    except BaseException as error:
+        primary = error
+    finally:
+        def verify(callback):
+            nonlocal primary
+            try:
+                callback()
+            except BaseException as error:
+                report["errors"].append(f"{type(error).__name__}: {error}")
+                if primary is None:
+                    primary = error
+                elif error is not primary:
+                    primary.add_note(f"DJI feedback post-cleanup verification failed: {type(error).__name__}: {error}")
+                    for note in tuple(getattr(error, "__notes__", ())):
+                        primary.add_note(note)
+        for name in DJI_SCENARIO_MEMBERS:
+            rows = report["cases"][name]
+            report["missing"][name] = sorted(DJI_FEEDBACK_REQUIRED -
+                {row["name"] for row in rows if row["status"] == "PASS"})
+            report["skips"][name] = [row["name"] for row in rows if row["status"] == "SKIP"]
+            report["missing_skips"][name] = [] if "plant.physics" in report["skips"][name] else ["plant.physics"]
+            verify(lambda name=name: check_dji_feedback_coverage(report["cases"][name], report["summaries"][name]))
+        report["physical_can_suffixes"] = [] if observer is None else [
+            {"peer": item.peer, "suffix_hex": item.suffix.hex()} for item in observer.written]
+        verify(lambda: check_dji_feedback_observations(report))
+        verify(lambda: verify_firmware_cleanup(report, observer, label="DJI feedback Scenario", controls=True))
+        verify(lambda: verify_firmware_sources(report, inputs, firmware, observer=observer, label="DJI feedback Scenario"))
+        verify(lambda: verify_firmware_watchdogs(report, label="DJI feedback Scenario"))
+        signal.signal(signal.SIGTERM, previous_signal)
+        report["result"] = "passed" if primary is None else "failed"
+        if primary is not None:
+            report["errors"].insert(0, f"{type(primary).__name__}: {primary}")
+            report["error_type"], report["notes"] = type(primary).__name__, list(getattr(primary, "__notes__", ()))
+        write_json(output / "report.json", report)
+    print("RESULT: dual-QEMU DJI feedback Scenario consumer " + report["result"])
+    if primary is not None:
+        print(f"DJI feedback Scenario failed: {primary}", file=sys.stderr)
+    return 0 if primary is None else 130 if isinstance(primary, KeyboardInterrupt) else 1
+
+
 def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
     """One existing Arena execution, with passed published after cleanup checks."""
     if cli and not scenario:
