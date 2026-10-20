@@ -51,7 +51,7 @@ class Machine(Component):
         self.input_values = []
         self.request_views = []
         self.sender = send
-        self.connection = context.attach_can("can", self)
+        self.connection = context.attach("can", self)
 
     def receive(self, frame):
         self.frames.append(frame)
@@ -76,7 +76,7 @@ class Plant(Component):
         super().__init__(spec, context, trace)
         self.control = 0
         self.integrated_controls = []
-        self.connection = context.attach_can("can", self)
+        self.connection = context.attach("can", self)
 
     def receive(self, frame):
         self.control = frame.data[0]
@@ -125,6 +125,134 @@ def input_scene(**kwargs):
     simulation = Simulation(Topology((NodeSpec("plant", "plant"),)),
                             {"plant": factory}, quantum_ns=10, **kwargs)
     return simulation, factory
+
+
+def test_generic_connection_owners_sample_all_sources_before_dispatching_sinks():
+    trace = []
+
+    class Owner(Component):
+        dispatch_budget = 4
+
+        def __init__(self, spec, context):
+            super().__init__(spec, context, trace)
+            trace.append(("create", self.name))
+            self.queue = []
+
+        def attach_port(self, endpoint, *, descriptor, endpoint_name, owner_port, context):
+            assert descriptor.name == "p" and descriptor.protocol == "opaque"
+            assert endpoint_name == f"{context.node_id}.p" and owner_port == "wire"
+            self.endpoint = endpoint
+            return self
+
+        def start(self):
+            trace.append(("start", self.name))
+
+        def sample(self, cut):
+            trace.append(("sample", self.name, cut))
+            self.queue.append(cut)
+
+        @property
+        def next_due_ns(self):
+            return self.queue[0] if self.queue else None
+
+        def dispatch(self, cut, budget):
+            if not self.queue or not budget:
+                return 0
+            trace.append(("dispatch", self.name, cut))
+            self.endpoint.receive(self.queue.pop(0))
+            return 1
+
+    class Consumer(Component):
+        def __init__(self, spec, context):
+            super().__init__(spec, context, trace)
+            trace.append(("create", self.name))
+            self.connection = context.attach("p", self)
+            self.received = []
+
+        def start(self):
+            trace.append(("start", self.name))
+
+        def receive(self, value):
+            self.received.append(value)
+
+        def step(self, ctx):
+            trace.append(("step", self.name))
+            return StepResult("ok", ctx.t_sim_ns)
+
+    owner = Factory(Owner, {"connection", "dispatch", "sample"},
+                    (PortSpec("wire", "opaque", max_connections=None),))
+    consumer = Factory(Consumer, {"step"}, (PortSpec("p", "opaque"),))
+    topology = Topology(tuple(NodeSpec(name, kind) for name, kind in
+        (("first", "consumer"), ("wire1", "owner"), ("second", "consumer"), ("wire2", "owner"))),
+        (LinkSpec("first.p", "wire1.wire"), LinkSpec("second.p", "wire2.wire")))
+    with Simulation(topology, {"owner": owner, "consumer": consumer}) as simulation:
+        assert trace[:4] == [("create", "wire1"), ("create", "wire2"),
+                             ("create", "first"), ("create", "second")]
+        assert all(item.received == [0] for item in consumer.instances)
+        simulation.run_until(0)
+        simulation.step(3)
+        assert all(item.received == [0, 3] for item in consumer.instances)
+        for cut in (0, 3):
+            samples = [trace.index(("sample", name, cut)) for name in ("wire1", "wire2")]
+            deliveries = [trace.index(("dispatch", name, cut)) for name in ("wire1", "wire2")]
+            assert max(samples) < min(deliveries)
+            completed = [index for index, item in enumerate(trace)
+                         if item[0] == ("start" if cut == 0 else "step")]
+            assert max(completed) < min(samples)
+        assert len([item for item in trace if item[0] == "sample"]) == 4
+
+
+@pytest.mark.parametrize("failure", ["bad_due", "bad_due_after_dispatch", "negative_count",
+                                     "boolean_count", "excess_count", "no_progress"])
+def test_dispatch_contract_failures_freeze_and_cleanup_without_retry(failure):
+    class Dispatcher(Component):
+        dispatch_budget = 2
+        next_due_ns = None
+        calls = 0
+        enabled = False
+
+        def dispatch(self, cut, budget):
+            if not self.enabled:
+                return 0
+            self.calls += 1
+            if failure == "bad_due_after_dispatch":
+                self.next_due_ns = 1 << 64
+                return 1
+            return {"negative_count": -1, "boolean_count": True,
+                    "excess_count": 3, "no_progress": 0}[failure]
+
+    factory = Factory(Dispatcher, {"dispatch"})
+    simulation = Simulation(Topology((NodeSpec("dispatch", "dispatch"),)), {"dispatch": factory})
+    with simulation:
+        item = factory.instances[0]
+        item.enabled = True
+        item.next_due_ns = -1 if failure == "bad_due" else 0
+        with pytest.raises((ValueError, RuntimeError)):
+            simulation.run_until(0)
+        assert item.calls == (0 if failure == "bad_due" else 1)
+        assert (simulation.t_sim_ns, simulation.step_id) == (0, 0)
+        assert simulation.state == SimulationState.FAILED
+        with pytest.raises(RuntimeError):
+            simulation.step()
+    assert item.close_count == 1
+
+
+def test_bad_dispatcher_admission_closes_returned_owner_before_any_start():
+    class Invalid(Component):
+        dispatch_budget = True
+        next_due_ns = None
+
+        def dispatch(self, cut, budget):
+            raise AssertionError("invalid owner dispatched")
+
+    factory = Factory(Invalid, {"dispatch"})
+    simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory})
+    with pytest.raises(ValueError, match="dispatch_budget"):
+        simulation.start()
+    assert factory.instances[0].sessions == []
+    assert factory.instances[0].close_count == 1
+    assert simulation.state == SimulationState.FAILED
+    simulation.close()
 
 
 @pytest.mark.parametrize("operation", ["step", "run_until"])
@@ -240,7 +368,7 @@ def test_can_budget_does_not_refresh_when_callbacks_schedule_more_current_inputs
     class Alternating(Component):
         def __init__(self, spec, context):
             super().__init__(spec, context)
-            self.link = context.attach_can("can", self)
+            self.link = context.attach("can", self)
             self.inputs = self.received = 0
 
         def input(self, port, payload):
@@ -474,7 +602,7 @@ def test_can_self_excitation_and_queue_capacity_are_bounded():
     class Echo(Component):
         def __init__(self, spec, context):
             super().__init__(spec, context)
-            self.link = context.attach_can("can", self)
+            self.link = context.attach("can", self)
         def receive(self, frame):
             self.link.send(frame)
     factory = Factory(Echo, ports=(PortSpec("can", "can"),))

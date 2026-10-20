@@ -115,7 +115,7 @@ class QemuMachine:
         self._ctx, self._factory = ctx, factory
         self._can_ports = tuple(port for port in CAN_PORTS if port in ctx.connected_ports)
         # Connections attach before any process creation. Runtime owns the buses.
-        self._can = {port: ctx.attach_can(port, _CanInput(self, port))
+        self._can = {port: ctx.attach(port, _CanInput(self, port))
                      for port in self._can_ports}
         self._manager = self._owner = self._qmp = self._board = None
         self._peers = []

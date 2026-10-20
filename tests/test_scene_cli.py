@@ -10,7 +10,7 @@ import sys
 import pytest
 import yaml
 
-from sim.api import LinkSpec, NodeSpec, Topology
+from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
 from sim.composition import builtin_registry
 from sim.config.scene import load_scene
 from sim.fabric import CanBusFactory, CanFrame
@@ -87,6 +87,9 @@ def test_core_static_import_direction():
                          else [node.module or ""] if isinstance(node, ast.ImportFrom) else [])
                 assert not any(name == prefix or name.startswith(prefix + ".")
                                for name in names for prefix in forbidden), (path, names)
+                if directory in ("api", "runtime", "config"):
+                    assert not any(name == "sim.fabric" or name.startswith("sim.fabric.")
+                                   for name in names), (path, names)
 
 
 def test_help_and_validate_refuse_optional_imports_in_fresh_process(tmp_path):
@@ -128,20 +131,34 @@ def test_missing_native_backend_is_blocked_and_preserves_report(tmp_path):
 
 def test_fixed_rotor_reuses_actual_protocol_and_timeout():
     from sim.devices.dji.fixed import FixedRotorFactory
-    registry = {"bus.can": CanBusFactory(), "fixed": FixedRotorFactory()}
+
+    class Sender:
+        def __init__(self, spec, context):
+            self.connection = context.attach("can", self)
+
+        def reset(self, session):
+            self.connection.send(CanFrame(0x200, data=bytes.fromhex("0040000000000000")))
+
+        def receive(self, frame):
+            pass
+
+        def close(self):
+            pass
+
+    class SenderFactory:
+        def describe(self, spec):
+            return NodeDescription((PortSpec("can", "can"),))
+
+        def create(self, spec, context):
+            return Sender(spec, context)
+
+    registry = {"bus.can": CanBusFactory(), "fixed": FixedRotorFactory(), "sender": SenderFactory()}
     topology = Topology((NodeSpec("bus", "bus.can"), NodeSpec("motor", "fixed", {
         "motor_id": 1, "plant": "fixed-rotor", "position_rad": 0,
-        "velocity_rad_s": 0})), (LinkSpec("bus.can", "motor.can"),))
+        "velocity_rad_s": 0}), NodeSpec("host", "sender")),
+        (LinkSpec("bus.can", "motor.can"), LinkSpec("host.can", "bus.can")))
     observed = []
     with Simulation(topology, registry, on_event=observed.append) as simulation:
-        # A caller-provided endpoint exercises the same public bus protocol.
-        bus = simulation.components["bus"]
-        class Sender:
-            def receive(self, frame):
-                pass
-        sender = Sender()
-        bus.attach(sender, "external")
-        bus.send(sender, CanFrame(0x200, data=bytes.fromhex("0040000000000000")))
         simulation.step()
         feedback = [event.payload["frame"] for event in observed
                     if event.kind == "can.sent" and event.source_node == "motor"]

@@ -96,7 +96,7 @@ factory 的 `describe(spec)` 纯校验并返回 `NodeDescription`/`PortSpec`，
 所有实例提供 `close()`；按实际能力提供 `request_step/finish_step`（machine）、
 `step`（同步设备/plant）、`input`，以及可选 `reset(session)`、`start()`。
 机器的 request 全部发出后才逐一等待 finish。CAN endpoint 通过
-`context.attach_can(port, endpoint)` 借用总线，`receive(frame)` 接收、返回的 connection 发送；
+`context.attach(port, endpoint)` 借用连接所有者返回的协议句柄；CAN以`receive(frame)`接收、句柄发送；
 设备不拥有总线或 QEMU。新增 endpoint 无需修改调度器。
 
 `runtime.mode: interactive` 与 stepped 使用相同切点。终端支持
@@ -2903,3 +2903,12 @@ CAN保留来源时间并应用区间末下限和链路延迟，UART保持读取�
 QEMU按键要求bool，GPIO要求整数0/1，UART接受bytes或UTF-8字符串（编码后最多4096字节，
 保留NUL）。连接占用的输入及物理别名拒绝外部注入。交互inject同样使用工厂准入，
 错误后仍可继续；执行阶段的设备错误则冻结并走统一清理。
+
+
+连接所有者声明`connection`与`dispatch`能力，按需声明`sample`。它们只拥有协议队列，
+不能声明machine或step；每条link恰有一个owner，每个端点只接一个owner。
+`attach_port(endpoint, *, descriptor, endpoint_name, owner_port, context)`返回借用句柄。
+`dispatch(cut_ns, budget)`返回实际广播次数，`next_due_ns`和`dispatch_budget`分别公开
+下一到期时刻与每切点预算；无进展、非法计数、超时或预算耗尽均冻结执行。
+所有组件启动后先采样并交付初始切点；每一区间完成全部machine/step后，先采样所有源，
+再交付输入和连接队列。接收端写入不会触发同切点重新采样。Runtime不解析CAN或GPIO协议。

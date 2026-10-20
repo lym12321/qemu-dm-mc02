@@ -113,13 +113,13 @@ def test_simulation_static_capabilities_and_can_wiring_admission():
     with pytest.raises(ValueError, match="both machine"):
         Simulation(Topology((NodeSpec("a", "a"),)), {"a": Factory(capabilities={"machine", "step"})})
     a = Factory(PortSpec("p", "can"))
-    with pytest.raises(ValueError, match="one bus and one endpoint"):
+    with pytest.raises(ValueError, match="exactly one connection owner"):
         Simulation(pair(a, a), {"a": a, "b": a})
     for options in ({"unknown": 1}, {"delay_ns": True}, {"max_pending": 0}, {"dispatch_budget": 65537}):
         with pytest.raises(ValueError):
             Simulation(Topology((NodeSpec("bus", "bus.can", options),)), {"bus.can": CanBusFactory()})
     simulation = Simulation(Topology((NodeSpec("bus", "bus.can"),)), {"bus.can": CanBusFactory()})
-    assert simulation.validate()["bus"].capabilities == frozenset({"can_bus"})
+    assert simulation.validate()["bus"].capabilities == frozenset({"connection", "dispatch"})
     assert not simulation.components
     simulation.close()
 
@@ -132,13 +132,28 @@ def test_required_connection_and_unimplemented_typed_links_rejected_before_resou
     for category, protocol in (("protocol", "uart"), ("signal", "digital"), ("binding", "joint")):
         a = Factory(PortSpec("p", protocol, "out", category))
         b = Factory(PortSpec("p", protocol, "in", category))
-        with pytest.raises(ValueError, match="runtime does not support linked"):
+        with pytest.raises(ValueError, match="exactly one connection owner"):
             Simulation(pair(a, b), {"a": a, "b": b})
         assert a.created == b.created == 0
     a = Factory(PortSpec("p", "can", direction="in"))
     topology = Topology((NodeSpec("a", "a"), NodeSpec("bus", "bus")), (LinkSpec("a.p", "bus.can"),))
     with pytest.raises(ValueError, match="inout"):
         Simulation(topology, {"a": a, "bus": CanBusFactory()})
+
+
+def test_connection_owners_and_endpoint_owner_peers_are_unique_before_create():
+    owner = Factory(PortSpec("wire", "opaque", max_connections=None),
+                    capabilities={"connection", "dispatch"})
+    endpoint = Factory(PortSpec("p", "opaque", max_connections=None))
+    for kinds, links, error in (
+        (("owner", "owner"), (LinkSpec("a.wire", "b.wire"),), "exactly one connection owner"),
+        (("endpoint", "owner", "owner"),
+         (LinkSpec("a.p", "b.wire"), LinkSpec("a.p", "c.wire")), "exactly one connection owner peer"),
+    ):
+        topology = Topology(tuple(NodeSpec(name, kind) for name, kind in zip("abc", kinds)), links)
+        with pytest.raises(ValueError, match=error):
+            Simulation(topology, {"owner": owner, "endpoint": endpoint})
+    assert owner.created == endpoint.created == 0
 
 
 def test_pure_topology_admission_hook_runs_once_per_factory_object_across_kind_aliases():

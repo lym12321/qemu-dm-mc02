@@ -20,7 +20,6 @@ from typing import Any
 from sim.api import Endpoint, Event, NodeDescription, Session, StepContext, StepResult, TimeQuality, Topology
 from sim.api.events import check_timestamp
 from sim.api.topology import immutable
-from sim.fabric import CanBus, CanDelivery, CanFrame
 
 
 class SimulationState(StrEnum):
@@ -37,26 +36,6 @@ class _Input:
     payload: Any
 
 
-class CanConnection:
-    """Borrow one endpoint and queue; every send obeys the active cut floor."""
-
-    def __init__(self, context: ComponentContext, port: str, bus: CanBus, endpoint: Any):
-        self._context = context
-        self.port = port
-        self.bus = bus
-        self._endpoint = endpoint
-
-    def send(self, frame: CanFrame) -> None:
-        self._context._check_active()
-        sim = self._context._simulation
-        if sim._phase == "creating" or sim._closing:
-            raise RuntimeError("CAN sends require completed component wiring")
-        self.bus.send(self._endpoint, frame, not_before_ns=sim._not_before_ns)
-        self._context.emit(self.port, "can.sent", {"frame": frame},
-                           source_time_ns=frame.timestamp_ns,
-                           mapped_time_ns=frame.timestamp_ns)
-
-
 class ComponentContext:
     """Factory access to admitted wiring, observations and a shared deadline.
 
@@ -70,7 +49,7 @@ class ComponentContext:
         self.node_id = node_id
         self.session = simulation.session
         self._active = True
-        self._connections: dict[str, CanConnection] = {}
+        self._connections: dict[str, Any] = {}
 
     def _check_active(self) -> None:
         if not self._active or self.session is not self._simulation.session:
@@ -100,6 +79,14 @@ class ComponentContext:
         self._check_active()
         self._simulation._check_deadline()
 
+    def check_io(self) -> None:
+        """Admit borrowed-handle IO only after wiring and before cleanup."""
+        self._check_active()
+        sim = self._simulation
+        if (sim._phase == "creating" or sim._closing
+                or sim.state in (SimulationState.FAILED, SimulationState.CLOSED)):
+            raise RuntimeError("connection IO requires completed, healthy component wiring")
+
     def peers(self, port: str) -> tuple[Endpoint, ...]:
         self._check_active()
         self._simulation._descriptions[self.node_id].port(port)
@@ -112,28 +99,23 @@ class ComponentContext:
             raise RuntimeError("component lookup requires completed construction")
         return self._simulation._components[node_id]
 
-    def can_bus(self, port: str) -> CanBus:
-        peers = self.peers(port)
-        description = self._simulation._descriptions[self.node_id].port(port)
-        if description.category != "protocol" or description.protocol != "can":
-            raise ValueError(f"{self.node_id}.{port} is not a CAN protocol port")
-        if len(peers) != 1:
-            raise ValueError(f"{self.node_id}.{port} requires exactly one connected CAN bus")
-        peer = peers[0]
-        if "can_bus" not in self._simulation._descriptions[peer.node].capabilities:
-            raise ValueError(f"{self.node_id}.{port} is not connected to a CAN bus")
-        bus = self._simulation._components.get(peer.node)
-        if not isinstance(bus, CanBus):
-            raise TypeError(f"CAN bus factory {peer.node} did not return a CanBus")
-        return bus
-
-    def attach_can(self, port: str, endpoint: Any) -> CanConnection:
+    def attach(self, port: str, endpoint: Any) -> Any:
+        """Borrow the typed handle supplied by this port's connection owner."""
         self._check_active()
+        sim = self._simulation
+        if sim._phase != "creating":
+            raise RuntimeError("ports must attach during component construction")
         if port in self._connections:
-            raise ValueError(f"CAN port is already attached: {self.node_id}.{port}")
-        bus = self.can_bus(port)
-        bus.attach(endpoint, f"{self.node_id}.{port}")
-        connection = CanConnection(self, port, bus, endpoint)
+            raise ValueError(f"port is already attached: {self.node_id}.{port}")
+        peers = self.peers(port)
+        if len(peers) != 1 or "connection" not in sim._descriptions[peers[0].node].capabilities:
+            raise ValueError(f"{self.node_id}.{port} requires exactly one connection owner")
+        peer = peers[0]
+        owner = sim._components[peer.node]
+        descriptor = sim._descriptions[self.node_id].port(port)
+        connection = owner.attach_port(endpoint, descriptor=descriptor,
+                                       endpoint_name=f"{self.node_id}.{port}",
+                                       owner_port=peer.port, context=self)
         self._connections[port] = connection
         return connection
 
@@ -154,7 +136,7 @@ class ComponentContext:
 class Simulation:
     """Own all topology instances and one integer-nanosecond logical clock.
 
-    ``describe`` is pure. ``create`` constructs buses first, then other nodes in
+    ``describe`` is pure. ``create`` constructs connection owners first, then other nodes in
     manifest order. After all wiring, optional reset(Session) and start() hooks
     run. Machine capability requires request_step/finish_step; step capability
     requires step. Both return exact-target StepResult values. Every instance
@@ -229,19 +211,19 @@ class Simulation:
             caps = description.capabilities
             if "machine" in caps and "step" in caps:
                 raise ValueError(f"{name} cannot own both machine and component step capabilities")
-            if "can_bus" in caps and ("machine" in caps or "step" in caps):
-                raise ValueError(f"{name} cannot independently advance a CAN bus")
+            if "connection" in caps and ("machine" in caps or "step" in caps):
+                raise ValueError(f"{name} cannot independently advance a connection owner")
+        connected = set()
         for link in self.topology.links:
             first = self._descriptions[link.source.node]
             second = self._descriptions[link.target.node]
-            port = first.port(link.source.port)
-            if port.category == "protocol" and port.protocol == "can":
-                if ("can_bus" in first.capabilities) == ("can_bus" in second.capabilities):
-                    raise ValueError("each CAN link requires one bus and one endpoint")
-                if port.direction != "inout" or second.port(link.target.port).direction != "inout":
-                    raise ValueError("runtime CAN connections require inout ports")
-            else:
-                raise ValueError(f"runtime does not support linked {port.category}/{port.protocol} ports")
+            first_owner = "connection" in first.capabilities
+            if first_owner == ("connection" in second.capabilities):
+                raise ValueError("each link requires exactly one connection owner")
+            endpoint = link.target if first_owner else link.source
+            if endpoint in connected:
+                raise ValueError(f"endpoint requires exactly one connection owner peer: {endpoint}")
+            connected.add(endpoint)
 
     def validate(self) -> Mapping[str, NodeDescription]:
         """Return static admission results without constructing any instance."""
@@ -288,20 +270,10 @@ class Simulation:
             self.on_event(event)
         return event
 
-    def _bus_log(self, delivery: CanDelivery) -> None:
-        node, _, port = delivery.source.partition(".")
-        self._emit(node, port or None, "can.delivery", {
-            "destination": delivery.destination, "frame": delivery.frame,
-            "bus_sequence": delivery.sequence, "due_ns": delivery.due_ns,
-            "late": delivery.late, "dropped": delivery.dropped,
-        }, source_time_ns=delivery.timestamp_ns,
-            mapped_time_ns=delivery.timestamp_ns,
-            delivery_time_ns=delivery.delivered_ns)
-
     def _create_resources(self) -> None:
         self._phase = "creating"
         nodes = sorted(self.topology.nodes,
-                       key=lambda node: "can_bus" not in self._descriptions[node.name].capabilities)
+                       key=lambda node: "connection" not in self._descriptions[node.name].capabilities)
         for node in nodes:
             self._check_deadline()
             context = ComponentContext(self, node.name)
@@ -321,31 +293,27 @@ class Simulation:
                 methods += ["step"]
             if "input" in caps:
                 methods += ["input"]
+            if "connection" in caps:
+                methods += ["attach_port"]
+            if "dispatch" in caps:
+                methods += ["dispatch"]
+            if "sample" in caps:
+                methods += ["sample"]
             if any(not callable(getattr(component, method, None)) for method in methods):
                 raise TypeError(f"component {node.name} lacks capability methods: {', '.join(methods)}")
-            if "can_bus" in caps:
-                if not isinstance(component, CanBus):
-                    raise TypeError(f"CAN bus factory {node.name} must return a CanBus")
-                previous_log = component.log
-
-                def log(delivery, previous=previous_log):
-                    if previous is not None:
-                        previous(delivery)
-                    self._bus_log(delivery)
-
-                component.log = log
+            if "dispatch" in caps:
+                self._dispatch_limit(node.name, component)
+                self._next_due(node.name, component)
         for endpoint in self._peers:
             description = self._descriptions[endpoint.node]
-            if "can_bus" not in description.capabilities:
+            if "connection" not in description.capabilities:
                 if endpoint.port not in self._contexts[endpoint.node]._connections:
-                    raise ValueError(f"factory did not attach its connected CAN endpoint: {endpoint}")
+                    raise ValueError(f"factory did not attach its connected endpoint: {endpoint}")
         self._phase = "initializing"
         for name, component in self._owned:
             self._check_deadline()
             reset = getattr(component, "reset", None)
-            if "can_bus" in self._descriptions[name].capabilities:
-                component.reset(self.session.t_sim_ns)
-            elif callable(reset):
+            if callable(reset):
                 reset(self.session)
             self._check_deadline()
         for _, component in self._owned:
@@ -354,6 +322,10 @@ class Simulation:
             if callable(start):
                 start()
             self._check_deadline()
+        self._phase = "initial sample"
+        self._sample(self.t_sim_ns)
+        self._phase = "initial delivery"
+        self._settle(self.t_sim_ns)
 
     def start(self) -> None:
         if self.state != SimulationState.NEW or self._phase != "new":
@@ -401,13 +373,37 @@ class Simulation:
         heapq.heappush(self._inputs, (when, self._input_sequence, _Input(endpoint, value)))
         self._input_sequence += 1
 
+    @staticmethod
+    def _dispatch_limit(name: str, component: Any) -> int:
+        value = component.dispatch_budget
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"dispatcher {name} dispatch_budget must be a positive integer")
+        return value
+
+    @staticmethod
+    def _next_due(name: str, component: Any) -> int | None:
+        value = component.next_due_ns
+        if value is not None:
+            try:
+                check_timestamp(value)
+            except ValueError as exc:
+                raise ValueError(f"dispatcher {name} returned invalid next_due_ns: {value!r}") from exc
+        return value
+
+    def _sample(self, cut: int) -> None:
+        for name, component in self._owned:
+            if "sample" in self._descriptions[name].capabilities:
+                self._check_deadline()
+                component.sample(cut)
+                self._check_deadline()
+
     def _settle(self, cut: int) -> None:
         self._dispatch_time_ns = cut
         self._not_before_ns = cut
         remaining = self.dispatch_budget
-        buses = tuple(component for name, component in self._owned
-                      if "can_bus" in self._descriptions[name].capabilities)
-        bus_budgets = [bus.dispatch_budget for bus in buses]
+        dispatchers = tuple((name, component) for name, component in self._owned
+                            if "dispatch" in self._descriptions[name].capabilities)
+        budgets = [self._dispatch_limit(name, component) for name, component in dispatchers]
         while True:
             self._check_deadline()
             while self._inputs and self._inputs[0][0] <= cut:
@@ -419,18 +415,25 @@ class Simulation:
                            source_time_ns=when, mapped_time_ns=when, delivery_time_ns=cut)
                 self._check_deadline()
                 remaining -= 1
-            for index, bus in enumerate(buses):
+            for index, (name, component) in enumerate(dispatchers):
                 self._check_deadline()
-                if remaining <= 0 and bus.has_due(cut):
-                    raise RuntimeError("simulation CAN dispatch budget exhausted (possible event loop)")
-                dispatched = bus.step(cut, max_dispatch=min(remaining, bus_budgets[index]))
+                due = self._next_due(name, component)
+                budget = min(remaining, budgets[index])
+                if budget <= 0 and due is not None and due <= cut:
+                    raise RuntimeError(f"dispatcher {name} dispatch budget exhausted (possible event loop)")
+                dispatched = component.dispatch(cut, budget)
+                if type(dispatched) is not int or not 0 <= dispatched <= budget:
+                    raise RuntimeError(f"dispatcher {name} returned invalid dispatch count: {dispatched!r}")
                 remaining -= dispatched
-                bus_budgets[index] -= dispatched
-                if bus.has_due(cut):
-                    raise RuntimeError("CAN dispatch budget exhausted (possible event loop)")
+                budgets[index] -= dispatched
+                after = self._next_due(name, component)
+                if dispatched == 0 and ((due is not None and due <= cut)
+                                        or (after is not None and after <= cut)):
+                    raise RuntimeError(f"dispatcher {name} made no progress on due work")
                 self._check_deadline()
             if (not (self._inputs and self._inputs[0][0] <= cut)
-                    and not any(bus.has_due(cut) for bus in buses)):
+                    and not any((due := self._next_due(name, component)) is not None and due <= cut
+                                for name, component in dispatchers)):
                 return
 
     @staticmethod
@@ -469,6 +472,8 @@ class Simulation:
                 self._reached(name, result, ctx)
                 results[name] = result
                 self._check_deadline()
+        self._phase = "target sample"
+        self._sample(target)
         self._phase = "target delivery"
         self._settle(target)
         self._check_deadline()
@@ -493,8 +498,8 @@ class Simulation:
                 if self._inputs:
                     cut = min(cut, self._inputs[0][0])
                 for name, component in self._owned:
-                    if "can_bus" in self._descriptions[name].capabilities:
-                        due = component.next_due_ns
+                    if "dispatch" in self._descriptions[name].capabilities:
+                        due = self._next_due(name, component)
                         if due is not None:
                             cut = min(cut, due)
                 results = self._step(cut)

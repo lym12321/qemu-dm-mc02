@@ -43,7 +43,7 @@ class _BorrowedPort:
         if self.endpoint is not None:
             raise ValueError("fixed rotor already has an endpoint")
         self.endpoint = endpoint
-        self.connection = self.context.attach_can("can", endpoint)
+        self.connection = self.context.attach("can", endpoint)
 
     def send(self, source, frame):
         if source is not self.endpoint:
@@ -95,7 +95,7 @@ class FixedRotorFactory:
             if not isinstance(registry[node.kind], FixedRotorFactory):
                 continue
             peer = peers.get(Endpoint(node.name, "can"))
-            if peer is None or "can_bus" not in descriptions[peer.node].capabilities:
+            if peer is None or "connection" not in descriptions[peer.node].capabilities:
                 continue  # Ordinary link admission reports the invalid wiring.
             identity = (peer.node, node.options["motor_id"])
             previous = identities.get(identity)

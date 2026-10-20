@@ -2,6 +2,6 @@
 
 from sim.api import Topology
 
-from .simulation import CanConnection, ComponentContext, Simulation, SimulationState
+from .simulation import ComponentContext, Simulation, SimulationState
 
-__all__ = ["CanConnection", "ComponentContext", "Simulation", "SimulationState", "Topology"]
+__all__ = ["ComponentContext", "Simulation", "SimulationState", "Topology"]
