@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import pytest
 
 from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
+from sim.composition import builtin_registry
+from sim.fabric.digital import DigitalSample
 from sim.machines.qemu import BackendUnavailable, QemuFactory
 from sim.machines.qemu import machine as adapter
 from sim.runtime import Simulation, SimulationState
@@ -45,6 +47,9 @@ from sim.machines.qemu import QemuFactory
 value = QemuFactory(qemu='/missing').describe(NodeSpec('board', 'machine.qemu', {'firmware': sys.argv[1]}))
 assert value.port('fdcan3').protocol == 'can'
 assert value.port('gpio.H15').category == 'signal'
+assert value.port('gpio.H15').direction == 'in'
+assert value.port('gpio.H15.out').direction == 'out'
+assert 'external_input' not in value.port('gpio.H15.out').capabilities
 assert value.port('snapshot').direction == 'out'
 assert value.capabilities == frozenset({'machine', 'input'})
 assert 'external_input' in value.port('key').capabilities
@@ -134,6 +139,8 @@ def test_invalid_inputs_reject_without_acquiring_native_resources(firmware, back
     ('key', True, 'gpio.A15'),
     ('gpio.A15', 0, 'key'),
     ('gpio.A0', 1, 'gpio.A0'),
+    ('gpio.B0', 0, 'gpio.B0.out'),
+    ('key', True, 'gpio.A15.out'),
     ('uart1', b'wire', 'uart1'),
 ])
 def test_wired_inputs_and_physical_aliases_reject_external_injection(firmware, port, payload, owned):
@@ -145,7 +152,8 @@ def test_wired_inputs_and_physical_aliases_reject_external_injection(firmware, p
                                       connected_ports=(owned,)) == 0
 
 
-def test_topology_rejects_multiple_key_pin_alias_owners_before_creation(firmware, backend):
+@pytest.mark.parametrize('alias', ['gpio.A15', 'gpio.A15.out'])
+def test_topology_rejects_multiple_key_pin_alias_owners_before_creation(firmware, backend, alias):
     factory = QemuFactory()
     wire = SimpleNamespace(
         describe=lambda _spec: NodeDescription((PortSpec('signal', 'digital', category='signal',
@@ -154,13 +162,45 @@ def test_topology_rejects_multiple_key_pin_alias_owners_before_creation(firmware
     nodes = (NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
              NodeSpec('wire', 'fixture.wire'))
     topology = Topology(nodes, (LinkSpec('board.key', 'wire.signal'),
-                               LinkSpec('wire.signal', 'board.gpio.A15')))
+                               LinkSpec('wire.signal', f'board.{alias}')))
     registry = {'machine.qemu': factory, 'fixture.wire': wire}
-    with pytest.raises(ValueError, match='aliases.*share physical input gpio.A15'):
+    with pytest.raises(ValueError, match='aliases.*share physical pin gpio.A15'):
         topology.validate(registry)
     independent_pins = Topology(nodes, (LinkSpec('board.key', 'wire.signal'),
                                        LinkSpec('wire.signal', 'board.gpio.A14')))
     independent_pins.validate(registry)
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+@pytest.mark.parametrize('port, protocol', [('spi1', 'spi'), ('i2c1', 'i2c'), ('adc1', 'adc')])
+def test_unsupported_interfaces_name_endpoint_and_reject_before_acquisition(firmware, backend, port, protocol):
+    # These interfaces have no public execution adapter in the QEMU profile.
+    owner = SimpleNamespace(
+        describe=lambda _spec: NodeDescription((PortSpec('port', protocol),), {'connection'}),
+        create=lambda *_args: pytest.fail('unsupported topology acquired resources'))
+    graph = Topology((NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                      NodeSpec('wire', 'fixture.owner')),
+                     (LinkSpec(f'board.{port}', 'wire.port'),))
+    with pytest.raises(ValueError) as caught:
+        Simulation(graph, {'machine.qemu': QemuFactory(), 'fixture.owner': owner})
+    assert str(caught.value) == f"invalid link board.{port}, wire.port: unknown port '{port}'"
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+@pytest.mark.parametrize('port, protocol, category', [
+    ('uart1', 'uart', 'protocol'), ('snapshot', 'snapshot', 'signal'),
+])
+def test_described_but_unimplemented_connections_reject_explicitly_before_acquisition(
+        firmware, backend, port, protocol, category):
+    owner = SimpleNamespace(
+        describe=lambda _spec: NodeDescription((PortSpec('port', protocol, category=category),),
+                                                {'connection'}),
+        create=lambda *_args: pytest.fail('unsupported topology acquired resources'))
+    graph = Topology((NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                      NodeSpec('wire', 'fixture.owner')),
+                     (LinkSpec(f'board.{port}', 'wire.port'),))
+    with pytest.raises(ValueError, match=rf'unsupported QEMU connection: board\.{port} \({protocol}\)'):
+        Simulation(graph, {'machine.qemu': QemuFactory(), 'fixture.owner': owner})
     assert backend.calls == backend.commands == backend.sockets == []
 
 
@@ -169,11 +209,12 @@ def backend(monkeypatch, tmp_path):
     """Substitute acquisition only; all adapter/transport/lifecycle code is real."""
     calls, clients, sockets, commands = [], [], [], []
     state = SimpleNamespace(origin=71, commands_available=True, close_error=None,
-                            external_change=False)
+                            external_change=False, read_snapshot=None)
 
     class Qmp:
         def __init__(self, *_args, **_kwargs):
             self.current, self.target = state.origin, None
+            self.index, self.key_pressed = len(clients), False
             self.timeouts = []
             clients.append(self)
 
@@ -199,11 +240,13 @@ def backend(monkeypatch, tmp_path):
                 return {'running': False, 'status': 'prelaunch' if self.target is None else 'paused'}
             if name == 'qom-get':
                 assert arguments == {'path': '/machine', 'property': 'board-state'}
-                return snapshot(self.current)
+                return state.read_snapshot(self) if state.read_snapshot else snapshot(self.current)
             if name == 'x-run-to-virtual-time':
                 self.target = self.current = arguments['target-ns']
                 return {}
             assert name == 'qom-set'
+            if arguments['property'] == 'user-key':
+                self.key_pressed = arguments['value']
             return {}
 
         def close(self):
@@ -243,6 +286,102 @@ def backend(monkeypatch, tmp_path):
 def simulation(firmware, **options):
     spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware, **options})
     return Simulation(Topology((spec,)), {'machine.qemu': QemuFactory()})
+
+
+def digital_simulation(firmware):
+    options = {'firmware': firmware, 'uarts': ()}
+    graph = Topology((NodeSpec('source', 'machine.qemu', options),
+                      NodeSpec('receiver', 'machine.qemu', options),
+                      NodeSpec('wire', 'net.digital')),
+                     (LinkSpec('source.gpio.B0.out', 'wire.signal'),
+                      LinkSpec('wire.signal', 'receiver.key'),
+                      LinkSpec('receiver.gpio.C5', 'wire.signal')))
+    return Simulation(graph, builtin_registry(), quantum_ns=10)
+
+
+def native_digital_snapshots(client, *, lose_drive_at=None):
+    """Fixed native-boundary observations; this fixture does not execute firmware."""
+    value = snapshot(client.current)
+    cut = client.current - 71
+    if client.index == 0:
+        value['gpio']['B']['output_mask'] = int(cut > 0 and (lose_drive_at is None or cut < lose_drive_at))
+        value['gpio']['B']['sampled'] = int(cut >= 20)
+        # The public sampled field is the observation contract, rather than ODR.
+        value['gpio']['B']['odr'] = int(cut < 20)
+    else:
+        level = int(not client.key_pressed)
+        value['key'].update(pressed=client.key_pressed, level=level)
+        value['gpio']['A']['sampled'] = level << 15
+    return value
+
+
+def test_unified_simulation_samples_completed_gpio_then_drives_physical_key_and_gpio(
+        firmware, backend, monkeypatch):
+    backend.state.read_snapshot = native_digital_snapshots
+    projections = []
+    public_projection = adapter.digital_level
+
+    def project(endpoint, value):
+        assert isinstance(value, dict)  # Projection precedes immutable publication.
+        projections.append((endpoint, value['timestamp_ns']))
+        return public_projection(endpoint, value)
+
+    monkeypatch.setattr(adapter, 'digital_level', project)
+    with digital_simulation(firmware) as sim:
+        assert not any(name == 'qom-set' for name, _ in backend.commands)
+        assert sim.components['wire'].observe()['active'] is False
+        assert projections == []
+        before, events = list(backend.commands), sim.events
+        for endpoint, payload in (('receiver.key', True), ('receiver.gpio.A15', 0),
+                                  ('receiver.gpio.C5', 1), ('source.gpio.B0', 0)):
+            with pytest.raises(ValueError, match='owned by a connection'):
+                sim.schedule_input(endpoint, payload)
+        with pytest.raises(ValueError, match='cannot accept external'):
+            sim.schedule_input('source.gpio.B0.out', 1)
+        assert backend.commands == before and sim.events == events
+        assert sim.state == SimulationState.PAUSED
+
+        sim.step(10)
+        assert projections == [('gpio.B0', 81)]
+        assert sim.components['source'].observe()['gpio']['B']['sampled'] == 0
+        # Delivery occurs after both native snapshots; the receiver has not run yet.
+        assert sim.components['receiver'].observe()['key']['level'] == 1
+        assert backend.clients[1].key_pressed is True
+        assert ('qom-set', {'path': '/machine', 'property': 'gpio-input', 'value': 'C5=0'}) in backend.commands
+        samples = [event for event in sim.events if event.kind == 'net.digital.sample']
+        deliveries = [event for event in sim.events if event.kind == 'net.digital.delivery']
+        assert samples[-1].payload['source'] == 'source.gpio.B0.out'
+        assert [(event.payload['destination'], event.payload['level']) for event in deliveries] == [
+            ('receiver.key', 0), ('receiver.gpio.C5', 0)]
+        assert all(event.quality == 'sampled' and event.source_time_ns == 81
+                   and event.mapped_time_ns == event.delivery_time_ns == 10 for event in deliveries)
+        snapshots = [event for event in sim.events if event.kind == 'snapshot' and event.mapped_time_ns == 10]
+        assert len(snapshots) == 2 and max(event.sequence for event in snapshots) < samples[-1].sequence
+        assert samples[-1].sequence < deliveries[0].sequence
+
+        sim.step(10)
+        assert sim.components['receiver'].observe()['key']['level'] == 0
+        assert backend.clients[1].key_pressed is False
+        sim.step(10)
+        assert sim.components['receiver'].observe()['key']['level'] == 1
+        assert projections == [('gpio.B0', 81), ('gpio.B0', 91), ('gpio.B0', 101)]
+        assert [event.payload['level'] for event in sim.events
+                if event.kind == 'net.digital.delivery' and event.payload['destination'] == 'receiver.key'] == [0, 1]
+
+
+def test_unified_simulation_lost_gpio_drive_names_source_and_freezes_at_last_completed_time(firmware, backend):
+    backend.state.read_snapshot = lambda client: native_digital_snapshots(client, lose_drive_at=20)
+    with digital_simulation(firmware) as sim:
+        sim.step(10)
+        with pytest.raises(RuntimeError, match=r'source\.gpio\.B0\.out lost output drive') as caught:
+            sim.step(10)
+        assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 10
+        assert backend.clients[1].key_pressed is True
+        assert 'source.gpio.B0.out' in caught.value.__notes__[0]
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step(10)
+        assert backend.commands == before
 
 
 def test_native_target_mapping_uart_bound_and_immutable_observation(firmware, backend):

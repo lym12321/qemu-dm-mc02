@@ -1,0 +1,19 @@
+schema: sim/v1
+runtime:
+  mode: stepped
+  quantum: 1ms
+  duration: 200ms
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ../minimal-board/build/firmware.elf
+  wire:
+    kind: net.digital
+  peer:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ../minimal-board/build/firmware.elf
+links:
+  - [main.gpio.B0.out, wire.signal]
+  - [wire.signal, peer.key]

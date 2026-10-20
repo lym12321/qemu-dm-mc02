@@ -18,7 +18,9 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 CASES = ("minimal-board", "can-motor")
-EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor"}
+EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor",
+                   "digital-link": "minimal-board"}
+NATIVE_CASES = (*CASES, "pulse", "digital-link")
 
 
 class Blocked(RuntimeError):
@@ -45,6 +47,9 @@ class Observations:
         self.deliveries = []
         self.receipts = []
         self.inputs = []
+        self.uart_batches = []
+        self.digital = []
+        self.digital_consumption = []
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -54,7 +59,7 @@ class Observations:
         if event.sequence <= self.last_sequence:
             raise ValueError("observation sequence did not increase")
         self.last_sequence = event.sequence
-        stamp = {"source_time_ns": event.source_time_ns,
+        stamp = {"event_sequence": event.sequence, "source_time_ns": event.source_time_ns,
                  "mapped_time_ns": event.mapped_time_ns,
                  "delivery_time_ns": event.delivery_time_ns,
                  "quality": str(event.quality)}
@@ -65,6 +70,8 @@ class Observations:
             if len(target) + len(event.payload) > 16384:
                 raise BufferError("example UART observation budget exhausted")
             target.extend(event.payload)
+            self.uart_batches.append({**stamp, "source": event.source_node,
+                                      "data_hex": event.payload.hex()})
         elif event.kind == "snapshot" and event.source_node in ("main", "peer"):
             # Reuse the public hardware projection. Copying this frozen public
             # value changes neither the native observation nor its meaning.
@@ -76,6 +83,9 @@ class Observations:
                 "key": digital_level("gpio.A15", snapshot),
                 "b0": digital_level("gpio.B0", snapshot),
                 "b0_output": bool(snapshot["gpio"]["B"]["output_mask"] & 1)})
+        elif event.kind in ("net.digital.sample", "net.digital.delivery"):
+            self.digital.append({**stamp, "source": event.source_node,
+                "endpoint": event.source_port, "kind": event.kind, "payload": _plain(event.payload)})
         elif event.kind == "input.delivered":
             self.inputs.append({**stamp, "source": event.source_node,
                                 "endpoint": event.source_port, "value": _plain(event.payload)})
@@ -104,8 +114,8 @@ class Observations:
             raise AssertionError(f"actual guest UART ready is missing: {uart!r}")
         if not self.snapshots:
             raise AssertionError("no actual native board snapshot was observed")
-        if case in ("minimal-board", "hal-gpio", "pulse"):
-            if case in ("minimal-board", "pulse"):
+        if case in ("minimal-board", "hal-gpio", "pulse", "digital-link"):
+            if case in ("minimal-board", "pulse", "digital-link"):
                 required = (b"KEY released B0=0\n", b"KEY pressed B0=1\n",
                             b"KEY released B0=0\n")
                 start = uart.index(ready) + len(ready)
@@ -116,6 +126,9 @@ class Observations:
                     start = found + len(pattern)
             if case == "pulse":
                 self._verify_pulse()
+                return self.report()
+            if case == "digital-link":
+                self._verify_digital(ready)
                 return self.report()
             for lower, upper, key, b0 in ((0, 40_000_000, 1, 0),
                     (40_000_000, 90_000_000, 0, 1), (90_000_000, 200_000_001, 1, 0)):
@@ -184,6 +197,73 @@ class Observations:
                         raise AssertionError("peer command filter rejection and complete feedback receipts disagree")
         return self.report()
 
+    def _verify_digital(self, ready):
+        peer_uart = bytes(self.peer_uart)
+        if ready not in peer_uart or b"FAIL" in peer_uart:
+            raise AssertionError("peer digital firmware ready is missing or failed")
+        if [(item["source"], item["endpoint"], item["value"], item["source_time_ns"],
+             item["delivery_time_ns"]) for item in self.inputs] != [
+                ("main", "key", True, 40_000_000, 40_000_000),
+                ("main", "key", False, 90_000_000, 90_000_000)]:
+            raise AssertionError("digital fixture must inject only main's scheduled key inputs")
+        deliveries = [item for item in self.digital if item["kind"] == "net.digital.delivery"]
+        if [item["payload"]["level"] for item in deliveries] != [0, 1, 0]:
+            raise AssertionError("digital wire must deliver the three completed source phases")
+        peer_batches = [item for item in self.uart_batches if item["source"] == "peer"]
+        accumulated = b""
+        bounds = []
+        for batch in peer_batches:
+            accumulated += bytes.fromhex(batch["data_hex"])
+            bounds.append((len(accumulated), batch))
+        if accumulated != peer_uart:
+            raise AssertionError("peer UART bytes and observation bounds disagree")
+        cursor = peer_uart.index(ready) + len(ready)
+        self.digital_consumption = []
+        for index, (delivery, marker) in enumerate(zip(deliveries, (
+                b"KEY pressed B0=1\n", b"KEY released B0=0\n", b"KEY pressed B0=1\n"))):
+            payload = delivery["payload"]
+            cut, level = delivery["mapped_time_ns"], payload["level"]
+            lower, upper = ((0, 40_000_000), (40_000_000, 90_000_000),
+                            (90_000_000, 200_000_000))[index]
+            source = [item for item in self.snapshots
+                      if item["source"] == "main" and item["mapped_time_ns"] == cut]
+            samples = [item for item in self.digital if item["kind"] == "net.digital.sample"
+                       and item["mapped_time_ns"] == cut]
+            if (delivery["source"] != "wire" or delivery["endpoint"] != "signal"
+                    or payload["source"] != "main.gpio.B0.out" or payload["destination"] != "peer.key"
+                    or payload["sequence"] != index or payload["due_ns"] != cut
+                    or delivery["delivery_time_ns"] != cut or delivery["quality"] != "sampled"
+                    or not lower < cut < upper or len(source) != 1 or len(samples) != 1
+                    or not source[0]["b0_output"] or source[0]["b0"] != level
+                    or delivery["source_time_ns"] != source[0]["native_timestamp_ns"]
+                    or samples[0]["payload"] != {"source": "main.gpio.B0.out", "level": level,
+                                                 "active": True, "changed": True}
+                    or not source[0]["event_sequence"] < samples[0]["event_sequence"] < delivery["event_sequence"]):
+                raise AssertionError("digital source provenance does not match its completed native sample")
+            preceding = [item for item in self.snapshots
+                         if item["source"] == "peer" and item["mapped_time_ns"] == cut]
+            if (len(preceding) != 1 or preceding[0]["key"] != 1 - level
+                    or preceding[0]["event_sequence"] >= delivery["event_sequence"]):
+                raise AssertionError("digital delivery changed the preceding peer interval")
+            responses = [item for item in self.snapshots
+                         if item["source"] == "peer" and cut < item["mapped_time_ns"] < upper
+                         and item["b0_output"] and (item["key"], item["b0"]) == (level, 1 - level)]
+            if not responses:
+                raise AssertionError("digital delivery lacks a later peer GPIO firmware response")
+            found = peer_uart.find(marker, cursor)
+            if found < 0:
+                raise AssertionError(f"ordered peer UART marker missing: {marker!r}")
+            cursor = found + len(marker)
+            bound = next(batch for length, batch in bounds if length >= cursor)
+            if (not cut < bound["mapped_time_ns"] < upper
+                    or bound["event_sequence"] <= delivery["event_sequence"]):
+                raise AssertionError("digital delivery lacks a later peer UART observation bound")
+            self.digital_consumption.append({"level": level, "source_cut_ns": cut,
+                "source_native_time_ns": delivery["source_time_ns"],
+                "delivery_cut_ns": delivery["delivery_time_ns"],
+                "peer_gpio_cut_ns": responses[0]["mapped_time_ns"],
+                "peer_uart_upper_bound_ns": bound["mapped_time_ns"]})
+
     def _verify_pulse(self):
         inputs = [item for item in self.inputs
                   if item["source"] == "main" and item["endpoint"] == "key"]
@@ -211,7 +291,8 @@ class Observations:
                 "peer_uart": bytes(self.peer_uart).decode("ascii", errors="backslashreplace"),
                 "snapshots": self.snapshots, "can": self.can,
                 "deliveries": self.deliveries, "receipts": self.receipts,
-                "inputs": self.inputs}
+                "inputs": self.inputs, "uart_batches": self.uart_batches,
+                "digital": self.digital, "digital_consumption": self.digital_consumption}
 
 
 def build_example(case, *, build_dir=None):
@@ -222,7 +303,7 @@ def build_example(case, *, build_dir=None):
     default_build = ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse" else source / "build"
     build = default_build if build_dir is None else Path(build_dir)
     variant = (["-DSIM_KEY_PULSE_TEST=ON"] if case == "pulse" else
-               ["-DSIM_KEY_PULSE_TEST=OFF"] if case == "minimal-board" else [])
+               ["-DSIM_KEY_PULSE_TEST=OFF"] if source.name == "minimal-board" else [])
     commands = (["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Debug", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
@@ -251,7 +332,7 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         scene = Scene(Topology((NodeSpec("main", "machine.qemu", {
             "model": "dm-mc02", "firmware": str(firmware), "uarts": ()}),), ()))
     else:
-        example = EXAMPLE_ALIASES.get(case, case)
+        example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
                            "scene.yaml", registry)
         if case == "pulse":
@@ -288,9 +369,10 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
                 starttime = stat.read_text().rsplit(")", 1)[1].split()[19]
                 resources.append({"name": name, "pid": pid, "starttime": starttime,
                                   "sockets": dict(info["sockets"])})
-        if {item["name"] for item in resources} != ({"main", "peer"} if case == "dual-board" else {"main"}):
+        if {item["name"] for item in resources} != (
+                {"main", "peer"} if case in ("dual-board", "digital-link") else {"main"}):
             raise AssertionError("the real machine did not expose its native process identity")
-        if case in ("minimal-board", "hal-gpio"):
+        if case in ("minimal-board", "hal-gpio", "digital-link"):
             simulation.schedule_input("main.key", True, at_ns=40_000_000)
             simulation.schedule_input("main.key", False, at_ns=90_000_000)
         elif case == "pulse":
@@ -346,7 +428,7 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*CASES, "pulse", "hal-gpio", "dual-board", "all"), default="all")
+    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "all"), default="all")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",
                         help="existing HAL GPIO lesson ELF, used only by --case hal-gpio")
@@ -366,7 +448,7 @@ def main(argv=None):
             raise Blocked(f"project dm-mc02 QEMU executable is missing: {args.qemu}")
         payload["qemu"] = {"path": str(args.qemu.resolve()),
                            "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest()}
-        for case in (*CASES, "pulse") if args.case == "all" else (args.case,):
+        for case in NATIVE_CASES if args.case == "all" else (args.case,):
             if case == "hal-gpio":
                 if not args.hal_elf.is_file():
                     raise Blocked(f"the existing HAL GPIO lesson ELF is missing: {args.hal_elf}")

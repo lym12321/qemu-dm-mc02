@@ -15,10 +15,11 @@ import time
 
 from sim.api import StepResult
 from sim.api.topology import immutable as _freeze
-from sim.boards import (QemuBoard, drain_paused_can, observe_initial_paused_can,
+from sim.boards import (QemuBoard, digital_level, drain_paused_can, observe_initial_paused_can,
                         wait_paused_can_input)
 from sim.boards.launch import qemu_command, qmp_socket_path, resolve_qemu
 from sim.fabric.frame import CanFrame
+from sim.fabric.digital import DigitalSample
 from sim.transports import StreamTransport, connect_unix
 from sim.transports.can_stream import CanStream
 
@@ -54,6 +55,22 @@ class _CanInput:
 
     def receive(self, frame):
         self.machine._receive_can(self.port, frame)
+
+
+class _DigitalOutput:
+    def __init__(self, machine, port):
+        self.machine, self.port = machine, port
+
+    def read_digital(self):
+        return self.machine._read_digital(self.port)
+
+
+class _DigitalInput:
+    def __init__(self, machine, port):
+        self.machine, self.port = machine, port
+
+    def receive_digital(self, level):
+        self.machine._receive_digital(self.port, level)
 
 
 class QemuFactory:
@@ -95,12 +112,14 @@ class QemuFactory:
                 if endpoint.node not in qemu_nodes:
                     continue
                 port = descriptions[endpoint.node].port(endpoint.port)
-                if 'external_input' not in port.capabilities:
+                if port.protocol not in ('can', 'digital'):
+                    raise ValueError(f'unsupported QEMU connection: {endpoint} ({port.protocol})')
+                if port.protocol != 'digital' and 'external_input' not in port.capabilities:
                     continue
                 identity = (endpoint.node, input_identity(endpoint.port))
                 if identity in inputs:
-                    raise ValueError(f'QEMU input aliases {inputs[identity]} and {endpoint} '
-                                     f'share physical input {identity[1]}')
+                    raise ValueError(f'QEMU pin aliases {inputs[identity]} and {endpoint} '
+                                     f'share physical pin {identity[1]}')
                 inputs[identity] = endpoint
 
     def create(self, spec, ctx):
@@ -117,6 +136,13 @@ class QemuMachine:
         # Connections attach before any process creation. Runtime owns the buses.
         self._can = {port: ctx.attach(port, _CanInput(self, port))
                      for port in self._can_ports}
+        digital_ports = tuple(port for port in ctx.connected_ports
+                              if port == 'key' or port.startswith('gpio.'))
+        self._digital_outputs = tuple(port for port in digital_ports if port.endswith('.out'))
+        self._digital_samples = {}
+        for port in digital_ports:
+            endpoint = _DigitalOutput(self, port) if port.endswith('.out') else _DigitalInput(self, port)
+            ctx.attach(port, endpoint)
         self._manager = self._owner = self._qmp = self._board = None
         self._peers = []
         self._streams = {}
@@ -211,7 +237,7 @@ class QemuMachine:
         snapshot = self._board.snapshot()
         if snapshot['timestamp_ns'] != self._origin_ns:
             raise RuntimeError('native snapshot and execution origin disagree')
-        self._snapshot = _freeze(snapshot)
+        self._complete_snapshot(snapshot, self._last_time_ns)
         for port in self._can_ports:
             wire = port.replace('fdcan', 'can')
             state = observe_initial_paused_can(
@@ -228,6 +254,36 @@ class QemuMachine:
         allowed = ('paused', 'prelaunch') if initial else ('paused',)
         if not isinstance(status, dict) or status.get('running') is not False or status.get('status') not in allowed:
             raise RuntimeError('QEMU must remain paused at each completed target')
+
+    def _complete_snapshot(self, snapshot, mapped_time_ns):
+        # Project through the public native helper before freezing its mapping.
+        samples = {}
+        for port in self._digital_outputs:
+            endpoint = port.removesuffix('.out')
+            pin = endpoint[5:]
+            driven = snapshot['gpio'][pin[0]]['output_mask'] & (1 << int(pin[1:]))
+            level = digital_level(endpoint, snapshot) if driven else None
+            samples[port] = DigitalSample(level, snapshot['timestamp_ns'], mapped_time_ns)
+        frozen = _freeze(snapshot)
+        self._snapshot, self._digital_samples = frozen, samples
+
+    def _read_digital(self, port):
+        """Read a completed source projection without QMP, CPU work or IO."""
+        self._ctx.check_io()
+        if self._closed or self._pending is not None or port not in self._digital_samples:
+            raise RuntimeError(f'digital source has no completed sample: {self._ctx.node_id}.{port}')
+        return self._digital_samples[port]
+
+    def _receive_digital(self, port, level):
+        """Deliver a physical line level; external key inputs use pressedness."""
+        if type(level) is not int or level not in (0, 1):
+            raise ValueError(f'digital input requires integer 0 or 1: {self._ctx.node_id}.{port}')
+        self._ctx.check_io()
+        try:
+            self.input(port, level == 0 if port == 'key' else level)
+        except BaseException as error:
+            error.add_note(f'digital input failed: {self._ctx.node_id}.{port}')
+            raise
 
     def _validate_cut(self):
         execution = self._query('x-query-virtual-execution')
@@ -291,7 +347,7 @@ class QemuMachine:
         snapshot = self._board.snapshot()
         if snapshot['timestamp_ns'] != target:
             raise RuntimeError('native snapshot moved outside the completed target')
-        self._snapshot = _freeze(snapshot)
+        self._complete_snapshot(snapshot, step.t_sim_ns)
         for port, payload in uart_batches:
             self._ctx.emit(port, 'uart', payload, source_time_ns=target,
                            mapped_time_ns=step.t_sim_ns, delivery_time_ns=step.t_sim_ns,

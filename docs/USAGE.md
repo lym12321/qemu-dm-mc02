@@ -122,10 +122,10 @@ FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot
 缺失可选后端返回 78，执行失败 1，中断 130。
 同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
 
-当前只执行 CAN 连接；UART/GPIO 可作机器外部输入和观测，连接到其他节点的
-UART/signal/physics-binding 会在资源创建前明确拒绝。第二种真实 MCU、物理信号路由、
-完整动力学组合及跨板事件级锁步尚未实现。DM-MC02 是首个真实 profile，不能靠 YAML
-声明额外板卡。`api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
+当前执行CAN与数字GPIO连接。UART可作机器外部输入和观测，跨节点UART、SPI/I2C/ADC、
+physics-binding尚不支持，在资源创建前拒绝未知端口或不支持的连接。第二种真实MCU、
+完整动力学组合及跨板事件级锁步尚未实现。DM-MC02是首个真实profile，不能靠YAML
+声明额外板卡。`api/runtime/config/fabric`不导入任何具体板卡、DJI或物理后端。
 
 Lab、Robot、Arena、Scenario 及原有 MuJoCo/Gazebo/Trace 组合仍是**尚未迁移的应用**，
 下面的相关命令统一使用 `tools/sim-unmigrated`；它们的旧 runner 不属于新 Simulation 支持范围。
@@ -2912,3 +2912,21 @@ QEMU按键要求bool，GPIO要求整数0/1，UART接受bytes或UTF-8字符串（
 下一到期时刻与每切点预算；无进展、非法计数、超时或预算耗尽均冻结执行。
 所有组件启动后先采样并交付初始切点；每一区间完成全部machine/step后，先采样所有源，
 再交付输入和连接队列。接收端写入不会触发同切点重新采样。Runtime不解析CAN或GPIO协议。
+
+
+数字GPIO连接：`net.digital`的`signal`端口连接恰好一个out驱动与至少一个in接收端。
+QEMU用`gpio.B0.out`暴露已完成快照的公开数字投影；`gpio.B0`和`key`是输入。
+同一物理pin只能被一个连接占用；key与PA15互为别名，连接占用后拒绝外部注入。
+key外部输入为pressed布尔值，线传递的是整数电平：低电平按下，高电平释放。
+初始GPIO未配置输出时记录inactive且不驱动；激活后失去输出模式立即失败。
+每切点先采样所有源，再在同切点传播已知电平变化；接收固件只能在后续CPU区间消费。
+单驱动冲突静态拒绝，fanout按连接次序稳定交付；一次广播计一个预算单位，
+默认队列及预算256，可用`max_pending`/`dispatch_budget`显式收紧。
+不模拟模拟电压、开漏/上拉、电路延迟或同切点组合反馈。观察事件
+`net.digital.sample`/`net.digital.delivery`保留native来源时间、mapped/delivery切点和sampled质量。
+
+无CAN的真实双板例子见`examples/digital-link/README.txt`；构建普通minimal-board后：
+`sim validate examples/digital-link/scene.yaml`，
+`bash tools/run-simulation-smoke.sh --case digital-link --qemu /path/to/qemu-system-arm`。
+调试可将该scene仅保留一块机器后用`sim run ... --gdb-port 1234`；多机器须分别配置独立
+QEMU factory端点，不共享单一GDB/QMP路径。

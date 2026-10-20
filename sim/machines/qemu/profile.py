@@ -40,15 +40,17 @@ def describe(spec):
     ports += [PortSpec('key', 'digital', direction='in', category='signal',
                        capabilities=EXTERNAL_INPUT),
               PortSpec('snapshot', 'snapshot', direction='out', category='signal')]
-    ports += [PortSpec(f'gpio.{bank}{pin}', 'digital', category='signal',
+    ports += [PortSpec(f'gpio.{bank}{pin}', 'digital', direction='in', category='signal',
                        capabilities=EXTERNAL_INPUT)
+              for bank in 'ABCDEFGH' for pin in range(16)]
+    ports += [PortSpec(f'gpio.{bank}{pin}.out', 'digital', direction='out', category='signal')
               for bank in 'ABCDEFGH' for pin in range(16)]
     return NodeDescription(ports=tuple(ports), capabilities=frozenset({'machine', 'input'}))
 
 
 def input_identity(port):
-    """The user key and PA15 are aliases of the same native physical input."""
-    return 'gpio.A15' if port == 'key' else port
+    """All input/output spellings reserve their one physical native pin."""
+    return 'gpio.A15' if port == 'key' else port.removesuffix('.out')
 
 
 def validate_input(spec, port, payload, *, connected_ports=()):
