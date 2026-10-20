@@ -27,7 +27,7 @@ from sim.devices.referee import (
     RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot, decode_frame,
 )
 from sim.fabric import CanBus, CanFrame
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.physics import ImuSample, JointState
 from sim.robots.shared_world import (
     BoardBinding, BoardExecution, RefereeBinding, SharedWorldRuntime,

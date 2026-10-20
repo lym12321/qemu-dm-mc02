@@ -129,7 +129,7 @@ class Observation:
                     for key, value in options.items() if key != "emit"})
             assert evidence["runtime_calls"] == 1
             assert manifest == expected_manifest and manifest is not expected_manifest
-            assert entrypoint == ROOT / "sim/__main__.py"
+            assert entrypoint == ROOT / "tools/sim-unmigrated"
             assert evidence["runtime_options"] == expected_options
             emit = options.pop("emit")
             assert callable(emit)
@@ -516,7 +516,7 @@ class Observation:
 
 
 def invoke_cli(observer, report_path, *, scenario=False):
-    """Run the selected package's real module entry within this instrumented fixture."""
+    """Run the selected package's real tool entry within this instrumented fixture."""
     evidence = observer.report["cli"]
     if scenario:
         argv = ["sim", "scenario", "run", str(observer.scenario_manifest.path),
@@ -531,7 +531,7 @@ def invoke_cli(observer, report_path, *, scenario=False):
     try:
         sys.argv = list(argv)
         try:
-            runpy.run_module("sim", run_name="__main__", alter_sys=True)
+            runpy.run_path(str(ROOT / "tools/sim-unmigrated"), run_name="__main__")
         except SystemExit as exit:
             evidence["exit_code"] = exit.code
         else:
@@ -540,7 +540,7 @@ def invoke_cli(observer, report_path, *, scenario=False):
         sys.argv = previous_argv
     try:
         assert evidence["runtime_calls"] == 1
-        assert evidence["module_argv"] == [str(ROOT / "sim/__main__.py"), *argv[1:]]
+        assert evidence["module_argv"] == [str(ROOT / "tools/sim-unmigrated"), *argv[1:]]
         payload = json.loads(report_path.read_text())
         evidence.update(report=payload, report_sha256=sha(report_path))
         error = observer.run_error
@@ -2275,7 +2275,7 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
     if cli:
         report["cli"] = {}
         report["limitations"].append(
-            "Instrumented runpy sim module entry in the existing fixture subprocess; not an unmodified external python -m sim run.")
+            "Instrumented runpy unmigrated application tool entry in the existing fixture subprocess; not an unmodified external python -m sim.apps.unmigrated_cli run.")
     write_json(output / "report.json", report)
     observer = primary = binary = manifest = scenario_manifest = None
     previous_signal = signal.getsignal(signal.SIGTERM)
@@ -2429,8 +2429,8 @@ def main(args):
     if args.cli:
         report["cli"] = {}
         report["limitations"].append(
-            "Instrumented runpy sim module entry in the existing shell subprocess; not an unmodified external python -m sim run.")
-        for path in (ROOT / "sim/__main__.py", ROOT / "sim/cli.py"):
+            "Instrumented runpy unmigrated application tool entry in the existing shell subprocess; not an unmodified external python -m sim.apps.unmigrated_cli run.")
+        for path in (ROOT / "tools/sim-unmigrated", ROOT / "sim/apps/unmigrated_cli.py"):
             report["inputs"][str(path)] = sha(path)
     overrides = {"create_arena_plant": "world", "running_qemu": "qemu", "QmpSession": "qmp",
         "CanStream": "can", "StepFramedSocket": "cosim", "SharedWorldRuntime": "shared", "ChildProcess": "child"}

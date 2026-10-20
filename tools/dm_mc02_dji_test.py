@@ -29,7 +29,7 @@ from dm_mc02_sim_worker import CanStream, QemuTimestampMapper
 from sim.devices.dji.m3508 import M3508
 from sim.devices.dji.protocol import encode_feedback
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.fabric.runtime import CanRuntime
 
 STEP_NS = 1_000_000

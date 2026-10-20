@@ -30,7 +30,7 @@ from sim.boards.launch import qemu_command, regular_file, resolve_qemu
 from sim.core import Session
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.fabric import CanBus
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.physics import MujocoPhysics
 from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
 from sim.transports.can_codec import WIRE_SIZE, unpack_wire_frame

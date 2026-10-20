@@ -367,7 +367,7 @@ def drain_paused_can(qmp, stream: CanStream, sink, *, target_ns: int,
 
 def wait_paused_can_input(qmp, stream: CanStream, *, target_ns: int,
                           controller: str, chardev: str, completed_frames: int,
-                          deadline: float, check) -> dict:
+                          deadline: float, check, initial: bool = False) -> dict:
     """Flush admitted input and observe its synchronous native processing.
 
     The caller establishes a pre-send native baseline and the exact number of
@@ -383,16 +383,23 @@ def wait_paused_can_input(qmp, stream: CanStream, *, target_ns: int,
     final native controller dict, including actual rx_dropped: completed input
     includes rejected records and does not prove FIFO or firmware consumption.
     No time is advanced and no baseline or count is cached across calls.
+    ``initial=True`` admits the original idle/prelaunch cut before the first
+    CPU request, with the same original connection and empty output premise.
     """
+    if type(initial) is not bool:
+        raise TypeError("initial must be a boolean")
     _integer(completed_frames, "completed_frames", 0xfffffffffffffffe)
     guard, observe_state = _paused_can_io(
         qmp, stream, target_ns=target_ns, controller=controller, chardev=chardev,
-        deadline=deadline, check=check, direction="input")
+        deadline=deadline, check=check, direction="input", initial=initial)
     if stream.buffer:
         raise RuntimeError("drain CAN output before waiting for input")
 
     def observe():
-        rx, = observe_state()
+        states = observe_state()
+        if initial and (states[0]["pending_frames"] or states[0]["pending_bytes"]):
+            raise RuntimeError("CAN initial input requires empty native output")
+        rx = states[-1]
         if rx["completed_frames"] > completed_frames:
             raise RuntimeError("CAN input completed count exceeds goal")
         _empty_can_output(stream, guard)

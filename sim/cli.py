@@ -1,360 +1,244 @@
-"""Small command entry for native board debugging and manifest experiments."""
-
+"""Installed entry point for the single Simulation execution path."""
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict
+from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
+from enum import Enum
 import json
 import math
-import os
 from pathlib import Path
 import signal
 import sys
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-
-
-def _seconds(value) -> float:
-    if isinstance(value, bool):
-        raise argparse.ArgumentTypeError("must be finite and positive")
+def _seconds(value):
     try:
-        number = float(value)
+        result = float(value)
     except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError("must be finite and positive") from None
-    if not math.isfinite(number) or number <= 0:
-        raise argparse.ArgumentTypeError("must be finite and positive")
-    return number
+        raise argparse.ArgumentTypeError('must be finite and positive') from None
+    if not math.isfinite(result) or result <= 0:
+        raise argparse.ArgumentTypeError('must be finite and positive')
+    return result
 
 
-def _port(value) -> int:
-    if isinstance(value, bool):
-        raise argparse.ArgumentTypeError("must be an integer in 1..65535")
+def _port(value):
     try:
-        number = int(value)
+        result = int(value)
     except (TypeError, ValueError):
-        raise argparse.ArgumentTypeError("must be an integer in 1..65535") from None
-    if not 1 <= number <= 65535:
-        raise argparse.ArgumentTypeError("must be an integer in 1..65535")
-    return number
+        raise argparse.ArgumentTypeError('port must be in 1..65535') from None
+    if not 1 <= result <= 65535:
+        raise argparse.ArgumentTypeError('port must be in 1..65535')
+    return result
 
 
-def _runtime_options(parser, *, timeout: float, paused=True, debug=True) -> None:
-    parser.add_argument("--qemu", metavar="PATH", help="QEMU executable (default: project build)")
-    parser.add_argument("--timeout", type=_seconds, default=timeout, metavar="SECONDS",
-                        help=f"active host deadline including startup; cleanup separate (default: {timeout:g})")
-    parser.add_argument("--startup-timeout", type=_seconds, default=10.0, metavar="SECONDS",
-                        help="startup deadline from QEMU launch (default: 10)")
-    if not debug:
-        return
-    parser.add_argument("--qmp", metavar="PATH", help="additional native QMP Unix socket")
-    parser.add_argument("--gdb-port", type=_port, metavar="PORT",
-                        help="native GDB port on 127.0.0.1, in 1..65535")
-    if paused:
-        parser.add_argument("--paused", action="store_true",
-                            help="start paused for native GDB or interactive cont (requires --gdb-port)")
-
-
-def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="sim", description="Run DM-MC02 firmware, Lab experiments, robots and scenarios.")
-    groups = parser.add_subparsers(dest="group", required=True)
-    board = groups.add_parser("board", help="native firmware terminal, QMP and GDB")
-    boards = board.add_subparsers(dest="action", required=True)
-    boards.add_parser("run", help="forward all options to tools/run-qemu.sh",
-                      add_help=False)
-    lab = groups.add_parser("lab", help="manifest experiments and interactive public board IO")
-    labs = lab.add_subparsers(dest="action", required=True)
-    run = labs.add_parser("run", help="apply a Lab manifest and report its assertions",
-                         description="Run one YAML Lab manifest with native QEMU observations.")
-    run.add_argument("manifest", metavar="PATH", type=Path,
-                     help="YAML manifest; firmware paths are relative to its directory")
-    _runtime_options(run, timeout=30.0)
-    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
-    interactive = labs.add_parser("interactive", help="observe UART/CAN and enter GPIO/key/ADC commands",
-                                  description="Use a pipe or TTY for commands; enter help to list commands.")
-    interactive.add_argument("--elf", required=True, type=Path, metavar="PATH", help="firmware ELF")
-    interactive.add_argument("--uart", action="append", choices=("uart1", "uart2", "uart3", "uart5", "uart7", "uart10"),
-                             help="attach a UART; repeat for several (default: uart1)")
-    interactive.add_argument("--can", action="append", choices=("can1", "can2", "can3"),
-                             help="attach a CAN channel; repeat for several")
-    interactive.add_argument("--adc", action="store_true", help="enable ADC1 raw16/voltage input")
-    _runtime_options(interactive, timeout=300.0)
-    robot = groups.add_parser("robot", help="single-board four-wheel robot manifests")
-    robots = robot.add_subparsers(dest="action", required=True)
-    run = robots.add_parser("run", help="run firmware, chassis physics and optional upper processes")
-    run.add_argument("manifest", type=Path, metavar="PATH",
-                     help="YAML robot manifest; paths are relative to its directory")
-    run.add_argument("--duration", type=_seconds, default=5.0, metavar="SECONDS",
-                     help="QEMU virtual duration after optional UART ready (default: 5)")
-    _runtime_options(run, timeout=30.0, paused=False)
-    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
-    arena = groups.add_parser("arena", help="two firmware robots sharing one native world")
-    arenas = arena.add_subparsers(dest="action", required=True)
-    run = arenas.add_parser("run", help="run an admitted two-robot Arena manifest")
-    run.add_argument("manifest", type=Path, metavar="PATH",
-                     help="YAML Arena manifest; robot references are relative to its directory")
-    run.add_argument("--duration", type=_seconds, default=5.0, metavar="SECONDS",
-                     help="shared logical world duration after all requested UART ready markers (default: 5)")
-    _runtime_options(run, timeout=30.0, debug=False)
-    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
-    scenario = groups.add_parser("scenario", help="scheduled inputs for an admitted Arena")
-    scenarios = scenario.add_subparsers(dest="action", required=True)
-    run = scenarios.add_parser("run", help="run a Scenario with its configured duration")
-    run.add_argument("manifest", type=Path, metavar="PATH",
-                     help="YAML Scenario manifest; Arena reference is relative to its directory")
-    _runtime_options(run, timeout=30.0, debug=False)
-    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
-    replay = scenarios.add_parser("replay", help="reevaluate assertions from a completed observation trace")
-    replay.add_argument("manifest", type=Path, metavar="MANIFEST",
-                        help="original YAML Scenario manifest")
-    replay.add_argument("trace", type=Path, metavar="TRACE", help="completed MCAP observation file")
-    replay.add_argument("--clock", action="append", required=True, metavar="MEMBER=EPOCH",
-                        help="original member clock/epoch; repeat for every Arena member")
-    replay.add_argument("--report", type=Path, metavar="NEW_PATH",
-                        help="create a new JSON result file, including failures")
+def _parser():
+    parser = argparse.ArgumentParser(prog='sim', description='Compose and run embedded simulations.')
+    commands = parser.add_subparsers(dest='command', required=True)
+    validate = commands.add_parser('validate', help='validate sim/v1 without starting native resources')
+    validate.add_argument('scene', type=Path)
+    run = commands.add_parser('run', help='run a sim/v1 scene through Simulation')
+    run.add_argument('scene', type=Path)
+    run.add_argument('--qemu', help='native QEMU executable (or QEMU_SYSTEM_ARM)')
+    run.add_argument('--backend-root', type=Path, help='canonical backend checkout when installed outside it')
+    run.add_argument('--timeout', type=_seconds, help='total host budget including startup')
+    run.add_argument('--startup-timeout', type=_seconds, default=10.0)
+    run.add_argument('--gdb-port', type=_port, help='single machine native GDB port')
+    run.add_argument('--qmp', type=Path, help='single machine additional native QMP socket')
+    run.add_argument('--report', type=Path, help='create a new JSON report after cleanup')
     return parser
 
 
-def _emit(event, *, member=None) -> None:
-    """Keep serial bytes inert and distinguish the two observation clocks."""
-    from sim.fabric import CanFrame
-
-    endpoint = event.endpoint if member is None else f"{member}.{event.endpoint}"
-    if isinstance(event.data, bytes):
-        print(f"UART {endpoint} poll_sample_ns={event.timestamp_ns} {event.data!r}",
-              flush=True)
-    elif isinstance(event.data, CanFrame):
-        frame = event.data
-        print(f"CAN {endpoint} native_timestamp_ns={frame.timestamp_ns} "
-              f"id=0x{frame.can_id:x} flags=0x{frame.flags:x} dlc={frame.dlc} "
-              f"data={frame.data.hex()}", flush=True)
-    else:
-        raise TypeError("unsupported Lab observation")
-
-
-def _emit_arena(event) -> None:
-    _emit(event.event, member=event.name)
+def _json(value):
+    if isinstance(value, bytes):
+        return {'hex': value.hex()}
+    if isinstance(value, Enum):
+        return value.value
+    if is_dataclass(value):
+        return {field.name: _json(getattr(value, field.name)) for field in fields(value)}
+    if isinstance(value, Mapping):
+        return {str(key): _json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_json(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
 
 
-def _write_report(path: Path, payload: dict, *, exclusive=False) -> None:
-    text = json.dumps(payload, indent=2, ensure_ascii=True) + "\n"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if exclusive:
-        with path.open("x", encoding="utf-8") as output:
-            output.write(text)
-    else:
-        path.write_text(text, encoding="utf-8")
+def _emit(event):
+    # Keep firmware control bytes inert; preserve explicit source clocks.
+    if event.kind != 'snapshot':
+        print(json.dumps(_json(event), ensure_ascii=True), flush=True)
 
 
-def _diagnose(error: BaseException) -> None:
-    print(f"error: {error}", file=sys.stderr)
-    for note in getattr(error, "__notes__", ()):
-        print(note, file=sys.stderr)
+def _interactive(simulation, scene):
+    """One bounded command pump and at most one common step per iteration."""
+    import os
+    import select
+    import time
+    from sim.config.yaml import parse_time
 
-
-def _run_lab(args) -> int:
-    code = 1
-    try:
-        # Help and the native board launcher need no Lab/YAML dependencies.
-        from sim.lab.manifest import load_manifest
-        from sim.lab.runtime import run_manifest
-
-        manifest = load_manifest(args.manifest)
-        result = run_manifest(
-            manifest, emit=_emit, paused=args.paused, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout,
-            qmp_path=args.qmp, gdb_port=args.gdb_port)
-        # run_manifest returns only after every connection/process cleanup.
-        payload = {"status": "passed" if result.passed else "failed",
-                   "result": asdict(result)}
-        code = 0 if result.passed else 1
-        for failure in result.failures:
-            print(f"assertion failed: {failure}", file=sys.stderr)
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        payload = {"status": "failed", "error": str(error),
-                   "error_type": type(error).__name__,
-                   "notes": list(getattr(error, "__notes__", ()))}
-        code = 130 if isinstance(error, KeyboardInterrupt) else 1
-    if args.report is not None:
-        try:
-            _write_report(args.report, payload)
-        except (Exception, KeyboardInterrupt) as error:
-            _diagnose(error)
-            return 130 if isinstance(error, KeyboardInterrupt) else 1
-    if "result" in payload:
-        print(f"Lab {result.name!r}: {payload['status']} "
-              f"({len(result.status)} assertions)", flush=True)
-    return code
-
-
-def _interrupted(signum, _frame) -> None:
-    # Unwind the runtime's existing process/connection owners on external TERM.
-    raise KeyboardInterrupt(f"interrupted by signal {signum}")
-
-
-def _run_interactive(args) -> int:
-    try:
-        from sim.lab.interactive import run_interactive
-        result = run_interactive(
-            args.elf, uarts=tuple(args.uart or ("uart1",)), cans=tuple(args.can or ()),
-            adc=args.adc, emit=_emit, paused=args.paused, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout,
-            qmp_path=args.qmp, gdb_port=args.gdb_port)
-        print(f"Lab interactive closed: {result['commands']} commands, "
-              f"{result['observation_batches']} observations", flush=True)
-        return 0
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        return 130 if isinstance(error, KeyboardInterrupt) else 1
-
-
-def _run_robot(args) -> int:
-    try:
-        from sim.robots.manifest import load_manifest
-        from sim.robots.runtime import run_manifest
-
-        manifest = load_manifest(args.manifest)
-        result = run_manifest(
-            manifest, emit=_emit, duration=args.duration, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout,
-            qmp_path=args.qmp, gdb_port=args.gdb_port)
-        payload = {"status": "passed", "result": asdict(result)}
-        code = 0
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        payload = {"status": "failed", "error": str(error),
-                   "error_type": type(error).__name__,
-                   "notes": list(getattr(error, "__notes__", ()))}
-        code = 130 if isinstance(error, KeyboardInterrupt) else 1
-    if args.report is not None:
-        try:
-            _write_report(args.report, payload)
-        except (Exception, KeyboardInterrupt) as error:
-            _diagnose(error)
-            return 130 if isinstance(error, KeyboardInterrupt) else 1
-    if code == 0:
-        print(f"Robot {result.name!r}: passed (application ready: {result.ready})", flush=True)
-    return code
-
-
-def _run_arena(args) -> int:
-    scenario = args.group == "scenario"
-    try:
-        if scenario:
-            from sim.scenario.manifest import load_manifest
-        else:
-            from sim.arena.manifest import load_manifest
-
-        manifest = load_manifest(args.manifest)
-        if scenario:
-            from sim.scenario.runtime import run_manifest
-            options = {}
-        else:
-            from sim.arena.runtime import run_manifest
-            options = {"duration": args.duration}
-
-        result = run_manifest(
-            manifest, emit=_emit_arena, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout, **options)
-        payload = {"status": "passed", "result": asdict(result)}
-        code = 0
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        payload = {"status": "failed", "error": str(error),
-                   "error_type": type(error).__name__,
-                   "notes": list(getattr(error, "__notes__", ()))}
-        code = 130 if isinstance(error, KeyboardInterrupt) else 1
-    if args.report is not None:
-        try:
-            _write_report(args.report, payload)
-        except (Exception, KeyboardInterrupt) as error:
-            _diagnose(error)
-            return 130 if isinstance(error, KeyboardInterrupt) else 1
-    if code == 0:
-        label = "Scenario" if scenario else "Arena"
-        print(f"{label} {result.name!r}: passed (shared world {result.origin_ns}..{result.end_ns} ns, "
-              f"{len(result.boards)} boards)", flush=True)
-    return code
-
-
-def _run_scenario_replay(args) -> int:
-    try:
-        from sim.arena.trace import validate_clocks
-        from sim.boards.launch import regular_file
-        from sim.scenario.manifest import load_manifest
-        from sim.scenario.replay import replay_assertions
-
-        clocks = {}
-        for value in args.clock:
-            member, separator, epoch = value.partition("=")
-            if not separator or not member or not epoch:
-                raise ValueError("--clock requires MEMBER=EPOCH with nonempty values")
-            if member in clocks:
-                raise ValueError(f"duplicate --clock member: {member}")
-            clocks[member] = epoch
-        clocks = validate_clocks(clocks)
-        manifest = load_manifest(args.manifest)
-        trace_path = regular_file(args.trace, "Scenario replay trace")
-        source = trace_path.open("rb")
-        primary = None
-        try:
-            result = replay_assertions(source, manifest, clocks=clocks)
-        except BaseException as error:
-            primary = error
-            raise
-        finally:
+    print('Commands: run, pause, step [1ms], state, inject ENDPOINT JSON, reset, quit', flush=True)
+    running = False
+    pending = bytearray()
+    discarding = False
+    stdin_open = True
+    next_tick = time.monotonic()
+    while True:
+        wait = max(0.0, min(.05, next_tick - time.monotonic())) if running else .05
+        # Drain already-read lines before reading again, keeping memory bounded
+        # even when a pipe supplies many short commands faster than execution.
+        readable = []
+        if b'\n' not in pending and stdin_open:
+            readable, _, _ = select.select([sys.stdin], [], [], wait)
+        elif not pending and not stdin_open:
+            return
+        if readable:
+            raw = os.read(sys.stdin.fileno(), 4096)
+            if not raw:
+                stdin_open = False
+                if pending and not discarding:
+                    pending.extend(b'\n')
+            if discarding:
+                _, newline, raw = raw.partition(b'\n')
+                if not newline:
+                    raw = b''
+                else:
+                    discarding = False
+            pending.extend(raw)
+        if b'\n' in pending:
+            raw_line, _, rest = pending.partition(b'\n')
+            pending[:] = rest
             try:
-                source.close()
-            except BaseException as error:
-                if primary is None:
-                    raise
-                BaseException.add_note(primary, f"Scenario replay source close failed: {error}")
-        payload = {"status": "passed" if result.passed else "failed",
-                   "result": asdict(result)}
-        code = 0 if result.passed else 1
-        for failure in result.failures:
-            print(f"assertion failed: {failure}", file=sys.stderr)
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        payload = {"status": "failed", "error": str(error),
-                   "error_type": type(error).__name__,
-                   "notes": list(getattr(error, "__notes__", ()))}
-        code = 130 if isinstance(error, KeyboardInterrupt) else 1
-    if args.report is not None:
-        try:
-            _write_report(args.report, payload, exclusive=True)
-        except (Exception, KeyboardInterrupt) as error:
-            _diagnose(error)
-            return 130 if code == 130 or isinstance(error, KeyboardInterrupt) else 1
-    if "result" in payload:
-        print(f"Scenario replay: {payload['status']} "
-              f"({len(result.status)} assertions)", flush=True)
-    return code
+                if len(raw_line) > 4096:
+                    raise ValueError('command exceeds 4096 bytes')
+                line = raw_line.decode('utf-8').strip()
+                command, _, arguments = line.partition(' ')
+                value = None
+                if command == 'step':
+                    value = parse_time(arguments or '1ms', 'step', zero=False)
+                elif command == 'inject':
+                    endpoint, separator, encoded = arguments.partition(' ')
+                    if not separator:
+                        raise ValueError('inject requires ENDPOINT JSON')
+                    payload = json.loads(encoded)
+                    node, _, port = endpoint.partition('.')
+                    descriptor = next((item for item in simulation.validate()[node].ports
+                                       if item.name == port), None)
+                    if descriptor is not None and descriptor.protocol == 'uart' and type(payload) is str:
+                        payload = payload.encode('utf-8')
+                    # Admission mutates only the bounded input queue. Applying
+                    # the input happens inside step, where errors are terminal.
+                    simulation.schedule_input(endpoint, payload, at_ns=simulation.t_sim_ns)
+                elif arguments or command not in ('', 'quit', 'run', 'pause', 'state', 'reset'):
+                    raise ValueError('unknown command or arguments')
+            except (ValueError, KeyError, UnicodeError) as error:
+                print(f'error: {error}', file=sys.stderr, flush=True)
+            else:
+                # Execution errors must escape to the common cleanup/report
+                # path, including ValueError raised after a component effect.
+                if command == 'quit':
+                    return
+                if command == 'run':
+                    running = True
+                    next_tick = time.monotonic()
+                elif command == 'pause':
+                    running = False
+                    simulation.pause()
+                elif command == 'step':
+                    running = False
+                    simulation.step(value)
+                elif command == 'state':
+                    print(json.dumps({'state': _json(simulation.state),
+                                      'time_ns': simulation.t_sim_ns}), flush=True)
+                elif command == 'reset':
+                    running = False
+                    simulation.reset()
+        if len(pending) > 4096 and b'\n' not in pending:
+            pending.clear()
+            discarding = True
+            print('error: command exceeds 4096 bytes; discarded through newline', file=sys.stderr, flush=True)
+        if running and time.monotonic() >= next_tick:
+            if simulation.t_sim_ns >= scene.duration_ns:
+                running = False
+                simulation.pause()
+            else:
+                simulation.step(min(scene.quantum_ns, scene.duration_ns - simulation.t_sim_ns))
+                next_tick = time.monotonic() + scene.quantum_ns / 1e9
+        simulation.check_deadline()
 
 
-def main(argv=None) -> int:
-    arguments = list(sys.argv[1:] if argv is None else argv)
-    # The existing native launcher owns all board option admission. Preserve
-    # its exact argv, stdio mux, process identity and GDB/QMP semantics.
-    if arguments[:2] == ["board", "run"]:
-        launcher = str(PROJECT_ROOT / "tools/run-qemu.sh")
-        try:
-            os.execv(launcher, [launcher, *arguments[2:]])
-        except OSError as error:
-            _diagnose(error)
-            return 1
-        return 0  # Only reachable when execv is replaced by an embedding caller.
-    args = _parser().parse_args(arguments)
+def _interrupted(_signum, _frame):
+    raise KeyboardInterrupt('simulation interrupted')
+
+
+def main(argv=None):
+    args = _parser().parse_args(argv)
+    simulation = None
+    error = None
+    code = 0
+    result = None
     previous = signal.signal(signal.SIGTERM, _interrupted)
     try:
-        if args.group == "robot":
-            return _run_robot(args)
-        if args.group == "scenario" and args.action == "replay":
-            return _run_scenario_replay(args)
-        if args.group in ("arena", "scenario"):
-            return _run_arena(args)
-        return _run_lab(args) if args.action == "run" else _run_interactive(args)
+        from sim.composition import builtin_registry
+        from sim.config.scene import load_scene
+        from sim.runtime import Simulation
+
+        registry = builtin_registry(**({'qemu': args.qemu, 'backend_root': args.backend_root,
+                                       'gdb_port': args.gdb_port, 'qmp_path': args.qmp}
+                                      if args.command == 'run' else {}))
+        scene = load_scene(args.scene, registry)
+        if args.command == 'validate':
+            print(f'valid: {args.scene} ({len(scene.topology.nodes)} nodes)')
+            return 0
+        if (args.gdb_port is not None or args.qmp is not None) and sum(
+                node.kind == 'machine.qemu' for node in scene.topology.nodes) != 1:
+            raise ValueError('--gdb-port/--qmp require exactly one QEMU machine')
+        timeout = args.timeout or (300.0 if scene.mode == 'interactive' else 30.0)
+        simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
+                                mode=scene.mode, host_timeout_s=timeout,
+                                startup_timeout_s=args.startup_timeout, on_event=_emit)
+        simulation.start()
+        if scene.mode == 'interactive':
+            _interactive(simulation, scene)
+        else:
+            simulation.run_until(scene.duration_ns)
+        result = {'time_ns': simulation.t_sim_ns}
+    except BaseException as caught:
+        error = caught
+        code = 130 if isinstance(caught, KeyboardInterrupt) else 1
+        from sim.machines.qemu import BackendUnavailable
+        if isinstance(caught, BackendUnavailable):
+            code = 78
     finally:
+        if simulation is not None:
+            try:
+                simulation.close()
+            except BaseException as cleanup:
+                if error is None:
+                    error = cleanup
+                    code = 130 if isinstance(cleanup, KeyboardInterrupt) else 1
+                else:
+                    error.add_note(f'Simulation cleanup: {type(cleanup).__name__}: {cleanup}')
         signal.signal(signal.SIGTERM, previous)
+    payload = ({'status': 'passed', 'result': result} if error is None else
+               {'status': 'blocked' if code == 78 else 'failed', 'error': str(error),
+                'error_type': type(error).__name__, 'notes': getattr(error, '__notes__', [])})
+    if args.command == 'run' and args.report:
+        try:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            with args.report.open('x', encoding='utf-8') as output:
+                output.write(json.dumps(payload, ensure_ascii=True, indent=2) + '\n')
+        except BaseException as report_error:
+            if error is None:
+                error = report_error
+                code = 130 if isinstance(report_error, KeyboardInterrupt) else 1
+            else:
+                error.add_note(f'report: {type(report_error).__name__}: {report_error}')
+    if error is not None:
+        print(f'error: {error}', file=sys.stderr)
+        for note in getattr(error, '__notes__', ()):
+            print(note, file=sys.stderr)
+    else:
+        print(f"passed: time_ns={result['time_ns']}")
+    return code

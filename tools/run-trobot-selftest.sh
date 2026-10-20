@@ -45,7 +45,7 @@ from dm_mc02_qmp import QmpSession
 from dm_mc02_sim_worker import (RESET, TELEMETRY, CanStream, FramedSocket, adc_voltage_frame,
                                  imu_frame, protocol_frame, QemuTimestampMapper)
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 
 names = ['cosim', 'uart1', 'uart2', 'uart3', 'uart5', 'uart7', 'uart10', 'can1', 'can2', 'can3']
 qmp_path, *values = sys.argv[1:]

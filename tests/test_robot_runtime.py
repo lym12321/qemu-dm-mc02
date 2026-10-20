@@ -17,6 +17,7 @@ from sim import processes
 from sim.robots import runtime
 from sim.robots.manifest import load_manifest
 from tools import dm_mc02_firmware_rtf as rtf
+from sim.machines.qemu import deadline as qmp_deadline
 from tools.dm_mc02_test_harness import stop
 from test_harness_lifecycle import identity
 from test_lab_runtime import snapshot
@@ -75,6 +76,7 @@ class Environment:
         clock = SimpleNamespace(monotonic=lambda: self.clock)
         monkeypatch.setattr(runtime, "time", clock)
         monkeypatch.setattr(rtf, "time", clock)
+        monkeypatch.setattr(qmp_deadline, "time", clock)
         monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select))
 
     @contextmanager

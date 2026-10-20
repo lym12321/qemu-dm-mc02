@@ -272,7 +272,8 @@ class WorkerRunTests(unittest.TestCase):
 
     def test_can_runtime_routes_real_wire_without_legacy_motor_decode(self):
         from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-        from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+        from sim.machines.qemu.endpoints import QemuCanEndpoint
+        from sim.transports.socketcan_endpoint import SocketCanEndpoint
         from sim.fabric.runtime import CanRuntime
 
         class Echo(VirtualCanDevice):
@@ -774,7 +775,8 @@ class WorkerRunTests(unittest.TestCase):
 
     def _assert_fabric_wait_does_not_step(self, phase):
         from sim.fabric import CanBus
-        from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+        from sim.machines.qemu.endpoints import QemuCanEndpoint
+        from sim.transports.socketcan_endpoint import SocketCanEndpoint
         from sim.fabric.runtime import CanRuntime
         _, observed = self._continuous_input_fixture(phase)
         runtimes = []

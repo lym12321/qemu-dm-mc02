@@ -21,9 +21,13 @@ else:
     from dm_mc02_qmp import QmpSession
 
 
+from sim.machines.qemu.deadline import (StartupTimeoutError,
+    QMP_COMMAND_TIMEOUT_SECONDS, _deadline_remaining,
+    _set_startup_qmp_timeout, deadline_qmp_call)
+
+
 UINT32_MASK = 0xFFFF_FFFF
 UINT32_HALF_RANGE = 0x8000_0000
-QMP_COMMAND_TIMEOUT_SECONDS = 2.0
 PROCESS_CLEANUP_TIMEOUT_SECONDS = 2.0
 STDERR_EXCERPT_BYTES = 16 * 1024
 T = TypeVar("T")
@@ -31,10 +35,6 @@ T = TypeVar("T")
 
 class SampleInvalidError(RuntimeError):
     """The observed values no longer belong to one valid sampling epoch."""
-
-
-class StartupTimeoutError(RuntimeError):
-    """The process did not reach the requested sampling-ready boundary."""
 
 
 def forward_tick_delta(previous: int, current: int) -> int:
@@ -192,34 +192,6 @@ def _assert_process_running(
         return
     error = _stderr_excerpt(process, stderr_file)
     raise RuntimeError(f"QEMU exited during {phase} with status {status}: {error}")
-
-
-def _deadline_remaining(deadline: float, phase: str) -> float:
-    remaining = deadline - time.monotonic()
-    if remaining <= 0:
-        raise StartupTimeoutError(f"{phase} exceeded startup timeout")
-    return remaining
-
-
-def _set_startup_qmp_timeout(qmp: QmpSession, deadline: float, phase: str) -> None:
-    qmp.settimeout(
-        min(QMP_COMMAND_TIMEOUT_SECONDS, _deadline_remaining(deadline, phase))
-    )
-
-
-def deadline_qmp_call(
-    qmp: QmpSession,
-    deadline: float,
-    phase: str,
-    callback: Callable[[], T],
-) -> T:
-    _set_startup_qmp_timeout(qmp, deadline, phase)
-    try:
-        result = callback()
-    except TimeoutError as exc:
-        raise StartupTimeoutError(f"{phase} QMP command timed out") from exc
-    _deadline_remaining(deadline, phase)
-    return result
 
 
 def require_stopped_status(

@@ -31,7 +31,7 @@ from sim.core import Coordinator, Session, StepContext
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.lab.experiment import LabExperiment
 from sim.lab.manifest import Assertion, LabManifest, Ready
 from sim.robots import shared_world
@@ -39,6 +39,7 @@ from sim.scenario import ScenarioCanDelay, ScenarioManifest, ScenarioReferee, lo
 from sim.scenario import runtime as scenario_runtime
 from sim.transports import cosim
 from tools import dm_mc02_firmware_rtf as rtf
+from sim.machines.qemu import deadline as qmp_deadline
 from test_arena_manifest import ROBOT_DOCUMENT, referee_configuration, write_arena, write_executable
 from test_lab_runtime import snapshot
 from test_robot_runtime import Pipe
@@ -129,7 +130,7 @@ class Environment:
         monkeypatch.setattr(runtime, "stop", self.stop)
         clock = SimpleNamespace(monotonic=lambda: self.clock,
                                 monotonic_ns=lambda: round(self.clock * 1e9))
-        for module in (runtime, shared_world, board_qmp, cosim, rtf):
+        for module in (runtime, shared_world, board_qmp, cosim, rtf, qmp_deadline):
             monkeypatch.setattr(module, "time", clock)
         monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select), raising=False)
 
@@ -1134,7 +1135,7 @@ def test_loaded_scenario_motor_feedback_uses_actual_socket_dispatch_without_rere
     observed.after_set = lambda value, member, motor_id, enabled: order.append((value.t_sim_ns, "feedback", enabled))
     environment.can_commands = ["1000 0000 0000 0000", "f000 0000 0000 0000"]
     if via_cli:
-        from sim import cli
+        from sim.apps import unmigrated_cli as cli
         results, calls = [], []
         run = scenario_runtime.run_manifest
         def execute(actual, **options):
@@ -1271,7 +1272,7 @@ def test_loaded_scenario_can_delays_consumes_actual_arena_bus_without_rereading(
             environment.schedule_can(0, can_wire(1000, "0800 0000 0000 0000"))
     observed.after_set = after_set
     if via_cli:
-        from sim import cli
+        from sim.apps import unmigrated_cli as cli
         calls, results = [], []
         run_scenario = scenario_runtime.run_manifest
         def execute(actual, **options):
@@ -3168,7 +3169,7 @@ def test_loaded_scenario_assertions_use_reset_epochs_and_actual_startup_batches(
         return result
     monkeypatch.setattr(runtime, "run_manifest", lower)
     if via_cli:
-        from sim import cli
+        from sim.apps import unmigrated_cli as cli
         report, write = environment.directory / "assertion-report.json", Path.write_text
         def report_after_cleanup(path, *args, **kwargs):
             if path == report:
@@ -3293,7 +3294,7 @@ def test_scenario_assertion_callback_guard_stops_before_observation_or_world_ste
 
 
 def test_scenario_assertion_cli_reports_failure_only_after_cleanup(environment, monkeypatch, capsys):
-    from sim import cli
+    from sim.apps import unmigrated_cli as cli
 
     arena = environment.manifest()
     path, report = environment.directory / "failure.yaml", environment.directory / "failure-report.json"
@@ -3768,7 +3769,7 @@ def test_offline_replay_rejects_actual_failure_diagnostics_without_completion(en
 
 
 def test_offline_replay_cli_consumes_actual_socket_capture_after_cleanup(environment, monkeypatch, capsys):
-    from sim import cli
+    from sim.apps import unmigrated_cli as cli
     from sim.arena.trace import ArenaTrace
     from sim.trace import TraceWriter
 
@@ -3967,7 +3968,7 @@ def test_scenario_capture_actual_assertion_failure_retains_its_batch_without_com
 
 
 def test_scenario_capture_actual_live_assertions_complete_then_original_cli_replay(environment, monkeypatch, capsys):
-    from sim import cli
+    from sim.apps import unmigrated_cli as cli
     from sim.arena.trace import ArenaTrace
     from sim.trace import TraceWriter
 

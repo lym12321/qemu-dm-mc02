@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from sim.arena.manifest import ArenaManifest
-from sim.manifest import MAX_TIME_NS
+from sim.config.yaml import MAX_TIME_NS
 from sim.scenario.manifest import (
     ScenarioCanDelay, ScenarioManifest, ScenarioMotorFeedback,
     ScenarioReferee, validate_assertions,

@@ -13,7 +13,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim.lab import Assertion, CanMatch, ManifestError, load_manifest, parse_assertion
 from sim.lab.manifest import MAX_TIME_NS as LAB_MAX_TIME_NS
-from sim.manifest import MAX_TIME_NS, parse_time
+from sim.config.yaml import MAX_TIME_NS, parse_time
 
 
 HEADER = "schema: 1\nname: admission\nboard: dm-mc02\nfirmware: firmware.elf\n"

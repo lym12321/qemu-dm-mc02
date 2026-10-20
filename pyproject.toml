@@ -1,15 +1,22 @@
 [project]
 name = "dm-mc02-qemu-tools"
 version = "0.1.0"
-description = "Deterministic tooling for the independent DM-MC02 QEMU backend"
+description = "Composable embedded simulation with optional native machine backends"
 requires-python = ">=3.11"
 dependencies = [
-    "crccheck==1.3.1",
-    "mcap==1.5.0",
     "PyYAML==6.0.3",
 ]
 
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.scripts]
+sim = "sim.cli:main"
+
 [project.optional-dependencies]
+trace = ["mcap==1.5.0"]
+referee = ["crccheck==1.3.1"]
 mujoco = [
     "mujoco==3.12.0",
 ]
@@ -17,10 +24,13 @@ mujoco = [
 [dependency-groups]
 dev = [
     "pytest>=8,<9",
+    "mcap==1.5.0",
+    "crccheck==1.3.1",
 ]
 
-[tool.uv]
-package = false
+[tool.setuptools.packages.find]
+include = ["sim*"]
+namespaces = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

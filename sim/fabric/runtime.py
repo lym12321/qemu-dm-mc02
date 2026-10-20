@@ -10,12 +10,32 @@ This host schedule does not establish a QEMU CPU or physical CAN time barrier.
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Protocol
 
 from sim.core import Coordinator, Session, SimParticipant, StepContext, StepResult
 
 from .can import CanBus, check_can_time
-from .endpoints import QemuCanEndpoint, SocketCanEndpoint, TimestampMapper
 from .frame import CanFrame
+
+
+class TimestampMapper(Protocol):
+    def map(self, timestamp_ns: int, fallback_ns: int) -> int: ...
+
+    def unmap(self, timestamp_ns: int, fallback_ns: int) -> int: ...
+
+
+class TransportEndpoint(Protocol):
+    bus: CanBus
+
+    def bind_mapper(self, mapper: TimestampMapper) -> None: ...
+
+    def ingest(self, frame: CanFrame, current_time_ns: int) -> None: ...
+
+
+class DatagramEndpoint(Protocol):
+    bus: CanBus
+
+    def ingest(self, raw: bytes, current_time_ns: int) -> None: ...
 
 
 class CanParticipant:
@@ -120,16 +140,18 @@ class CanParticipant:
 
 
 class CanRuntime:
-    """Explicit CAN composition; the coordinator owns the sole participant."""
+    """Unmigrated CAN composition helper; new execution uses Simulation."""
 
-    def __init__(self, bus: CanBus, endpoint: QemuCanEndpoint,
+    def __init__(self, bus: CanBus, endpoint: TransportEndpoint,
                  devices: Iterable[SimParticipant] = (),
-                 socket_endpoint: SocketCanEndpoint | None = None):
-        if not isinstance(endpoint, QemuCanEndpoint) or endpoint.bus is not bus:
-            raise ValueError("QEMU endpoint must belong to the runtime CAN bus")
+                 socket_endpoint: DatagramEndpoint | None = None):
+        if (getattr(endpoint, "bus", None) is not bus
+                or any(not callable(getattr(endpoint, name, None))
+                       for name in ("bind_mapper", "ingest"))):
+            raise ValueError("transport endpoint must belong to the runtime CAN bus")
         if socket_endpoint is not None and (
-                not isinstance(socket_endpoint, SocketCanEndpoint)
-                or socket_endpoint.bus is not bus):
+                getattr(socket_endpoint, "bus", None) is not bus
+                or not callable(getattr(socket_endpoint, "ingest", None))):
             raise ValueError("SocketCAN endpoint must belong to the runtime CAN bus")
         self.bus = bus
         self.endpoint = endpoint

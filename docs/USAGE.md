@@ -2,6 +2,137 @@
 
 本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；可使用下面的 HAL 教学工程，或提供自己的固件 ELF。
 
+<a id="simulation"></a>
+## Simulation：通用场景入口
+
+新入口是可安装的 `sim` 命令和 `sim.runtime.Simulation`。Python 3.11+ 的基础安装只依赖
+锁定的 PyYAML；`pip install -e .`、`sim --help`、`sim validate` 不加载原生 QMP 或物理引擎。
+MuJoCo、Trace、Referee 分别使用 `mujoco`、`trace`、`referee` extra。
+Linux 是当前原生运行平台。
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build examples/minimal-board/build
+sim validate examples/minimal-board/scene.yaml
+sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
+```
+
+先按[构建](#build)得到当前子模块的项目 QEMU。默认使用 `build/qemu/qemu-system-arm`，
+也可设置 `QEMU_SYSTEM_ARM` 或传 `--qemu`。原生后端要求 `x-run-to-virtual-time`、
+`x-query-virtual-execution` 和当前 CAN execution QOM 接口；旧二进制会明确报错。
+wheel 安装在 checkout 外时，原生执行还须 `--backend-root /path/to/checkout`，
+借用其已初始化的 `qemu/upstream/python` 中唯一 QMP 实现。
+配置校验只检查资源和拓扑，不能证明 ELF 能运行或后端二进制能力完备。
+
+`examples/minimal-board` 是真实 Cortex-M7 裸机固件：SysTick、USART1 和 A15→B0。
+`examples/can-motor` 使用相同构建命令，将目录名替换即可；固件通过真实 FDCAN1
+发送一条 C620 电流命令，并读取 M3508 的 ACTIVE、超时后零电流反馈。
+这里的转子位置和速度固定为显式配置值，不计算力学。
+验收脚本还会注入按键，检查有序 UART/GPIO、CAN 来源、切点延迟、超时及资源清理：
+
+```bash
+bash tools/run-simulation-smoke.sh --case all
+bash tools/run-simulation-smoke.sh --case dual-board
+python -m pytest -q tests/test_topology.py tests/test_simulation.py tests/test_qemu_machine.py tests/test_scene_cli.py
+```
+
+场景只有 `schema: sim/v1` 一套格式。单板可省略总线、电机并使用 `links: []`：
+
+```yaml
+schema: sim/v1
+runtime:
+  mode: stepped
+  quantum: 1ms
+  duration: 200ms
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build/firmware.elf
+    uarts: [uart1]
+  can0:
+    kind: bus.can
+  motor0:
+    kind: device.dji-m3508
+    motor_id: 1
+    plant: fixed-rotor
+    position_rad: 0
+    velocity_rad_s: 0
+links:
+  - [main.fdcan1, can0.can]
+  - [motor0.can, can0.can]
+```
+
+路径相对 YAML 所在目录解析；不会执行主机 shell 或自动加载主机程序。未知字段、重复 key、
+anchor/alias、未知 kind/model/port、协议/方向/能力不匹配及连接重复在创建资源前拒绝。
+同一总线的 M3508 ID 必须唯一。文件最多 1 MiB、节点最多 64、连接最多 256；
+时间为整数 `ns/us/ms/s`，场景时长最多 3600s。固件文件必须已存在。
+`bus.can` 可配置 `delay_ns`、`loopback`、`max_pending`、`dispatch_budget`；
+固定转子可配置 `command_timeout: 100ms`、`feedback_period: 1ms`、`temperature_c: 25`。
+
+Python 使用同一个准入和执行路径；也可直接构建 `Topology`/`NodeSpec`/`LinkSpec`，
+使用显式 registry 注册自己的 factory：
+
+```python
+from sim.composition import builtin_registry
+from sim.config.scene import load_scene
+from sim.runtime import Simulation
+
+registry = builtin_registry()
+scene = load_scene("examples/minimal-board/scene.yaml", registry)
+with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
+                on_event=lambda event: print(event.kind, event.mapped_time_ns)) as simulation:
+    simulation.schedule_input("main.key", True, at_ns=40_000_000)
+    simulation.schedule_input("main.key", False, at_ns=90_000_000)
+    simulation.run_until(scene.duration_ns)
+```
+
+factory 的 `describe(spec)` 纯校验并返回 `NodeDescription`/`PortSpec`，
+`create(spec, context)` 返回唯一 owned 实例；构造失败时 factory 负责未返回的部分资源。
+可选纯 `validate_topology(topology, descriptions, registry)` 在创建前校验组件间约束。
+所有实例提供 `close()`；按实际能力提供 `request_step/finish_step`（machine）、
+`step`（同步设备/plant）、`input`，以及可选 `reset(session)`、`start()`。
+机器的 request 全部发出后才逐一等待 finish。CAN endpoint 通过
+`context.attach_can(port, endpoint)` 借用总线，`receive(frame)` 接收、返回的 connection 发送；
+设备不拥有总线或 QEMU。新增 endpoint 无需修改调度器。
+
+`runtime.mode: interactive` 与 stepped 使用相同切点。终端支持
+`run`、`pause`、`step 1ms`、`state`、`inject main.key true`、
+`inject main.uart1 "text"`、`reset`、`quit`。每轮至多一条命令和一个公共 step，
+读取最多 4096 字节，过长行丢到换行并报错。`run` 仅在 host 上按 quantum pacing，
+不保证实时；默认总 host 预算 stepped 30s、interactive 300s，启动 10s，
+可用 `--timeout`、`--startup-timeout` 修改。`--gdb-port 1234` 和
+`--qmp /tmp/sim-user-qmp.sock` 暴露单机器的原生接口，仍受同一 host 期限。
+手动 GDB 运行/暂停会影响切点前提；应通过 Runtime 的 run/step 推进，不能另开 CPU 时间 owner。
+
+每步先在 t 交付到期输入，再让机器和同步组件前进到 t+dt；plant 使用区间开始时已生效的控制量。
+区间末收集到的机器 CAN 输出最早在 t+dt 加链路延迟后交付，不能回写过去积分。
+所有观测含 session、稳定 sequence、来源 node/port、原始 source time、映射时间、交付时间和
+`exact/sampled/lower_bound/upper_bound` 质量。CAN 保留 guest wire 时间；UART 取 read 后
+原生暂停快照作为观察上界。`can-input-processed` 只证明 native transport 处理，
+FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot` 可由 Python 回调观察。
+默认只保留最近 256 个事件，丢弃数公开；回调可消费完整流并自行有界记录。
+
+失败保留部分效果并进入 FAILED，关闭后新建 Simulation，不隐式回滚/重试。
+健康且暂停时 `reset()` 销毁并重建全部 owned 组件，session 递增，原 host 总预算不重启。
+`close()` 独立尝试所有资源；CLI 在清理成功后才报告 passed，报告路径拒绝覆盖。
+缺失可选后端返回 78，执行失败 1，中断 130。
+同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
+
+当前只执行 CAN 连接；UART/GPIO 可作机器外部输入和观测，连接到其他节点的
+UART/signal/physics-binding 会在资源创建前明确拒绝。第二种真实 MCU、物理信号路由、
+完整动力学组合及跨板事件级锁步尚未实现。DM-MC02 是首个真实 profile，不能靠 YAML
+声明额外板卡。`api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
+
+Lab、Robot、Arena、Scenario 及原有 MuJoCo/Gazebo/Trace 组合仍是**尚未迁移的应用**，
+下面的相关命令统一使用 `tools/sim-unmigrated`；它们的旧 runner 不属于新 Simulation 支持范围。
+迁移时须保留各自底层和直接消费者回归，通过 factory/公开事件接入同一 Runtime，不能新增 scheduler。
+
+## 原生板级接口与既有应用
+
 板级状态可通过原生 QMP 读取，无需检查固件内存：
 
 ```json
@@ -78,7 +209,7 @@ B0 是本课观察的数字输出；板载 A7 是 WS2812 数据线，普通 GPIO
 uv sync --frozen
 cmake -S examples/teaching -B build/teaching/Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/teaching/Debug
-uv run tools/sim lab run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
+uv run tools/sim-unmigrated lab run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
 ```
 
 Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同命令，
@@ -92,7 +223,7 @@ Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同�
 可用同一个 ELF 交互观察：
 
 ```bash
-uv run tools/sim lab interactive --elf build/teaching/Debug/gpio_key.elf
+uv run tools/sim-unmigrated lab interactive --elf build/teaching/Debug/gpio_key.elf
 ```
 
 依次输入 `state`、`key press`、`state`、`key release`、`state`，最后输入 `quit`。
@@ -103,7 +234,7 @@ uv run tools/sim lab interactive --elf build/teaching/Debug/gpio_key.elf
 要调试同一份源码，在终端一启动：
 
 ```bash
-uv run tools/sim lab interactive --elf build/teaching/Debug/gpio_key.elf \
+uv run tools/sim-unmigrated lab interactive --elf build/teaching/Debug/gpio_key.elf \
   --gdb-port 1234 --paused --startup-timeout 120 --timeout 300
 ```
 
@@ -141,13 +272,14 @@ bash tools/run-teaching-smoke.sh
 GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字模型的边界，不代表实板电气校准。
 当前只交付第一课；UART、ADC、CAN 实验将沿用同一工程逐课增加。
 
-## Virtual Lab
+<a id="virtual-lab"></a>
+## Virtual Lab（尚未迁移）
 
 先安装固定 Python 依赖，再运行实验：
 
 ```bash
 uv sync --frozen
-uv run tools/sim lab run path/to/lab.yaml --report build/lab-result.json
+uv run tools/sim-unmigrated lab run path/to/lab.yaml --report build/lab-result.json
 # 验证公共示例，自动编译专用裸机测试固件：
 nix develop -c bash tools/run-lab-channels-smoke.sh
 ```
@@ -184,13 +316,13 @@ CAN 断言 `can_seen` 要求 `endpoint/id`，可再指定精确 flags、DLC 和�
 
 ```bash
 # Lab 内部 monitor 与用户 QMP 独立；GDB 使用 QEMU 原生 server：
-uv run tools/sim lab run lab.yaml --qmp /tmp/student-qmp.sock --gdb-port 1234 --paused
+uv run tools/sim-unmigrated lab run lab.yaml --qmp /tmp/student-qmp.sock --gdb-port 1234 --paused
 # 在 startup 期限内从 GDB 恢复，或增大 --startup-timeout/--timeout：
 arm-none-eabi-gdb build/student.elf
 # (gdb) target remote 127.0.0.1:1234
 # (gdb) continue
 # 原生 UART terminal、monitor mux、GDB 和 QMP 仍可直接使用：
-uv run tools/sim board run --elf build/student.elf --debug --qmp /tmp/student-qmp.sock
+uv run tools/sim-unmigrated board run --elf build/student.elf --debug --qmp /tmp/student-qmp.sock
 ```
 
 从仓库根目录可用 `uv run python -m sim`；`tools/sim` 也可从任意目录启动，或将 `tools`
@@ -199,7 +331,7 @@ uv run tools/sim board run --elf build/student.elf --debug --qmp /tmp/student-qm
 交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
 
 ```bash
-uv run tools/sim lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
+uv run tools/sim-unmigrated lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
 ```
 
 连接提示只说明 transport 已连接。输入 `help` 查看命令；`state` 显示原生只读 JSON：
@@ -227,14 +359,15 @@ quit
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
 
-## Robot manifest
+<a id="robot-manifest"></a>
+## Robot manifest（尚未迁移）
 
 `sim robot run` 将一块 DM-MC02、FDCAN1、一条 CAN 总线、四个 M3508 与既有 MuJoCo
 四轮模型组合运行，可同时启动上位机程序。先在构建 QEMU 的环境中安装 MuJoCo extra：
 
 ```bash
 uv sync --frozen --extra mujoco
-uv run --extra mujoco tools/sim robot run robot.yaml --duration 5 --report build/robot-result.json
+uv run --extra mujoco tools/sim-unmigrated robot run robot.yaml --duration 5 --report build/robot-result.json
 # 自动编译既有裸机测试固件，验证实际进程组合与失败清理：
 nix develop -c uv run --frozen --extra mujoco bash tools/run-robot-smoke.sh
 ```
@@ -296,7 +429,8 @@ worker 独占 co-sim 与 FDCAN1，运行既有 v2、1 kHz、realtime 四轮 prof
 ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控制见下文 ChassisTest；
 持续四轮实时性能、实板标定、多板、DR16、裁判系统和赛场组合仍未由该入口支持。
 
-## Arena 配置准入
+<a id="arena-配置准入"></a>
+## Arena 配置准入（尚未迁移）
 
 `sim.arena.manifest.load_manifest()` 可读取固定双底盘的 schema 1 配置，复用两个
 完整的 Robot 配置。将下面的 `arena.yaml` 放在仓库根目录：
@@ -366,11 +500,11 @@ referees:
 命令行运行同一配置：
 
 ```bash
-uv run --frozen --extra mujoco python -m sim arena run arena.yaml \
+uv run --frozen --extra mujoco python -m sim.apps.unmigrated_cli arena run arena.yaml \
   --duration 1 --report build/test-results/arena.json
 ```
 
-`tools/sim arena run` 使用相同入口。`--qemu`、`--startup-timeout` 和 `--timeout`
+`tools/sim-unmigrated arena run` 使用相同入口。`--qemu`、`--startup-timeout` 和 `--timeout`
 分别选择 QEMU 和设置主机期限；默认值及参数可用 `arena run --help` 查看。
 UART 文本带成员名称，例如 `UART east.uart1 poll_sample_ns=... b'...'`，字节以
 转义形式显示。`poll_sample_ns` 属于该 QEMU 的采样时间；结果中的 `origin_ns`、
@@ -508,7 +642,7 @@ pending 限制。该调用不推进时间或发布 UART；名称、输入、sess
 `sim.devices.referee.validate_referee_events(events)` 校验，类型、范围和顺序规则
 与引擎一致。
 
-`sim.manifest.parse_time(value, label, zero=True)` 供配置消费者复用 Lab 的时间语法：
+`sim.config.yaml.parse_time(value, label, zero=True)` 供配置消费者复用 Lab 的时间语法：
 整数 `ns/us/ms/s` 字符串，最多 13 位十进制数字，结果不超过 3600 秒。
 `zero=False` 拒绝零值；不接受浮点、负数或其它单位，不推进任何时钟。
 
@@ -568,7 +702,7 @@ CAN 动作独立限制为 1024 项，不占用 referee 的 1024 项额度。
 命令行使用同一执行入口，时长由 Scenario 配置决定：
 
 ```bash
-uv run --frozen --extra mujoco python -m sim scenario run scenario.yaml --report build/scenario.json
+uv run --frozen --extra mujoco python -m sim.apps.unmigrated_cli scenario run scenario.yaml --report build/scenario.json
 ```
 
 `--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
@@ -1057,7 +1191,7 @@ RESET 下界和实验时长均须一致，包括没有断言的成员。每个 U
 命令行可以直接使用同一离线回放入口：
 
 ```bash
-tools/sim scenario replay scenario.yaml observations.mcap \
+tools/sim-unmigrated scenario replay scenario.yaml observations.mcap \
   --clock east=qemu:east:run1:reset0 \
   --clock west=qemu:west:run1:reset0 \
   --report replay-result.json
@@ -1066,7 +1200,7 @@ tools/sim scenario replay scenario.yaml observations.mcap \
 每个成员必须提供一次 `--clock MEMBER=EPOCH`，标签须与录制时一致且彼此不同；
 只在第一个 `=` 处分割，epoch 可以包含 `=`。使用原始 Scenario 文件及其引用的配置，
 录制文件须为可读普通文件。该命令关闭输入文件后才发布结果，不启动 QEMU、物理后端或
-上层进程，也不接受运行时启动选项；`python -m sim scenario replay` 使用同一入口。
+上层进程，也不接受运行时启动选项；`python -m sim.apps.unmigrated_cli scenario replay` 使用同一入口。
 
 全部断言通过时退出码为 `0`；断言未满足、配置/容器损坏或文件错误为 `1`，
 中断或 SIGTERM 为 `130`。可选报告保留逐断言状态、成员完成元数据或失败诊断。

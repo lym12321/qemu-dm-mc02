@@ -20,7 +20,7 @@ from typing import Callable
 
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import CanDelivery, check_can_time
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.transports import FixedRecordStream, LengthPrefixedStream, StreamTransport
 from tools.dm_mc02_sim_worker import (
     ADC_VOLTAGE_MAX_UV, CAN_WIRE_SIZE, HEADER, MAX_PAYLOAD, RESET,

@@ -35,7 +35,7 @@ from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot,
 )
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.robots.four_wheel import create_four_wheel_plant
 from sim.robots.shared_world import BoardBinding, RefereeBinding, SharedWorldRuntime
 from sim.transports import StreamTransport, connect_unix

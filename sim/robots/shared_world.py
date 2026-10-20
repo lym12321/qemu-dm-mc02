@@ -29,7 +29,7 @@ from sim.devices.dji.protocol import validate_motor_id
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, ScriptEvent
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import check_can_time
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.fabric.runtime import CanParticipant
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import (

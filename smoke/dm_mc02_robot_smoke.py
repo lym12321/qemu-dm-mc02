@@ -74,7 +74,7 @@ def run_case(name, manifest, options):
     with (RUN / (name + ".log")).open("wb") as log:
         try:
             process = subprocess.Popen(
-                [sys.executable, str(ROOT / "tools/sim"), "robot", "run", str(path),
+                [sys.executable, str(ROOT / "tools/sim-unmigrated"), "robot", "run", str(path),
                  "--qemu", os.environ.get("QEMU_SYSTEM_ARM", str(ROOT / "build/qemu/qemu-system-arm")),
                  "--report", str(report), *options],
                 stdout=log, stderr=log, start_new_session=True)

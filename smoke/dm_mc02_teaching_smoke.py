@@ -212,7 +212,7 @@ def lab_cli(elf, qemu, manifest_path, directory, record, *, expect_failure=False
     manifest = directory / "lesson.yaml"
     manifest.write_text(yaml.safe_dump(document, sort_keys=False))
     report = directory / "lab-result.json"
-    result = command([sys.executable, str(ROOT / "tools/sim"), "lab", "run", str(manifest),
+    result = command([sys.executable, str(ROOT / "tools/sim-unmigrated"), "lab", "run", str(manifest),
                       "--qemu", str(qemu), "--startup-timeout", "10", "--timeout", "15",
                       "--report", str(report)], time.monotonic() + 20.0, record)
     record["report"] = json.loads(report.read_text())
@@ -266,7 +266,7 @@ def interactive(elf, qemu, record):
             return state
 
         try:
-            process = subprocess.Popen([sys.executable, str(ROOT / "tools/sim"), "lab", "interactive",
+            process = subprocess.Popen([sys.executable, str(ROOT / "tools/sim-unmigrated"), "lab", "interactive",
                 "--elf", str(elf), "--qemu", str(qemu), "--qmp", str(qmp_path),
                 "--startup-timeout", "10", "--timeout", "15"],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,

@@ -17,7 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from sim.core import Coordinator, Session, StepResult
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
+from sim.transports.socketcan_endpoint import SocketCanEndpoint
 from sim.fabric.frame import WIRE_FD, WIRE_BRS
 from sim.fabric.runtime import CanParticipant, CanRuntime
 

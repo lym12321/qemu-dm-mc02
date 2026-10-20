@@ -17,7 +17,7 @@ from sim.core import Session
 from sim.devices.dji.protocol import validate_motor_id
 from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, validate_referee_events
 from sim.devices.referee.engine import MAX_SCRIPT_EVENTS
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.fabric.can import check_can_time
 from sim.processes import ChildProcess
 from sim.robots.manifest import Ready

@@ -1032,9 +1032,9 @@ def test_referee_cli_requires_scenario_before_output_or_admission(tmp_path, monk
     (False, "success"), (True, "success"), (True, "error"), (True, "interrupt"),
     (True, "report_mismatch"), (True, "error_report_mismatch")
 ], indirect=["referee_arena_manifest"])
-def test_instrumented_cli_uses_actual_module_reload_single_call_and_exact_report(
+def test_instrumented_cli_uses_actual_unmigrated_entry_single_call_and_exact_report(
         referee_arena_manifest, outcome, tmp_path, monkeypatch, capsys):
-    from sim import cli as cli_module
+    from sim.apps import unmigrated_cli as cli_module
     from sim.arena import runtime as arena_runtime
     from sim.boards.channels import ChannelEvent
     from sim.scenario import ScenarioManifest, runtime as scenario_runtime
@@ -1091,7 +1091,7 @@ def test_instrumented_cli_uses_actual_module_reload_single_call_and_exact_report
                      "--startup-timeout", "10", "--timeout", "20" if scenario else "15",
                      "--report", str(report_path)]
     assert evidence["argv"] == expected_argv
-    entry = arena_module.ROOT / "sim/__main__.py"
+    entry = arena_module.ROOT / "tools/sim-unmigrated"
     assert evidence["module_argv"] == [str(entry), *expected_argv[1:]]
     assert evidence["entrypoint"] == str(entry)
     assert evidence["entrypoint_sha256"] == hashlib.sha256(entry.read_bytes()).hexdigest()

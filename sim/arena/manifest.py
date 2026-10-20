@@ -12,7 +12,7 @@ from dataclasses import dataclass, fields as dataclass_fields
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from sim.manifest import (ManifestError, fields, file_path, identifier,
+from sim.config.yaml import (ManifestError, fields, file_path, identifier,
                           load_document, text_bytes)
 from sim.robots.manifest import (MAX_UPPER_COMPUTERS, Physics, RobotManifest,
                                 load_manifest as load_robot_manifest)

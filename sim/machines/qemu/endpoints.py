@@ -1,8 +1,7 @@
-"""Borrowed CAN transport boundaries; ingress never advances virtual time.
+"""Borrowed QEMU CAN transport; ingress never advances virtual time.
 
-QEMU uses the existing RESET-origin mapper supplied by its owner. SocketCAN
-has no simulation timestamp, so native ingress is stamped by the caller.
-Neither endpoint owns the transport queue, socket, or its cleanup.
+The caller supplies the existing RESET-origin mapper. This endpoint owns
+neither transport queues nor sockets or their cleanup.
 """
 
 from __future__ import annotations
@@ -10,10 +9,8 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Protocol
 
-from sim.transports.can_codec import unpack_can_frame
-
-from .can import CanBus, check_can_time
-from .frame import CanFrame
+from sim.fabric.can import CanBus, check_can_time
+from sim.fabric.frame import CanFrame
 
 
 class QemuCanStream(Protocol):
@@ -27,10 +24,6 @@ class TimestampMapper(Protocol):
     def map(self, qemu_timestamp_ns: int, fallback_ns: int) -> int: ...
 
     def unmap(self, worker_timestamp_ns: int, fallback_ns: int) -> int: ...
-
-
-class CanDatagramQueue(Protocol):
-    def send(self, frame: CanFrame) -> None: ...
 
 
 class QemuCanEndpoint:
@@ -93,25 +86,3 @@ class QemuCanEndpoint:
         self._send(frame.can_id, frame.flags, frame.dlc,
                    timestamp_ns, frame.data)
         self._submitted_frames += 1
-
-
-class SocketCanEndpoint:
-    """Translate native CAN datagrams while borrowing the existing TX queue."""
-
-    def __init__(self, bus: CanBus, tx: CanDatagramQueue,
-                 name: str = "socketcan"):
-        if not isinstance(bus, CanBus):
-            raise TypeError("SocketCAN endpoint requires a CanBus")
-        send = getattr(tx, "send", None)
-        if not callable(send):
-            raise TypeError("SocketCAN TX queue requires callable send")
-        self.bus = bus
-        self._send = send
-        bus.attach(self, name)
-
-    def ingest(self, raw: bytes, current_time_ns: int) -> None:
-        check_can_time(current_time_ns)
-        self.bus.send(self, unpack_can_frame(raw, current_time_ns))
-
-    def receive(self, frame: CanFrame) -> None:
-        self._send(frame)

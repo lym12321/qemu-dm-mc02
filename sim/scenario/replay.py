@@ -16,7 +16,7 @@ from sim.arena.trace import (
 from sim.boards.launch import UARTS
 from sim.lab.experiment import LabExperiment
 from sim.lab.manifest import LabManifest
-from sim.manifest import MAX_TIME_NS, identifier
+from sim.config.yaml import MAX_TIME_NS, identifier
 from sim.robots.manifest import Board, Ready, RobotManifest
 from sim.trace import iter_events
 

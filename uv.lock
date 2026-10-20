@@ -36,10 +36,8 @@ wheels = [
 [[package]]
 name = "dm-mc02-qemu-tools"
 version = "0.1.0"
-source = { virtual = "." }
+source = { editable = "." }
 dependencies = [
-    { name = "crccheck" },
-    { name = "mcap" },
     { name = "pyyaml" },
 ]
 
@@ -47,23 +45,35 @@ dependencies = [
 mujoco = [
     { name = "mujoco" },
 ]
+referee = [
+    { name = "crccheck" },
+]
+trace = [
+    { name = "mcap" },
+]
 
 [package.dev-dependencies]
 dev = [
+    { name = "crccheck" },
+    { name = "mcap" },
     { name = "pytest" },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "crccheck", specifier = "==1.3.1" },
-    { name = "mcap", specifier = "==1.5.0" },
+    { name = "crccheck", marker = "extra == 'referee'", specifier = "==1.3.1" },
+    { name = "mcap", marker = "extra == 'trace'", specifier = "==1.5.0" },
     { name = "mujoco", marker = "extra == 'mujoco'", specifier = "==3.12.0" },
     { name = "pyyaml", specifier = "==6.0.3" },
 ]
-provides-extras = ["mujoco"]
+provides-extras = ["trace", "referee", "mujoco"]
 
 [package.metadata.requires-dev]
-dev = [{ name = "pytest", specifier = ">=8,<9" }]
+dev = [
+    { name = "crccheck", specifier = "==1.3.1" },
+    { name = "mcap", specifier = "==1.5.0" },
+    { name = "pytest", specifier = ">=8,<9" },
+]
 
 [[package]]
 name = "etils"

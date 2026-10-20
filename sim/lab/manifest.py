@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 
-from sim.manifest import (MAX_FILE_BYTES, MAX_TIME_NS, ManifestError, fields as _fields,
+from sim.config.yaml import (MAX_FILE_BYTES, MAX_TIME_NS, ManifestError, fields as _fields,
                           load_document, parse_time as _time, readable_file as _readable_file,
                           text_bytes as _text)
 

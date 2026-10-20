@@ -8,7 +8,8 @@ borrowed. Native IMU observations use SI and the completed physics state.
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.fabric import CanBus
-from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
+from sim.transports.socketcan_endpoint import SocketCanEndpoint
 from sim.fabric.runtime import CanRuntime
 from sim.physics import ImuSample, MujocoPhysics
 

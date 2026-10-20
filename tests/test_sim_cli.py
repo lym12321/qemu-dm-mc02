@@ -14,7 +14,7 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sim import cli
+from sim.apps import unmigrated_cli as cli
 from sim.arena import manifest as arena_manifest_module
 from sim.arena import runtime as arena_runtime
 from sim.boards.channels import ChannelEvent
@@ -35,7 +35,7 @@ def manifest_runtime(group):
 
 
 def isolated(tmp_path, *arguments):
-    return subprocess.run([sys.executable, "-I", str(ROOT / "tools/sim"), *arguments],
+    return subprocess.run([sys.executable, "-I", str(ROOT / "tools/sim-unmigrated"), *arguments],
                           cwd=tmp_path, capture_output=True, text=True, timeout=5)
 
 
@@ -47,7 +47,7 @@ def test_isolated_entry_help_and_module_help(tmp_path):
     result = isolated(tmp_path, "board", "run", "--help")
     assert result.returncode == 0, result.stderr
     assert "Ctrl-a c" in result.stdout and "--elf" in result.stdout
-    result = subprocess.run([sys.executable, "-m", "sim", "--help"], cwd=ROOT,
+    result = subprocess.run([sys.executable, "-m", "sim.apps.unmigrated_cli", "--help"], cwd=ROOT,
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0, result.stderr
     assert all(group in result.stdout for group in ("board", "lab", "robot", "arena", "scenario"))
@@ -558,7 +558,7 @@ def test_replay_actual_mcap_original_manifest_entrypoints(tmp_path, entry, outco
     report = tmp_path / "result.json"
     arguments += ["--report", str(report)]
     result = (isolated(tmp_path, *arguments) if entry == "isolated" else
-              subprocess.run([sys.executable, "-m", "sim", *arguments], cwd=ROOT,
+              subprocess.run([sys.executable, "-m", "sim.apps.unmigrated_cli", *arguments], cwd=ROOT,
                              capture_output=True, text=True, timeout=5))
     assert result.returncode == (0 if outcome == "passed" else 1), result.stderr
     payload = json.loads(report.read_text())

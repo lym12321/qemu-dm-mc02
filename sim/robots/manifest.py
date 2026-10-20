@@ -13,7 +13,7 @@ import os
 from pathlib import Path
 import shutil
 
-from sim.manifest import (ManifestError, fields, file_path as _file,
+from sim.config.yaml import (ManifestError, fields, file_path as _file,
                           identifier as _label, load_document, text_bytes)
 
 

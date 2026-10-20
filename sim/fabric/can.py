@@ -85,6 +85,7 @@ class CanBus:
         self._sequence = 0
         self._started = False
         self._dispatching = False
+        self._closed = False
 
     @property
     def delay_ns(self) -> int:
@@ -109,6 +110,8 @@ class CanBus:
 
     def attach(self, endpoint: CanEndpoint, name: str | None = None) -> None:
         """Borrow one endpoint; wiring is fixed after the first send or step."""
+        if self._closed:
+            raise RuntimeError("CAN bus is closed")
         if self._started:
             raise RuntimeError("CAN endpoints must attach before the first send or step")
         if id(endpoint) in self._endpoints:
@@ -124,14 +127,24 @@ class CanBus:
             raise ValueError("CAN endpoint name is already attached")
         self._endpoints[id(endpoint)] = _Attached(endpoint, name, receive)
 
-    def send(self, source: CanEndpoint, frame: CanFrame) -> None:
-        """Enqueue one complete frame or explicitly reject admission."""
+    def send(self, source: CanEndpoint, frame: CanFrame, *,
+             not_before_ns: int | None = None) -> None:
+        """Enqueue a complete frame, preserving its source timestamp.
+
+        ``not_before_ns`` is the earliest admitted delivery cut before link
+        delay. Interval output can therefore retain its original timestamp
+        without affecting another component's already executed interval.
+        """
+        if self._closed:
+            raise RuntimeError("CAN bus is closed")
         attached = self._endpoints.get(id(source))
         if attached is None or attached.endpoint is not source:
             raise ValueError("CAN source is not attached")
         if not isinstance(frame, CanFrame):
             raise ValueError("CAN send requires a CanFrame")
-        due_ns = frame.timestamp_ns + self.delay_ns
+        if not_before_ns is not None:
+            check_can_time(not_before_ns)
+        due_ns = max(frame.timestamp_ns, not_before_ns or 0) + self.delay_ns
         check_can_time(due_ns)
         if len(self._queue) >= self.max_pending:
             raise BufferError("CAN pending frame capacity exhausted")
@@ -141,6 +154,8 @@ class CanBus:
 
     def step(self, t_sim_ns: int) -> int:
         """Advance virtual delivery time, returning dispatched broadcast count."""
+        if self._closed:
+            raise RuntimeError("CAN bus is closed")
         check_can_time(t_sim_ns, self.t_sim_ns)
         if self._dispatching:
             raise RuntimeError("CAN step cannot be called from a delivery callback")
@@ -173,12 +188,24 @@ class CanBus:
 
     def reset(self, t_sim_ns: int = 0) -> None:
         """Clear logical delivery state while preserving borrowed wiring."""
+        if self._closed:
+            raise RuntimeError("CAN bus is closed")
         check_can_time(t_sim_ns)
         if self._dispatching:
             raise RuntimeError("CAN reset cannot be called from a delivery callback")
         self._queue.clear()
         self._sequence = 0
         self.t_sim_ns = t_sim_ns
+
+    def close(self) -> None:
+        """Release owned pending frames; borrowed endpoints are never closed."""
+        if self._closed:
+            return
+        if self._dispatching:
+            raise RuntimeError("CAN close cannot be called from a delivery callback")
+        self._closed = True
+        self._queue.clear()
+        self._endpoints.clear()
 
 
 class VirtualCanDevice:

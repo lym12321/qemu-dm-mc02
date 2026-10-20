@@ -19,7 +19,7 @@ from sim.arena.manifest import (
     member_uarts, parse_referee_events, validate_can_delays,
 )
 from sim.lab.manifest import Assertion, MAX_ITEMS, parse_assertion
-from sim.manifest import (
+from sim.config.yaml import (
     ManifestError, fields, file_path, identifier, load_document, parse_time,
 )
 

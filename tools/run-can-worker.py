@@ -8,7 +8,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dm_mc02_sim_worker as worker
 from sim.devices.dji import M3508
 from sim.fabric import CanBus
-from sim.fabric.endpoints import QemuCanEndpoint, SocketCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
+from sim.transports.socketcan_endpoint import SocketCanEndpoint
 from sim.fabric.runtime import CanRuntime
 
 

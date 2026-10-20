@@ -25,7 +25,7 @@ SPEC.loader.exec_module(module)
 from tools import dm_mc02_arena_smoke as arena_module
 from sim.boards.channels import ChannelEvent
 from sim.core import Session
-from sim.fabric.endpoints import QemuCanEndpoint
+from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.transports.cosim import QemuTimestampMapper
 from sim.transports import StreamTransport
 from sim.scenario import ScenarioCanDelay, load_manifest as load_scenario, runtime as scenario_runtime

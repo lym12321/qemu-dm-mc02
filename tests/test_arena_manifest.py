@@ -16,7 +16,7 @@ import pytest
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.manifest import ManifestError
+from sim.config.yaml import ManifestError
 from sim.robots.manifest import Physics, RobotManifest, load_manifest as load_robot
 
 

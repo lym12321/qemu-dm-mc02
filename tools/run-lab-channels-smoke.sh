@@ -248,7 +248,7 @@ manifest = yaml.safe_load(Path(example).read_text())
 manifest["firmware"] = firmware
 Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
 PY
-uv run --frozen python tools/sim lab run "$run_dir/lab.yaml" \
+uv run --frozen python tools/sim-unmigrated lab run "$run_dir/lab.yaml" \
     --qemu "$qemu_bin" --report "$run_dir/lab-report.json"
 python3 - "$run_dir/lab-report.json" <<'PY'
 from pathlib import Path
@@ -277,7 +277,7 @@ manifest = yaml.safe_load(Path(source).read_text())
 manifest["ready"]["text"] = "THIS_APPLICATION_EVENT_NEVER_OCCURS"
 Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
 PY
-if uv run --frozen python tools/sim lab run "$run_dir/not-ready.yaml" \
+if uv run --frozen python tools/sim-unmigrated lab run "$run_dir/not-ready.yaml" \
     --qemu "$qemu_bin" --startup-timeout 0.3 --timeout 2 \
     --report "$run_dir/not-ready-report.json" > "$run_dir/not-ready.log" 2>&1; then
     printf '%s\n' 'missing application ready unexpectedly passed' >&2
@@ -380,7 +380,7 @@ def snapshot():
 
 try:
     process = subprocess.Popen(
-        [sys.executable, "tools/sim", "lab", "interactive", "--elf", firmware,
+        [sys.executable, "tools/sim-unmigrated", "lab", "interactive", "--elf", firmware,
          "--qemu", qemu_bin, "--uart", "uart1", "--can", "can1", "--adc",
          "--qmp", qmp_path, "--gdb-port", str(gdb_port), "--paused",
          "--startup-timeout", "5", "--timeout", "15"],

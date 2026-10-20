@@ -1,20 +1,55 @@
 # DM-MC02 QEMU
 
-**基于 QEMU 的 STM32H723 / DM-MC02 固件仿真工程**
+**可组合的嵌入式固件仿真工具，首个机器后端为 QEMU STM32H723 / DM-MC02**
 
-在 Linux 上构建并运行面向 DM-MC02 的 Cortex-M7 固件，验证已建模的芯片与板级行为，并通过确定性虚拟时间接口连接外部仿真后端。
+通过一个 `Simulation` 组合真实 ELF、机器、CAN 总线和外部设备。Python 核心可独立安装；运行原生固件需要本仓库的 QEMU 构建。当前支持切点采样执行，不声称跨板事件级锁步。
 
 | 快速入口 | 项目文档 |
 | --- | --- |
+| [Simulation 入门](#simulation) | [API、场景与时间语义](docs/USAGE.md#simulation) |
 | [快速构建](#快速开始) | [详细使用手册](docs/USAGE.md) |
 | [运行固件](#运行固件) | [串口与调试](docs/USAGE.md#serial-qmp-and-gdb) |
 | [验证](#验证) | [故障排查](docs/USAGE.md#troubleshooting) |
 | [Virtual Lab：YAML 与交互命令](docs/USAGE.md#virtual-lab) | [GPIO/UART/CAN/ADC 示例](examples/labs/board-io.yaml) |
 | [HAL 教学：按键与 GPIO](docs/USAGE.md#hal-teaching) | [独立固件工程](examples/teaching/) |
-| [Robot：固件、四轮模型与上位机](docs/USAGE.md#robot-manifest) | `uv run --extra mujoco tools/sim robot run robot.yaml` |
+| [未迁移 Robot：固件、四轮模型与上位机](docs/USAGE.md#robot-manifest) | `uv run --extra mujoco tools/sim-unmigrated robot run robot.yaml` |
 
 > [!IMPORTANT]
 > 项目面向固件功能验证，采用数字外设模型和虚拟时间。它不提供完整 STM32H723 硅级时序、模拟电气行为或整机 snapshot/live migration。真实机构闭环和完整业务就绪需要针对具体固件与外部后端验证。
+
+<a id="simulation"></a>
+## 安装与运行 Simulation
+
+Python 3.11+，基础依赖只有 PyYAML。安装、帮助和场景校验无需 QEMU、MuJoCo 或 Nix：
+
+```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+sim --help
+```
+
+有 ARM GCC 和 CMake 后，构建一个独立裸机示例：
+
+```bash
+cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build examples/minimal-board/build
+sim validate examples/minimal-board/scene.yaml
+sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
+```
+
+最后一条命令需要下文构建的项目 QEMU。可用 `--qemu /path/to/qemu-system-arm` 或
+`QEMU_SYSTEM_ARM` 指定二进制；它必须包含当前子模块的原生执行和 CAN 观测接口。
+`examples/can-motor` 使用相同构建命令，把目录名替换即可；该例连接一台 M3508 的显式固定转子状态，
+不需要四轮底盘或物理引擎。两个例子的真实 UART/GPIO、FDCAN 收发与超时验收：
+
+```bash
+bash tools/run-simulation-smoke.sh --case all
+```
+
+[使用手册](docs/USAGE.md#simulation)包含完整 YAML、Python API、交互命令与时间限制。
+Lab、Robot、Arena、Scenario 和原有物理组合尚未迁移，保留在
+`tools/sim-unmigrated` 以运行既有功能和回归；新 `sim` 入口只运行 `sim/v1`。
 
 ## 快速开始
 
@@ -81,7 +116,10 @@ bash tools/run-trobot-business.sh
 | --- | --- |
 | `qemu/upstream/` | 固定版本的 QEMU fork、STM32H723/DM-MC02 模型与 QEMU 原生测试 |
 | `cosim/` | 板卡无关的协议、数据模型与 transport adapter |
-| `sim/` | 通用 coordinator、transport、CAN Fabric、虚拟器件与简单 plant |
+| `sim/api`、`sim/runtime`、`sim/config`、`sim/fabric` | 公开契约、唯一 Simulation、场景准入与 CAN 传输 |
+| `sim/machines/qemu` | 原生进程、QMP、端点与机器 profile |
+| `sim/devices`、`sim/physics` | 协议设备与独立物理后端；原有物理组合待迁移 |
+| `examples/minimal-board`、`examples/can-motor` | 统一 Runtime 的真实固件示例 |
 | `tools/` | 构建、QMP、worker、性能采样、源码包和统一测试门禁 |
 | `tests/` | Host、Python 与协议测试 |
 | `flake.nix`、`flake.lock` | 固定的 Nix 构建与测试环境 |
