@@ -1,0 +1,10 @@
+schema: 1
+name: gpio-key-lesson
+board: dm-mc02
+firmware: ../../build/teaching/Debug/gpio_key.elf
+duration: 800ms
+stimulus:
+  - {at: 100ms, endpoint: key, pressed: true}
+  - {at: 600ms, endpoint: key, pressed: false}
+assertions:
+  - {before: 500ms, digital_equals: {endpoint: gpio.B0, value: 1}}

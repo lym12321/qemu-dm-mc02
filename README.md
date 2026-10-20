@@ -10,6 +10,7 @@
 | [运行固件](#运行固件) | [串口与调试](docs/USAGE.md#serial-qmp-and-gdb) |
 | [验证](#验证) | [故障排查](docs/USAGE.md#troubleshooting) |
 | [Virtual Lab：YAML 与交互命令](docs/USAGE.md#virtual-lab) | [GPIO/UART/CAN/ADC 示例](examples/labs/board-io.yaml) |
+| [HAL 教学：按键与 GPIO](docs/USAGE.md#hal-teaching) | [独立固件工程](examples/teaching/) |
 | [Robot：固件、四轮模型与上位机](docs/USAGE.md#robot-manifest) | `uv run --extra mujoco tools/sim robot run robot.yaml` |
 
 > [!IMPORTANT]
@@ -54,7 +55,7 @@ python3 tools/dm_mc02_test_gate.py --jobs 4
 
 ## 运行固件
 
-固件由外部工程提供；本仓库不分发 `trobot` 固件。
+可构建仓库内的 [HAL 教学工程](docs/USAGE.md#hal-teaching)，或使用外部工程的 ELF；本仓库不分发 `trobot` 固件。
 
 ```bash
 export DM_MC02_ELF=/absolute/path/to/trobot.elf

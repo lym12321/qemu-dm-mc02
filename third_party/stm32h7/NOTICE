@@ -1,0 +1,23 @@
+This directory contains an unmodified subset of STMicroelectronics STM32CubeH7
+v1.12.1 and its pinned HAL/CMSIS Device submodules, plus ARM CMSIS headers shipped
+by that release. The complete upstream repository is not required to build the
+teaching example. CMake uses only the files in this directory and the local
+application; it does not download dependencies.
+
+SOURCES.json records each original repository, commit, source path, Git blob ID
+and SHA256. The Cube commit is f5c0b7a2b1f6eb26fde150f72edb2d7deb647066;
+its HAL and CMSIS Device gitlinks are verified in that commit's Git trees.
+
+HAL/LICENSE.txt contains the original HAL BSD 3-Clause license.
+CMSIS/Device/LICENSE.txt contains the original CMSIS Device Apache-2.0 license.
+CMSIS/Core/LICENSE.txt contains the original ARM CMSIS Apache-2.0 license.
+STM32CubeH7-LICENSE.txt contains the original Cube package license notice.
+reference/LICENSE.txt contains the original NUCLEO-H723ZG Templates BSD 3-Clause
+license, including the linker script's license.
+These license files retain the original bytes; only their local filenames differ.
+All copyright and license notices in the source files are retained.
+
+reference/STM32H723ZGTX_FLASH.ld is the original NUCLEO-H723ZG GCC linker template.
+The teaching target uses it unchanged: 1 MiB Flash, 128 KiB DTCM RAM and the
+official reset/startup symbols. The application selects HSI64 and LDO through
+the public HAL and uses the official SystemInit, startup vector and SysTick API.

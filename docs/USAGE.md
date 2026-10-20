@@ -1,6 +1,6 @@
 # DM-MC02 QEMU 使用手册
 
-本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；固件 ELF 由用户另行提供。
+本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；可使用下面的 HAL 教学工程，或提供自己的固件 ELF。
 
 板级状态可通过原生 QMP 读取，无需检查固件内存：
 
@@ -62,6 +62,84 @@ Python 调用者可用 `sim.lab.parse_assertion(value, index)` 单独解析一�
 `LabExperiment` 只消费实际数字快照、UART 字节与 CAN 帧；`before` 为严格截止时间。
 UART 判断用读取后 QMP 上界，CAN 用原始 wire 时间，数字用快照时间；观测较晚可能保守失败，
 失败后不会被迟到数据改成通过。串口匹配只保留最小尾部，不缓存完整运行记录。
+
+<a id="hal-teaching"></a>
+## HAL 教学：按键控制 GPIO
+
+第一课使用独立的 C 工程，通过 ST HAL 读取 DM-MC02 的 A15 按键，并控制 B0 GPIO：
+松开为 0，按下为 1。它不依赖 `trobot`、FreeRTOS 或物理仿真后端。
+B0 是本课观察的数字输出；板载 A7 是 WS2812 数据线，普通 GPIO 高电平不等同于驱动该 LED。
+
+先按[环境准备](#environment)及[构建](#build)得到项目 QEMU，再进入 `nix develop`。
+官方 STM32CubeH7 v1.12.1 所需 HAL/CMSIS 源码随仓库固定，来源和逐文件校验值见
+`third_party/stm32h7/SOURCES.json`，构建时不下载 SDK，也不需要 CubeMX。
+
+```bash
+uv sync --frozen
+cmake -S examples/teaching -B build/teaching/Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/teaching/Debug
+uv run tools/sim lab run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
+```
+
+Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同命令，
+将构建目录中的 `Debug` 和 `CMAKE_BUILD_TYPE` 都改为 `Release`。
+修改 `examples/teaching/gpio_key.c` 后再次执行 `cmake --build` 即可。
+初始化使用 HSI 64 MHz、LDO、官方启动代码和 HAL SysTick；主循环读取按键后调用 `HAL_Delay(1)`。
+本课学习轮询 GPIO，后续课程再增加中断、DMA 和通信外设。
+
+自动实验注入按键，并要求实际 B0 快照在截止时间前出现高电平。
+`before` 断言第一次匹配就记为通过，不能单靠两个高低电平断言证明完整的按下/释放顺序。
+可用同一个 ELF 交互观察：
+
+```bash
+uv run tools/sim lab interactive --elf build/teaching/Debug/gpio_key.elf
+```
+
+依次输入 `state`、`key press`、`state`、`key release`、`state`，最后输入 `quit`。
+在 JSON 的 `key.level` 中查看松开 1、按下 0；`gpio.B.sampled` 的最低位就是 B0，
+按下为 1、释放为 0。`gpio.B.output_mask` 的最低位为 1，表示 B0 已配置为输出。
+本课不发送 UART 文本，控制台连接提示也不表示固件初始化完成。
+
+要调试同一份源码，在终端一启动：
+
+```bash
+uv run tools/sim lab interactive --elf build/teaching/Debug/gpio_key.elf \
+  --gdb-port 1234 --paused --startup-timeout 120 --timeout 300
+```
+
+终端二使用原生 GDB：
+
+```bash
+arm-none-eabi-gdb build/teaching/Debug/gpio_key.elf
+```
+
+```gdb
+target remote 127.0.0.1:1234
+hbreak lesson_step
+continue
+list
+info registers pc
+delete breakpoints
+detach
+quit
+```
+
+断点命中实际固件函数。`detach` 后回到终端一操作按键，输入 `quit` 结束实验。
+调试时间计入启动和总期限，超时后需要重新启动实验。
+
+练习：把 `HAL_GPIO_WritePin` 的输出值改为恒定 `GPIO_PIN_RESET`，重新构建并运行同一个
+YAML。应得到非零退出码和 `failed` JSON，失败断言指向 `gpio.B0`。
+恢复按键决定输出的代码后再次构建，实验应通过。
+
+完整的教学验收入口为：
+
+```bash
+bash tools/run-teaching-smoke.sh
+```
+
+该门构建 Debug/Release，并用公开快照顺序验证初始状态、按下和释放，另外执行实际交互、
+GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字模型的边界，不代表实板电气校准。
+当前只交付第一课；UART、ADC、CAN 实验将沿用同一工程逐课增加。
 
 ## Virtual Lab
 
