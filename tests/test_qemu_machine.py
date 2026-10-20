@@ -8,10 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
-from sim.api import NodeSpec, Topology
+from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
 from sim.machines.qemu import BackendUnavailable, QemuFactory
 from sim.machines.qemu import machine as adapter
-from sim.runtime import Simulation
+from sim.runtime import Simulation, SimulationState
 
 
 def snapshot(timestamp):
@@ -47,6 +47,14 @@ assert value.port('fdcan3').protocol == 'can'
 assert value.port('gpio.H15').category == 'signal'
 assert value.port('snapshot').direction == 'out'
 assert value.capabilities == frozenset({'machine', 'input'})
+assert 'external_input' in value.port('key').capabilities
+assert 'external_input' in value.port('gpio.H15').capabilities
+assert 'external_input' in value.port('uart1').capabilities
+assert 'external_input' not in value.port('fdcan3').capabilities
+assert 'external_input' not in value.port('snapshot').capabilities
+factory = QemuFactory(qemu='/missing')
+spec = NodeSpec('board', 'machine.qemu', {'firmware': sys.argv[1]})
+assert factory.validate_input(spec, 'uart1', 'hi\\0é') == b'hi\\0\\xc3\\xa9'
 assert not any(name.startswith('qemu.qmp') for name in sys.modules)
 '''
     subprocess.run([sys.executable, '-c', code, str(firmware)], check=True,
@@ -72,6 +80,88 @@ def test_firmware_resolves_against_manifest_directory(firmware):
                                                  {'firmware': firmware, 'uarts': []}))
     with pytest.raises(ValueError, match='unknown port'):
         description.port('uart1')
+
+
+@pytest.mark.parametrize('port, payload, expected', [
+    ('key', True, True),
+    ('gpio.A0', 1, 1),
+    ('gpio.H15', 0, 0),
+    ('uart1', b'\0bytes', b'\0bytes'),
+    ('uart1', 'hi\0é', b'hi\0\xc3\xa9'),
+    ('uart1', 'é' * 2048, b'\xc3\xa9' * 2048),
+])
+def test_input_admission_is_pure_and_returns_canonical_payload(firmware, backend,
+                                                             port, payload, expected):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware})
+    actual = QemuFactory(qemu='/missing').validate_input(spec, port, payload)
+    assert actual == expected and type(actual) is type(expected)
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+def test_input_admission_does_not_recheck_admitted_firmware(firmware):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware})
+    factory = QemuFactory()
+    factory.describe(spec)
+    firmware.unlink()
+    assert factory.validate_input(spec, 'key', True) is True
+    assert factory.validate_input(spec, 'uart1', 'é\0') == b'\xc3\xa9\0'
+
+
+@pytest.mark.parametrize('port, payload, error, match', [
+    ('key', 1, TypeError, 'boolean'),
+    ('gpio.A0', True, TypeError, 'integer'),
+    ('gpio.A0', '1', TypeError, 'integer'),
+    ('gpio.A0', 2, ValueError, '0 or 1'),
+    ('gpio.A16', 0, ValueError, 'A0 through H15'),
+    ('uart1', bytearray(b'mutable'), TypeError, 'bytes or'),
+    ('uart1', 'é' * 2049, ValueError, '4096 bytes'),
+    ('uart1', b'x' * 4097, ValueError, '4096 bytes'),
+    ('uart1', '\ud800', ValueError, 'surrogates'),
+    ('uart2', b'unopened', ValueError, 'cannot accept'),
+    ('fdcan1', b'unsupported', ValueError, 'cannot accept'),
+    ('snapshot', {}, ValueError, 'cannot accept'),
+])
+def test_invalid_inputs_reject_without_acquiring_native_resources(firmware, backend,
+                                                                 port, payload, error, match):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware})
+    with pytest.raises(error, match=match):
+        QemuFactory().validate_input(spec, port, payload)
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+@pytest.mark.parametrize('port, payload, owned', [
+    ('key', False, 'key'),
+    ('key', True, 'gpio.A15'),
+    ('gpio.A15', 0, 'key'),
+    ('gpio.A0', 1, 'gpio.A0'),
+    ('uart1', b'wire', 'uart1'),
+])
+def test_wired_inputs_and_physical_aliases_reject_external_injection(firmware, port, payload, owned):
+    # Native dm_mc02.c routes user-key and gpio-input A15 to the same input.
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware})
+    with pytest.raises(ValueError, match='owned by a connection'):
+        QemuFactory().validate_input(spec, port, payload, connected_ports=(owned,))
+    assert QemuFactory().validate_input(spec, 'gpio.A14', 0,
+                                      connected_ports=(owned,)) == 0
+
+
+def test_topology_rejects_multiple_key_pin_alias_owners_before_creation(firmware, backend):
+    factory = QemuFactory()
+    wire = SimpleNamespace(
+        describe=lambda _spec: NodeDescription((PortSpec('signal', 'digital', category='signal',
+                                                       max_connections=None),)),
+        create=lambda *_args: pytest.fail('pure admission created a connection'))
+    nodes = (NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+             NodeSpec('wire', 'fixture.wire'))
+    topology = Topology(nodes, (LinkSpec('board.key', 'wire.signal'),
+                               LinkSpec('wire.signal', 'board.gpio.A15')))
+    registry = {'machine.qemu': factory, 'fixture.wire': wire}
+    with pytest.raises(ValueError, match='aliases.*share physical input gpio.A15'):
+        topology.validate(registry)
+    independent_pins = Topology(nodes, (LinkSpec('board.key', 'wire.signal'),
+                                       LinkSpec('wire.signal', 'board.gpio.A14')))
+    independent_pins.validate(registry)
+    assert backend.calls == backend.commands == backend.sockets == []
 
 
 @pytest.fixture
@@ -198,6 +288,32 @@ def test_inputs_only_change_admitted_public_board_ports(firmware, backend):
     assert ('qom-set', {'path': '/machine', 'property': 'gpio-input', 'value': 'A0=1'}) in backend.commands
     assert backend.sockets[0][2].recv(4096) == b'hello'
     sim.close()
+
+
+def test_rejected_scheduled_inputs_do_not_touch_started_machine_and_allow_recovery(firmware, backend):
+    with simulation(firmware) as sim:
+        before_commands, before_calls = list(backend.commands), list(backend.calls)
+        before_events = sim.events
+        for port, payload, error, match in (
+            ('fdcan1', b'unsupported', ValueError, 'cannot accept external'),
+            ('snapshot', {}, ValueError, 'cannot accept external'),
+            ('unknown', 1, ValueError, 'unknown port'),
+            ('key', 1, TypeError, 'boolean'),
+            ('gpio.A0', 2, ValueError, '0 or 1'),
+            ('uart1', 'é' * 2049, ValueError, '4096 bytes'),
+        ):
+            with pytest.raises(error, match=match):
+                sim.schedule_input(f'board.{port}', payload)
+            assert backend.commands == before_commands and backend.calls == before_calls
+            assert sim.events == before_events
+            assert sim.state == SimulationState.PAUSED and sim.failure is None
+        sim.schedule_input('board.key', True)
+        sim.schedule_input('board.uart1', 'hello\0é')
+        sim.step(1000)
+        assert ('qom-set', {'path': '/machine', 'property': 'user-key', 'value': True}) in backend.commands
+        assert backend.sockets[0][2].recv(4096) == b'hello\0\xc3\xa9'
+        delivered = [event.payload for event in sim.events if event.kind == 'input.delivered']
+        assert delivered == [True, b'hello\0\xc3\xa9']
 
 
 def test_external_run_control_invalidates_machine_cut_before_io(firmware, backend):

@@ -384,13 +384,18 @@ class Simulation:
             raise ValueError(f"unknown input node {endpoint.node}")
         description = self._descriptions[endpoint.node]
         port = description.port(endpoint.port)
-        if "input" not in description.capabilities or port.direction == "out":
+        if ("input" not in description.capabilities or port.direction == "out"
+                or "external_input" not in port.capabilities):
             raise ValueError(f"endpoint cannot accept external inputs: {endpoint}")
         when = self._dispatch_time_ns if at_ns is None else at_ns
         check_timestamp(when)
         if when < self._dispatch_time_ns:
             raise ValueError("input time must not precede the current dispatch cut")
-        value = immutable(payload)
+        spec = next(node for node in self.topology.nodes if node.name == endpoint.node)
+        connected = tuple(port.name for port in description.ports
+                          if self._peers.get(Endpoint(endpoint.node, port.name)))
+        value = immutable(self.registry[spec.kind].validate_input(
+            spec, endpoint.port, payload, connected_ports=connected))
         if len(self._inputs) >= self.max_pending_inputs:
             raise BufferError("simulation input capacity exhausted")
         heapq.heappush(self._inputs, (when, self._input_sequence, _Input(endpoint, value)))

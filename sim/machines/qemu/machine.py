@@ -25,7 +25,7 @@ from sim.transports.can_stream import CanStream
 from .deadline import deadline_qmp_call
 from .errors import BackendUnavailable
 from .process import running_qemu
-from .profile import CAN_PORTS, admit_options, describe
+from .profile import CAN_PORTS, admit_options, describe, input_identity, validate_input
 from .qmp import backend_root as resolve_backend_root, qmp_session_class
 
 _SIGNED64_MAX = 0x7fffffffffffffff
@@ -71,12 +71,18 @@ class QemuFactory:
     def describe(self, spec):
         return describe(spec)
 
+    def validate_input(self, spec, port, payload, *, connected_ports=()):
+        return validate_input(spec, port, payload, connected_ports=connected_ports)
+
     def validate_topology(self, topology, descriptions, registry):
         owners = {'gdb_port': {}, 'qmp_path': {}}
+        inputs = {}
+        qemu_nodes = set()
         for node in topology.nodes:
             factory = registry[node.kind]
             if not isinstance(factory, QemuFactory):
                 continue
+            qemu_nodes.add(node.name)
             for name, seen in owners.items():
                 value = getattr(factory, name)
                 if value is None:
@@ -84,6 +90,18 @@ class QemuFactory:
                 if value in seen:
                     raise ValueError(f'QEMU nodes {seen[value]} and {node.name} share {name}: {value}')
                 seen[value] = node.name
+        for link in topology.links:
+            for endpoint in (link.source, link.target):
+                if endpoint.node not in qemu_nodes:
+                    continue
+                port = descriptions[endpoint.node].port(endpoint.port)
+                if 'external_input' not in port.capabilities:
+                    continue
+                identity = (endpoint.node, input_identity(endpoint.port))
+                if identity in inputs:
+                    raise ValueError(f'QEMU input aliases {inputs[identity]} and {endpoint} '
+                                     f'share physical input {identity[1]}')
+                inputs[identity] = endpoint
 
     def create(self, spec, ctx):
         return QemuMachine(spec, ctx, self)

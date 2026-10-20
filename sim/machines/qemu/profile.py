@@ -3,8 +3,10 @@ from pathlib import Path
 
 from sim.api import NodeDescription, PortSpec
 from sim.boards.launch import UARTS, regular_file
+from sim.gpio import validate_gpio_pin
 
 CAN_PORTS = ('fdcan1', 'fdcan2', 'fdcan3')
+EXTERNAL_INPUT = frozenset({'external_input'})
 
 
 def admit_options(spec):
@@ -33,10 +35,50 @@ def admit_options(spec):
 
 def describe(spec):
     _, uarts = admit_options(spec)
-    ports = [PortSpec(port, 'uart') for port in uarts]
+    ports = [PortSpec(port, 'uart', capabilities=EXTERNAL_INPUT) for port in uarts]
     ports += [PortSpec(port, 'can') for port in CAN_PORTS]
-    ports += [PortSpec('key', 'digital', direction='in', category='signal'),
+    ports += [PortSpec('key', 'digital', direction='in', category='signal',
+                       capabilities=EXTERNAL_INPUT),
               PortSpec('snapshot', 'snapshot', direction='out', category='signal')]
-    ports += [PortSpec(f'gpio.{bank}{pin}', 'digital', category='signal')
+    ports += [PortSpec(f'gpio.{bank}{pin}', 'digital', category='signal',
+                       capabilities=EXTERNAL_INPUT)
               for bank in 'ABCDEFGH' for pin in range(16)]
     return NodeDescription(ports=tuple(ports), capabilities=frozenset({'machine', 'input'}))
+
+
+def input_identity(port):
+    """The user key and PA15 are aliases of the same native physical input."""
+    return 'gpio.A15' if port == 'key' else port
+
+
+def validate_input(spec, port, payload, *, connected_ports=()):
+    """Validate payloads using a spec already admitted by describe(), without IO."""
+    uarts = tuple(spec.options.get('uarts', ('uart1',)))
+    if port == 'key':
+        if type(payload) is not bool:
+            raise TypeError('key input must be a boolean')
+        value = payload
+    elif isinstance(port, str) and port.startswith('gpio.'):
+        validate_gpio_pin(port[5:])
+        if type(payload) is not int:
+            raise TypeError('GPIO input must be an integer')
+        if payload not in (0, 1):
+            raise ValueError('GPIO input must be 0 or 1')
+        value = payload
+    elif port in uarts:
+        if isinstance(payload, str):
+            if len(payload) > 4096:
+                raise ValueError('one UART input is limited to 4096 bytes')
+            value = str.encode(payload, 'utf-8')
+        elif isinstance(payload, bytes):
+            value = bytes(payload)
+        else:
+            raise TypeError('UART input must be bytes or a UTF-8 string')
+        if len(value) > 4096:
+            raise ValueError('one UART input is limited to 4096 bytes')
+    else:
+        raise ValueError(f'QEMU port cannot accept external inputs: {port}')
+    identity = input_identity(port)
+    if any(input_identity(connected) == identity for connected in connected_ports):
+        raise ValueError(f'QEMU input is owned by a connection: {port}')
+    return value

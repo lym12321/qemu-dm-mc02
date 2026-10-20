@@ -93,6 +93,22 @@ def test_unknown_factory_duplicate_node_and_invalid_descriptors():
     assert Endpoint.parse("main.gpio.A15") == Endpoint("main", "gpio.A15")
 
 
+def test_external_input_contract_is_admitted_before_create():
+    port = PortSpec("p", "values", "in", capabilities={"external_input"})
+    factory = Factory(port, capabilities={"input"})
+    topology = Topology((NodeSpec("n", "n"),))
+    with pytest.raises(TypeError, match="validate_input"):
+        topology.validate({"n": factory})
+    factory.validate_input = lambda spec, port, payload, **kwargs: payload
+    assert topology.validate({"n": factory})["n"].port("p") == port
+    for capabilities, direction in (((), "in"), (("input",), "out")):
+        factory.description = NodeDescription((PortSpec("p", "values", direction,
+            capabilities={"external_input"}),), capabilities)
+        with pytest.raises(ValueError, match="external_input"):
+            topology.validate({"n": factory})
+    assert factory.created == 0
+
+
 def test_simulation_static_capabilities_and_can_wiring_admission():
     with pytest.raises(ValueError, match="both machine"):
         Simulation(Topology((NodeSpec("a", "a"),)), {"a": Factory(capabilities={"machine", "step"})})

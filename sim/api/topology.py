@@ -218,6 +218,12 @@ class Topology:
                 raise TypeError(f"factory {node.kind!r} did not return a NodeDescription")
             if not node.required_capabilities <= description.capabilities:
                 raise ValueError(f"node {node.name} lacks required capabilities")
+            for port in description.ports:
+                if "external_input" in port.capabilities:
+                    if port.direction == "out" or "input" not in description.capabilities:
+                        raise ValueError(f"invalid external_input capability: {node.name}.{port.name}")
+                    if not callable(getattr(factory, "validate_input", None)):
+                        raise TypeError(f"factory {node.kind!r} requires pure validate_input")
             descriptions[node.name] = description
         seen: set[frozenset[Endpoint]] = set()
         counts: dict[Endpoint, int] = {}

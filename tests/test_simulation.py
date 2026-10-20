@@ -19,6 +19,9 @@ class Factory:
     def describe(self, spec):
         return self.description
 
+    def validate_input(self, spec, port, payload, *, connected_ports):
+        return payload
+
     def create(self, spec, context):
         result = self.build(spec, context)
         self.instances.append(result)
@@ -87,7 +90,7 @@ class Plant(Component):
 def scene(*, delay=0, on_event=None, mode="stepped"):
     trace = []
     machine = Factory(lambda spec, ctx: Machine(spec, ctx, trace, send=spec.name == "first"),
-                      {"machine", "input"}, (PortSpec("can", "can"), PortSpec("key", "digital", "in", "signal")))
+                      {"machine", "input"}, (PortSpec("can", "can"), PortSpec("key", "digital", "in", "signal", capabilities={"external_input"})))
     plant = Factory(lambda spec, ctx: Plant(spec, ctx, trace), {"step"}, (PortSpec("can", "can"),))
     topology = Topology((NodeSpec("first", "machine"), NodeSpec("bus", "bus", {"delay_ns": delay}),
                          NodeSpec("plant", "plant"), NodeSpec("second", "machine")),
@@ -118,7 +121,7 @@ class InputPlant(Component):
 
 def input_scene(**kwargs):
     factory = Factory(InputPlant, {"step", "input"},
-                      (PortSpec("key", "digital", "in", "signal"),))
+                      (PortSpec("key", "digital", "in", "signal", capabilities={"external_input"}),))
     simulation = Simulation(Topology((NodeSpec("plant", "plant"),)),
                             {"plant": factory}, quantum_ns=10, **kwargs)
     return simulation, factory
@@ -249,7 +252,7 @@ def test_can_budget_does_not_refresh_when_callbacks_schedule_more_current_inputs
             simulation.schedule_input("n.key", 1)
 
     factory = Factory(Alternating, {"input"},
-                      (PortSpec("can", "can"), PortSpec("key", "digital", "in", "signal")))
+                      (PortSpec("can", "can"), PortSpec("key", "digital", "in", "signal", capabilities={"external_input"})))
     topology = Topology((NodeSpec("bus", "bus", {"loopback": True, "dispatch_budget": 1}),
                          NodeSpec("n", "n")), (LinkSpec("n.can", "bus.can"),))
     simulation = Simulation(topology, {"bus": CanBusFactory(), "n": factory}, dispatch_budget=5)
@@ -456,7 +459,7 @@ def test_input_self_excitation_is_bounded_and_failure_not_replayed():
             self.count += 1
             simulation.schedule_input("n.key", payload)
     factory = Factory(lambda spec, context: Echo(spec, context), {"input"},
-                      (PortSpec("key", "digital", "in", "signal"),))
+                      (PortSpec("key", "digital", "in", "signal", capabilities={"external_input"}),))
     simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory}, dispatch_budget=3)
     with simulation:
         factory.instances[0].count = 0

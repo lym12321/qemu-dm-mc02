@@ -2894,3 +2894,12 @@ CAN保留来源时间并应用区间末下限和链路延迟，UART保持读取�
 短脉冲原生门：`tools/run-simulation-smoke.sh --case pulse --qemu /path/to/qemu-system-arm`。
 它编译独立、默认关闭的`SIM_KEY_PULSE_TEST`变体，延后transition UART，使用真实GPIO
 证明3–4ms期间固件执行；普通minimal-board固件保持原有日志行为。
+
+
+外部输入在`schedule_input()`入队前完成纯准入：端口必须声明`external_input`能力，
+工厂提供`validate_input(spec, port, payload, *, connected_ports)`并返回规范化数据。
+方向、类型、时间和容量错误不执行设备操作、不污染队列，也不令健康Simulation失败。
+内部连接能力与外部注入独立；QEMU的FDCAN端口仅接受总线连接，不能通过inject直接输入。
+QEMU按键要求bool，GPIO要求整数0/1，UART接受bytes或UTF-8字符串（编码后最多4096字节，
+保留NUL）。连接占用的输入及物理别名拒绝外部注入。交互inject同样使用工厂准入，
+错误后仍可继续；执行阶段的设备错误则冻结并走统一清理。
