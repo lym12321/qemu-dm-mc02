@@ -204,6 +204,43 @@ def test_recursive_emits_share_bounded_dispatch_budget():
     assert bus.pending == 1
 
 
+def test_next_due_is_a_read_only_queue_projection_through_delivery_reset_and_close():
+    bus = CanBus(delay_ns=3)
+    source, sink = Sink("source"), Sink("sink")
+    bus.attach(source)
+    bus.attach(sink)
+    assert bus.next_due_ns is None
+    bus.send(source, CanFrame(1, timestamp_ns=7))
+    bus.send(source, CanFrame(2, timestamp_ns=2))
+    assert (bus.next_due_ns, bus.next_due_ns, bus.pending, bus.t_sim_ns) == (5, 5, 2, 0)
+    assert sink.frames == []
+    bus.step(5)
+    assert bus.next_due_ns == 10
+    bus.reset()
+    assert bus.next_due_ns is None
+    bus.send(source, CanFrame(3))
+    bus.close()
+    assert bus.next_due_ns is None
+
+
+def test_caller_dispatch_cap_precedes_side_effects_and_preserves_bus_budget():
+    bus = CanBus(max_pending=1, dispatch_budget=3)
+    first, second = Echo(bus, "first"), Echo(bus, "second")
+    first.emit(CanFrame(1, timestamp_ns=5))
+    for invalid in (-1, True, 1.5):
+        with pytest.raises(ValueError, match="max_dispatch"):
+            bus.step(5, max_dispatch=invalid)
+        assert (bus.t_sim_ns, bus.pending) == (0, 1)
+    assert bus.step(5, max_dispatch=0) == 0
+    assert (first.seen, second.seen, bus.pending) == ([], [], 1)
+    assert bus.step(5, max_dispatch=1) == 1
+    assert (first.seen, second.seen, bus.pending) == ([], [1], 1)
+    assert bus.dispatch_budget == 3
+    # A caller cannot enlarge the bus's own limit.
+    assert bus.step(5, max_dispatch=4) == 3
+    assert (first.seen, second.seen, bus.pending) == ([2, 4], [1, 3], 1)
+
+
 def test_capacity_rejection_preserves_existing_pending_frame():
     bus = CanBus(max_pending=1)
     source, sink = Sink("source"), Sink("sink")

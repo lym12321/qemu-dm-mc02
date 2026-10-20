@@ -97,6 +97,170 @@ def scene(*, delay=0, on_event=None, mode="stepped"):
     return simulation, machine, plant, trace
 
 
+class InputPlant(Component):
+    """Record the control actually held over each completed interval."""
+
+    def __init__(self, spec, context):
+        super().__init__(spec, context)
+        self.control = 0
+        self.intervals = []
+        self.inputs = []
+
+    def input(self, port, payload):
+        self.control = payload
+        self.inputs.append((port, payload))
+
+    def step(self, ctx):
+        self.intervals.append((ctx.step_id, ctx.t_sim_ns - ctx.dt_ns,
+                               ctx.t_sim_ns, self.control))
+        return StepResult("ok", ctx.t_sim_ns)
+
+
+def input_scene(**kwargs):
+    factory = Factory(InputPlant, {"step", "input"},
+                      (PortSpec("key", "digital", "in", "signal"),))
+    simulation = Simulation(Topology((NodeSpec("plant", "plant"),)),
+                            {"plant": factory}, quantum_ns=10, **kwargs)
+    return simulation, factory
+
+
+@pytest.mark.parametrize("operation", ["step", "run_until"])
+def test_known_off_grid_pulse_cuts_intervals_and_quantum_is_a_maximum(operation):
+    simulation, factory = input_scene()
+    with simulation:
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        simulation.schedule_input("plant.key", 0, at_ns=7)
+        result = getattr(simulation, operation)(22)
+        assert factory.instances[0].intervals == [
+            (1, 0, 3, 0), (2, 3, 7, 1), (3, 7, 17, 0), (4, 17, 22, 0)]
+        assert [(event.source_time_ns, event.delivery_time_ns)
+                for event in simulation.events if event.kind == "input.delivered"] == [(3, 3), (7, 7)]
+        assert result.status == "ok" and result.reached_time_ns == 22
+        assert result.diagnostics["requested_time_ns"] == 22
+        assert result.diagnostics["substeps_completed"] == 4
+        assert result.diagnostics["step_id"] == 4
+        # Aggregation keeps only the final component result, not an interval log.
+        assert result.diagnostics["components"] == {"plant": StepResult("ok", 22)}
+
+
+def test_run_until_current_settles_due_inputs_without_new_intervals_or_step_ids():
+    simulation, factory = input_scene()
+    with simulation:
+        simulation.schedule_input("plant.key", 1)
+        simulation.schedule_input("plant.key", 2)
+        result = simulation.run_until(0)
+        assert factory.instances[0].inputs == [("key", 1), ("key", 2)]
+        assert factory.instances[0].intervals == []
+        assert (simulation.t_sim_ns, simulation.step_id) == (0, 0)
+        assert result.diagnostics["substeps_completed"] == 0
+        assert result.diagnostics["components"] == {}
+
+
+def test_callbacks_can_add_the_next_future_cut_after_current_delivery():
+    simulation, factory = input_scene()
+    with simulation:
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        def schedule_release(event):
+            if event.kind == "input.delivered" and event.payload == 1:
+                simulation.schedule_input("plant.key", 0, at_ns=7)
+        simulation.on_event = schedule_release
+        simulation.step(10)
+        assert factory.instances[0].intervals == [(1, 0, 3, 0), (2, 3, 7, 1), (3, 7, 10, 0)]
+
+
+def test_same_cut_inputs_keep_enqueue_order_before_due_can_delivery():
+    simulation, machines, plants, _ = scene()
+    with simulation:
+        machines.instances[0].connection.send(CanFrame(1, data=b"\x03"))
+        simulation.schedule_input("first.key", 1)
+        simulation.schedule_input("first.key", 2)
+        result = simulation.run_until(0)
+        kinds = [event.kind for event in simulation.events]
+        assert kinds == ["can.sent", "input.delivered", "input.delivered", "can.delivery", "can.delivery"]
+        assert machines.instances[0].input_values == [("key", 1), ("key", 2)]
+        assert plants.instances[0].control == 3
+        assert plants.instances[0].integrated_controls == []
+        assert result.reached_time_ns == simulation.step_id == 0
+
+
+@pytest.mark.parametrize("operation", ["step", "run_until"])
+def test_pause_returns_partial_result_at_committed_internal_cut_and_resume_clears_request(operation):
+    simulation, factory = input_scene()
+    with simulation:
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        simulation.on_event = lambda event: simulation.pause()
+        result = getattr(simulation, operation)(10)
+        assert (result.status, result.reached_time_ns) == ("paused", 3)
+        assert result.diagnostics["requested_time_ns"] == 10
+        assert result.diagnostics["substeps_completed"] == 1
+        assert factory.instances[0].intervals == [(1, 0, 3, 0)]
+        simulation.on_event = None
+        assert simulation.run_until(10).status == "ok"
+        assert factory.instances[0].intervals[-1] == (2, 3, 10, 1)
+
+
+def test_second_internal_interval_failure_retains_first_commit_and_freezes():
+    simulation, factory = input_scene()
+    failure = OSError("second interval failed")
+    with simulation:
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        def fail_second(ctx):
+            if ctx.step_id == 2:
+                raise failure
+            return StepResult("ok", ctx.t_sim_ns)
+        factory.instances[0].step = fail_second
+        with pytest.raises(OSError) as caught:
+            simulation.step(10)
+        assert caught.value is failure
+        assert (simulation.t_sim_ns, simulation.step_id) == (3, 1)
+        assert simulation.state == SimulationState.FAILED
+        with pytest.raises(RuntimeError):
+            simulation.run_until(10)
+    assert factory.instances[0].close_count == 1
+
+
+def test_global_can_budget_is_enforced_before_additional_broadcast_callbacks():
+    simulation, machines, _, _ = scene()
+    simulation.dispatch_budget = 1
+    with simulation:
+        first, second = machines.instances
+        first.connection.send(CanFrame(1, data=b"\x01"))
+        first.connection.send(CanFrame(2, data=b"\x02"))
+        with pytest.raises(RuntimeError, match="dispatch budget"):
+            simulation.run_until(1)
+        assert [frame.can_id for frame in second.frames] == [1]
+        assert simulation.components["bus"].pending == 1
+        assert simulation.state == SimulationState.FAILED
+
+
+def test_can_budget_does_not_refresh_when_callbacks_schedule_more_current_inputs():
+    class Alternating(Component):
+        def __init__(self, spec, context):
+            super().__init__(spec, context)
+            self.link = context.attach_can("can", self)
+            self.inputs = self.received = 0
+
+        def input(self, port, payload):
+            self.inputs += 1
+            self.link.send(CanFrame(1))
+
+        def receive(self, frame):
+            self.received += 1
+            simulation.schedule_input("n.key", 1)
+
+    factory = Factory(Alternating, {"input"},
+                      (PortSpec("can", "can"), PortSpec("key", "digital", "in", "signal")))
+    topology = Topology((NodeSpec("bus", "bus", {"loopback": True, "dispatch_budget": 1}),
+                         NodeSpec("n", "n")), (LinkSpec("n.can", "bus.can"),))
+    simulation = Simulation(topology, {"bus": CanBusFactory(), "n": factory}, dispatch_budget=5)
+    with simulation:
+        simulation.schedule_input("n.key", 1)
+        with pytest.raises(RuntimeError, match="dispatch budget"):
+            simulation.run_until(0)
+        assert (factory.instances[0].inputs, factory.instances[0].received) == (2, 1)
+        assert simulation.components["bus"].pending == 1
+
+
 @pytest.mark.parametrize("mode", ["stepped", "interactive"])
 def test_two_machines_share_bus_all_requests_precede_completions_and_no_retroactive_plant_control(mode):
     all_events = []
@@ -127,11 +291,11 @@ def test_interval_floor_precedes_link_delay_and_sampling_cut():
     simulation, machines, plants, _ = scene(delay=3)
     with simulation:
         simulation.run_until(20)
-        assert plants.instances[0].integrated_controls == [0, 0]
-        deliveries = [event for event in simulation.events if event.kind == "can.delivery"]
-        assert [(event.payload["due_ns"], event.delivery_time_ns) for event in deliveries] == [(13, 20), (13, 20)]
-        simulation.step()
         assert plants.instances[0].integrated_controls == [0, 0, 7]
+        deliveries = [event for event in simulation.events if event.kind == "can.delivery"]
+        assert [(event.payload["due_ns"], event.delivery_time_ns) for event in deliveries] == [(13, 13), (13, 13)]
+        simulation.step()
+        assert plants.instances[0].integrated_controls == [0, 0, 7, 7]
 
 
 def test_inputs_stable_ties_deep_snapshot_capacity_and_pause_at_completed_cut():
@@ -363,7 +527,8 @@ def test_connected_endpoint_must_be_attached_by_its_factory_before_start_hooks()
 
 def test_invalid_step_admission_is_reversible_and_uint64_overflow_rejected():
     factory = Factory(lambda spec, context: Component(spec, context))
-    simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory})
+    simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory},
+                            quantum_ns=(1 << 64) - 1)
     with simulation:
         for value in (0, -1, True, 1.5, 1 << 64):
             with pytest.raises(ValueError):

@@ -13,7 +13,7 @@ smoke = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smoke)
 
 
-@pytest.mark.parametrize("case", smoke.CASES)
+@pytest.mark.parametrize("case", (*smoke.CASES, "pulse"))
 def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(tmp_path, case):
     if any(shutil.which(program) is None for program in ("cmake", "arm-none-eabi-gcc")):
         pytest.skip("optional ARM cross compiler/CMake are unavailable")
@@ -28,12 +28,13 @@ def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(
     from sim.config.scene import load_scene
 
     scene_file = tmp_path / "scene.yaml"
-    scene_file.write_text((ROOT / "examples" / case / "scene.yaml").read_text().replace(
+    example = smoke.EXAMPLE_ALIASES.get(case, case)
+    scene_file.write_text((ROOT / "examples" / example / "scene.yaml").read_text().replace(
         "./build/firmware.elf", result["elf"]))
     scene = load_scene(scene_file, builtin_registry(backend_root=ROOT))
     assert scene.mode == "stepped" and scene.quantum_ns == 1_000_000
     assert scene.duration_ns == 200_000_000
-    assert len(scene.topology.nodes) == (1 if case == "minimal-board" else 3)
+    assert len(scene.topology.nodes) == (3 if case == "can-motor" else 1)
 
 
 def test_missing_build_dependency_is_explicitly_blocked(monkeypatch):
@@ -71,6 +72,53 @@ def test_acceptance_rejects_old_uart_marker_order_and_guest_failure():
     observations.uart.extend(b"FAIL\n")
     with pytest.raises(AssertionError, match="guest reported failure"):
         observations.verify("minimal-board")
+
+
+def _pulse_observations():
+    result = _minimal_observations()
+    result.snapshots = [
+        {"source": "main", "mapped_time_ns": cut, "delivery_time_ns": cut,
+         "native_timestamp_ns": 123 + cut, "quality": "exact",
+         "b0_output": cut != 0, "key": key, "b0": b0}
+        for cut, key, b0 in ((0, 1, 0), (3_000_000, 1, 0),
+                             (4_000_000, 0, 1), (10_000_000, 1, 0), (20_000_000, 1, 0))
+    ]
+    result.inputs = [
+        {"source": "main", "endpoint": "key", "value": value,
+         "source_time_ns": cut, "delivery_time_ns": cut}
+        for value, cut in ((True, 3_000_000), (False, 4_000_000))
+    ]
+    return result
+
+
+def test_pulse_requires_native_cuts_and_guest_response_between_input_times():
+    observations = _pulse_observations()
+    observations.verify("pulse")
+    # Correctly timestamped inputs and later UART text cannot stand in for the
+    # guest's actual GPIO response before the release input at 4ms.
+    observations.snapshots[2]["b0"] = 0
+    with pytest.raises(AssertionError, match="guest GPIO response.*4000000"):
+        observations.verify("pulse")
+
+
+def test_pulse_rejects_inputs_coalesced_at_the_outer_quantum():
+    observations = _pulse_observations()
+    for item in observations.inputs:
+        item["delivery_time_ns"] = 10_000_000
+    with pytest.raises(AssertionError, match="scheduled native cuts"):
+        observations.verify("pulse")
+
+
+@pytest.mark.parametrize("field,value", [
+    ("mapped_time_ns", 10_000_000),
+    ("native_timestamp_ns", 3_000_124),
+    ("quality", "sampled"),
+])
+def test_pulse_rejects_missing_or_inexact_actual_native_cut(field, value):
+    observations = _pulse_observations()
+    observations.snapshots[1][field] = value
+    with pytest.raises(AssertionError, match="actual native run cut.*3000000"):
+        observations.verify("pulse")
 
 
 def test_motor_uart_pass_alone_cannot_replace_actual_can_and_native_receipts():

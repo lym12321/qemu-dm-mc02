@@ -2873,3 +2873,24 @@ ID2 是各成员的持续在线对照。主机还检查真实 CAN 命令、器�
 
 这是反馈不可达测试；50 ms 是该驱动的应用配置，不能据此声明电机断电、精确中断
 时刻、全局锁步或实时性能。物理校准保留 SKIP；本门不替代上面的固定 Release 场景门。
+
+
+## 已知事件与运行切点
+
+`quantum` 是机器运行区间的上限。`step(dt_ns)` 和 `run_until(target_ns)` 都在已排队
+输入及传输到期时间切步：10ms 请求中3ms按下、4ms松开，机器实际运行0→3→4→10ms。
+每个切点先完成前一区间，再交付事件；当前时刻输入先交付，终点输入在返回前交付。
+`run_until(now)` 只处理当前事件，不新增运行区间。quantum不要求固定网格。
+
+`step_id` 按成功的内部区间递增。公开 `StepResult` 返回实际时间、最后组件结果，及
+`requested_time_ns`、`step_id`、`substeps_completed`。两入口都在完成切点响应pause；
+提前返回的status为`paused`。中途失败保留此前已提交时间和外部效果，禁止自动重试。
+CAN全局及每总线派发预算在回调前执行，过载冻结；队列容量拒绝不删除已有事件。
+
+上述承诺只适用于运行请求前已知的事件。区间内才观察到的CPU输出仍在区间末变为可交付；
+CAN保留来源时间并应用区间末下限和链路延迟，UART保持读取后时间上界。
+这仍是采样式co-simulation，不是跨MCU指令级或事件级锁步。
+
+短脉冲原生门：`tools/run-simulation-smoke.sh --case pulse --qemu /path/to/qemu-system-arm`。
+它编译独立、默认关闭的`SIM_KEY_PULSE_TEST`变体，延后transition UART，使用真实GPIO
+证明3–4ms期间固件执行；普通minimal-board固件保持原有日志行为。

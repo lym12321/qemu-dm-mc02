@@ -18,6 +18,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 CASES = ("minimal-board", "can-motor")
+EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor"}
 
 
 class Blocked(RuntimeError):
@@ -43,6 +44,7 @@ class Observations:
         self.can = []
         self.deliveries = []
         self.receipts = []
+        self.inputs = []
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -74,6 +76,9 @@ class Observations:
                 "key": digital_level("gpio.A15", snapshot),
                 "b0": digital_level("gpio.B0", snapshot),
                 "b0_output": bool(snapshot["gpio"]["B"]["output_mask"] & 1)})
+        elif event.kind == "input.delivered":
+            self.inputs.append({**stamp, "source": event.source_node,
+                                "endpoint": event.source_port, "value": _plain(event.payload)})
         elif event.kind == "can-input-processed":
             self.receipts.append({**stamp, "source": event.source_node,
                                   "endpoint": event.source_port,
@@ -94,13 +99,13 @@ class Observations:
         uart = bytes(self.uart)
         if b"FAIL" in uart:
             raise AssertionError(f"guest reported failure: {uart!r}")
-        ready = f"SIM_READY {'can-motor' if case == 'dual-board' else case}\n".encode()
+        ready = f"SIM_READY {EXAMPLE_ALIASES.get(case, case)}\n".encode()
         if case != "hal-gpio" and ready not in uart:
             raise AssertionError(f"actual guest UART ready is missing: {uart!r}")
         if not self.snapshots:
             raise AssertionError("no actual native board snapshot was observed")
-        if case in ("minimal-board", "hal-gpio"):
-            if case == "minimal-board":
+        if case in ("minimal-board", "hal-gpio", "pulse"):
+            if case in ("minimal-board", "pulse"):
                 required = (b"KEY released B0=0\n", b"KEY pressed B0=1\n",
                             b"KEY released B0=0\n")
                 start = uart.index(ready) + len(ready)
@@ -109,6 +114,9 @@ class Observations:
                     if found < 0:
                         raise AssertionError(f"ordered guest UART marker missing: {pattern!r}")
                     start = found + len(pattern)
+            if case == "pulse":
+                self._verify_pulse()
+                return self.report()
             for lower, upper, key, b0 in ((0, 40_000_000, 1, 0),
                     (40_000_000, 90_000_000, 0, 1), (90_000_000, 200_000_001, 1, 0)):
                 if not any(lower <= item["mapped_time_ns"] < upper
@@ -176,21 +184,46 @@ class Observations:
                         raise AssertionError("peer command filter rejection and complete feedback receipts disagree")
         return self.report()
 
+    def _verify_pulse(self):
+        inputs = [item for item in self.inputs
+                  if item["source"] == "main" and item["endpoint"] == "key"]
+        if [(item["value"], item["source_time_ns"], item["delivery_time_ns"])
+                for item in inputs] != [(True, 3_000_000, 3_000_000),
+                                       (False, 4_000_000, 4_000_000)]:
+            raise AssertionError("key pulse was not delivered at its scheduled native cuts")
+        # These are actual QEMU snapshots collected after completed native
+        # runs, before that cut's inputs. B0 high at 4ms proves the guest acted
+        # during the 3..4ms pulse, even though UART serialization finishes later.
+        for cut, key, b0 in ((3_000_000, 1, 0), (4_000_000, 0, 1),
+                             (10_000_000, 1, 0)):
+            rows = [item for item in self.snapshots
+                    if item["source"] == "main" and item["mapped_time_ns"] == cut]
+            if (len(rows) != 1 or rows[0]["delivery_time_ns"] != cut
+                    or rows[0]["native_timestamp_ns"] - self.snapshots[0]["native_timestamp_ns"] != cut
+                    or rows[0]["quality"] != "exact"):
+                raise AssertionError(f"actual native run cut is missing or inexact: {cut}")
+            if not rows[0]["b0_output"] or (rows[0]["key"], rows[0]["b0"]) != (key, b0):
+                raise AssertionError(f"guest GPIO response missing at pulse cut {cut}: {(key, b0)}")
+
     def report(self):
         return {"events": self.total,
                 "uart": bytes(self.uart).decode("ascii", errors="backslashreplace"),
                 "peer_uart": bytes(self.peer_uart).decode("ascii", errors="backslashreplace"),
                 "snapshots": self.snapshots, "can": self.can,
-                "deliveries": self.deliveries, "receipts": self.receipts}
+                "deliveries": self.deliveries, "receipts": self.receipts,
+                "inputs": self.inputs}
 
 
 def build_example(case, *, build_dir=None):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
-    source = ROOT / "examples" / case
-    build = source / "build" if build_dir is None else Path(build_dir)
-    commands = (["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Debug"],
+    source = ROOT / "examples" / EXAMPLE_ALIASES.get(case, case)
+    default_build = ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse" else source / "build"
+    build = default_build if build_dir is None else Path(build_dir)
+    variant = (["-DSIM_KEY_PULSE_TEST=ON"] if case == "pulse" else
+               ["-DSIM_KEY_PULSE_TEST=OFF"] if case == "minimal-board" else [])
+    commands = (["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Debug", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
     for command in commands:
@@ -218,8 +251,18 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         scene = Scene(Topology((NodeSpec("main", "machine.qemu", {
             "model": "dm-mc02", "firmware": str(firmware), "uarts": ()}),), ()))
     else:
-        scene = load_scene(ROOT / "examples" / ("can-motor" if case == "dual-board" else case) /
+        example = EXAMPLE_ALIASES.get(case, case)
+        scene = load_scene(ROOT / "examples" / example /
                            "scene.yaml", registry)
+        if case == "pulse":
+            from sim.api import NodeSpec, Topology
+            from sim.config.scene import Scene
+
+            main = scene.topology.nodes[0]
+            node = NodeSpec(main.name, main.kind, {**main.options, "firmware": str(firmware)},
+                            base_dir=main.base_dir)
+            scene = Scene(Topology((node,), scene.topology.links), scene.mode,
+                          10_000_000, 20_000_000)
         if case == "dual-board":
             from sim.api import LinkSpec, NodeSpec, Topology
             from sim.config.scene import Scene
@@ -250,6 +293,12 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         if case in ("minimal-board", "hal-gpio"):
             simulation.schedule_input("main.key", True, at_ns=40_000_000)
             simulation.schedule_input("main.key", False, at_ns=90_000_000)
+        elif case == "pulse":
+            simulation.schedule_input("main.key", True, at_ns=3_000_000)
+            simulation.schedule_input("main.key", False, at_ns=4_000_000)
+            # One public step must execute the interior cuts and still reach
+            # its requested 10ms endpoint. Continue for the serialized UART.
+            simulation.step(10_000_000)
         simulation.run_until(scene.duration_ns)
     except BaseException as error:
         if isinstance(error, BackendUnavailable):
@@ -297,7 +346,7 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*CASES, "hal-gpio", "dual-board", "all"), default="all")
+    parser.add_argument("--case", choices=(*CASES, "pulse", "hal-gpio", "dual-board", "all"), default="all")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",
                         help="existing HAL GPIO lesson ELF, used only by --case hal-gpio")
@@ -317,7 +366,7 @@ def main(argv=None):
             raise Blocked(f"project dm-mc02 QEMU executable is missing: {args.qemu}")
         payload["qemu"] = {"path": str(args.qemu.resolve()),
                            "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest()}
-        for case in CASES if args.case == "all" else (args.case,):
+        for case in (*CASES, "pulse") if args.case == "all" else (args.case,):
             if case == "hal-gpio":
                 if not args.hal_elf.is_file():
                     raise Blocked(f"the existing HAL GPIO lesson ELF is missing: {args.hal_elf}")
@@ -325,9 +374,9 @@ def main(argv=None):
                 payload["cases"][case] = {"elf": str(elf),
                     "sha256": hashlib.sha256(elf.read_bytes()).hexdigest()}
             else:
-                payload["cases"][case] = build_example("can-motor" if case == "dual-board" else case)
+                payload["cases"][case] = build_example(case)
             payload["cases"][case]["observations"] = run_case(
-                case, qemu=args.qemu, firmware=args.hal_elf.resolve())
+                case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
             binary = Path(payload["cases"][case]["elf"])
             if hashlib.sha256(binary.read_bytes()).hexdigest() != payload["cases"][case]["sha256"]:
                 raise AssertionError("firmware ELF changed during the native acceptance run")

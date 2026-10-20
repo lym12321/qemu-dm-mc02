@@ -103,6 +103,11 @@ class CanBus:
     def pending(self) -> int:
         return len(self._queue)
 
+    @property
+    def next_due_ns(self) -> int | None:
+        """Earliest queued delivery time, without advancing or consuming work."""
+        return self._queue[0][0] if self._queue else None
+
     def has_due(self, t_sim_ns: int) -> bool:
         """Query due work without consuming frames or advancing virtual time."""
         check_can_time(t_sim_ns)
@@ -152,20 +157,27 @@ class CanBus:
         self._sequence += 1
         self._started = True
 
-    def step(self, t_sim_ns: int) -> int:
-        """Advance virtual delivery time, returning dispatched broadcast count."""
+    def step(self, t_sim_ns: int, *, max_dispatch: int | None = None) -> int:
+        """Advance delivery time with an optional tighter broadcast limit.
+
+        Zero advances the clock without dispatch. The caller limit is applied
+        before popping a broadcast, including callback-generated work.
+        """
         if self._closed:
             raise RuntimeError("CAN bus is closed")
         check_can_time(t_sim_ns, self.t_sim_ns)
+        if max_dispatch is not None and (type(max_dispatch) is not int or max_dispatch < 0):
+            raise ValueError("max_dispatch must be a nonnegative integer or None")
         if self._dispatching:
             raise RuntimeError("CAN step cannot be called from a delivery callback")
+        budget = self.dispatch_budget if max_dispatch is None else min(self.dispatch_budget, max_dispatch)
         self.t_sim_ns = t_sim_ns
         self._started = True
         dispatched = 0
         self._dispatching = True
         try:
             while (self._queue and self._queue[0][0] <= t_sim_ns
-                   and dispatched < self.dispatch_budget):
+                   and dispatched < budget):
                 due_ns, sequence, source, original = heapq.heappop(self._queue)
                 delivered_ns = max(due_ns, self.t_sim_ns)
                 frame = replace(original, timestamp_ns=delivered_ns)

@@ -402,6 +402,7 @@ class Simulation:
         remaining = self.dispatch_budget
         buses = tuple(component for name, component in self._owned
                       if "can_bus" in self._descriptions[name].capabilities)
+        bus_budgets = [bus.dispatch_budget for bus in buses]
         while True:
             self._check_deadline()
             while self._inputs and self._inputs[0][0] <= cut:
@@ -413,13 +414,14 @@ class Simulation:
                            source_time_ns=when, mapped_time_ns=when, delivery_time_ns=cut)
                 self._check_deadline()
                 remaining -= 1
-            for bus in buses:
+            for index, bus in enumerate(buses):
                 self._check_deadline()
                 if remaining <= 0 and bus.has_due(cut):
                     raise RuntimeError("simulation CAN dispatch budget exhausted (possible event loop)")
-                dispatched = bus.step(cut)
+                dispatched = bus.step(cut, max_dispatch=min(remaining, bus_budgets[index]))
                 remaining -= dispatched
-                if remaining < 0 or bus.has_due(cut):
+                bus_budgets[index] -= dispatched
+                if bus.has_due(cut):
                     raise RuntimeError("CAN dispatch budget exhausted (possible event loop)")
                 self._check_deadline()
             if (not (self._inputs and self._inputs[0][0] <= cut)
@@ -433,69 +435,92 @@ class Simulation:
                 or result.reached_time_ns != ctx.t_sim_ns):
             raise RuntimeError(f"component {name} did not reach exact target: {result!r}")
 
-    def _step(self, dt_ns: int) -> StepResult:
+    def _step(self, target: int) -> dict[str, StepResult]:
+        """Execute one admitted interval; its start cut is already settled."""
+        ctx = StepContext(self.session.session_id, self.step_id + 1,
+                          target, target - self.t_sim_ns)
+        results = {}
+        self._dispatch_time_ns = target
+        self._not_before_ns = target
+        self._phase = "machine request"
+        for name, component in self._owned:
+            if "machine" in self._descriptions[name].capabilities:
+                self._check_deadline()
+                component.request_step(ctx)
+                self._check_deadline()
+        self._phase = "machine completion"
+        for name, component in self._owned:
+            if "machine" in self._descriptions[name].capabilities:
+                self._check_deadline()
+                result = component.finish_step(ctx)
+                self._reached(name, result, ctx)
+                results[name] = result
+                self._check_deadline()
+        self._phase = "component step"
+        for name, component in self._owned:
+            if "step" in self._descriptions[name].capabilities:
+                self._check_deadline()
+                result = component.step(ctx)
+                self._reached(name, result, ctx)
+                results[name] = result
+                self._check_deadline()
+        self._phase = "target delivery"
+        self._settle(target)
+        self._check_deadline()
+        self.t_sim_ns = target
+        self.step_id = ctx.step_id
+        return results
+
+    def _advance_to(self, target: int) -> StepResult:
+        """Share bounded event cuts and pause semantics across public drivers."""
         if self._stepping:
             raise RuntimeError("Simulation execution cannot be reentered")
-        check_timestamp(dt_ns)
-        if dt_ns == 0:
-            raise ValueError("dt_ns must be positive")
-        target = self.t_sim_ns + dt_ns
-        check_timestamp(target)
-        ctx = StepContext(self.session.session_id, self.step_id + 1, target, dt_ns)
+        self._pause_requested = False
+        self.state = SimulationState.RUNNING
         self._stepping = True
         results = {}
+        completed = 0
         try:
             self._phase = "start delivery"
             self._settle(self.t_sim_ns)
-            self._dispatch_time_ns = target
-            self._not_before_ns = target
-            self._phase = "machine request"
-            for name, component in self._owned:
-                if "machine" in self._descriptions[name].capabilities:
-                    self._check_deadline()
-                    component.request_step(ctx)
-                    self._check_deadline()
-            self._phase = "machine completion"
-            for name, component in self._owned:
-                if "machine" in self._descriptions[name].capabilities:
-                    self._check_deadline()
-                    result = component.finish_step(ctx)
-                    self._reached(name, result, ctx)
-                    results[name] = result
-                    self._check_deadline()
-            self._phase = "component step"
-            for name, component in self._owned:
-                if "step" in self._descriptions[name].capabilities:
-                    self._check_deadline()
-                    result = component.step(ctx)
-                    self._reached(name, result, ctx)
-                    results[name] = result
-                    self._check_deadline()
-            self._phase = "target delivery"
-            self._settle(target)
+            while self.t_sim_ns < target and not self._pause_requested:
+                cut = min(target, self.t_sim_ns + self.quantum_ns)
+                if self._inputs:
+                    cut = min(cut, self._inputs[0][0])
+                for name, component in self._owned:
+                    if "can_bus" in self._descriptions[name].capabilities:
+                        due = component.next_due_ns
+                        if due is not None:
+                            cut = min(cut, due)
+                results = self._step(cut)
+                completed += 1
             self._check_deadline()
-            self.t_sim_ns = target
-            self.step_id = ctx.step_id
-            return StepResult("ok", target, {"step_id": self.step_id, "components": results})
+            status = "paused" if self.t_sim_ns < target else "ok"
+            return StepResult(status, self.t_sim_ns, {
+                "requested_time_ns": target, "step_id": self.step_id,
+                "substeps_completed": completed, "components": results,
+            })
         except BaseException as exc:
-            exc.add_note(f"simulation failed during {self._phase}, step {ctx.step_id}; completed time remains {self.t_sim_ns}")
+            exc.add_note(f"simulation failed during {self._phase}, step {self.step_id + 1}; completed time remains {self.t_sim_ns}")
             self.failure = exc
             self.state = SimulationState.FAILED
             raise
         finally:
             self._stepping = False
-            if self.state != SimulationState.FAILED:
+            if self.state == SimulationState.RUNNING:
+                self.state = SimulationState.PAUSED
                 self._phase = "paused"
 
     def step(self, dt_ns: int | None = None) -> StepResult:
         if self.state != SimulationState.PAUSED:
             raise RuntimeError("step requires a paused, healthy Simulation")
-        self.state = SimulationState.RUNNING
-        try:
-            return self._step(self.quantum_ns if dt_ns is None else dt_ns)
-        finally:
-            if self.state == SimulationState.RUNNING:
-                self.state = SimulationState.PAUSED
+        dt_ns = self.quantum_ns if dt_ns is None else dt_ns
+        check_timestamp(dt_ns)
+        if dt_ns == 0:
+            raise ValueError("dt_ns must be positive")
+        target = self.t_sim_ns + dt_ns
+        check_timestamp(target)
+        return self._advance_to(target)
 
     def run_until(self, target_ns: int) -> StepResult:
         if self.state != SimulationState.PAUSED:
@@ -503,17 +528,7 @@ class Simulation:
         check_timestamp(target_ns)
         if target_ns < self.t_sim_ns:
             raise ValueError("run target must not precede completed simulation time")
-        self.check_deadline()
-        self._pause_requested = False
-        self.state = SimulationState.RUNNING
-        result = StepResult("ok", self.t_sim_ns)
-        try:
-            while self.t_sim_ns < target_ns and not self._pause_requested:
-                result = self._step(min(self.quantum_ns, target_ns - self.t_sim_ns))
-            return result
-        finally:
-            if self.state == SimulationState.RUNNING:
-                self.state = SimulationState.PAUSED
+        return self._advance_to(target_ns)
 
     def pause(self) -> None:
         if self.state not in (SimulationState.PAUSED, SimulationState.RUNNING):
