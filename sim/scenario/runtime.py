@@ -15,7 +15,7 @@ if TYPE_CHECKING:
     from sim.arena.runtime import ArenaResult
 
 
-def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
+def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None, on_observation=None,
                  qemu=None, startup_timeout=10.0, timeout=30.0,
                  referee_period_ns=100_000_000) -> ArenaResult:
     """Delegate once; Arena owns event admission, execution and cleanup.
@@ -27,6 +27,10 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     Scoped assertions reuse LabExperiment with each member's actual initial
     RESET_ACK time. Startup and empty post-read observation batches count;
     success requires all assertions and the original Arena cleanup to complete.
+    Optional on_observation borrows every Arena batch read-only and must not
+    reenter the runtime. It runs before the internal assertion checker, including
+    for members without assertions. Either failure terminates without replay;
+    already captured observations remain available, but no result is returned.
     """
     if type(manifest) is not ScenarioManifest:
         raise TypeError("ScenarioManifest is required")
@@ -57,6 +61,8 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
     if any(type(item.member) is not str or type(item.events) is not tuple
            for item in manifest.referees):
         raise TypeError("Scenario referees require plain member strings and event tuples")
+    if on_observation is not None and not callable(on_observation):
+        raise TypeError("Arena observation sink must be callable")
     batches = tuple((item.member, item.events) for item in manifest.referees)
     actions = tuple((item.offset_ns, item.member, item.delay_ns)
                     for item in manifest.can_delays)
@@ -65,6 +71,8 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
                      for item in manifest.motor_feedback)
     if feedback:
         can_options["motor_feedback"] = feedback
+    if on_observation is not None:
+        can_options["on_observation"] = on_observation
 
     experiments = {}
     if manifest.assertions:
@@ -93,6 +101,8 @@ def run_manifest(manifest: ScenarioManifest, *, emit=None, on_response=None,
                 on_response(name, frame, decoded)
 
         def observe(item):
+            if on_observation is not None:
+                on_observation(item)
             if item.name not in labs:
                 return
             if item.name not in experiments:

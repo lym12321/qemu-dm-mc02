@@ -3813,3 +3813,238 @@ def test_offline_replay_cli_consumes_actual_socket_capture_after_cleanup(environ
     assert environment.events == history
     assert (path.read_bytes(), arena.path.read_bytes(), trace.read_bytes()) == protected
     environment.assert_clean()
+
+
+def test_scenario_capture_isolation_forwards_exact_callback_result_and_options(environment, monkeypatch):
+    arena = environment.manifest()
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_234_567, (),
+                                can_delays=(ScenarioCanDelay(0, "west", 7),))
+    observed, calls, result = [], [], object()
+    item = runtime.ArenaObservation("east", snapshot(1000), [])
+    class Sink:
+        def __call__(self, value):
+            observed.append(value)
+        def close(self):
+            pytest.fail("Scenario closed its borrowed observation sink")
+    sink = Sink()
+    emit, response = lambda value: None, lambda *values: None
+    options = dict(emit=emit, on_response=response, qemu=environment.binary,
+                   startup_timeout=3, timeout=7, referee_period_ns=2_000_000)
+    def lower(actual, **forwarded):
+        calls.append((actual, forwarded))
+        forwarded["on_observation"](item)
+        return result
+    monkeypatch.setattr(runtime, "run_manifest", lower)
+    assert scenario_runtime.run_manifest(manifest, on_observation=sink, **options) is result
+    assert len(calls) == 1 and calls[0][0] is arena
+    assert calls[0][1] == dict(options, duration=.001234567, referee_events=(),
+                               can_delays=((0, "west", 7),), on_observation=sink)
+    assert calls[0][1]["on_observation"] is sink and observed == [item] and observed[0] is item
+    assert environment.events == [] and environment.plant is None
+
+
+@pytest.mark.parametrize("assertions", [False, True], ids=["direct", "composite"])
+def test_scenario_capture_isolation_rejects_bad_sink_before_lower_import(environment, monkeypatch, assertions):
+    from sim.scenario import ScenarioAssertion
+
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+        1_000_000, (), assertions=(ScenarioAssertion("east",
+            Assertion(1_000_000, "uart1", "uart_contains", b"OK")),) if assertions else ())
+    original_import = builtins.__import__
+    def forbid_lower(name, *args, **kwargs):
+        if name == "sim.arena.runtime":
+            pytest.fail("invalid Scenario observation sink reached lower import")
+        return original_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, "__import__", forbid_lower)
+    with pytest.raises(TypeError, match="observation sink.*callable"):
+        scenario_runtime.run_manifest(manifest, on_observation=object())
+    assert environment.events == [] and environment.owners == [] and environment.launches == []
+    assert environment.plant is None and environment.native.resets == 0 and environment.native.steps == []
+
+
+def test_scenario_capture_isolation_external_precedes_real_checker_for_all_original_batches(environment, monkeypatch):
+    from sim.scenario import ScenarioAssertion
+
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+        2_500_000, (), assertions=(ScenarioAssertion("east",
+            Assertion(1_000_000, "uart1", "uart_contains", b"OK")),))
+    batches = [runtime.ArenaObservation("east", snapshot(1000), []),
+               runtime.ArenaObservation("west", snapshot(2000), []),
+               runtime.ArenaObservation("east", snapshot(1001), [ChannelEvent("uart1", 1000, b"OK")]),
+               runtime.ArenaObservation("west", snapshot(2001), [ChannelEvent("uart1", 2000, b"other")]),
+               runtime.ArenaObservation("east", snapshot(2_501_000), [])]
+    result = runtime.ArenaResult("isolated", 0, 2_500_000, 3, (
+        runtime.ArenaBoardResult("east", "alpha_", "not requested", None, 2_501_000, 1000, 3),
+        runtime.ArenaBoardResult("west", "bravo_", "not requested", None, 2_502_000, 2000, 2)), ())
+    sequence, external, statuses = [], [], []
+    observe = LabExperiment.observe
+    def checker(experiment, state, events, bound):
+        item = external[-1]
+        assert state is item.snapshot and events is item.events and bound == state["timestamp_ns"]
+        assert sequence[-1] == ("external", id(item))
+        sequence.append(("checker", id(item)))
+        observe(experiment, state, events, bound)
+        statuses.append(experiment.status)
+    monkeypatch.setattr(LabExperiment, "observe", checker)
+    def sink(item):
+        external.append(item)
+        sequence.append(("external", id(item)))
+    calls = []
+    def lower(actual, **options):
+        calls.append(actual)
+        options["on_response"]("east", SimpleNamespace(header=SimpleNamespace(kind=runtime.codec.RESET_ACK)),
+                               SimpleNamespace(virtual_time_ns=1000))
+        for item in batches:
+            options["on_observation"](item)
+        return result
+    monkeypatch.setattr(runtime, "run_manifest", lower)
+    assert scenario_runtime.run_manifest(manifest, on_observation=sink) is result
+    assert calls == [manifest.arena] and all(a is b for a, b in zip(external, batches, strict=True))
+    assert sequence == [(kind, id(item)) for item in batches
+                        for kind in (("external", "checker") if item.name == "east" else ("external",))]
+    assert statuses == [("pending",), ("pass",), ("pass",)]
+    assert environment.events == [] and environment.plant is None
+
+
+@pytest.mark.parametrize("interrupt", [False, True], ids=["error", "interrupt"])
+def test_scenario_capture_actual_sink_failure_skips_checker_and_preserves_cleanup(environment, monkeypatch, interrupt):
+    from sim.scenario import ScenarioAssertion
+
+    arena = environment.manifest(upper=True)
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", arena, 1_000_000, (),
+        assertions=(ScenarioAssertion("east", Assertion(1_000_000, "uart1", "uart_contains", b"OK")),))
+    environment.uart_chunks = [[b"OK"], [b"unread"]]
+    primary = KeyboardInterrupt("Scenario capture interrupted") if interrupt else OSError("Scenario capture failed")
+    environment.world_close_failure = OSError("capture world cleanup failed")
+    environment.world_close_failure.add_note("nested capture cleanup evidence")
+    environment.close_failures = {"peer0 uart1", "peer1 qmp"}
+    environment.owner_failures = {0: OSError("capture harness cleanup failed")}
+    calls, result = [], None
+    def forbidden(*args):
+        pytest.fail("failed external sink reached internal checker")
+    monkeypatch.setattr(LabExperiment, "observe", forbidden)
+    def sink(item):
+        calls.append(item)
+        raise primary
+    with pytest.raises(type(primary)) as caught:
+        result = scenario_runtime.run_manifest(manifest, qemu=environment.binary, on_observation=sink)
+    assert caught.value is primary and result is None
+    assert len(calls) == 1 and calls[0].name == "east" and calls[0].events[0].data == b"OK"
+    assert environment.uart_reads == [1, 0] and environment.native.steps == []
+    assert all(not cpu.requests for cpu in environment.cpus.values())
+    notes = "\n".join(primary.__notes__)
+    assert all(label in notes for label in ("world cleanup", "nested capture cleanup", "uart1", "qmp", "harness cleanup"))
+    environment.assert_clean()
+    assert all(environment.events.count(f"upper{index} stop") == 1 for index in range(2))
+
+
+def test_scenario_capture_actual_assertion_failure_retains_its_batch_without_completion(environment):
+    from io import BytesIO
+    from sim.arena.trace import ArenaTrace, decode_observation
+    from sim.scenario import ScenarioAssertion
+    from sim.trace import TraceWriter, iter_events
+
+    manifest = ScenarioManifest(environment.directory / "unread.yaml", environment.manifest(),
+        2_500_000, (), assertions=(ScenarioAssertion("east",
+            Assertion(1_000_000, "uart1", "uart_contains", b"missing")),))
+    clocks = {"east": "qemu:east:run16", "west": "qemu:west:run16"}
+    output = BytesIO()
+    writer = TraceWriter(output)
+    capture, result = ArenaTrace(writer, clocks=clocks), None
+    with pytest.raises(RuntimeError, match="east.*did not match before"):
+        result = scenario_runtime.run_manifest(manifest, qemu=environment.binary, on_observation=capture)
+        capture.complete(result)
+    assert result is None
+    environment.assert_clean()
+    writer.finish()  # Keep diagnostic observations, without pretending the run completed.
+    events = list(iter_events(BytesIO(output.getvalue())))
+    assert len(events) == 3 and all(event.event_type == "arena.observation/1" for event in events)
+    batches = [decode_observation(event, clocks=clocks) for event in events]
+    assert [(item.name, item.snapshot["timestamp_ns"], item.events) for item in batches] == [
+        ("east", 1000, []), ("west", 2000, []), ("east", 1_001_000, [])]
+    assert environment.native.steps == [1_000_000] and environment.uart_reads == [2, 1]
+    assert not output.closed
+
+
+def test_scenario_capture_actual_live_assertions_complete_then_original_cli_replay(environment, monkeypatch, capsys):
+    from sim import cli
+    from sim.arena.trace import ArenaTrace
+    from sim.trace import TraceWriter
+
+    arena = environment.manifest(ready=("READY", "READY"), ready_ports=("uart1", "uart1"))
+    path = environment.directory / "captured-scenario.yaml"
+    path.write_text(yaml.safe_dump({"schema": 1, "arena": arena.path.name, "duration": "2500us",
+        "assertions": [
+            {"member": "west", "before": "2ms", "uart_contains": {"endpoint": "uart1", "text": "world"}},
+            {"member": "east", "before": "2ms", "uart_contains": {"endpoint": "uart1", "text": "hello"}},
+            {"member": "east", "before": "1ns", "digital_equals": {"endpoint": "gpio.A0", "value": 1}},
+        ]}), encoding="utf-8")
+    original = load_scenario(path)
+    environment.uart_chunks = [[b"he", b"llo", b"READY"], [b"wo", b"rld", b"READY"]]
+    command = environment.command
+    def sampled_state(index, name, arguments=None):
+        state = command(index, name, arguments)
+        if name == "qom-get":
+            state["gpio"]["A"].update(sampled=1, odr=0, output_mask=1)
+        return state
+    monkeypatch.setattr(environment, "command", sampled_state)
+    observe, finish = LabExperiment.observe, LabExperiment.finish
+    live, current, history, finishes = {}, None, [], []
+    def checker(experiment, state, events, bound):
+        assert current is not None and state is current.snapshot and events is current.events
+        observe(experiment, state, events, bound)
+        live[experiment.manifest.name] = experiment
+    def finish_after_cleanup(experiment, stamp):
+        environment.assert_clean()
+        finishes.append((experiment.manifest.name, stamp))
+        return finish(experiment, stamp)
+    trace = environment.directory / "scenario-capture.mcap"
+    clocks = {"east": "qemu:east:run16", "west": "qemu:west:run16"}
+    with monkeypatch.context() as live_spies:
+        live_spies.setattr(LabExperiment, "observe", checker)
+        live_spies.setattr(LabExperiment, "finish", finish_after_cleanup)
+        with trace.open("xb") as output:
+            writer = TraceWriter(output)
+            capture = ArenaTrace(writer, clocks=clocks)
+            def sink(item):
+                nonlocal current
+                current = item
+                capture(item)
+                history.append(item)
+            result = scenario_runtime.run_manifest(original, qemu=environment.binary, on_observation=sink)
+            environment.assert_clean()
+            assert len(finishes) == 2 and live["east"].status == ("pass", "pass")
+            assert live["west"].status == ("pass",)
+            capture.complete(result)
+            writer.finish()
+    assert [(item.name, item.snapshot["timestamp_ns"], tuple(event.data for event in item.events))
+            for item in history[:4]] == [
+        ("east", 1000, (b"he",)), ("west", 2000, (b"wo",)),
+        ("east", 1_001_000, (b"llo",)), ("west", 1_002_000, (b"rld",))]
+    assert any(not item.events for item in history)
+    protected = path.read_bytes(), arena.path.read_bytes(), trace.read_bytes()
+    lifecycle = list(environment.events)
+    def forbidden(*args, **kwargs):
+        pytest.fail("offline Scenario capture replay acquired native resources")
+    monkeypatch.setattr(runtime, "running_qemu", forbidden)
+    monkeypatch.setattr(runtime, "create_arena_plant", forbidden)
+    monkeypatch.setattr(scenario_runtime, "run_manifest", forbidden)
+    monkeypatch.setattr(socket, "socket", forbidden)
+    report = environment.directory / "capture-replayed.json"
+    arguments = ["scenario", "replay", str(path), str(trace), "--report", str(report)]
+    for member, epoch in clocks.items():
+        arguments += ["--clock", f"{member}={epoch}"]
+    assert cli.main(arguments) == 0
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "passed" and payload["result"]["status"] == ["pass", "pass", "pass"]
+    assert payload["result"]["failures"] == []
+    assert [(item["name"], item["reset_qemu_ns"], item["end_qemu_ns"], item["observation_batches"])
+            for item in payload["result"]["completions"]] == [
+        (board.name, board.reset_qemu_ns, board.end_qemu_ns, board.observation_batches)
+        for board in result.boards]
+    assert [board.reset_qemu_ns for board in result.boards] == [1000, 2000]
+    assert all(board.ready_qemu_ns > board.reset_qemu_ns for board in result.boards)
+    assert "Scenario replay: passed" in capsys.readouterr().out
+    assert environment.events == lifecycle
+    assert (path.read_bytes(), arena.path.read_bytes(), trace.read_bytes()) == protected
+    environment.assert_clean()

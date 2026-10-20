@@ -887,6 +887,34 @@ for event in stored:
         completions.append(decode_completion(event, clocks=clocks))
 ```
 
+Scenario 也接受同一观察回调，可在执行输入动作及检查断言时录制：
+
+```python
+from sim.scenario.manifest import load_manifest as load_scenario
+from sim.scenario.runtime import run_manifest as run_scenario
+from sim.arena.trace import ArenaTrace
+from sim.trace import TraceWriter
+
+scenario = load_scenario("scenario.yaml")
+clocks = {member.name: f"qemu:{member.name}:run1:reset0"
+          for member in scenario.arena.robots}
+with open("scenario-observations.mcap", "xb") as output:
+    trace = TraceWriter(output)
+    capture = ArenaTrace(trace, clocks=clocks)
+    result = run_scenario(scenario, on_observation=capture)
+    capture.complete(result)
+    trace.finish()
+```
+
+`on_observation` 收到每个成员的原始观察对象，包括启动、空批次和未配置断言的成员。
+回调先于 Scenario 内部断言检查，因此导致断言失败的批次也会交给录制器。回调借用快照和
+UART 列表，只能读取，不能重入 runtime。回调失败会跳过该批次的断言检查，原样传播错误
+并执行既有清理；断言失败则保留已经录制的观察。两种情况均不重试，也不返回成功结果。
+调用者拥有输出和 writer；只有成功返回后才能调用 `complete()`。录制器仍可用时，失败后
+可完成仅含观察的诊断文件，但它缺少成功完成元数据，不能用于完整离线断言回放。
+同步回调须自行及时返回；
+既有期限检查包围整个回调组合，不能中断阻塞的回调，也不会在两个消费者之间另查期限。
+
 每次回调保存一条 `arena.observation/1` 事件，source 是成员名，endpoint 为
 `observation`，时间是实际读后快照的 QEMU 时间。payload 使用紧凑 ASCII JSON，
 包含完整 `snapshot` 和有序 `events`；每项保存 `endpoint`、轮询 `timestamp_ns`
@@ -912,8 +940,8 @@ epoch 的真实性。它不查询 manifest、不推断 RESET 原点，也不排�
 展示解码，尚未执行这些整段回放校验。
 
 这是 Arena 实际已打开 UART 与板级快照的观察记录；CAN、world、输入动作和 RESET_ACK
-原始帧不在其中。离线断言仍需另行保留实验配置。当前没有 Scenario/CLI
-自动记录、完整系统 trace 或硬件回放调度器。
+原始帧不在其中。离线断言仍需另行保留实验配置。命令行当前不自动记录观察，也不提供
+完整系统 trace 或硬件回放调度器。
 
 已完成的观察文件可以用原始 Scenario 配置离线重新判断 UART/数字断言：
 
