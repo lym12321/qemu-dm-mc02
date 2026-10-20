@@ -599,7 +599,8 @@ class Simulation:
     def close(self) -> None:
         if self.state == SimulationState.CLOSED:
             return
-        if self._stepping or self._phase in ("creating", "initializing") or self._closing:
+        if (self._stepping or self._closing
+                or self._phase in ("creating", "initializing", "initial sample", "initial delivery")):
             raise RuntimeError("close cannot interrupt active construction, execution or cleanup")
         self._phase = "cleanup"
         self.state = SimulationState.CLOSED

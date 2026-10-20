@@ -255,6 +255,59 @@ def test_bad_dispatcher_admission_closes_returned_owner_before_any_start():
     simulation.close()
 
 
+@pytest.mark.parametrize("operation", ["start", "reset"])
+@pytest.mark.parametrize("callback_phase", ["sample", "delivery"])
+def test_initial_sample_and_delivery_reject_close_reentry_and_preserve_cleanup(operation, callback_phase):
+    rejected = []
+    enabled = False
+    failing_session = 1 if operation == "start" else 2
+
+    class InitialEvents(Component):
+        dispatch_budget = 1
+        next_due_ns = None
+
+        def sample(self, cut):
+            self.context.emit(None, "startup.sample", cut)
+            self.next_due_ns = cut
+
+        def dispatch(self, cut, budget):
+            if self.next_due_ns is None:
+                return 0
+            self.context.emit(None, "startup.delivery", cut)
+            self.next_due_ns = None
+            return 1
+
+        def close(self):
+            super().close()
+            if self.context.session.session_id == failing_session:
+                raise ValueError("initial cleanup also failed")
+
+    events = Factory(InitialEvents, {"sample", "dispatch"})
+    probe = Factory(lambda spec, context: Component(spec, context))
+    topology = Topology((NodeSpec("probe", "probe"), NodeSpec("events", "events")))
+
+    def attempt_close(event):
+        if enabled and event.kind == f"startup.{callback_phase}":
+            try:
+                simulation.close()
+            except RuntimeError as exc:
+                rejected.append(exc)
+                raise
+
+    simulation = Simulation(topology, {"probe": probe, "events": events}, on_event=attempt_close)
+    if operation == "reset":
+        simulation.start()
+    enabled = True
+    with pytest.raises(RuntimeError, match="active construction") as caught:
+        getattr(simulation, operation)()
+    assert caught.value is rejected[0]
+    assert any("initial cleanup also failed" in note for note in caught.value.__notes__)
+    assert all(item.close_count == 1 for item in (*events.instances, *probe.instances))
+    assert simulation.state == SimulationState.FAILED
+    assert not simulation.components
+    simulation.close()
+
+
 @pytest.mark.parametrize("operation", ["step", "run_until"])
 def test_known_off_grid_pulse_cuts_intervals_and_quantum_is_a_maximum(operation):
     simulation, factory = input_scene()
