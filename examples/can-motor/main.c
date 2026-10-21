@@ -21,7 +21,11 @@ void SysTick_Handler(void)
 
 static void fail(void)
 {
+#ifdef SIM_ROTOR_LOOP_TEST
+    uart_text("ROTOR_FAIL\n");
+#else
     uart_text("MOTOR_FAIL\n");
+#endif
     for (;;) { idle(); }
 }
 
@@ -45,16 +49,46 @@ void firmware_main(void)
     uart_text("SIM_READY can-motor\n");
     MSGRAM[0] = 0x200u << 18;
     MSGRAM[1] = 8u << 16;
+#ifdef SIM_ROTOR_LOOP_TEST
+    MSGRAM[2] = 0x00000010u; /* Wire 10 00 00 00: motor1 raw4096 (5A). */
+#else
     MSGRAM[2] = 0x00004000u; /* Wire 00 40 00 00: motor1 raw64. */
+#endif
     MSGRAM[3] = 0;
     command_at = ticks_ms;
     FDCAN_TXBAR = 1u;
     for (;;) {
         while (FDCAN_RXF0S & 0x7fu) {
+#ifdef SIM_ROTOR_LOOP_TEST
+            if (ticks_ms - command_at >= 75u && phase != 2) { fail(); }
+#endif
             const uint32_t index = (FDCAN_RXF0S >> 8) & 0x3fu;
             volatile uint32_t *rx = MSGRAM + 32u + index * 4u;
             const uint32_t low = rx[2], high = rx[3];
             const uint32_t raw = ((high & 0xffu) << 8) | ((high >> 8) & 0xffu);
+#ifdef SIM_ROTOR_LOOP_TEST
+            const uint32_t encoder = ((low & 0xffu) << 8) | ((low >> 8) & 0xffu);
+            const int16_t rpm = (int16_t)(((low >> 8) & 0xff00u) | (low >> 24));
+            if (rx[0] != (0x201u << 18) ||
+                (rx[1] & 0x003f0000u) != (8u << 16) ||
+                encoder > 8191u || rpm < 0 || (high >> 16) != 25u ||
+                (raw != 0 && raw != 4096)) { fail(); }
+            FDCAN_RXF0A = index;
+            if (!phase && raw == 4096 && rpm >= 2 && encoder > 0) {
+                /* The actual feedback read above causes the only zero command.
+                 * Submit it before the UART log, whose bytes take guest time. */
+                MSGRAM[0] = 0x200u << 18;
+                MSGRAM[1] = 8u << 16;
+                MSGRAM[2] = 0;
+                MSGRAM[3] = 0;
+                FDCAN_TXBAR = 1u;
+                phase = 1;
+                uart_text("ROTOR_MOVING rpm>=2\n");
+            } else if (phase == 1 && raw == 0 && rpm > 0 && encoder > 0) {
+                phase = 2;
+                uart_text("ROTOR_COAST current=0 motion=1\nROTOR_PASS\n");
+            }
+#else
             if (rx[0] != (0x201u << 18) ||
                 (rx[1] & 0x003f0000u) != (8u << 16) ||
                 low != 0 || (high >> 16) != 25u ||
@@ -68,8 +102,13 @@ void firmware_main(void)
                 phase = 2;
                 uart_text("MOTOR_TIMEOUT current=0\nMOTOR_PASS\n");
             }
+#endif
         }
+#ifdef SIM_ROTOR_LOOP_TEST
+        if (ticks_ms - command_at >= 75u && phase != 2) { fail(); }
+#else
         if (ticks_ms > 175u && phase != 2) { fail(); }
+#endif
         idle();
     }
 }

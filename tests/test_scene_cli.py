@@ -76,6 +76,25 @@ def test_unique_yaml_loader_still_rejects_alias_and_duplicate(tmp_path):
             load_scene(path, builtin_registry())
 
 
+@pytest.mark.parametrize("plant", ["fixed-rotor", "rigid-rotor"])
+def test_rotor_plants_validate_without_physics_imports_or_resource_creation(tmp_path, monkeypatch, plant):
+    path, document = write_scene(tmp_path, motor=True)
+    document["nodes"]["motor0"]["plant"] = plant
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    original_import = builtins.__import__
+
+    def refuse_physics(name, *args, **kwargs):
+        if name == "sim.physics" or name.startswith("sim.physics."):
+            pytest.fail("pure factory admission imported physics")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", refuse_physics)
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("configuration had effects"))
+    assert load_scene(path, registry).topology.nodes[-1].options["plant"] == plant
+
+
 def test_core_static_import_direction():
     forbidden = ("sim.machines", "sim.devices", "sim.lab", "sim.robots", "sim.arena",
                  "sim.scenario", "sim.physics", "tools", "qemu", "mujoco", "gazebo")
@@ -130,7 +149,7 @@ def test_missing_native_backend_is_blocked_and_preserves_report(tmp_path):
 
 
 def test_fixed_rotor_reuses_actual_protocol_and_timeout():
-    from sim.devices.dji.fixed import FixedRotorFactory
+    from sim.devices.dji.factory import M3508Factory
 
     class Sender:
         def __init__(self, spec, context):
@@ -152,7 +171,7 @@ def test_fixed_rotor_reuses_actual_protocol_and_timeout():
         def create(self, spec, context):
             return Sender(spec, context)
 
-    registry = {"bus.can": CanBusFactory(), "fixed": FixedRotorFactory(), "sender": SenderFactory()}
+    registry = {"bus.can": CanBusFactory(), "fixed": M3508Factory(), "sender": SenderFactory()}
     topology = Topology((NodeSpec("bus", "bus.can"), NodeSpec("motor", "fixed", {
         "motor_id": 1, "plant": "fixed-rotor", "position_rad": 0,
         "velocity_rad_s": 0}), NodeSpec("host", "sender")),

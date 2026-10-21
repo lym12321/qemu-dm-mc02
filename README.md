@@ -47,6 +47,10 @@ sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
 bash tools/run-simulation-smoke.sh --case all
 ```
 
+可选的[转子反馈闭环](docs/USAGE.md#rotor-loop)复用同一示例和现有刚体转子：
+`bash tools/run-simulation-smoke.sh --case rotor-loop` 验证实际反馈触发后续零电流命令与滑行。
+该动力学模型的参数未标定。
+
 [使用手册](docs/USAGE.md#simulation)包含完整 YAML、Python API、交互命令与时间限制。
 Lab、Robot、Arena、Scenario 和原有物理组合尚未迁移，保留在
 `tools/sim-unmigrated` 以运行既有功能和回归；新 `sim` 入口只运行 `sim/v1`。

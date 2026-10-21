@@ -8,6 +8,7 @@
 *.py[cod]
 *.egg-info/
 **/build/
+/examples/can-motor/build-rotor-loop/
 
 # qemu/upstream is a tracked submodule pinned alongside qemu.lock.
 

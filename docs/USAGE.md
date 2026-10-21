@@ -39,6 +39,37 @@ bash tools/run-simulation-smoke.sh --case dual-board
 python -m pytest -q tests/test_topology.py tests/test_simulation.py tests/test_qemu_machine.py tests/test_scene_cli.py
 ```
 
+
+<a id="rotor-loop"></a>
+### 单电机转子反馈闭环
+
+`device.dji-m3508` 的 `plant` 可显式选择 `fixed-rotor` 或 `rigid-rotor`；
+两者使用相同 C620 协议与 CAN Fabric。前者保持配置的位置、速度，后者复用既有刚体转子。
+`position_rad`、`velocity_rad_s` 是必填的初始转子状态；两种选择都支持相同的超时、反馈周期和温度配置。
+刚体参数固定为惯量 0.02 kg·m²、阻尼 0.08 N·m·s/rad、转矩系数 0.02 N·m/A，均未经过实物标定。
+
+现有 can-motor 的默认关闭变体通过真实 FDCAN 读取运动反馈后，才发送零电流命令：
+
+```bash
+cmake -S examples/can-motor -B examples/can-motor/build-rotor-loop -DCMAKE_BUILD_TYPE=Debug -DSIM_ROTOR_LOOP_TEST=ON
+cmake --build examples/can-motor/build-rotor-loop
+sim validate examples/can-motor/rotor-loop.yaml
+sim run examples/can-motor/rotor-loop.yaml
+bash tools/run-simulation-smoke.sh --case rotor-loop
+# 同一验收器重新构建并验证 Release：
+bash tools/run-simulation-smoke.sh --case rotor-loop --build-type Release
+```
+
+场景采用 1ms quantum、80ms 时长。guest 先发送 raw4096（理想 5A），实际读取电流4096、
+RPM≥2、编码器非零后立即发送一次零电流，再记录 `ROTOR_MOVING`。随后读取零电流且仍运动的反馈，
+才记录 `ROTOR_COAST`、`ROTOR_PASS`；75ms 内未完成则失败。原固定转子示例继续验证100ms超时。
+
+验收器分别检查 CAN 来源与交付、对应 native receipt、guest 后续命令和有序 UART，
+并按实际命令交付切点，用独立闭式解校验完成的转子位置、速度。receipt 证明传输处理，
+UART 时间是观察上界；guest 消费证据还依赖实际读取分支和随后输出。区间末命令只影响下一区间积分。
+当前模型采用半隐式 Euler 近似，反馈按完成的 step 合并；电流是命令值，未模拟电气动态或齿轮损耗。
+`--case all` 包含此门，结果只在资源清理和输入哈希核对后发布，不代表实物精度或全局 CPU/plant 锁步。
+
 场景只有 `schema: sim/v1` 一套格式。单板可省略总线、电机并使用 `links: []`：
 
 ```yaml

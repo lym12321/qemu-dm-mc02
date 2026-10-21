@@ -1,6 +1,7 @@
 """Example manifest, real build and direct acceptance-verifier coverage."""
 
 import importlib.util
+import math
 from pathlib import Path
 import shutil
 from types import SimpleNamespace
@@ -13,7 +14,7 @@ smoke = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smoke)
 
 
-@pytest.mark.parametrize("case", (*smoke.CASES, "pulse"))
+@pytest.mark.parametrize("case", (*smoke.CASES, "pulse", "rotor-loop"))
 def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(tmp_path, case):
     if any(shutil.which(program) is None for program in ("cmake", "arm-none-eabi-gcc")):
         pytest.skip("optional ARM cross compiler/CMake are unavailable")
@@ -29,12 +30,14 @@ def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(
 
     scene_file = tmp_path / "scene.yaml"
     example = smoke.EXAMPLE_ALIASES.get(case, case)
-    scene_file.write_text((ROOT / "examples" / example / "scene.yaml").read_text().replace(
-        "./build/firmware.elf", result["elf"]))
+    scene_name = "rotor-loop.yaml" if case == "rotor-loop" else "scene.yaml"
+    scene_file.write_text((ROOT / "examples" / example / scene_name).read_text().replace(
+        "./build-rotor-loop/firmware.elf" if case == "rotor-loop" else "./build/firmware.elf",
+        result["elf"]))
     scene = load_scene(scene_file, builtin_registry(backend_root=ROOT))
     assert scene.mode == "stepped" and scene.quantum_ns == 1_000_000
-    assert scene.duration_ns == 200_000_000
-    assert len(scene.topology.nodes) == (3 if case == "can-motor" else 1)
+    assert scene.duration_ns == (80_000_000 if case == "rotor-loop" else 200_000_000)
+    assert len(scene.topology.nodes) == (3 if case in ("can-motor", "rotor-loop") else 1)
 
 
 def test_missing_build_dependency_is_explicitly_blocked(monkeypatch):
@@ -215,6 +218,134 @@ def test_motor_uart_pass_alone_cannot_replace_actual_can_and_native_receipts():
     observations.snapshots = [{"mapped_time_ns": 200_000_000}]
     with pytest.raises(AssertionError, match="actual guest current command"):
         observations.verify("can-motor")
+
+
+def _rotor_observations():
+    """Closed-form independent fixture; no production integrator is called."""
+    result = smoke.Observations()
+    result.uart.extend(b"SIM_READY can-motor\nROTOR_MOVING rpm>=2\n"
+                       b"ROTOR_COAST current=0 motion=1\nROTOR_PASS\n")
+    result.snapshots = [{"mapped_time_ns": 80_000_000}]
+    result.rotor_state = {"time_ns": 80_000_000}
+    result.can = []
+    result.deliveries = []
+    for index, (data, source, cut) in enumerate((
+            ("1000000000000000", 1_650_878, 2_000_000),
+            ("0000000000000000", 37_100_000, 38_000_000))):
+        stamp = {"event_sequence": 10 + index * 400, "source_time_ns": source,
+                 "mapped_time_ns": source, "delivery_time_ns": cut, "quality": "exact"}
+        result.can.append({**stamp, "source": "main", "endpoint": "fdcan1",
+            "kind": "can-tx", "can_id": 0x200, "flags": 0, "dlc": 8,
+            "data": data, "wire_timestamp_ns": source})
+        result.deliveries.append({**stamp, "event_sequence": stamp["event_sequence"] + 2,
+            "source": "main", "endpoint": "fdcan1", "destination": "motor0.can",
+            "can_id": 0x200, "data": data, "dropped": False})
+    # A driven feedback frame causes the later actual zero-current command.
+    # The next interval reflects that command while the rotor keeps moving.
+    for sequence, cut, data in ((400, 36_000_000, "0004000210001900"),
+                               (420, 38_000_000, "0004000210001900"),
+                               (430, 39_000_000, "0004000200001900")):
+        result.can.append({"event_sequence": sequence, "source": "motor0",
+            "endpoint": "can", "kind": "can.sent", "can_id": 0x201,
+            "flags": 0, "dlc": 8, "data": data, "source_time_ns": cut,
+            "mapped_time_ns": cut, "delivery_time_ns": cut, "quality": "exact",
+            "wire_timestamp_ns": cut})
+        result.deliveries.append({"event_sequence": sequence + 1,
+            "source": "motor0", "endpoint": "can", "destination": "main.fdcan1",
+            "can_id": 0x201, "data": data, "dropped": False,
+            "source_time_ns": cut, "mapped_time_ns": cut,
+            "delivery_time_ns": cut, "quality": "exact"})
+    result.receipts = [{"event_sequence": sequence, "source": "main", "endpoint": "fdcan1",
+        "mapped_time_ns": cut, "payload": {
+            "completed_frames": cut // 1_000_000, "rx_dropped": 0, "partial_bytes": 0}}
+        for sequence, cut in ((402, 36_000_000), (422, 38_000_000), (432, 39_000_000))]
+    result.uart_batches = [{"source": "main", "event_sequence": 450,
+        "mapped_time_ns": 45_000_000, "quality": "upper_bound",
+        "data_hex": bytes(result.uart).hex()}]
+    # Compute only the fixture's final constants from its analytic expression.
+    r, v, n, m = 0.996, 1.25, 36, 42
+    driven = v * (1 - r ** n)
+    result.rotor_state["position_rad"] = (
+        .001 * v * (n - r * (1 - r ** n) / (1 - r))
+        + .001 * driven * r * (1 - r ** m) / (1 - r))
+    result.rotor_state["velocity_rad_s"] = driven * r ** m
+    return result
+
+
+def test_rotor_loop_requires_feedback_guest_command_coast_and_closed_form_state():
+    observations = _rotor_observations()
+    report = observations.verify("rotor-loop")
+    assert report["rotor_consumption"]["command_delivery_ns"] == [2_000_000, 38_000_000]
+    assert math.isfinite(report["rotor_state"]["position_rad"])
+    observations.rotor_state["velocity_rad_s"] = 0
+    with pytest.raises(AssertionError, match="closed-form rotor"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_uart_pass_without_two_actual_guest_commands():
+    observations = _rotor_observations()
+    observations.can = [item for item in observations.can
+                        if item["source"] != "main" or item["data"] != "0000000000000000"]
+    with pytest.raises(AssertionError, match="drive and zero commands"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_timeout_as_zero_command_explanation():
+    observations = _rotor_observations()
+    observations.deliveries[1]["delivery_time_ns"] = 102_000_000
+    with pytest.raises(AssertionError, match="before command expiry"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_retroactive_current_or_missing_guest_consumption():
+    observations = _rotor_observations()
+    observations.can[-2]["data"] = "0004000200001900"
+    with pytest.raises(AssertionError, match="next plant interval"):
+        observations.verify("rotor-loop")
+    observations = _rotor_observations()
+    observations.receipts.clear()
+    with pytest.raises(AssertionError, match="native CAN input completion"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_preserves_can_source_time_and_later_firmware_feedback_response():
+    observations = _rotor_observations()
+    observations.can[0]["source_time_ns"] = None
+    with pytest.raises(AssertionError, match="CAN source timestamp"):
+        observations.verify("rotor-loop")
+    observations = _rotor_observations()
+    observations.can[1]["source_time_ns"] = 35_000_000
+    observations.can[1]["mapped_time_ns"] = 35_000_000
+    observations.can[1]["wire_timestamp_ns"] = 35_000_000
+    observations.deliveries[1]["source_time_ns"] = 35_000_000
+    with pytest.raises(AssertionError, match="later actual guest zero"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_sent_feedback_without_actual_guest_delivery():
+    observations = _rotor_observations()
+    observations.deliveries = [row for row in observations.deliveries
+                               if row["source"] != "motor0"]
+    with pytest.raises(AssertionError, match="feedback delivery to guest"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_unrelated_receipt_and_early_coast_uart():
+    observations = _rotor_observations()
+    observations.receipts[0]["mapped_time_ns"] = 37_000_000
+    with pytest.raises(AssertionError, match="matching native CAN input completion"):
+        observations.verify("rotor-loop")
+    observations = _rotor_observations()
+    observations.uart_batches[0]["mapped_time_ns"] = 38_000_000
+    with pytest.raises(AssertionError, match="later UART observation"):
+        observations.verify("rotor-loop")
+
+
+def test_rotor_loop_rejects_stale_native_completion_counter():
+    observations = _rotor_observations()
+    observations.receipts[-1]["payload"]["completed_frames"] = 36
+    with pytest.raises(AssertionError, match="counter did not advance"):
+        observations.verify("rotor-loop")
 
 
 def test_dual_guest_acceptance_requires_each_real_source_and_later_peer_delivery():

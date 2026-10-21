@@ -173,10 +173,10 @@ def test_pure_topology_admission_hook_runs_once_per_factory_object_across_kind_a
     assert first.created == second.created == 0
 
 
-def test_fixed_rotor_duplicate_address_rejected_before_io_across_factory_aliases():
-    from sim.devices.dji.fixed import FixedRotorFactory
+def test_m3508_duplicate_address_rejected_before_io_across_plants_and_factory_aliases():
+    from sim.devices.dji.factory import M3508Factory
 
-    class Watched(FixedRotorFactory):
+    class Watched(M3508Factory):
         def __init__(self):
             self.created = 0
         def create(self, spec, context):
@@ -186,15 +186,18 @@ def test_fixed_rotor_duplicate_address_rejected_before_io_across_factory_aliases
     first, second = Watched(), Watched()
     registry = {"bus": CanBusFactory(), "one": first, "alias": first, "two": second}
     for kind in ("alias", "two"):
-        topology = Topology((NodeSpec("bus", "bus"), NodeSpec("a", "one", options), NodeSpec("b", kind, options)),
-                            (LinkSpec("a.can", "bus.can"), LinkSpec("b.can", "bus.can")))
-        with pytest.raises(ValueError, match="duplicate M3508 motor_id 1 on bus bus"):
-            Simulation(topology, registry)
+        for plant in ("fixed-rotor", "rigid-rotor"):
+            topology = Topology((NodeSpec("bus", "bus"), NodeSpec("a", "one", options),
+                                 NodeSpec("b", kind, {**options, "plant": plant})),
+                                (LinkSpec("a.can", "bus.can"), LinkSpec("b.can", "bus.can")))
+            with pytest.raises(ValueError, match="duplicate M3508 motor_id 1 on bus bus"):
+                Simulation(topology, registry)
     assert first.created == second.created == 0
     topology = Topology((NodeSpec("bus_a", "bus"), NodeSpec("bus_b", "bus"),
-                         NodeSpec("a", "one", options), NodeSpec("b", "two", options)),
+                         NodeSpec("a", "one", options),
+                         NodeSpec("b", "two", {**options, "plant": "rigid-rotor"})),
                         (LinkSpec("a.can", "bus_a.can"), LinkSpec("b.can", "bus_b.can")))
     with Simulation(topology, registry) as simulation:
         simulation.step()
-        assert simulation.components["a"].device.motor_id == simulation.components["b"].device.motor_id == 1
+        assert simulation.components["a"].device.motor_id == simulation.components["b"].motor_id == 1
     assert first.created == second.created == 1

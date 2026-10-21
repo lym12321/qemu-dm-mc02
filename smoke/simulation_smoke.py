@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from datetime import datetime, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -19,8 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 CASES = ("minimal-board", "can-motor")
 EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor",
-                   "digital-link": "minimal-board"}
-NATIVE_CASES = (*CASES, "pulse", "digital-link")
+                   "digital-link": "minimal-board", "rotor-loop": "can-motor"}
+NATIVE_CASES = (*CASES, "pulse", "digital-link", "rotor-loop")
 
 
 class Blocked(RuntimeError):
@@ -50,6 +51,8 @@ class Observations:
         self.uart_batches = []
         self.digital = []
         self.digital_consumption = []
+        self.rotor_state = None
+        self.rotor_consumption = None
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -114,6 +117,9 @@ class Observations:
             raise AssertionError(f"actual guest UART ready is missing: {uart!r}")
         if not self.snapshots:
             raise AssertionError("no actual native board snapshot was observed")
+        if case == "rotor-loop":
+            self._verify_rotor(ready)
+            return self.report()
         if case in ("minimal-board", "hal-gpio", "pulse", "digital-link"):
             if case in ("minimal-board", "pulse", "digital-link"):
                 required = (b"KEY released B0=0\n", b"KEY pressed B0=1\n",
@@ -196,6 +202,144 @@ class Observations:
                             or receipts[-1]["payload"]["partial_bytes"] != 0):
                         raise AssertionError("peer command filter rejection and complete feedback receipts disagree")
         return self.report()
+
+    def _verify_rotor(self, ready):
+        uart = bytes(self.uart)
+        cursor = uart.index(ready) + len(ready)
+        for marker in (b"ROTOR_MOVING rpm>=2\n",
+                       b"ROTOR_COAST current=0 motion=1\nROTOR_PASS\n"):
+            found = uart.find(marker, cursor)
+            if found < 0:
+                raise AssertionError("ordered guest rotor motion/coast/PASS evidence missing")
+            cursor = found + len(marker)
+
+        commands = [row for row in self.can if row["source"] == "main"
+                    and row["endpoint"] == "fdcan1" and row["can_id"] == 0x200]
+        if ([row["data"] for row in commands] != ["1000000000000000", "0000000000000000"]
+                or any(row["flags"] or row["dlc"] != 8 for row in commands)):
+            raise AssertionError("expected actual guest drive and zero commands")
+        for row in commands:
+            if (row["source_time_ns"] is None
+                    or row["source_time_ns"] != row["wire_timestamp_ns"]
+                    or row["mapped_time_ns"] != row["source_time_ns"]
+                    or row["quality"] != "exact"):
+                raise AssertionError("guest CAN source timestamp was discarded or changed")
+        deliveries = [row for row in self.deliveries if row["source"] == "main"
+                      and row["destination"] == "motor0.can" and row["can_id"] == 0x200]
+        if ([row["data"] for row in deliveries] != [row["data"] for row in commands]
+                or any(row["dropped"] for row in deliveries)):
+            raise AssertionError("actual drive and zero commands were not delivered once")
+        drive_ns, zero_ns = [row["delivery_time_ns"] for row in deliveries]
+        if not drive_ns < zero_ns < drive_ns + 100_000_000:
+            raise AssertionError("actual zero command must arrive before command expiry")
+        for command, delivery in zip(commands, deliveries):
+            if (delivery["source_time_ns"] != command["source_time_ns"]
+                    or delivery["delivery_time_ns"] != command["delivery_time_ns"]
+                    or delivery["event_sequence"] <= command["event_sequence"]
+                    or command["source_time_ns"] > delivery["delivery_time_ns"]):
+                raise AssertionError("guest command source and completed delivery cut disagree")
+
+        feedback = []
+        for row in self.can:
+            if row["source"] != "motor0" or row["endpoint"] != "can" or row["can_id"] != 0x201:
+                continue
+            raw = bytes.fromhex(row["data"])
+            if (row["flags"] or row["dlc"] != 8 or len(raw) != 8 or raw[6:] != b"\x19\0"
+                    or row["source_time_ns"] != row["mapped_time_ns"]
+                    or row["wire_timestamp_ns"] != row["mapped_time_ns"]):
+                raise AssertionError("unexpected rotor feedback fields or source time")
+            encoder = int.from_bytes(raw[:2], "big")
+            rpm = int.from_bytes(raw[2:4], "big", signed=True)
+            current = int.from_bytes(raw[4:6], "big", signed=True)
+            cut = row["mapped_time_ns"]
+            # Feedback is completed before that cut's commands are delivered.
+            expected_current = 4096 if drive_ns < cut <= zero_ns else 0
+            if current != expected_current:
+                raise AssertionError("command must affect only the next plant interval")
+            if not 0 <= encoder < 8192 or rpm < 0:
+                raise AssertionError("invalid positive rotor feedback observation")
+            feedback.append((row, encoder, rpm, current))
+
+        def delivered(row):
+            matches = [item for item in self.deliveries
+                       if item["source"] == "motor0" and item["endpoint"] == "can"
+                       and item["destination"] == "main.fdcan1" and item["can_id"] == 0x201
+                       and item["data"] == row["data"] and not item["dropped"]
+                       and item["source_time_ns"] == row["source_time_ns"]
+                       and item["delivery_time_ns"] == row["mapped_time_ns"]
+                       and item["event_sequence"] > row["event_sequence"]]
+            if len(matches) != 1:
+                raise AssertionError("actual rotor feedback delivery to guest is missing")
+            delivery = matches[0]
+            receipts = [item for item in self.receipts
+                        if item["source"] == "main" and item["endpoint"] == "fdcan1"
+                        and item["mapped_time_ns"] == delivery["delivery_time_ns"]
+                        and item["event_sequence"] > delivery["event_sequence"]
+                        and item["payload"]["completed_frames"] > 0
+                        and item["payload"]["rx_dropped"] == 0
+                        and item["payload"]["partial_bytes"] == 0]
+            if len(receipts) != 1:
+                raise AssertionError("matching native CAN input completion receipt is missing")
+            return delivery, receipts[0]
+
+        moving = [row for row, encoder, rpm, current in feedback
+                  if encoder > 0 and rpm >= 2 and current == 4096
+                  and row["mapped_time_ns"] < commands[1]["source_time_ns"]]
+        if not moving:
+            raise AssertionError("moving feedback lacks a later actual guest zero command")
+        motion_delivery, motion_receipt = delivered(moving[0])
+        if motion_receipt["event_sequence"] >= commands[1]["event_sequence"]:
+            raise AssertionError("moving feedback lacks a later actual guest zero command")
+        coast = [row for row, encoder, rpm, current in feedback
+                 if encoder > 0 and rpm > 0 and current == 0 and row["mapped_time_ns"] > zero_ns]
+        if not coast:
+            raise AssertionError("actual zero-current moving feedback is missing")
+        coast_delivery, coast_receipt = delivered(coast[0])
+        if coast_receipt["payload"]["completed_frames"] <= motion_receipt["payload"]["completed_frames"]:
+            raise AssertionError("native CAN input completion counter did not advance for coast")
+        observed = 0
+        coast_bound = None
+        for batch in self.uart_batches:
+            if batch["source"] != "main":
+                continue
+            observed += len(bytes.fromhex(batch["data_hex"]))
+            if observed >= cursor:
+                coast_bound = batch
+                break
+        if (coast_bound is None or coast_bound["quality"] != "upper_bound"
+                or coast_bound["mapped_time_ns"] <= coast_delivery["delivery_time_ns"]
+                or coast_bound["event_sequence"] <= coast_receipt["event_sequence"]):
+            raise AssertionError("guest coast/PASS lacks a later UART observation upper bound")
+
+        state = self.rotor_state
+        if state is None or state["time_ns"] != 80_000_000:
+            raise AssertionError("completed public rotor state at 80ms is missing")
+        end_ns = state["time_ns"]
+        if not 0 < drive_ns < zero_ns < end_ns or any(
+                value % 1_000_000 for value in (drive_ns, zero_ns, end_ns)):
+            raise AssertionError("rotor fixture requires complete 1ms integration intervals")
+        # Independent closed form of the declared 1ms half-implicit Euler
+        # approximation (J=.02, damping=.08, kt=.02, C620 raw4096=5A).
+        # The start of torque is the delivery cut, never the source timestamp.
+        n, m = (zero_ns - drive_ns) // 1_000_000, (end_ns - zero_ns) // 1_000_000
+        r, v_inf = .996, 1.25
+        velocity = v_inf * (1 - r ** n)
+        expected_position = (.001 * v_inf * (n - r * (1 - r ** n) / (1 - r))
+                             + .001 * velocity * r * (1 - r ** m) / (1 - r))
+        expected_velocity = velocity * r ** m
+        if (not math.isclose(state["position_rad"], expected_position, rel_tol=0, abs_tol=1e-12)
+                or not math.isclose(state["velocity_rad_s"], expected_velocity, rel_tol=0, abs_tol=1e-12)):
+            raise AssertionError("completed state disagrees with independent closed-form rotor")
+        self.rotor_consumption = {
+            "command_source_ns": [row["source_time_ns"] for row in commands],
+            "command_delivery_ns": [drive_ns, zero_ns],
+            "moving_feedback_delivery_ns": motion_delivery["delivery_time_ns"],
+            "moving_receipt_sequence": motion_receipt["event_sequence"],
+            "coast_feedback_delivery_ns": coast_delivery["delivery_time_ns"],
+            "coast_receipt_sequence": coast_receipt["event_sequence"],
+            "coast_uart_upper_bound_ns": coast_bound["mapped_time_ns"],
+            "driven_intervals": n, "coast_intervals": m,
+            "expected_position_rad": expected_position, "expected_velocity_rad_s": expected_velocity}
 
     def _verify_digital(self, ready):
         peer_uart = bytes(self.peer_uart)
@@ -292,19 +436,23 @@ class Observations:
                 "snapshots": self.snapshots, "can": self.can,
                 "deliveries": self.deliveries, "receipts": self.receipts,
                 "inputs": self.inputs, "uart_batches": self.uart_batches,
-                "digital": self.digital, "digital_consumption": self.digital_consumption}
+                "digital": self.digital, "digital_consumption": self.digital_consumption,
+                "rotor_state": self.rotor_state, "rotor_consumption": self.rotor_consumption}
 
 
-def build_example(case, *, build_dir=None):
+def build_example(case, *, build_dir=None, build_type="Debug"):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
     source = ROOT / "examples" / EXAMPLE_ALIASES.get(case, case)
-    default_build = ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse" else source / "build"
+    default_build = (ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse"
+                     else source / "build-rotor-loop" if case == "rotor-loop" else source / "build")
     build = default_build if build_dir is None else Path(build_dir)
     variant = (["-DSIM_KEY_PULSE_TEST=ON"] if case == "pulse" else
                ["-DSIM_KEY_PULSE_TEST=OFF"] if source.name == "minimal-board" else [])
-    commands = (["cmake", "-S", str(source), "-B", str(build), "-DCMAKE_BUILD_TYPE=Debug", *variant],
+    if source.name == "can-motor":
+        variant.append("-DSIM_ROTOR_LOOP_TEST=" + ("ON" if case == "rotor-loop" else "OFF"))
+    commands = (["cmake", "-S", str(source), "-B", str(build), f"-DCMAKE_BUILD_TYPE={build_type}", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
     for command in commands:
@@ -314,7 +462,8 @@ def build_example(case, *, build_dir=None):
         if result.returncode:
             raise RuntimeError(f"example build failed: {logs[-1]}")
     elf = build / "firmware.elf"
-    return {"elf": str(elf), "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(), "build": logs}
+    return {"elf": str(elf), "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(),
+            "build_type": build_type, "build": logs}
 
 
 def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
@@ -334,7 +483,7 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
     else:
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
-                           "scene.yaml", registry)
+                           ("rotor-loop.yaml" if case == "rotor-loop" else "scene.yaml"), registry)
         if case == "pulse":
             from sim.api import NodeSpec, Topology
             from sim.config.scene import Scene
@@ -382,6 +531,10 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
             # its requested 10ms endpoint. Continue for the serialized UART.
             simulation.step(10_000_000)
         simulation.run_until(scene.duration_ns)
+        if case == "rotor-loop":
+            position, velocity = simulation.components["motor0"].get_rotor_state()
+            observations.rotor_state = {"time_ns": simulation.t_sim_ns,
+                "position_rad": position, "velocity_rad_s": velocity}
     except BaseException as error:
         if isinstance(error, BackendUnavailable):
             unavailable = error
@@ -429,6 +582,7 @@ def _interrupted(signum, _frame):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "all"), default="all")
+    parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",
                         help="existing HAL GPIO lesson ELF, used only by --case hal-gpio")
@@ -456,7 +610,7 @@ def main(argv=None):
                 payload["cases"][case] = {"elf": str(elf),
                     "sha256": hashlib.sha256(elf.read_bytes()).hexdigest()}
             else:
-                payload["cases"][case] = build_example(case)
+                payload["cases"][case] = build_example(case, build_type=args.build_type)
             payload["cases"][case]["observations"] = run_case(
                 case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
             binary = Path(payload["cases"][case]["elf"])

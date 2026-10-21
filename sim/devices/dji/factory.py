@@ -1,4 +1,4 @@
-"""Explicit fixed rotor observations over the existing C620 protocol owner."""
+"""Explicit fixed observations or the existing uncalibrated rigid rotor."""
 
 import math
 
@@ -11,14 +11,18 @@ def _configuration(spec):
     fields(options, {"motor_id", "plant", "position_rad", "velocity_rad_s",
                      "command_timeout", "feedback_period", "temperature_c"},
            {"motor_id", "plant", "position_rad", "velocity_rad_s"}, spec.name)
-    if options["plant"] != "fixed-rotor":
-        raise ValueError(f"{spec.name}: this factory requires explicit plant: fixed-rotor")
+    if options["plant"] not in ("fixed-rotor", "rigid-rotor"):
+        raise ValueError(f"{spec.name}: plant must be fixed-rotor or rigid-rotor")
     motor_id = options["motor_id"]
     if type(motor_id) is not int or not 1 <= motor_id <= 8:
         raise ValueError("motor_id must be an integer in 1..8")
     for field in ("position_rad", "velocity_rad_s"):
         value = options[field]
-        if type(value) not in (float, int) or not math.isfinite(value):
+        try:
+            finite = type(value) in (float, int) and math.isfinite(value)
+        except OverflowError:
+            finite = False
+        if not finite:
             raise ValueError(f"{field} must be finite")
     temperature = options.get("temperature_c", 25)
     if type(temperature) is not int or not 0 <= temperature <= 255:
@@ -41,7 +45,7 @@ class _BorrowedPort:
 
     def attach(self, endpoint, name=None):
         if self.endpoint is not None:
-            raise ValueError("fixed rotor already has an endpoint")
+            raise ValueError("M3508 already has an endpoint")
         self.endpoint = endpoint
         self.connection = self.context.attach("can", endpoint)
 
@@ -72,13 +76,21 @@ class FixedRotor:
         self.device.close()
 
 
-class FixedRotorFactory:
+class M3508Factory:
     def describe(self, spec):
         _configuration(spec)
         return NodeDescription((PortSpec("can", "can", min_connections=1),), frozenset({"step"}))
 
     def create(self, spec, context):
-        return FixedRotor(spec, context)
+        options = _configuration(spec)
+        if spec.options["plant"] == "fixed-rotor":
+            return FixedRotor(spec, context)
+        from sim.physics import Rotor
+        from .m3508 import M3508
+
+        rotor = Rotor(initial_position=options.pop("position_rad"),
+                      initial_velocity=options.pop("velocity_rad_s"))
+        return M3508(_BorrowedPort(context), rotor=rotor, name=spec.name, **options)
 
     def validate_topology(self, topology, descriptions, registry):
         """C620 motor addresses must be unique on each connected bus."""
@@ -90,9 +102,9 @@ class FixedRotorFactory:
             peers[link.target] = link.source
         identities = {}
         for node in topology.nodes:
-            # Inspect every registered fixed-rotor factory, including aliases
+            # Inspect every registered M3508 factory, including aliases
             # and separate instances; registry key spelling is not identity.
-            if not isinstance(registry[node.kind], FixedRotorFactory):
+            if not isinstance(registry[node.kind], M3508Factory):
                 continue
             peer = peers.get(Endpoint(node.name, "can"))
             if peer is None or "connection" not in descriptions[peer.node].capabilities:

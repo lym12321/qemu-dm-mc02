@@ -17,7 +17,7 @@ from .device import M3508Device
 
 
 class M3508(M3508Device):
-    """Compatibility participant: the shared protocol over one simple rotor."""
+    """The shared protocol over one simple rotor, also used by M3508Factory."""
 
     def __init__(self, bus: CanBus, motor_id: int = 1, *, rotor: Rotor | None = None,
                  torque_per_amp: float = 0.02,
