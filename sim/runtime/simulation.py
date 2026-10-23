@@ -36,6 +36,14 @@ class _Input:
     payload: Any
 
 
+def _owner_capability(category: str) -> str:
+    return "binding_owner" if category == "binding" else "connection"
+
+
+def _construction_rank(capabilities: frozenset[str]) -> int:
+    return 0 if "connection" in capabilities else 1 if "binding_owner" in capabilities else 2
+
+
 class ComponentContext:
     """Factory access to admitted wiring, observations and a shared deadline.
 
@@ -100,19 +108,21 @@ class ComponentContext:
         return self._simulation._components[node_id]
 
     def attach(self, port: str, endpoint: Any) -> Any:
-        """Borrow the typed handle supplied by this port's connection owner."""
+        """Borrow the typed handle supplied by this port category's owner."""
         self._check_active()
         sim = self._simulation
         if sim._phase != "creating":
             raise RuntimeError("ports must attach during component construction")
         if port in self._connections:
             raise ValueError(f"port is already attached: {self.node_id}.{port}")
+        descriptor = sim._descriptions[self.node_id].port(port)
+        capability = _owner_capability(descriptor.category)
+        owner_name = "binding owner" if capability == "binding_owner" else "connection owner"
         peers = self.peers(port)
-        if len(peers) != 1 or "connection" not in sim._descriptions[peers[0].node].capabilities:
-            raise ValueError(f"{self.node_id}.{port} requires exactly one connection owner")
+        if len(peers) != 1 or capability not in sim._descriptions[peers[0].node].capabilities:
+            raise ValueError(f"{self.node_id}.{port} requires exactly one {owner_name}")
         peer = peers[0]
         owner = sim._components[peer.node]
-        descriptor = sim._descriptions[self.node_id].port(port)
         connection = owner.attach_port(endpoint, descriptor=descriptor,
                                        endpoint_name=f"{self.node_id}.{port}",
                                        owner_port=peer.port, context=self)
@@ -136,8 +146,9 @@ class ComponentContext:
 class Simulation:
     """Own all topology instances and one integer-nanosecond logical clock.
 
-    ``describe`` is pure. ``create`` constructs connection owners first, then other nodes in
-    manifest order. After all wiring, optional reset(Session) and start() hooks
+    ``describe`` is pure. ``create`` constructs connection owners, then binding
+    owners, then other nodes, preserving manifest order within each group.
+    After all wiring, optional reset(Session) and start() hooks
     run. Machine capability requires request_step/finish_step; step capability
     requires step. Both return exact-target StepResult values. Every instance
     requires close(). No implicit retries or cross-component rollback occur.
@@ -217,13 +228,19 @@ class Simulation:
         for link in self.topology.links:
             first = self._descriptions[link.source.node]
             second = self._descriptions[link.target.node]
-            first_owner = "connection" in first.capabilities
-            if first_owner == ("connection" in second.capabilities):
-                raise ValueError("each link requires exactly one connection owner")
+            capability = _owner_capability(first.port(link.source.port).category)
+            owner_name = "binding owner" if capability == "binding_owner" else "connection owner"
+            first_owner = capability in first.capabilities
+            if first_owner == (capability in second.capabilities):
+                raise ValueError(f"each link requires exactly one {owner_name}")
             endpoint = link.target if first_owner else link.source
             if endpoint in connected:
-                raise ValueError(f"endpoint requires exactly one connection owner peer: {endpoint}")
+                raise ValueError(f"endpoint requires exactly one {owner_name} peer: {endpoint}")
             connected.add(endpoint)
+            owner, borrower = (first, second) if first_owner else (second, first)
+            if _construction_rank(owner.capabilities) >= _construction_rank(borrower.capabilities):
+                raise ValueError(f"unsupported owner dependency: {endpoint} requires its {owner_name} "
+                                 "in an earlier construction group")
 
     def validate(self) -> Mapping[str, NodeDescription]:
         """Return static admission results without constructing any instance."""
@@ -273,7 +290,7 @@ class Simulation:
     def _create_resources(self) -> None:
         self._phase = "creating"
         nodes = sorted(self.topology.nodes,
-                       key=lambda node: "connection" not in self._descriptions[node.name].capabilities)
+                       key=lambda node: _construction_rank(self._descriptions[node.name].capabilities))
         for node in nodes:
             self._check_deadline()
             context = ComponentContext(self, node.name)
@@ -293,7 +310,7 @@ class Simulation:
                 methods += ["step"]
             if "input" in caps:
                 methods += ["input"]
-            if "connection" in caps:
+            if "connection" in caps or "binding_owner" in caps:
                 methods += ["attach_port"]
             if "dispatch" in caps:
                 methods += ["dispatch"]
@@ -304,11 +321,12 @@ class Simulation:
             if "dispatch" in caps:
                 self._dispatch_limit(node.name, component)
                 self._next_due(node.name, component)
-        for endpoint in self._peers:
-            description = self._descriptions[endpoint.node]
-            if "connection" not in description.capabilities:
-                if endpoint.port not in self._contexts[endpoint.node]._connections:
-                    raise ValueError(f"factory did not attach its connected endpoint: {endpoint}")
+        for link in self.topology.links:
+            description = self._descriptions[link.source.node]
+            capability = _owner_capability(description.port(link.source.port).category)
+            endpoint = link.target if capability in description.capabilities else link.source
+            if endpoint.port not in self._contexts[endpoint.node]._connections:
+                raise ValueError(f"factory did not attach its connected endpoint: {endpoint}")
         self._phase = "initializing"
         for name, component in self._owned:
             self._check_deadline()

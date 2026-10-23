@@ -1,6 +1,8 @@
 """Example manifest, real build and direct acceptance-verifier coverage."""
 
 import importlib.util
+from fractions import Fraction
+import json
 import math
 from pathlib import Path
 import shutil
@@ -14,7 +16,7 @@ smoke = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(smoke)
 
 
-@pytest.mark.parametrize("case", (*smoke.CASES, "pulse", "rotor-loop"))
+@pytest.mark.parametrize("case", (*smoke.CASES, "pulse", "rotor-loop", "joint-loop"))
 def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(tmp_path, case):
     if any(shutil.which(program) is None for program in ("cmake", "arm-none-eabi-gcc")):
         pytest.skip("optional ARM cross compiler/CMake are unavailable")
@@ -25,25 +27,39 @@ def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(
     assert int.from_bytes(elf[24:28], "little") & ~1 >= 0x08000000
     assert len(result["sha256"]) == 64
     assert all(item["exit"] == 0 for item in result["build"])
+    if case in ("can-motor", "rotor-loop", "joint-loop"):
+        configure = result["build"][0]["command"]
+        assert "-DSIM_ROTOR_LOOP_TEST=" + ("ON" if case == "rotor-loop" else "OFF") in configure
+        assert "-DSIM_JOINT_LOOP_TEST=" + ("ON" if case == "joint-loop" else "OFF") in configure
     from sim.composition import builtin_registry
     from sim.config.scene import load_scene
 
     scene_file = tmp_path / "scene.yaml"
     example = smoke.EXAMPLE_ALIASES.get(case, case)
-    scene_name = "rotor-loop.yaml" if case == "rotor-loop" else "scene.yaml"
+    scene_name = case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"
     scene_file.write_text((ROOT / "examples" / example / scene_name).read_text().replace(
-        "./build-rotor-loop/firmware.elf" if case == "rotor-loop" else "./build/firmware.elf",
-        result["elf"]))
+        f"./build-{case}/firmware.elf" if case in ("rotor-loop", "joint-loop") else "./build/firmware.elf",
+        result["elf"]).replace("../shared-world/world.xml", str(ROOT / "examples/shared-world/world.xml")))
     scene = load_scene(scene_file, builtin_registry(backend_root=ROOT))
     assert scene.mode == "stepped" and scene.quantum_ns == 1_000_000
-    assert scene.duration_ns == (80_000_000 if case == "rotor-loop" else 200_000_000)
-    assert len(scene.topology.nodes) == (3 if case in ("can-motor", "rotor-loop") else 1)
+    assert scene.duration_ns == (80_000_000 if case in ("rotor-loop", "joint-loop") else 200_000_000)
+    assert len(scene.topology.nodes) == (5 if case == "joint-loop" else
+                                       3 if case in ("can-motor", "rotor-loop") else 1)
 
 
 def test_missing_build_dependency_is_explicitly_blocked(monkeypatch):
     monkeypatch.setattr(smoke.shutil, "which", lambda name: None)
     with pytest.raises(smoke.Blocked, match="cmake"):
         smoke.build_example("minimal-board")
+
+
+def test_motor_loop_variants_are_mutually_exclusive_at_cmake_admission(tmp_path):
+    if any(shutil.which(program) is None for program in ("cmake", "arm-none-eabi-gcc")):
+        pytest.skip("optional ARM cross compiler/CMake are unavailable")
+    result = smoke.subprocess.run(["cmake", "-S", str(ROOT / "examples/can-motor"),
+        "-B", str(tmp_path / "incompatible"), "-DSIM_ROTOR_LOOP_TEST=ON", "-DSIM_JOINT_LOOP_TEST=ON"],
+        capture_output=True, text=True, timeout=60)
+    assert result.returncode != 0 and "mutually exclusive" in result.stdout + result.stderr
 
 
 def _minimal_observations():
@@ -346,6 +362,138 @@ def test_rotor_loop_rejects_stale_native_completion_counter():
     observations.receipts[-1]["payload"]["completed_frames"] = 36
     with pytest.raises(AssertionError, match="counter did not advance"):
         observations.verify("rotor-loop")
+
+
+def _joint_observations():
+    """Exact rational mechanics for d=2ms/z=6ms; no production solver/helpers."""
+    result = smoke.Observations()
+    result.uart.extend(b"SIM_READY can-motor\nJOINT_MOVING ids=1,2\n"
+                       b"JOINT_COAST ids=1,2\nJOINT_PASS\n")
+    result.snapshots = [{"mapped_time_ns": 80_000_000}]
+    for sequence, data, source, cut in ((190, "1000f00000000000", 1_650_878, 2_000_000),
+                                        (590, "0000000000000000", 5_100_000, 6_000_000)):
+        row = {"event_sequence": sequence, "source": "main", "endpoint": "fdcan1",
+            "kind": "can-tx", "can_id": 0x200, "flags": 0, "dlc": 8, "data": data,
+            "source_time_ns": source, "mapped_time_ns": source, "delivery_time_ns": cut,
+            "quality": "exact", "wire_timestamp_ns": source}
+        result.can.append(row)
+        for index in (0, 1):
+            result.deliveries.append({**row, "event_sequence": cut // 10_000 + 60 + index,
+                "destination": f"motor{index}.can", "dropped": False})
+    ratio = Fraction(3591, 187)
+    for tick in range(81):
+        cut = tick * 1_000_000
+        n, m = max(0, min(tick, 6) - 2), max(0, tick - 6)
+        q = Fraction(5, 1_000_000) * ratio * (n * (n + 1) // 2 + n * m)
+        v = Fraction(5, 1000) * ratio * n
+        result.physics_states.append({"event_sequence": 100 * tick + 30,
+            "source": "world", "endpoint": "state", "source_time_ns": None,
+            "mapped_time_ns": cut, "delivery_time_ns": cut, "quality": "sampled",
+            "native_time_s": tick / 1000,
+            "joints": {"j1": {"position_rad": float(q), "velocity_rad_s": float(v)},
+                       "j2": {"position_rad": -float(q), "velocity_rad_s": -float(v)}}})
+        if not tick:
+            continue
+        for index, sign in ((0, 1), (1, -1)):
+            encoder = int((float(sign * q * ratio) % math.tau) * 8192 / math.tau)
+            rpm = round(float(sign * v * ratio) * 30 / math.pi)
+            current = sign * 4096 if 2 < tick <= 6 else 0
+            data = (encoder.to_bytes(2, "big") + rpm.to_bytes(2, "big", signed=True)
+                    + current.to_bytes(2, "big", signed=True) + bytes.fromhex("1900")).hex()
+            row = {"event_sequence": tick * 100 + index + 1, "source": f"motor{index}",
+                "endpoint": "can", "kind": "can.sent", "can_id": 0x201 + index,
+                "flags": 0, "dlc": 8, "data": data, "source_time_ns": cut,
+                "mapped_time_ns": cut, "delivery_time_ns": cut, "quality": "exact",
+                "wire_timestamp_ns": cut}
+            result.can.append(row)
+            result.deliveries.append({**row, "event_sequence": tick * 100 + index * 3 + 40,
+                "destination": "main.fdcan1", "dropped": False})
+            # The canonical receiver processes and receipts one frame before
+            # Fabric delivers the next, including two frames at the same cut.
+            result.receipts.append({"event_sequence": tick * 100 + index * 3 + 41,
+                "source": "main", "endpoint": "fdcan1", "mapped_time_ns": cut,
+                "source_time_ns": cut, "delivery_time_ns": cut, "quality": "exact",
+                "payload": {"completed_frames": 2 * tick - 1 + index,
+                            "rx_dropped": 0, "partial_bytes": 0}})
+    result.uart_batches = [{"source": "main", "event_sequence": 1250,
+        "mapped_time_ns": 12_000_000, "quality": "upper_bound",
+        "data_hex": bytes(result.uart).hex()}]
+    return result
+
+
+def test_joint_loop_proves_both_signed_feedback_reads_and_independent_native_state():
+    observations = _joint_observations()
+    report = observations.verify("joint-loop")
+    assert report["joint_consumption"]["command_delivery_ns"] == [2_000_000, 6_000_000]
+    assert set(report["joint_consumption"]["motors"]) == {"motor0", "motor1"}
+    assert [row["data"] for row in observations.can
+            if row["source"] in ("motor0", "motor1") and row["mapped_time_ns"] == 3_000_000] == [
+                "0002001210001900", "1ffdffeef0001900"]
+    json.dumps(report)  # Native JointState records have an explicit primitive projection.
+
+
+def test_joint_loop_rejects_motor2_sent_feedback_without_actual_delivery_despite_pass_and_receipts():
+    observations = _joint_observations()
+    observations.deliveries = [row for row in observations.deliveries if row["source"] != "motor1"]
+    with pytest.raises(AssertionError, match="motor1 feedback delivery to guest"):
+        observations.verify("joint-loop")
+
+
+@pytest.mark.parametrize("change,error", [
+    ("sign", "independent signed joint wire"),
+    ("same_joint", "independent joint mechanics"),
+    ("early_zero", "motor0 lacks moving/coast"),
+    ("late_motion_receipt", "next native per-frame"),
+    ("stale_receipt", "counter must advance exactly once"),
+    ("early_uart", "later UART observation"),
+])
+def test_joint_loop_rejects_false_two_motor_consumption_evidence(change, error):
+    observations = _joint_observations()
+    if change == "sign":
+        next(row for row in observations.can if row["source"] == "motor1"
+             and row["mapped_time_ns"] == 3_000_000)["data"] = "0002001210001900"
+    elif change == "same_joint":
+        observations.physics_states[-1]["joints"]["j2"] = observations.physics_states[-1]["joints"]["j1"]
+    elif change == "early_zero":
+        command = observations.can[1]
+        for field in ("source_time_ns", "mapped_time_ns", "wire_timestamp_ns"):
+            command[field] = 2_500_000
+        for row in observations.deliveries:
+            if row["source"] == "main" and row["data"] == "0000000000000000":
+                row["source_time_ns"] = 2_500_000
+    elif change == "late_motion_receipt":
+        observations.receipts[4]["event_sequence"] = 600
+    elif change == "stale_receipt":
+        observations.receipts[12]["payload"]["completed_frames"] = 12
+    elif change == "early_uart":
+        observations.uart_batches[0]["mapped_time_ns"] = 7_000_000
+    with pytest.raises(AssertionError, match=error):
+        observations.verify("joint-loop")
+
+
+def test_joint_loop_rejects_a_combined_receipt_in_place_of_per_frame_completion():
+    observations = _joint_observations()
+    observations.receipts = observations.receipts[1::2]
+    with pytest.raises(AssertionError, match="per-frame CAN input completion receipt"):
+        observations.verify("joint-loop")
+
+
+def test_joint_loop_is_explicit_and_keeps_the_original_five_native_cases():
+    assert smoke.NATIVE_CASES == ("minimal-board", "can-motor", "pulse", "digital-link", "rotor-loop")
+    assert smoke.EXAMPLE_ALIASES["joint-loop"] == "can-motor"
+
+
+def test_native_physics_observation_copies_frozen_joint_records_to_primitive_report():
+    from sim.api import Event
+    from sim.physics.base import JointState
+
+    observations = smoke.Observations()
+    observations(Event(1, 0, "world", "state", "physics.state",
+        {"native_time_s": .001, "joints": {"j1": JointState(.001, .2)}},
+        None, 1_000_000, 1_000_000, "sampled"))
+    assert observations.physics_states[0]["joints"] == {
+        "j1": {"position_rad": .001, "velocity_rad_s": .2}}
+    json.dumps(observations.report())
 
 
 def test_dual_guest_acceptance_requires_each_real_source_and_later_peer_delivery():

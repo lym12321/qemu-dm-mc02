@@ -52,8 +52,15 @@ The model has two independent hinge inertias of 0.02 kg·m², unit-gear motors,
 zero gravity and no damping or contacts. Its values are a mechanics fixture,
 not physical calibration. Native floating-point solver time is retained in the
 payload; sampled events use the integer Simulation cut and have no integer source
-timestamp. The world is independent of motor protocols and firmware. This slice
-does not connect M3508 devices to joints or establish CPU/world lockstep or real
-time performance. Invalid models/bindings fail at execution; validation checks
+timestamp. The world is independent of motor protocols and firmware. For a
+firmware-driven version, see [the two-motor example](../can-motor/README.md).
+It selects `control: bound`, connects each motor's `joint` port to
+`world.drives`, and lets one shared executor apply all motor controls before
+advancing the world. Bound worlds accept no external `world.effort` inputs;
+unbound joints keep their reset-zero controls. Native joint names are literal
+motor `joint` options, so they need not be valid topology port names.
+
+Direct control remains the default. Neither mode establishes CPU/world lockstep
+or real time performance. Invalid models/bindings fail at execution; validation checks
 configuration without loading MuJoCo. Missing native dependencies report
 `blocked` (exit 78), while execution failures report `failed` (exit 1).

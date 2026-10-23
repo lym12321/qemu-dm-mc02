@@ -1,0 +1,35 @@
+schema: sim/v1
+runtime:
+  mode: stepped
+  quantum: 1ms
+  duration: 80ms
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build-joint-loop/firmware.elf
+  can0:
+    kind: bus.can
+  motor0:
+    kind: device.dji-m3508
+    motor_id: 1
+    plant: joint
+    joint: j1
+  motor1:
+    kind: device.dji-m3508
+    motor_id: 2
+    plant: joint
+    joint: j2
+  world:
+    kind: physics.mujoco
+    control: bound
+    model: ../shared-world/world.xml
+    joints:
+      j1: m1
+      j2: m2
+links:
+  - [main.fdcan1, can0.can]
+  - [motor0.can, can0.can]
+  - [motor1.can, can0.can]
+  - [motor0.joint, world.drives]
+  - [motor1.joint, world.drives]

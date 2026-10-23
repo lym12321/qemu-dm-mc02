@@ -202,6 +202,138 @@ def test_generic_connection_owners_sample_all_sources_before_dispatching_sinks()
         assert len([item for item in trace if item[0] == "sample"]) == 4
 
 
+def binding_scene(*, attach_protocol=True, attach_binding=True):
+    """Only record generic ownership; no solver or device behavior is mocked."""
+    trace = []
+
+    class Connection(Component):
+        def __init__(self, spec, context):
+            super().__init__(spec, context, trace)
+            trace.append(("create", self.name))
+            self.endpoints = []
+
+        def attach_port(self, endpoint, **kwargs):
+            assert kwargs["descriptor"].category == "protocol"
+            self.endpoints.append(kwargs["endpoint_name"])
+            return self
+
+    class BindingOwner(Component):
+        def __init__(self, spec, context):
+            super().__init__(spec, context, trace)
+            trace.append(("create", self.name))
+            self.bindings = []
+            self.targets = []
+            if attach_protocol or self.name != "world_a":
+                self.connection = context.attach("p", self)
+
+        def attach_port(self, endpoint, *, descriptor, endpoint_name, owner_port, context):
+            assert descriptor.category == "binding" and owner_port == "bindings"
+            assert endpoint_name == f"{context.node_id}.binding"
+            self.bindings.append(endpoint)
+            return self
+
+        def reset(self, session):
+            super().reset(session)
+            trace.append(("reset", self.name))
+            self.reset_bindings = tuple(item.name for item in self.bindings)
+
+        def step(self, ctx):
+            self.targets.append(ctx.t_sim_ns)
+            return StepResult("ok", ctx.t_sim_ns)
+
+    class Borrower(Component):
+        def __init__(self, spec, context):
+            super().__init__(spec, context, trace)
+            trace.append(("create", self.name))
+            if attach_binding or self.name != "extra_a":
+                self.binding = context.attach("binding", self)
+
+    connection = Factory(Connection, {"connection"},
+                         (PortSpec("wire", "opaque", max_connections=None),))
+    owner = Factory(BindingOwner, {"binding_owner", "step"},
+                    (PortSpec("p", "opaque"),
+                     PortSpec("bindings", "kinematic", category="binding", max_connections=None)))
+    borrower = Factory(Borrower, ports=(PortSpec("binding", "kinematic", category="binding"),))
+    topology = Topology(tuple(NodeSpec(name, kind) for name, kind in (
+        ("client_b", "borrower"), ("world_a", "owner"), ("wire_b", "connection"),
+        ("client_a", "borrower"), ("wire_a", "connection"), ("world_b", "owner"),
+        ("extra_a", "borrower"))),
+        (LinkSpec("world_a.p", "wire_a.wire"), LinkSpec("wire_b.wire", "world_b.p"),
+         LinkSpec("client_b.binding", "world_b.bindings"),
+         LinkSpec("world_a.bindings", "client_a.binding"),
+         LinkSpec("extra_a.binding", "world_a.bindings")))
+    return Simulation(topology, {"connection": connection, "owner": owner, "borrower": borrower}), trace
+
+
+def test_binding_owners_step_once_with_stable_construction_order_and_borrowed_lifecycle():
+    simulation, trace = binding_scene()
+    with simulation:
+        expected_order = ("wire_b", "wire_a", "world_a", "world_b", "client_b", "client_a", "extra_a")
+        assert tuple(name for phase, name in trace if phase == "create") == expected_order
+        first = dict(simulation.components)
+        assert first["wire_a"].endpoints == ["world_a.p"]
+        assert first["wire_b"].endpoints == ["world_b.p"]
+        assert first["world_a"].reset_bindings == ("client_a", "extra_a")
+        assert first["world_b"].reset_bindings == ("client_b",)
+        assert first["client_a"].binding is first["extra_a"].binding is first["world_a"]
+        assert first["client_b"].binding is first["world_b"]
+        simulation.step(4)
+        simulation.step(3)
+        assert first["world_a"].targets == first["world_b"].targets == [4, 7]
+        simulation.reset()
+        assert simulation.session.session_id == 2
+        assert (simulation.t_sim_ns, simulation.step_id) == (0, 0)
+        assert tuple(name for phase, name in trace if phase == "close") == expected_order[::-1]
+        assert all(component.close_count == 1 for component in first.values())
+        assert all(component is not simulation.components[name] for name, component in first.items())
+        for name in ("world_a", "client_a"):
+            with pytest.raises(RuntimeError, match="closed session"):
+                first[name].context.check_io()
+            with pytest.raises(RuntimeError, match="closed session"):
+                first[name].context.attach("binding", object())
+        simulation.step(2)
+        second = dict(simulation.components)
+        assert second["world_a"].targets == second["world_b"].targets == [2]
+        assert all(component.sessions == [2] for component in second.values())
+    assert all(component.close_count == 1 for component in second.values())
+
+
+@pytest.mark.parametrize("options,endpoint", [
+    ({"attach_protocol": False}, "world_a.p"),
+    ({"attach_binding": False}, "extra_a.binding"),
+])
+def test_each_borrower_endpoint_must_attach_regardless_of_its_other_owner_capabilities(options, endpoint):
+    simulation, trace = binding_scene(**options)
+    with pytest.raises(ValueError, match=f"did not attach its connected endpoint: {endpoint}"):
+        simulation.start()
+    assert simulation.state == SimulationState.FAILED
+    assert len([item for item in trace if item[0] == "create"]) == 7
+    assert len([item for item in trace if item[0] == "close"]) == 7
+    assert not any(item[0] == "reset" for item in trace)
+    assert not simulation.components
+    simulation.close()
+
+
+def test_missing_binding_owner_attach_method_is_admitted_after_return_then_cleaned():
+    class Incomplete(Component):
+        def step(self, ctx):
+            raise AssertionError("invalid binding owner stepped")
+
+    owner = Factory(Incomplete, {"binding_owner", "step"},
+                    (PortSpec("p", "kinematic", category="binding"),))
+    borrower = Factory(Component, ports=(PortSpec("p", "kinematic", category="binding"),))
+    topology = Topology((NodeSpec("client", "client"), NodeSpec("owner", "owner")),
+                        (LinkSpec("client.p", "owner.p"),))
+    simulation = Simulation(topology, {"client": borrower, "owner": owner})
+    with pytest.raises(TypeError, match="lacks capability methods:.*attach_port"):
+        simulation.start()
+    assert owner.instances[0].sessions == []
+    assert owner.instances[0].close_count == 1
+    assert borrower.instances == []
+    assert simulation.state == SimulationState.FAILED
+    simulation.close()
+
+
 @pytest.mark.parametrize("failure", ["bad_due", "bad_due_after_dispatch", "negative_count",
                                      "boolean_count", "excess_count", "no_progress"])
 def test_dispatch_contract_failures_freeze_and_cleanup_without_retry(failure):

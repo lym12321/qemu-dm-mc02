@@ -3,7 +3,7 @@
 from .device import DrivePlan, M3508Device
 from .protocol import decode_current_command, encode_feedback
 
-__all__ = ["M3508", "M3508Device", "DrivePlan", "M3508JointPlant",
+__all__ = ["M3508", "M3508Device", "DrivePlan", "M3508JointPlant", "M3508JointExecution",
            "decode_current_command", "encode_feedback"]
 
 
@@ -15,4 +15,7 @@ def __getattr__(name):
     if name == "M3508JointPlant":
         from .joints import M3508JointPlant
         return M3508JointPlant
+    if name == "M3508JointExecution":
+        from .joints import M3508JointExecution
+        return M3508JointExecution
     raise AttributeError(name)

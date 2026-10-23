@@ -3,8 +3,9 @@
 The ratio3591/187 is from DJI M3508 P19 manual V1.0, p7/p13/p19, also used by
 the fixed reference firmware. Lossless conversion is a model approximation,
 not a C620 wire field or a calibrated gearbox. The XML actuators stay unit gear.
-Construction borrows inputs for admission; successful construction transfers
-exclusive execution ownership of the physics and devices. Buses are borrowed;
+The execution coordinator borrows physics and devices, controlling their reset
+and advance exclusively. The owned plant wrapper also closes those resources.
+Buses are always borrowed;
 motor IDs are unique on each bus, while joint bindings are unique in the world.
 The caller settles every bus around the one shared plant advance.
 """
@@ -30,7 +31,12 @@ def _finite(value, name):
     return value
 
 
-class M3508JointPlant:
+class M3508JointExecution:
+    """Borrow resources while owning their joint execution and plan state.
+
+    The resource owners close physics/devices independently. After closing this
+    executor, reset the devices before giving them to another execution owner.
+    """
     def __init__(self, physics: JointPhysics,
                  bindings: Mapping[M3508Device, str], *, gear_ratio=3591 / 187):
         if not isinstance(bindings, Mapping) or not bindings:
@@ -142,6 +148,15 @@ class M3508JointPlant:
             return
         self.closed = True
         self.failed = True
+
+
+class M3508JointPlant(M3508JointExecution):
+    """Own physics/devices after successful admission, preserving the old API."""
+
+    def close(self):
+        if self.closed:
+            return
+        super().close()
         primary = None
         for device in reversed(self.devices):
             try:

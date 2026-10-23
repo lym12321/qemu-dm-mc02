@@ -9,6 +9,7 @@
 *.egg-info/
 **/build/
 /examples/can-motor/build-rotor-loop/
+/examples/can-motor/build-joint-loop/
 
 # qemu/upstream is a tracked submodule pinned alongside qemu.lock.
 
@@ -26,6 +27,7 @@
 *.md
 !/README.md
 !/docs/USAGE.md
+!/examples/can-motor/README.md
 !/LICENSE*.md
 !/COPYING*.md
 /docs/history/

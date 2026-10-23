@@ -1,22 +1,32 @@
-"""Explicit fixed observations or the existing uncalibrated rigid rotor."""
+"""Explicit fixed, rigid-rotor or shared native-joint M3508 execution."""
 
 import math
 
 from sim.api import NodeDescription, PortSpec
-from sim.config.yaml import fields, parse_time
+from sim.config.yaml import fields, parse_time, text_bytes
 
 
 def _configuration(spec):
     options = dict(spec.options)
+    joint = options.get("plant") == "joint"
+    state_fields = {"joint"} if joint else {"position_rad", "velocity_rad_s"}
     fields(options, {"motor_id", "plant", "position_rad", "velocity_rad_s",
-                     "command_timeout", "feedback_period", "temperature_c"},
-           {"motor_id", "plant", "position_rad", "velocity_rad_s"}, spec.name)
-    if options["plant"] not in ("fixed-rotor", "rigid-rotor"):
-        raise ValueError(f"{spec.name}: plant must be fixed-rotor or rigid-rotor")
+                     "joint", "command_timeout", "feedback_period", "temperature_c"},
+           {"motor_id", "plant"} | state_fields, spec.name)
+    if options["plant"] not in ("fixed-rotor", "rigid-rotor", "joint"):
+        raise ValueError(f"{spec.name}: plant must be fixed-rotor, rigid-rotor or joint")
+    if joint:
+        if "position_rad" in options or "velocity_rad_s" in options:
+            raise ValueError("joint motor initial state belongs to its world")
+        text_bytes(options["joint"], "joint name")
+        if "\0" in options["joint"]:
+            raise ValueError("joint name must not contain NUL")
+    elif "joint" in options:
+        raise ValueError("joint name requires plant joint")
     motor_id = options["motor_id"]
     if type(motor_id) is not int or not 1 <= motor_id <= 8:
         raise ValueError("motor_id must be an integer in 1..8")
-    for field in ("position_rad", "velocity_rad_s"):
+    for field in (() if joint else ("position_rad", "velocity_rad_s")):
         value = options[field]
         try:
             finite = type(value) in (float, int) and math.isfinite(value)
@@ -27,13 +37,16 @@ def _configuration(spec):
     temperature = options.get("temperature_c", 25)
     if type(temperature) is not int or not 0 <= temperature <= 255:
         raise ValueError("temperature_c must be an integer in 0..255")
-    return {"motor_id": motor_id, "position_rad": float(options["position_rad"]),
-            "velocity_rad_s": float(options["velocity_rad_s"]),
+    result = {"motor_id": motor_id,
             "command_timeout_ns": parse_time(options.get("command_timeout", "100ms"),
                                              "command_timeout", zero=False),
             "feedback_period_ns": parse_time(options.get("feedback_period", "1ms"),
                                              "feedback_period", zero=False),
             "temperature_c": temperature}
+    if not joint:
+        result.update(position_rad=float(options["position_rad"]),
+                      velocity_rad_s=float(options["velocity_rad_s"]))
+    return result
 
 
 class _BorrowedPort:
@@ -76,15 +89,63 @@ class FixedRotor:
         self.device.close()
 
 
+class _JointBuilder:
+    def build(self, physics, bindings):
+        from .joints import M3508JointExecution
+
+        if len({id(binding.driver) for binding in bindings}) != len(bindings):
+            raise ValueError("each M3508 device must have one joint binding")
+        return M3508JointExecution(physics,
+                                  {binding.driver: binding.joint for binding in bindings})
+
+
+_JOINT_BUILDER = _JointBuilder()
+
+
+class _JointMotor:
+    """Own one device; the bound world exclusively resets and advances it."""
+
+    def __init__(self, spec, context, options):
+        from sim.physics.binding import JointDriveBinding
+        from .device import M3508Device
+
+        self.device = M3508Device(_BorrowedPort(context), name=spec.name, **options)
+        try:
+            self.binding = context.attach("joint", JointDriveBinding(
+                spec.options["joint"], self.device, _JOINT_BUILDER))
+        except BaseException as primary:
+            try:
+                self.device.close()
+            except BaseException as error:
+                primary.add_note(f"joint motor construction cleanup failed: {error}")
+            raise
+
+    def close(self):
+        self.device.close()
+
+
 class M3508Factory:
     def describe(self, spec):
         _configuration(spec)
+        if spec.options["plant"] == "joint":
+            return NodeDescription((
+                PortSpec("can", "can", min_connections=1),
+                PortSpec("joint", "joint-drive", category="binding", min_connections=1),
+            ))
         return NodeDescription((PortSpec("can", "can", min_connections=1),), frozenset({"step"}))
+
+    def describe_joint_binding(self, spec, port):
+        _configuration(spec)
+        if spec.options["plant"] != "joint" or port != "joint":
+            raise ValueError("M3508 joint binding requires the joint motor port")
+        return spec.options["joint"], _JOINT_BUILDER
 
     def create(self, spec, context):
         options = _configuration(spec)
         if spec.options["plant"] == "fixed-rotor":
             return FixedRotor(spec, context)
+        if spec.options["plant"] == "joint":
+            return _JointMotor(spec, context, options)
         from sim.physics import Rotor
         from .m3508 import M3508
 

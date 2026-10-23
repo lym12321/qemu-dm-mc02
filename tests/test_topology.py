@@ -132,7 +132,8 @@ def test_required_connection_and_unimplemented_typed_links_rejected_before_resou
     for category, protocol in (("protocol", "uart"), ("signal", "digital"), ("binding", "joint")):
         a = Factory(PortSpec("p", protocol, "out", category))
         b = Factory(PortSpec("p", protocol, "in", category))
-        with pytest.raises(ValueError, match="exactly one connection owner"):
+        owner = "binding owner" if category == "binding" else "connection owner"
+        with pytest.raises(ValueError, match=f"exactly one {owner}"):
             Simulation(pair(a, b), {"a": a, "b": b})
         assert a.created == b.created == 0
     a = Factory(PortSpec("p", "can", direction="in"))
@@ -154,6 +155,52 @@ def test_connection_owners_and_endpoint_owner_peers_are_unique_before_create():
         with pytest.raises(ValueError, match=error):
             Simulation(topology, {"owner": owner, "endpoint": endpoint})
     assert owner.created == endpoint.created == 0
+
+
+def test_binding_edges_require_their_own_owner_and_allow_one_shared_step_owner():
+    port = PortSpec("p", "joint", category="binding", max_connections=None)
+    endpoint = Factory(port)
+    owner = Factory(port, capabilities={"binding_owner", "step"})
+    connection = Factory(port, capabilities={"connection"})
+    registry = {"endpoint": endpoint, "owner": owner, "connection": connection}
+    for kinds, links, error in (
+        (("endpoint", "connection"), (LinkSpec("a.p", "b.p"),), "exactly one binding owner"),
+        (("owner", "owner"), (LinkSpec("a.p", "b.p"),), "exactly one binding owner"),
+        (("endpoint", "owner", "owner"),
+         (LinkSpec("a.p", "b.p"), LinkSpec("a.p", "c.p")), "exactly one binding owner peer"),
+    ):
+        topology = Topology(tuple(NodeSpec(name, kind) for name, kind in zip("abc", kinds)), links)
+        with pytest.raises(ValueError, match=error):
+            Simulation(topology, registry)
+    topology = Topology((NodeSpec("a", "endpoint"), NodeSpec("b", "owner"),
+                         NodeSpec("c", "endpoint")),
+                        (LinkSpec("a.p", "b.p"), LinkSpec("b.p", "c.p")))
+    simulation = Simulation(topology, registry)
+    assert simulation.validate()["b"].capabilities == frozenset({"binding_owner", "step"})
+    simulation.close()
+    assert owner.created == endpoint.created == connection.created == 0
+
+
+def test_binding_owner_does_not_replace_protocol_or_signal_connection_ownership():
+    for category, protocol in (("protocol", "opaque"), ("signal", "digital")):
+        port = PortSpec("p", protocol, category=category)
+        owner = Factory(port, capabilities={"binding_owner"})
+        endpoint = Factory(port)
+        with pytest.raises(ValueError, match="exactly one connection owner"):
+            Simulation(pair(owner, endpoint), {"a": owner, "b": endpoint})
+        assert owner.created == endpoint.created == 0
+    with pytest.raises(ValueError, match="independently advance a connection owner"):
+        Simulation(Topology((NodeSpec("a", "a"),)),
+                   {"a": Factory(capabilities={"binding_owner", "connection", "step"})})
+
+
+def test_connection_owner_cannot_borrow_a_binding_from_a_later_construction_group():
+    port = PortSpec("p", "joint", category="binding")
+    connection = Factory(port, capabilities={"connection"})
+    owner = Factory(port, capabilities={"binding_owner", "step"})
+    with pytest.raises(ValueError, match="unsupported owner dependency.*earlier construction group"):
+        Simulation(pair(connection, owner), {"a": connection, "b": owner})
+    assert connection.created == owner.created == 0
 
 
 def test_pure_topology_admission_hook_runs_once_per_factory_object_across_kind_aliases():

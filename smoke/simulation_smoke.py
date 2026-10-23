@@ -20,7 +20,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 CASES = ("minimal-board", "can-motor")
 EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor",
-                   "digital-link": "minimal-board", "rotor-loop": "can-motor"}
+                   "digital-link": "minimal-board", "rotor-loop": "can-motor",
+                   "joint-loop": "can-motor"}
 NATIVE_CASES = (*CASES, "pulse", "digital-link", "rotor-loop")
 
 
@@ -53,6 +54,8 @@ class Observations:
         self.digital_consumption = []
         self.rotor_state = None
         self.rotor_consumption = None
+        self.physics_states = []
+        self.joint_consumption = None
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -101,7 +104,13 @@ class Observations:
                 "endpoint": event.source_port, "destination": event.payload["destination"],
                 "can_id": event.payload["frame"].can_id,
                 "data": event.payload["frame"].data.hex(), "dropped": event.payload["dropped"]})
-        elif event.kind == "can-tx" or (event.kind == "can.sent" and event.source_node == "motor0"):
+        elif event.kind == "physics.state" and event.source_node == "world":
+            self.physics_states.append({**stamp, "source": event.source_node,
+                "endpoint": event.source_port, "native_time_s": event.payload["native_time_s"],
+                "joints": {name: {"position_rad": state.position_rad,
+                                   "velocity_rad_s": state.velocity_rad_s}
+                           for name, state in event.payload["joints"].items()}})
+        elif event.kind == "can-tx" or (event.kind == "can.sent" and event.source_node in ("motor0", "motor1")):
             frame = event.payload if event.kind == "can-tx" else event.payload["frame"]
             self.can.append({**stamp, "source": event.source_node,
                 "endpoint": event.source_port, "kind": event.kind,
@@ -119,6 +128,9 @@ class Observations:
             raise AssertionError("no actual native board snapshot was observed")
         if case == "rotor-loop":
             self._verify_rotor(ready)
+            return self.report()
+        if case == "joint-loop":
+            self._verify_joints(ready)
             return self.report()
         if case in ("minimal-board", "hal-gpio", "pulse", "digital-link"):
             if case in ("minimal-board", "pulse", "digital-link"):
@@ -341,6 +353,172 @@ class Observations:
             "driven_intervals": n, "coast_intervals": m,
             "expected_position_rad": expected_position, "expected_velocity_rad_s": expected_velocity}
 
+    def _verify_joints(self, ready):
+        uart = bytes(self.uart)
+        cursor = uart.index(ready) + len(ready)
+        for marker in (b"JOINT_MOVING ids=1,2\n", b"JOINT_COAST ids=1,2\nJOINT_PASS\n"):
+            found = uart.find(marker, cursor)
+            if found < 0:
+                raise AssertionError("ordered guest two-joint motion/coast/PASS evidence missing")
+            cursor = found + len(marker)
+        commands = [row for row in self.can if row["source"] == "main"
+                    and row["endpoint"] == "fdcan1" and row["can_id"] == 0x200]
+        if ([row["data"] for row in commands] != ["1000f00000000000", "0000000000000000"]
+                or any(row["flags"] or row["dlc"] != 8 for row in commands)):
+            raise AssertionError("expected actual guest signed drive and zero commands")
+        for row in commands:
+            if (row["source_time_ns"] is None or row["quality"] != "exact"
+                    or row["source_time_ns"] != row["wire_timestamp_ns"]
+                    or row["mapped_time_ns"] != row["source_time_ns"]):
+                raise AssertionError("guest joint CAN source timestamp was discarded or changed")
+        cuts = []
+        for motor in ("motor0", "motor1"):
+            deliveries = [row for row in self.deliveries if row["source"] == "main"
+                          and row["destination"] == motor + ".can" and row["can_id"] == 0x200]
+            if ([row["data"] for row in deliveries] != [row["data"] for row in commands]
+                    or any(row["dropped"] for row in deliveries)):
+                raise AssertionError(f"actual drive and zero commands were not delivered once to {motor}")
+            for command, delivery in zip(commands, deliveries):
+                if (delivery["source_time_ns"] != command["source_time_ns"]
+                        or delivery["delivery_time_ns"] != command["delivery_time_ns"]
+                        or delivery["event_sequence"] <= command["event_sequence"]
+                        or command["source_time_ns"] > delivery["delivery_time_ns"]):
+                    raise AssertionError("joint command source and completed delivery cut disagree")
+            cuts.append(tuple(row["delivery_time_ns"] for row in deliveries))
+        if cuts[0] != cuts[1]:
+            raise AssertionError("one command batch must reach both motors at the same cut")
+        drive_ns, zero_ns = cuts[0]
+        end_ns = 80_000_000
+        if (not 0 < drive_ns < zero_ns < end_ns
+                or zero_ns >= drive_ns + 100_000_000
+                or any(value % 1_000_000 for value in (drive_ns, zero_ns))):
+            raise AssertionError("joint fixture requires drive/zero before expiry on complete 1ms cuts")
+
+        # Independent literal mechanics: Izz=.02, kt=.02, raw4096=5A,
+        # ideal DJI P19 ratio3591/187 and native velocity-then-position Euler.
+        # Integration starts at actual command delivery, not CAN source time.
+        gear = 3591 / 187
+
+        def expected(cut):
+            n = max(0, (min(cut, zero_ns) - drive_ns) // 1_000_000)
+            m = max(0, (cut - zero_ns) // 1_000_000)
+            return (5 * gear * .001 ** 2 * (n * (n + 1) / 2 + n * m),
+                    5 * gear * .001 * n)
+
+        if [row["mapped_time_ns"] for row in self.physics_states] != list(range(0, end_ns + 1, 1_000_000)):
+            raise AssertionError("initial and every completed shared-world sample are required")
+        for row in self.physics_states:
+            cut = row["mapped_time_ns"]
+            if (row["source"] != "world" or row["endpoint"] != "state"
+                    or row["source_time_ns"] is not None or row["quality"] != "sampled"
+                    or row["delivery_time_ns"] != cut
+                    or not math.isclose(row["native_time_s"], cut / 1e9, rel_tol=0, abs_tol=1e-14)
+                    or set(row["joints"]) != {"j1", "j2"}):
+                raise AssertionError("shared-world sample lost native float/time provenance")
+            position, velocity = expected(cut)
+            for joint, sign in (("j1", 1), ("j2", -1)):
+                state = row["joints"][joint]
+                if (not math.isclose(state["position_rad"], sign * position, rel_tol=0, abs_tol=1e-12)
+                        or not math.isclose(state["velocity_rad_s"], sign * velocity, rel_tol=0, abs_tol=1e-12)):
+                    raise AssertionError("shared-world state disagrees with independent joint mechanics")
+
+        native_deliveries = sorted((row for row in self.deliveries
+            if row["source"] in ("motor0", "motor1") and row["endpoint"] == "can"
+            and row["destination"] == "main.fdcan1" and not row["dropped"]),
+            key=lambda row: row["event_sequence"])
+        for motor in ("motor0", "motor1"):
+            if sum(row["source"] == motor for row in native_deliveries) != 80:
+                raise AssertionError(f"actual {motor} feedback delivery to guest is missing")
+        native_receipts = sorted((row for row in self.receipts
+            if row["source"] == "main" and row["endpoint"] == "fdcan1"),
+            key=lambda row: row["event_sequence"])
+        if len(native_receipts) != len(native_deliveries):
+            raise AssertionError("matching native per-frame CAN input completion receipt is missing")
+        receipt_by_delivery = {}
+        # QemuMachine.receive waits for one additional completed frame, then
+        # emits its receipt before returning to Fabric's next delivery. The
+        # fresh guest starts at counter0; two frames at one cut have distinct
+        # receipts and consecutive counters, never one combined receipt.
+        for index, (delivery, receipt) in enumerate(zip(native_deliveries, native_receipts)):
+            next_sequence = (native_deliveries[index + 1]["event_sequence"]
+                             if index + 1 < len(native_deliveries) else math.inf)
+            if (not delivery["event_sequence"] < receipt["event_sequence"] < next_sequence
+                    or receipt["mapped_time_ns"] != delivery["delivery_time_ns"]
+                    or receipt["payload"]["rx_dropped"] != 0
+                    or receipt["payload"]["partial_bytes"] != 0):
+                raise AssertionError("matching next native per-frame CAN input completion receipt is missing")
+            if receipt["payload"]["completed_frames"] != index + 1:
+                raise AssertionError("native per-frame completion counter must advance exactly once per delivery")
+            receipt_by_delivery[delivery["event_sequence"]] = receipt
+
+        def delivered(row):
+            matches = [item for item in self.deliveries
+                       if item["source"] == row["source"] and item["endpoint"] == "can"
+                       and item["destination"] == "main.fdcan1" and item["can_id"] == row["can_id"]
+                       and item["data"] == row["data"] and not item["dropped"]
+                       and item["source_time_ns"] == row["source_time_ns"]
+                       and item["delivery_time_ns"] == row["mapped_time_ns"]
+                       and item["event_sequence"] > row["event_sequence"]]
+            if len(matches) != 1:
+                raise AssertionError(f"actual {row['source']} feedback delivery to guest is missing")
+            delivery = matches[0]
+            return delivery, receipt_by_delivery[delivery["event_sequence"]]
+
+        evidence = {}
+        for motor, can_id, sign in (("motor0", 0x201, 1), ("motor1", 0x202, -1)):
+            feedback = [row for row in self.can if row["source"] == motor and row["endpoint"] == "can"]
+            if [row["mapped_time_ns"] for row in feedback] != list(range(1_000_000, end_ns + 1, 1_000_000)):
+                raise AssertionError(f"complete 1ms feedback from {motor} is missing")
+            moving, coast = [], []
+            for row in feedback:
+                cut = row["mapped_time_ns"]
+                position, velocity = expected(cut)
+                rotor_position, rotor_velocity = sign * position * gear, sign * velocity * gear
+                # DJI C620 V1.01 fields: unsigned wrapped8192 encoder,
+                # signed nearest RPM/current, temperature25 and reserved0.
+                encoder = math.floor((rotor_position % math.tau) / math.tau * 8192)
+                rpm = round(rotor_velocity * 30 / math.pi)
+                current = sign * 4096 if drive_ns < cut <= zero_ns else 0
+                data = (encoder.to_bytes(2, "big") + rpm.to_bytes(2, "big", signed=True)
+                        + current.to_bytes(2, "big", signed=True) + b"\x19\0")
+                if (row["can_id"] != can_id or row["flags"] or row["dlc"] != 8
+                        or row["data"] != data.hex() or row["quality"] != "exact"
+                        or row["source_time_ns"] != cut or row["wire_timestamp_ns"] != cut):
+                    raise AssertionError(f"{motor} feedback disagrees with independent signed joint wire fields")
+                if encoder > 0 and sign * rpm >= 2 and sign * current == 4096 and cut < commands[1]["source_time_ns"]:
+                    moving.append(row)
+                if encoder > 0 and sign * rpm > 0 and current == 0 and cut > zero_ns:
+                    coast.append(row)
+            if not moving or not coast:
+                raise AssertionError(f"{motor} lacks moving/coast feedback around the actual guest zero command")
+            motion_delivery, motion_receipt = delivered(moving[0])
+            coast_delivery, coast_receipt = delivered(coast[0])
+            if motion_receipt["event_sequence"] >= commands[1]["event_sequence"]:
+                raise AssertionError(f"{motor} moving receipt must precede the actual guest zero command")
+            evidence[motor] = {"moving_delivery_ns": motion_delivery["delivery_time_ns"],
+                "moving_receipt_sequence": motion_receipt["event_sequence"],
+                "coast_delivery_ns": coast_delivery["delivery_time_ns"],
+                "coast_receipt_sequence": coast_receipt["event_sequence"]}
+        observed, coast_bound = 0, None
+        for batch in self.uart_batches:
+            if batch["source"] == "main":
+                observed += len(bytes.fromhex(batch["data_hex"]))
+                if observed >= cursor:
+                    coast_bound = batch
+                    break
+        if (coast_bound is None or coast_bound["quality"] != "upper_bound"
+                or any(coast_bound["mapped_time_ns"] <= row["coast_delivery_ns"]
+                       or coast_bound["event_sequence"] <= row["coast_receipt_sequence"]
+                       for row in evidence.values())):
+            raise AssertionError("guest joint coast/PASS lacks a later UART observation upper bound")
+        position, velocity = expected(end_ns)
+        self.joint_consumption = {"command_source_ns": [row["source_time_ns"] for row in commands],
+            "command_delivery_ns": [drive_ns, zero_ns], "motors": evidence,
+            "coast_uart_upper_bound_ns": coast_bound["mapped_time_ns"],
+            "driven_intervals": (zero_ns - drive_ns) // 1_000_000,
+            "coast_intervals": (end_ns - zero_ns) // 1_000_000,
+            "expected_j1_position_rad": position, "expected_j1_velocity_rad_s": velocity}
+
     def _verify_digital(self, ready):
         peer_uart = bytes(self.peer_uart)
         if ready not in peer_uart or b"FAIL" in peer_uart:
@@ -437,7 +615,8 @@ class Observations:
                 "deliveries": self.deliveries, "receipts": self.receipts,
                 "inputs": self.inputs, "uart_batches": self.uart_batches,
                 "digital": self.digital, "digital_consumption": self.digital_consumption,
-                "rotor_state": self.rotor_state, "rotor_consumption": self.rotor_consumption}
+                "rotor_state": self.rotor_state, "rotor_consumption": self.rotor_consumption,
+                "physics_states": self.physics_states, "joint_consumption": self.joint_consumption}
 
 
 def build_example(case, *, build_dir=None, build_type="Debug"):
@@ -446,12 +625,14 @@ def build_example(case, *, build_dir=None, build_type="Debug"):
             raise Blocked(f"{program} is required to build the real example ELF")
     source = ROOT / "examples" / EXAMPLE_ALIASES.get(case, case)
     default_build = (ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse"
-                     else source / "build-rotor-loop" if case == "rotor-loop" else source / "build")
+                     else source / "build-rotor-loop" if case == "rotor-loop"
+                     else source / "build-joint-loop" if case == "joint-loop" else source / "build")
     build = default_build if build_dir is None else Path(build_dir)
     variant = (["-DSIM_KEY_PULSE_TEST=ON"] if case == "pulse" else
                ["-DSIM_KEY_PULSE_TEST=OFF"] if source.name == "minimal-board" else [])
     if source.name == "can-motor":
         variant.append("-DSIM_ROTOR_LOOP_TEST=" + ("ON" if case == "rotor-loop" else "OFF"))
+        variant.append("-DSIM_JOINT_LOOP_TEST=" + ("ON" if case == "joint-loop" else "OFF"))
     commands = (["cmake", "-S", str(source), "-B", str(build), f"-DCMAKE_BUILD_TYPE={build_type}", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
@@ -483,7 +664,7 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
     else:
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
-                           ("rotor-loop.yaml" if case == "rotor-loop" else "scene.yaml"), registry)
+                           (case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"), registry)
         if case == "pulse":
             from sim.api import NodeSpec, Topology
             from sim.config.scene import Scene
@@ -581,7 +762,7 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "all"), default="all")
+    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "all"), default="all")
     parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",

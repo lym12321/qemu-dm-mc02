@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sim.core import Coordinator, Session, StepContext
-from sim.devices.dji import M3508, M3508Device, M3508JointPlant
+from sim.devices.dji import M3508, M3508Device, M3508JointExecution, M3508JointPlant
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.fabric.runtime import CanParticipant
 from sim.physics import JointState, MujocoPhysics
@@ -53,6 +53,57 @@ def native_stub():
         set_joint_effort=lambda *_: None, validate_step=lambda _: None,
         validate_steps=lambda _: None,
         validate_joint_effort=lambda *_: None, close=lambda: None)
+
+
+def test_borrowed_execution_closes_only_its_execution_state(monkeypatch):
+    native, bus = native_stub(), CanBus()
+    devices = (M3508Device(bus, 1), M3508Device(bus, 2))
+    closed = []
+    monkeypatch.setattr(native, "close", lambda: closed.append("physics"))
+    execution = M3508JointExecution(native, dict(zip(devices, ("j1", "j2"))))
+    execution.reset(Session(1))
+    execution.step(StepContext(1, 1, 1_000_000, 1_000_000))
+    execution.close()
+    execution.close()
+    assert execution.closed and execution.failed
+    assert closed == [] and all(not device.closed for device in devices)
+    with pytest.raises(RuntimeError, match="closed"):
+        execution.reset(Session(2))
+    # Their resource owners can reset/reassign the still-open borrows.
+    replacement = M3508JointExecution(native, dict(zip(devices, ("j1", "j2"))))
+    replacement.reset(Session(2))
+    replacement.close()
+    assert all(not device.closed for device in devices)
+    for device in devices:
+        device.close()
+    native.close()
+    bus.close()
+    assert closed == ["physics"]
+
+
+def test_borrowed_failed_execution_freezes_without_closing_resources(monkeypatch):
+    native, bus = native_stub(), CanBus()
+    device = M3508Device(bus)
+    primary, calls = RuntimeError("native step"), []
+
+    def fail(dt):
+        calls.append(dt)
+        raise primary
+
+    monkeypatch.setattr(native, "step", fail)
+    execution = M3508JointExecution(native, {device: "j1"})
+    execution.reset(Session(1))
+    context = StepContext(1, 1, 1_000_000, 1_000_000)
+    with pytest.raises(RuntimeError) as caught:
+        execution.step(context)
+    assert caught.value is primary and execution.failed
+    with pytest.raises(RuntimeError, match="successful reset"):
+        execution.step(context)
+    execution.close()
+    assert calls == [1_000_000] and not device.closed
+    device.close()
+    native.close()
+    bus.close()
 
 
 def setup(*, bus=None, native=None, timeouts=(100_000_000,) * 4):
