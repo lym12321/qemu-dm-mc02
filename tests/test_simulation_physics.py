@@ -7,13 +7,14 @@ no replacement solver or production integration helper supplies the oracle.
 
 import builtins
 from dataclasses import FrozenInstanceError
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
 import pytest
 
-from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
+from sim.api import ImuSignalSample, LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
 from sim.physics.base import JointState
 from sim.runtime import Simulation, SimulationState
 
@@ -93,7 +94,7 @@ def test_world_description_and_input_validation_do_not_import_native_backend(tmp
     {"model": ""}, {"model": "missing.xml"}, {"joints": {}},
     {"joints": {"": "m1"}}, {"joints": {"j1": ""}},
     {"joints": {"j1": "m1", "j2": "m1"}},
-    {"joints": {"j1": True}}, {"joints": [("j1", "m1")]}, {"imus": {}},
+    {"joints": {"j1": True}}, {"joints": [("j1", "m1")]}, {"sensors": {}},
 ])
 def test_bad_world_configuration_rejects_before_acquisition(tmp_path, change):
     from sim.physics.factory import MujocoFactory
@@ -182,7 +183,8 @@ def test_partial_construction_closes_native_owner_and_preserves_primary(tmp_path
     assert caught.value is simulation.failure is primary
     assert simulation.state is SimulationState.FAILED
     assert closed == [physics]
-    assert paths == [(tmp_path / "world.xml", {"joints": {"j1": "m1", "j2": "m2"}})]
+    assert paths == [(tmp_path / "world.xml", {
+        "joints": {"j1": "m1", "j2": "m2"}, "imus": {}})]
     assert any("native cleanup" in note for note in primary.__notes__)
     simulation.close()
     assert closed == [physics]
@@ -386,3 +388,315 @@ def test_native_or_sample_failure_keeps_primary_closes_once_and_never_replays(
     with pytest.raises(RuntimeError):
         simulation.step()
     assert calls == [0] and closes == pytest.approx([.001], abs=1e-15)
+
+
+class _ImuReceiver:
+    """An ordinary SI consumer; no native physics or transport ownership."""
+
+    def __init__(self, context, receive=None):
+        self.samples, self.bmi_units = [], []
+        self._receive = receive
+        context.attach("imu", self)
+
+    def receive_imu(self, sample):
+        from sim.devices.bmi088 import imu_to_bmi088_units
+
+        assert isinstance(sample, ImuSignalSample)
+        if self._receive is not None:
+            self._receive(sample)
+        self.bmi_units.append(imu_to_bmi088_units(sample.sample))
+        self.samples.append(sample)
+
+    def close(self):
+        pass
+
+
+class _ImuReceiverFactory:
+    def __init__(self, receive=None):
+        self._receive = receive
+
+    def describe(self, spec):
+        return NodeDescription((PortSpec("imu", "imu", "in", "signal",
+                                         min_connections=1),))
+
+    def create(self, spec, context):
+        return _ImuReceiver(context, self._receive)
+
+
+def _imu_topology(world, *, receive=None):
+    from sim.fabric.imu import ImuNetFactory
+    from sim.physics.factory import MujocoFactory
+
+    return (Topology((world, NodeSpec("wire", "net.imu"), NodeSpec("sink", "receiver")),
+                     (LinkSpec("world.imu.body", "wire.signal"),
+                      LinkSpec("wire.signal", "sink.imu"))),
+            {world.kind: MujocoFactory(), "net.imu": ImuNetFactory(),
+             "receiver": _ImuReceiverFactory(receive)})
+
+
+def _imu_rotor(tmp_path, **kwargs):
+    # Reuse the lower native fixture, without importing its optional dependency
+    # at collection time or obtaining expected data from the production solver.
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    from test_mujoco_physics import rotor_xml
+
+    path = tmp_path / "imu.xml"
+    path.write_text(rotor_xml(**kwargs))
+    return NodeSpec("world", "physics.mujoco", {
+        "model": path, "joints": {"shaft": "drive"},
+        "imus": {"body": ["gyro", "accel"]}})
+
+
+def test_imu_description_and_imu_only_configuration_are_native_free(tmp_path, monkeypatch):
+    from sim.physics.factory import MujocoFactory
+
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == "mujoco" or name.startswith("mujoco."):
+            pytest.fail("IMU topology admission imported native MuJoCo")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    spec = _spec(tmp_path, imus={"body": ["gyro sensor", "accel sensor"]})
+    topology, registry = _imu_topology(spec)
+    description = Simulation(topology, registry).validate()["world"]
+    port = description.port("imu.body")
+    assert (port.protocol, port.direction, port.category) == ("imu", "out", "signal")
+    assert description.capabilities == {"step", "input", "sample"}
+    for joints in ({}, None):
+        options = {"model": spec.options["model"], "imus": spec.options["imus"]}
+        if joints is not None:
+            options["joints"] = joints
+        only = NodeSpec("world", spec.kind, options, base_dir=tmp_path)
+        topology, registry = _imu_topology(only)
+        description = Simulation(topology, registry).validate()["world"]
+        assert description.capabilities == {"step", "sample"}
+        with pytest.raises(ValueError, match="unknown port"):
+            description.port("effort")
+        with pytest.raises(ValueError):
+            MujocoFactory().validate_input(only, "effort", {"shaft": .4})
+
+
+@pytest.mark.parametrize("change", [
+    {"imus": []}, {"imus": {"": ["gyro", "accel"]}},
+    {"imus": {"body.imu": ["gyro", "accel"]}},
+    {"imus": {"bad name": ["gyro", "accel"]}},
+    {"imus": {"body": ["gyro"]}}, {"imus": {"body": "gyro"}},
+    {"imus": {"body": ["gyro", 1]}}, {"imus": {"body": ["gyro\0", "accel"]}},
+    {"control": "bound", "joints": {}, "imus": {"body": ["gyro", "accel"]}},
+])
+def test_bad_imu_configuration_rejects_before_any_create(tmp_path, change):
+    from sim.physics.factory import MujocoFactory
+
+    class NoCreate(MujocoFactory):
+        def create(self, *args):
+            pytest.fail("invalid IMU configuration acquired a native resource")
+
+    with pytest.raises((TypeError, ValueError)):
+        _simulation(tmp_path, spec=_spec(tmp_path, **change), factory=NoCreate())
+
+
+@pytest.mark.parametrize("pair,error", [
+    (["missing", "accel"], "unknown MuJoCo name"),
+    (["accel", "gyro"], "native site gyro/accelerometer"),
+    (["gyro", "other_accel"], "share a site"),
+])
+def test_factory_native_imu_admission_precedes_runtime_data_and_execution(
+        tmp_path, monkeypatch, pair, error):
+    mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    spec = _imu_rotor(tmp_path)
+    path = Path(spec.options["model"])
+    path.write_text(path.read_text().replace(
+        "</sensor>", '<accelerometer name="other_accel" site="other_site"/></sensor>'))
+    spec = NodeSpec(spec.name, spec.kind, {**spec.options, "imus": {"body": pair}})
+    created = _capture_physics(monkeypatch)
+    for name in ("MjData", "mj_forward", "mj_resetData", "mj_step"):
+        monkeypatch.setattr(mujoco, name, lambda *_args:
+                            pytest.fail("invalid native IMU binding reached runtime data/execution"))
+    topology, registry = _imu_topology(spec)
+    simulation = Simulation(topology, registry)
+    with pytest.raises(ValueError, match=error):
+        simulation.start()
+    assert simulation.state is SimulationState.FAILED
+    assert created == []  # Native binding admission failed before a wrapper could escape.
+    simulation.close()
+
+
+def test_shipped_offset_site_factory_signal_has_independent_acceleration_oracle():
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    spec = NodeSpec("world", "physics.mujoco", {
+        "model": ROOT / "examples/shared-world/imu.xml", "joints": {"shaft": "drive"},
+        "imus": {"body": ["body gyro", "body accel"]}})
+    topology, registry = _imu_topology(spec)
+    with Simulation(topology, registry, quantum_ns=10_000_000) as simulation:
+        simulation.schedule_input("world.effort", {"shaft": .4})
+        simulation.step()
+        samples = simulation.components["sink"].samples
+        assert [item.mapped_time_ns for item in samples] == [0, 10_000_000]
+        # Izz=.02 and tau=.4 give alpha20, target omega=.2; site radius=.25.
+        # Proper acceleration is (-omega²*r, alpha*r, +gravity) in site axes.
+        assert samples[-1].sample.gyro_rad_s == pytest.approx((0, 0, .2), abs=1e-12)
+        assert samples[-1].sample.accel_m_s2 == pytest.approx((-.01, 5, 9.81), abs=1e-12)
+
+
+def test_direct_rotated_imu_uses_completed_cuts_and_readers_never_advance_native(
+        tmp_path, monkeypatch):
+    mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    counts = {"mj_step": 0, "mj_forward": 0, "mj_resetData": 0}
+    for name in counts:
+        original = getattr(mujoco, name)
+
+        def counted(*args, name=name, original=original):
+            counts[name] += 1
+            return original(*args)
+
+        monkeypatch.setattr(mujoco, name, counted)
+    created = _capture_physics(monkeypatch)
+    spec = _imu_rotor(tmp_path, site_quat="0.7071067811865476 0.7071067811865476 0 0")
+    topology, registry = _imu_topology(spec)
+    with Simulation(topology, registry) as simulation:
+        receiver = simulation.components["sink"]
+        assert len(receiver.samples) == 1
+        assert receiver.samples[0].sample.accel_m_s2 == pytest.approx((0, 9.81, 0), abs=1e-12)
+        baseline = dict(counts)
+        for _ in range(3):
+            created[0].get_imu("body")
+        simulation.run_until(0)
+        assert counts == baseline  # Reads and reentering a cut do not forward or integrate.
+        simulation.schedule_input("world.effort", {"shaft": .4})
+        simulation.schedule_input("world.effort", {"shaft": 0}, at_ns=1_500_000)
+        simulation.run_until(2_000_000)
+        assert [sample.mapped_time_ns for sample in receiver.samples] == [
+            0, 1_000_000, 1_500_000, 2_000_000]
+        assert all(sample.source_time_ns is None for sample in receiver.samples)
+        assert [sample.sample.gyro_rad_s[1] for sample in receiver.samples] == pytest.approx(
+            [0, .02, .03, .03], abs=1e-12)
+        assert receiver.bmi_units[-1][0] == pytest.approx((0, .03 * 180 / math.pi, 0), abs=1e-12)
+        assert receiver.bmi_units[-1][1] == pytest.approx((0, 9.81 / 9.80665, 0), abs=1e-12)
+        assert {name: counts[name] - baseline[name] for name in counts} == {
+            "mj_step": 3, "mj_forward": 3, "mj_resetData": 0}
+        worlds = _world_events(simulation)
+        assert [event.mapped_time_ns for event in worlds] == [0, 1_000_000, 1_500_000, 2_000_000]
+        assert worlds[-1].payload["imus"]["body"] == receiver.samples[-1].sample
+        assert worlds[-1].payload["native_time_s"] == pytest.approx(.002, abs=1e-15)
+        deliveries = [event for event in simulation.events if event.kind == "net.imu.delivery"]
+        assert [(event.source_time_ns, event.mapped_time_ns, event.delivery_time_ns,
+                 str(event.quality)) for event in deliveries] == [
+                     (None, cut, cut, "sampled") for cut in (0, 1_000_000, 1_500_000, 2_000_000)]
+        with pytest.raises(TypeError):
+            worlds[0].payload["imus"]["body"] = receiver.samples[-1].sample
+        with pytest.raises(FrozenInstanceError):
+            receiver.samples[0].sample.accel_m_s2 = (0, 0, 0)
+
+
+def test_imu_only_freefall_delivers_identical_samples_and_reset_recreates_source(tmp_path, monkeypatch):
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    created = _capture_physics(monkeypatch)
+    path = tmp_path / "fall.xml"
+    path.write_text("""<mujoco><option integrator="Euler" gravity="0 0 -9.81"/>
+      <worldbody><body name="falling" pos="1 2 3"><freejoint/>
+        <inertial pos="0 0 0" mass="1" diaginertia="0.02 0.02 0.02"/>
+        <site name="imu"/>
+      </body></worldbody>
+      <sensor><gyro name="gyro sensor" site="imu"/>
+        <accelerometer name="accel sensor" site="imu"/></sensor></mujoco>""")
+    world = NodeSpec("world", "physics.mujoco", {
+        "model": path, "imus": {"body": ["gyro sensor", "accel sensor"]}})
+    topology, registry = _imu_topology(world)
+    with Simulation(topology, registry) as simulation:
+        receiver = simulation.components["sink"]
+        simulation.run_until(3_000_000)
+        assert [item.mapped_time_ns for item in receiver.samples] == [0, 1_000_000, 2_000_000, 3_000_000]
+        assert all(item.sample.gyro_rad_s == (0, 0, 0) for item in receiver.samples)
+        assert all(item.sample.accel_m_s2 == pytest.approx((0, 0, 0), abs=1e-12)
+                   for item in receiver.samples)
+        assert _world_events(simulation)[-1].payload["joints"] == {}
+        assert created[0].get_body_pose("falling").position_m[2] < 3
+        simulation.reset()
+        assert len(created) == 2 and simulation.components["sink"] is not receiver
+        with pytest.raises(RuntimeError, match="closed"):
+            created[0].get_imu("body")
+        reset_receiver = simulation.components["sink"]
+        assert [item.mapped_time_ns for item in reset_receiver.samples] == [0]
+        assert created[1].get_body_pose("falling").position_m == (1, 2, 3)
+        simulation.step()
+        assert [item.mapped_time_ns for item in reset_receiver.samples] == [0, 1_000_000]
+
+
+def test_bound_motor_world_imu_reuses_the_single_joint_execution_owner(tmp_path, monkeypatch):
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    from sim.fabric.imu import ImuNetFactory
+    from test_simulation_joints import capture_native, command, scene
+
+    path = tmp_path / "bound-imu.xml"
+    xml = (ROOT / "examples/shared-world/world.xml").read_text().replace(
+        '<body name="rotor1" pos="-1 0 0">',
+        '<body name="rotor1" pos="-1 0 0"><site name="imu"/>')
+    path.write_text(xml.replace("</mujoco>", """<sensor>
+      <gyro name="gyro" site="imu"/><accelerometer name="accel" site="imu"/>
+      </sensor></mujoco>"""))
+    topology, registry = scene()
+    nodes = tuple(NodeSpec(node.name, node.kind, {
+        **node.options, "model": path, "imus": {"body": ["gyro", "accel"]}})
+        if node.name == "world" else node for node in topology.nodes)
+    nodes += (NodeSpec("wire", "net.imu"), NodeSpec("sink", "receiver"))
+    links = topology.links + (LinkSpec("world.imu.body", "wire.signal"),
+                              LinkSpec("wire.signal", "sink.imu"))
+    registry.update({"net.imu": ImuNetFactory(), "receiver": _ImuReceiverFactory()})
+    created, calls = capture_native(monkeypatch)
+    with Simulation(Topology(nodes, links), registry) as simulation:
+        simulation.schedule_input("host.can", command())
+        simulation.step()
+        samples = simulation.components["sink"].samples
+        assert [item.mapped_time_ns for item in samples] == [0, 1_000_000]
+        # Literal command raw4096 -> .1Nm rotor, ideal P19 ratio3591/187, Izz=.02.
+        velocity = .1 * (3591 / 187) / .02 * .001
+        assert samples[-1].sample.gyro_rad_s == pytest.approx((0, 0, velocity), abs=1e-12)
+        assert samples[-1].sample.accel_m_s2 == pytest.approx((0, 0, 0), abs=1e-12)
+        assert len(created) == len(calls["reset"]) == len(calls["step"]) == 1
+        assert {frame.can_id for frame in simulation.components["host"].frames} == {0x201, 0x202}
+    assert len(calls["close"]) == 1
+
+
+@pytest.mark.parametrize("failure_stage", ["step", "source", "sink"])
+def test_failed_native_imu_cut_keeps_primary_and_never_delivers_or_replays(
+        tmp_path, monkeypatch, failure_stage):
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    primary = RuntimeError(f"partial IMU {failure_stage}")
+    created = _capture_physics(monkeypatch)
+
+    def receive(sample):
+        if sample.mapped_time_ns:
+            raise primary
+
+    topology, registry = _imu_topology(_imu_rotor(tmp_path),
+                                     receive=receive if failure_stage == "sink" else None)
+    simulation = Simulation(topology, registry)
+    with simulation:
+        physics = created[0]
+        method = physics.step if failure_stage == "step" else physics.get_imu
+        calls = []
+
+        def fail(*args):
+            calls.append(args)
+            result = method(*args)
+            if failure_stage == "step" or physics.time_s > 0:
+                raise primary
+            return result
+
+        if failure_stage in ("step", "source"):
+            monkeypatch.setattr(physics, "step" if failure_stage == "step" else "get_imu", fail)
+        receiver = simulation.components["sink"]
+        simulation.schedule_input("world.effort", {"shaft": .4})
+        with pytest.raises(RuntimeError) as caught:
+            simulation.step()
+        assert caught.value is simulation.failure is primary
+        assert simulation.state is SimulationState.FAILED and simulation.t_sim_ns == 0
+        assert physics.time_s == pytest.approx(.001, abs=1e-15)
+        assert [item.mapped_time_ns for item in receiver.samples] == [0]
+        previous = list(calls)
+        for retry in (simulation.step, simulation.reset):
+            with pytest.raises(RuntimeError):
+                retry()
+        assert calls == previous

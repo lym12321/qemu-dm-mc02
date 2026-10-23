@@ -3,6 +3,8 @@
 from dataclasses import dataclass
 from typing import Protocol
 
+from sim.api.imu import ImuSample
+
 
 @dataclass(frozen=True)
 class JointState:
@@ -14,12 +16,6 @@ class JointState:
 class BodyPose:
     position_m: tuple[float, float, float]
     quaternion_wxyz: tuple[float, float, float, float]
-
-
-@dataclass(frozen=True)
-class ImuSample:
-    gyro_rad_s: tuple[float, float, float]
-    accel_m_s2: tuple[float, float, float]
 
 
 @dataclass(frozen=True)

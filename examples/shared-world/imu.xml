@@ -1,0 +1,18 @@
+<mujoco model="completed site IMU">
+  <!-- Uncalibrated mechanics fixture. Native gyro/accelerometer own the
+       site-frame observation; the host does not rotate or subtract gravity. -->
+  <compiler angle="radian"/>
+  <option timestep="0.001" integrator="Euler" gravity="0 0 -9.81"/>
+  <worldbody>
+    <body name="rotor">
+      <joint name="shaft" type="hinge" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.015 0.015 0.02"/>
+      <site name="imu site" pos="0.25 0 0"/>
+    </body>
+  </worldbody>
+  <actuator><motor name="drive" joint="shaft"/></actuator>
+  <sensor>
+    <gyro name="body gyro" site="imu site"/>
+    <accelerometer name="body accel" site="imu site"/>
+  </sensor>
+</mujoco>

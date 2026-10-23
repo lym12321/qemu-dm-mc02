@@ -64,3 +64,62 @@ Direct control remains the default. Neither mode establishes CPU/world lockstep
 or real time performance. Invalid models/bindings fail at execution; validation checks
 configuration without loading MuJoCo. Missing native dependencies report
 `blocked` (exit 78), while execution failures report `failed` (exit 1).
+
+## Completed IMU observations
+
+The separate IMU fixture has one hinge and a native gyro/accelerometer pair at
+an offset site. Run it through the same installed CLI:
+
+```sh
+uv run sim validate examples/shared-world/imu.yaml
+uv run --extra mujoco sim run examples/shared-world/imu.yaml
+```
+
+At the interactive prompt, enter:
+
+```text
+inject world.effort {"shaft":0.4}
+step 10ms
+inject world.effort {"shaft":0}
+step 10ms
+quit
+```
+
+`physics.state` includes `imus.body`, with gyro in rad/s and proper acceleration
+in m/s², expressed in the site's local axes. Initially the values are `(0,0,0)`
+and `(0,0,9.81)`. At 10ms of +0.4Nm, they are `(0,0,0.2)` and
+`(-0.01,5,9.81)`: the offset site observes centripetal and tangential acceleration.
+Native MuJoCo owns these observations and their gravity/frame semantics.
+
+The `imus` mapping uses topology identifier aliases and literal native sensor
+names in `[gyro, accelerometer]` order. Both sensors must share one site. A world
+may contain only IMUs, with `joints` omitted; it then has no effort input.
+Bound worlds expose the same IMU outputs while retaining their joint executor.
+
+To receive every completed sample in another component:
+
+```sh
+uv run --extra mujoco python examples/shared-world/imu_consumer.py
+```
+
+This example registers a small custom consumer and connects
+`world.imu.body → imu_wire.signal → monitor.imu`. The `net.imu` connection requires
+one source and at least one sink. Sources expose `read_imu()`; sinks implement
+`receive_imu(ImuSignalSample)`. Every completed cut, including the initial cut and
+unchanged values, produces one broadcast. All sources are sampled before any
+delivery, so a received value first affects a consumer's next interval.
+
+`ImuSignalSample.sample` is the immutable SI `ImuSample`; `mapped_time_ns` identifies
+its completed Simulation cut. Native observations have `source_time_ns=None`,
+because the solver retains floating-point seconds rather than an integer sensor
+timestamp. Events use `sampled` quality. `net.imu.sample` and `net.imu.delivery`
+include the source and sample; deliveries also identify destination, broadcast
+sequence and due time. A broadcast consumes one dispatch budget unit regardless
+of fanout. Queue and dispatch limits default to 256 (allowed range 1..65536),
+with at most 256 endpoints. Overflow or delivery failure freezes execution;
+partial sink effects are retained and never replayed. Connections borrow their
+endpoints and do not reset or close them.
+
+This is the host SI signal boundary. QEMU/BMI088 injection and firmware reads
+require a separate consumer gate; these observations do not establish physical
+calibration, sensor ODR/filter history, real-time performance or CPU/world lockstep.

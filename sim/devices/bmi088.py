@@ -7,7 +7,7 @@ The existing BMI088/link producer owns range/filter/ODR and source attribution.
 
 import math
 
-from sim.physics import ImuSample
+from sim.api import ImuSample, validate_imu_sample
 
 
 def imu_to_bmi088_units(sample: ImuSample) -> tuple[
@@ -15,19 +15,7 @@ def imu_to_bmi088_units(sample: ImuSample) -> tuple[
     """Return (gyro degrees/s, accel g), where one g is 9.80665 m/s²."""
     if not isinstance(sample, ImuSample):
         raise TypeError("BMI088 source requires an ImuSample")
-    for name, vector in (("gyro_rad_s", sample.gyro_rad_s),
-                         ("accel_m_s2", sample.accel_m_s2)):
-        if not isinstance(vector, tuple) or len(vector) != 3:
-            raise ValueError(f"{name} must be a tuple of three finite numbers")
-        for value in vector:
-            if (isinstance(value, bool) or not isinstance(value, (int, float))):
-                raise ValueError(f"{name} must contain finite numbers")
-            try:
-                finite = math.isfinite(value)
-            except OverflowError as exc:
-                raise ValueError(f"{name} must contain finite numbers") from exc
-            if not finite:
-                raise ValueError(f"{name} must contain finite numbers")
+    validate_imu_sample(sample)
     # Keep the legacy worker's arithmetic and axis order. No orientation or
     # gravity subtraction belongs here: native site sensors already supply it.
     gyro = tuple(value * 180.0 / math.pi for value in sample.gyro_rad_s)

@@ -1,0 +1,13 @@
+schema: sim/v1
+runtime:
+  mode: interactive
+  quantum: 1ms
+  duration: 20ms
+nodes:
+  world:
+    kind: physics.mujoco
+    model: imu.xml
+    joints:
+      shaft: drive
+    imus:
+      body: [body gyro, body accel]
