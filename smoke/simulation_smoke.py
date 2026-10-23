@@ -5,15 +5,18 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import subprocess
+import struct
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +37,8 @@ def _plain(value):
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, tuple):
         return [_plain(item) for item in value]
+    if is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
     return value
 
 
@@ -56,6 +61,8 @@ class Observations:
         self.rotor_consumption = None
         self.physics_states = []
         self.joint_consumption = None
+        self.imu = []
+        self.imu_readbacks = []
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -105,11 +112,17 @@ class Observations:
                 "can_id": event.payload["frame"].can_id,
                 "data": event.payload["frame"].data.hex(), "dropped": event.payload["dropped"]})
         elif event.kind == "physics.state" and event.source_node == "world":
-            self.physics_states.append({**stamp, "source": event.source_node,
+            state = {**stamp, "source": event.source_node,
                 "endpoint": event.source_port, "native_time_s": event.payload["native_time_s"],
                 "joints": {name: {"position_rad": state.position_rad,
                                    "velocity_rad_s": state.velocity_rad_s}
-                           for name, state in event.payload["joints"].items()}})
+                           for name, state in event.payload["joints"].items()}}
+            if "imus" in event.payload:
+                state["imus"] = _plain(event.payload["imus"])
+            self.physics_states.append(state)
+        elif (event.kind.startswith("net.imu.") or event.kind.startswith("imu-")):
+            self.imu.append({**stamp, "source": event.source_node,
+                "endpoint": event.source_port, "kind": event.kind, "payload": _plain(event.payload)})
         elif event.kind == "can-tx" or (event.kind == "can.sent" and event.source_node in ("motor0", "motor1")):
             frame = event.payload if event.kind == "can-tx" else event.payload["frame"]
             self.can.append({**stamp, "source": event.source_node,
@@ -131,6 +144,9 @@ class Observations:
             return self.report()
         if case == "joint-loop":
             self._verify_joints(ready)
+            return self.report()
+        if case == "imu-readback":
+            self._verify_imu(ready)
             return self.report()
         if case in ("minimal-board", "hal-gpio", "pulse", "digital-link"):
             if case in ("minimal-board", "pulse", "digital-link"):
@@ -519,6 +535,128 @@ class Observations:
             "coast_intervals": (end_ns - zero_ns) // 1_000_000,
             "expected_j1_position_rad": position, "expected_j1_velocity_rad_s": velocity}
 
+    def _verify_imu(self, ready):
+        """Independent Bosch bins plus actual UART/consumption attribution."""
+        cuts = list(range(0, 100_000_001, 10_000_000))
+        if [row["mapped_time_ns"] for row in self.physics_states] != cuts:
+            raise AssertionError("completed native IMU world cuts are missing")
+        for row in self.physics_states:
+            if (row["source_time_ns"] is not None or row["quality"] != "sampled"
+                    or row["delivery_time_ns"] != row["mapped_time_ns"]
+                    or not math.isclose(row["native_time_s"], row["mapped_time_ns"] / 1e9,
+                                        rel_tol=0, abs_tol=1e-12)
+                    or row["joints"] or set(row.get("imus", {})) != {"body"}):
+                raise AssertionError("completed native IMU state provenance is invalid")
+            sample = row["imus"]["body"]
+            if (sample["gyro_rad_s"] != [0.0, 0.0, 0.0]
+                    or sample["accel_m_s2"] != [0.0, 0.0, 9.81]):
+                raise AssertionError("native rest SI IMU disagrees with the independent fixture")
+
+        initial = [row for row in self.imu if row["kind"] == "imu-input-initial"]
+        accepted = [row for row in self.imu if row["kind"] == "imu-input-accepted"]
+        completed = [row for row in self.imu if row["kind"] == "imu-consumption"]
+        if len(initial) != 1 or initial[0]["mapped_time_ns"] != 0:
+            raise AssertionError("initial IMU observation must remain separate from positive STEP inputs")
+        if [row["mapped_time_ns"] for row in accepted] != cuts[1:]:
+            raise AssertionError("each positive completed IMU cut needs one native admission ACK")
+        # Independent unit and float32 expectations, not the production
+        # converter/codec. g0=9.80665 m/s² is the public SI conversion contract.
+        expected_accel_g = struct.unpack("<f", struct.pack("<f", 9.81 / 9.80665))[0]
+        by_identity = {}
+        for row in [*initial, *accepted]:
+            payload = row["payload"]
+            sample = payload["input"]
+            cut = row["mapped_time_ns"]
+            if (row["source"] != "main" or row["endpoint"] != "imu"
+                    or row["source_time_ns"] is not None or row["quality"] != "sampled"
+                    or row["delivery_time_ns"] != cut or sample != {
+                        "gyro_rad_s": [0.0, 0.0, 0.0], "accel_m_s2": [0.0, 0.0, 9.81],
+                        "source_time_ns": None, "mapped_time_ns": cut}):
+                raise AssertionError("IMU native admission lost the completed SI source provenance")
+            if not cut:
+                continue
+            wire = payload["wire"]
+            if (wire != {"gyro_dps": [0.0, 0.0, 0.0],
+                         "accel_g": [0.0, 0.0, expected_accel_g],
+                         "gyro_bias_dps": [0.0, 0.0, 0.0], "accel_bias_g": [0.0, 0.0, 0.0],
+                         "sensor_time_ns": cut, "sample_id": 0}
+                    or payload["status"] != 0 or payload["t_sim_ns"] != cut
+                    or payload["dt_ns"] != 10_000_000):
+                raise AssertionError("IMU actual float32 wire or native admission disagrees with the fixture")
+            key = (payload["session_id"], payload["step_id"])
+            if key in by_identity:
+                raise AssertionError("duplicate IMU input identity")
+            by_identity[key] = row
+
+        done_by_identity = {}
+        for row in completed:
+            payload = row["payload"]
+            key = (payload["session_id"], payload["step_id"])
+            admission = by_identity.get(key)
+            if (key in done_by_identity or admission is None
+                    or row["event_sequence"] <= admission["event_sequence"]
+                    or row["mapped_time_ns"] != admission["mapped_time_ns"]
+                    or row["delivery_time_ns"] < row["mapped_time_ns"]
+                    or row["source_time_ns"] is not None or row["quality"] != "sampled"
+                    or any(payload[field] != admission["payload"][field]
+                           for field in ("input", "wire", "t_sim_ns", "dt_ns"))):
+                raise AssertionError("IMU terminal consumption lost its actual admitted identity")
+            done_by_identity[key] = row
+
+        uart = bytes(self.uart)
+        matches = list(re.finditer(rb"^IMU_READ n=([12]) g=([0-9a-f]{12}) a=([0-9a-f]{12}) t=([0-9a-f]{6})\n",
+                                   uart, re.MULTILINE))
+        if ([int(match[1]) for match in matches] != [1, 2]
+                or matches[0].start() < uart.index(ready) + len(ready)
+                or uart.find(b"IMU_PASS\n", matches[-1].end()) < 0):
+            raise AssertionError("two ordered actual guest IMU readbacks and PASS are required")
+        bounds, length = [], 0
+        for batch in self.uart_batches:
+            if batch["source"] == "main":
+                length += len(bytes.fromhex(batch["data_hex"]))
+                bounds.append((length, batch))
+        if length != len(uart):
+            raise AssertionError("guest IMU UART bytes lack actual observation bounds")
+        readbacks = []
+        for match in matches:
+            gyro = struct.unpack("<3h", bytes.fromhex(match[2].decode()))
+            accel = struct.unpack("<3h", bytes.fromhex(match[3].decode()))
+            sensor_ticks = int(match[4], 16)
+            candidates = [row for row in accepted if
+                (row["payload"]["wire"]["sensor_time_ns"] * 25600 // 1_000_000_000) & 0xffffff == sensor_ticks]
+            if len(candidates) != 1:
+                raise AssertionError("guest sensortime does not identify one actual admitted IMU sample")
+            admission = candidates[0]
+            key = (admission["payload"]["session_id"], admission["payload"]["step_id"])
+            done = done_by_identity.get(key)
+            if (done is None or done["payload"]["status"] != 0
+                    or done["payload"]["consumed_mask"] != 3
+                    or done["payload"]["missing_mask"] != 0):
+                raise AssertionError("guest readback lacks matching full gyro/accel consumed DONE")
+            if gyro != (0, 0, 0) or accel != (0, 0, 5463):
+                raise AssertionError("guest raw IMU disagrees with independent rest values (accelZ=5463)")
+            # Bosch Rev1.9 p39 section5.5.5 and p30 section5.3.11:
+            # range1 gives +/-1000dps and +/-6g, signed16 half-LSB bins.
+            for name, values, raw, scale in (("gyro", admission["payload"]["wire"]["gyro_dps"], gyro, 1000.0),
+                                             ("accel", admission["payload"]["wire"]["accel_g"], accel, 6.0)):
+                lsb = scale / 32768
+                if any(abs(value - code * lsb) > lsb / 2 for value, code in zip(values, raw)):
+                    raise AssertionError(f"guest {name} raw misses the actual float32 wire half-LSB bin")
+            bound = next((batch for length, batch in bounds if length >= match.end()), None)
+            if (bound is None or bound["quality"] != "upper_bound"
+                    or bound["mapped_time_ns"] <= admission["mapped_time_ns"]
+                    or bound["event_sequence"] <= done["event_sequence"]):
+                raise AssertionError("guest final sensortime store lacks later actual UART publication")
+            readbacks.append({"number": int(match[1]), "gyro_raw": list(gyro),
+                "accel_raw": list(accel), "sensor_ticks_u24": sensor_ticks,
+                "session_id": key[0], "step_id": key[1],
+                "input_cut_ns": admission["mapped_time_ns"],
+                "done_observed_cut_ns": done["delivery_time_ns"],
+                "uart_upper_bound_ns": bound["mapped_time_ns"]})
+        if readbacks[0]["sensor_ticks_u24"] >= readbacks[1]["sensor_ticks_u24"]:
+            raise AssertionError("actual guest IMU sensor time must increase")
+        self.imu_readbacks = readbacks
+
     def _verify_digital(self, ready):
         peer_uart = bytes(self.peer_uart)
         if ready not in peer_uart or b"FAIL" in peer_uart:
@@ -616,10 +754,18 @@ class Observations:
                 "inputs": self.inputs, "uart_batches": self.uart_batches,
                 "digital": self.digital, "digital_consumption": self.digital_consumption,
                 "rotor_state": self.rotor_state, "rotor_consumption": self.rotor_consumption,
-                "physics_states": self.physics_states, "joint_consumption": self.joint_consumption}
+                "physics_states": self.physics_states, "joint_consumption": self.joint_consumption,
+                "imu": self.imu, "imu_readbacks": self.imu_readbacks,
+                "imu_pending": self._imu_pending()}
+
+    def _imu_pending(self):
+        completed = {(row["payload"]["session_id"], row["payload"]["step_id"])
+                     for row in self.imu if row["kind"] == "imu-consumption"}
+        return [row for row in self.imu if row["kind"] == "imu-input-accepted"
+                and (row["payload"]["session_id"], row["payload"]["step_id"]) not in completed]
 
 
-def build_example(case, *, build_dir=None, build_type="Debug"):
+def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=False):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
@@ -633,6 +779,8 @@ def build_example(case, *, build_dir=None, build_type="Debug"):
     if source.name == "can-motor":
         variant.append("-DSIM_ROTOR_LOOP_TEST=" + ("ON" if case == "rotor-loop" else "OFF"))
         variant.append("-DSIM_JOINT_LOOP_TEST=" + ("ON" if case == "joint-loop" else "OFF"))
+    if source.name == "imu-readback":
+        variant.append("-DSIM_IMU_SKIP_GYRO_TEST=" + ("ON" if imu_skip_gyro else "OFF"))
     commands = (["cmake", "-S", str(source), "-B", str(build), f"-DCMAKE_BUILD_TYPE={build_type}", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
@@ -665,6 +813,15 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
                            (case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"), registry)
+        if case == "imu-readback" and firmware is not None:
+            from sim.api import NodeSpec, Topology
+            from sim.config.scene import Scene
+
+            nodes = tuple(NodeSpec(node.name, node.kind,
+                {**node.options, "firmware": str(firmware)} if node.name == "main" else node.options,
+                base_dir=node.base_dir) for node in scene.topology.nodes)
+            scene = Scene(Topology(nodes, scene.topology.links), scene.mode,
+                          scene.quantum_ns, scene.duration_ns)
         if case == "pulse":
             from sim.api import NodeSpec, Topology
             from sim.config.scene import Scene
@@ -762,7 +919,7 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "all"), default="all")
+    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "imu-readback", "all"), default="all")
     parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",

@@ -1,0 +1,12 @@
+cmake_minimum_required(VERSION 3.20)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../minimal-board/arm-none-eabi.cmake"
+        CACHE FILEPATH "ARM bare-metal toolchain")
+endif()
+project(sim_imu_readback LANGUAGES C)
+option(SIM_IMU_SKIP_GYRO_TEST "Test-only mutant: omit the actual gyro burst" OFF)
+include("${CMAKE_CURRENT_LIST_DIR}/../minimal-board/firmware.cmake")
+target_include_directories(firmware PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../../smoke")
+if(SIM_IMU_SKIP_GYRO_TEST)
+    target_compile_definitions(firmware PRIVATE SIM_IMU_SKIP_GYRO_TEST=1)
+endif()

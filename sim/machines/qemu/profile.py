@@ -37,6 +37,7 @@ def describe(spec):
     _, uarts = admit_options(spec)
     ports = [PortSpec(port, 'uart', capabilities=EXTERNAL_INPUT) for port in uarts]
     ports += [PortSpec(port, 'can') for port in CAN_PORTS]
+    ports += [PortSpec('imu', 'imu', direction='in', category='signal')]
     ports += [PortSpec('key', 'digital', direction='in', category='signal',
                        capabilities=EXTERNAL_INPUT),
               PortSpec('snapshot', 'snapshot', direction='out', category='signal')]

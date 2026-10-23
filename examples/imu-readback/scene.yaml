@@ -1,0 +1,20 @@
+schema: sim/v1
+runtime:
+  mode: stepped
+  quantum: 10ms
+  duration: 100ms
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build/firmware.elf
+  world:
+    kind: physics.mujoco
+    model: ../shared-world/imu.xml
+    imus:
+      body: [body gyro, body accel]
+  wire:
+    kind: net.imu
+links:
+  - [world.imu.body, wire.signal]
+  - [wire.signal, main.imu]

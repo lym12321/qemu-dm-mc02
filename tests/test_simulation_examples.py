@@ -546,3 +546,125 @@ def test_blocked_native_gate_retains_new_report_and_returns_78(tmp_path):
     original = report.read_bytes()
     assert smoke.main(["--qemu", str(tmp_path / "not-a-qemu"), "--report", str(report)]) == 1
     assert report.read_bytes() == original
+
+
+def _imu_observations():
+    """Independent literal SI/wire/raw fixture; no converter or codec calls."""
+    import struct
+
+    result = smoke.Observations()
+    uart = (b"SIM_READY imu-readback\n"
+            b"IMU_READ n=1 g=000000000000 a=000000005715 t=000300\n"
+            b"IMU_READ n=2 g=000000000000 a=000000005715 t=000400\nIMU_PASS\n")
+    result.uart.extend(uart)
+    result.snapshots = [{"mapped_time_ns": 100_000_000}]
+    f32_g = struct.unpack("<f", struct.pack("<f", 9.81 / 9.80665))[0]
+    for tick in range(11):
+        cut = tick * 10_000_000
+        sample = {"gyro_rad_s": [0.0, 0.0, 0.0], "accel_m_s2": [0.0, 0.0, 9.81]}
+        result.physics_states.append({"event_sequence": tick * 100,
+            "source": "world", "endpoint": "state", "source_time_ns": None,
+            "mapped_time_ns": cut, "delivery_time_ns": cut, "quality": "sampled",
+            "native_time_s": tick / 100, "joints": {}, "imus": {"body": sample}})
+        payload = {"input": {**sample, "source_time_ns": None, "mapped_time_ns": cut}}
+        if tick:
+            payload.update(session_id=1, step_id=tick, t_sim_ns=cut, dt_ns=10_000_000,
+                status=0, queue_depth=0, dropped_count=0,
+                wire={"gyro_dps": [0.0, 0.0, 0.0], "accel_g": [0.0, 0.0, f32_g],
+                      "gyro_bias_dps": [0.0, 0.0, 0.0], "accel_bias_g": [0.0, 0.0, 0.0],
+                      "sensor_time_ns": cut, "sample_id": 0})
+        stamp = {"source": "main", "endpoint": "imu", "source_time_ns": None,
+            "mapped_time_ns": cut, "delivery_time_ns": cut, "quality": "sampled"}
+        result.imu.append({**stamp, "event_sequence": tick * 100 + 1,
+            "kind": "imu-input-accepted" if tick else "imu-input-initial", "payload": payload})
+        if 0 < tick < 10:
+            full = tick in (3, 4)
+            result.imu.append({**stamp, "event_sequence": tick * 100 + 50,
+                "delivery_time_ns": cut + 10_000_000,
+                "kind": "imu-consumption", "payload": {**payload,
+                    "status": 0 if full else 2,
+                    "consumed_mask": 3 if full else 0, "missing_mask": 0 if full else 3}})
+    result.uart_batches = [{"source": "main", "event_sequence": 550,
+        "mapped_time_ns": 50_000_000, "quality": "upper_bound", "data_hex": uart.hex()}]
+    return result
+
+
+def test_imu_readback_requires_two_actual_full_consumed_sources_and_retains_pending():
+    observations = _imu_observations()
+    report = observations.verify("imu-readback")
+    assert [row["input_cut_ns"] for row in report["imu_readbacks"]] == [30_000_000, 40_000_000]
+    assert [row["sensor_ticks_u24"] for row in report["imu_readbacks"]] == [768, 1024]
+    assert [row["payload"]["t_sim_ns"] for row in report["imu_pending"]] == [100_000_000]
+    assert len([row for row in report["imu"] if row["kind"] == "imu-consumption"]) == 9
+    json.dumps(report)
+
+
+def test_imu_readback_rejects_skipped_zero_gyro_burst_despite_identical_raw_and_pass():
+    observations = _imu_observations()
+    for row in observations.imu:
+        if row["kind"] == "imu-consumption" and row["payload"]["consumed_mask"] == 3:
+            row["payload"].update(status=2, consumed_mask=1, missing_mask=2)
+    with pytest.raises(AssertionError, match="matching full gyro/accel consumed DONE"):
+        observations.verify("imu-readback")
+
+
+@pytest.mark.parametrize("change,error", [
+    ("default_gravity", "independent rest values"),
+    ("wrong_sensor_time", "identify one actual admitted"),
+    ("wrong_done_identity", "actual admitted identity"),
+    ("early_uart", "final sensortime store"),
+    ("wrong_wire", "actual float32 wire"),
+    ("source_clock", "completed SI source provenance"),
+])
+def test_imu_readback_rejects_unattributed_or_default_sensor_evidence(change, error):
+    observations = _imu_observations()
+    if change == "default_gravity":
+        observations.uart = observations.uart.replace(b"5715", b"5515")
+        observations.uart_batches[0]["data_hex"] = bytes(observations.uart).hex()
+    elif change == "wrong_sensor_time":
+        observations.uart = observations.uart.replace(b"t=000300", b"t=000301")
+        observations.uart_batches[0]["data_hex"] = bytes(observations.uart).hex()
+    elif change == "wrong_done_identity":
+        next(row for row in observations.imu if row["kind"] == "imu-consumption")["payload"]["step_id"] = 50
+    elif change == "early_uart":
+        observations.uart_batches[0]["event_sequence"] = 340
+    elif change == "wrong_wire":
+        next(row for row in observations.imu if row["kind"] == "imu-input-accepted")["payload"]["wire"]["accel_g"][2] = 1.0
+    elif change == "source_clock":
+        next(row for row in observations.imu if row["kind"] == "imu-input-accepted")["source_time_ns"] = 1
+    with pytest.raises(AssertionError, match=error):
+        observations.verify("imu-readback")
+
+
+def test_imu_readback_build_and_scene_are_explicit_and_share_existing_helpers(tmp_path):
+    if any(shutil.which(program) is None for program in ("cmake", "arm-none-eabi-gcc")):
+        pytest.skip("optional ARM cross compiler/CMake are unavailable")
+    result = smoke.build_example("imu-readback", build_dir=tmp_path / "firmware")
+    assert "-DSIM_IMU_SKIP_GYRO_TEST=OFF" in result["build"][0]["command"]
+    from sim.composition import builtin_registry
+    from sim.config.scene import load_scene
+
+    scene_file = tmp_path / "scene.yaml"
+    scene_file.write_text((ROOT / "examples/imu-readback/scene.yaml").read_text().replace(
+        "./build/firmware.elf", result["elf"]).replace(
+        "../shared-world/imu.xml", str(ROOT / "examples/shared-world/imu.xml")))
+    scene = load_scene(scene_file, builtin_registry())
+    assert (scene.mode, scene.quantum_ns, scene.duration_ns) == ("stepped", 10_000_000, 100_000_000)
+    assert [(node.name, node.kind) for node in scene.topology.nodes] == [
+        ("main", "machine.qemu"), ("world", "physics.mujoco"), ("wire", "net.imu")]
+    assert [(str(link.source), str(link.target)) for link in scene.topology.links] == [
+        ("world.imu.body", "wire.signal"), ("wire.signal", "main.imu")]
+    assert smoke.NATIVE_CASES == ("minimal-board", "can-motor", "pulse", "digital-link", "rotor-loop")
+
+
+def test_imu_observation_projects_frozen_envelopes_without_serializing_backend_objects():
+    from sim.api import Event, ImuSample, ImuSignalSample
+
+    observations = smoke.Observations()
+    sample = ImuSignalSample(ImuSample((0.0, 0.0, 0.0), (0.0, 0.0, 9.81)), None, 10_000_000)
+    observations(Event(1, 0, "wire", "signal", "net.imu.sample", {"sample": sample},
+        None, 10_000_000, 10_000_000, "sampled"))
+    assert observations.imu[0]["payload"]["sample"] == {
+        "sample": {"gyro_rad_s": [0.0, 0.0, 0.0], "accel_m_s2": [0.0, 0.0, 9.81]},
+        "source_time_ns": None, "mapped_time_ns": 10_000_000}
+    json.dumps(observations.report())

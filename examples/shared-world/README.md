@@ -120,6 +120,13 @@ with at most 256 endpoints. Overflow or delivery failure freezes execution;
 partial sink effects are retained and never replayed. Connections borrow their
 endpoints and do not reset or close them.
 
-This is the host SI signal boundary. QEMU/BMI088 injection and firmware reads
-require a separate consumer gate; these observations do not establish physical
-calibration, sensor ODR/filter history, real-time performance or CPU/world lockstep.
+The fixed `machine.qemu.imu` input accepts the same connection and opens the
+existing co-sim transport only when wired. See the [firmware IMU readback
+example](../imu-readback/README.md) for a complete world-to-SPI consumer. Its
+zero-time observation stays on the host; each positive completed cut supplies
+one sensor input for subsequent CPU execution. `imu-input-accepted` reports
+protocol admission, while `imu-consumption` retains actual consumed/missing
+masks. A final input can remain pending when the run ends.
+
+These observations do not establish physical calibration, sensor ODR/filter
+history, real-time performance or CPU/world lockstep.

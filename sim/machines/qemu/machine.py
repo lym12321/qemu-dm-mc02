@@ -22,9 +22,11 @@ from sim.fabric.frame import CanFrame
 from sim.fabric.digital import DigitalSample
 from sim.transports import StreamTransport, connect_unix
 from sim.transports.can_stream import CanStream
+from sim.transports.cosim import StepFramedSocket
 
 from .deadline import deadline_qmp_call
 from .errors import BackendUnavailable
+from .imu import QemuImuEndpoint
 from .process import running_qemu
 from .profile import CAN_PORTS, admit_options, describe, input_identity, validate_input
 from .qmp import backend_root as resolve_backend_root, qmp_session_class
@@ -73,6 +75,14 @@ class _DigitalInput:
         self.machine._receive_digital(self.port, level)
 
 
+class _ImuInput:
+    def __init__(self, machine):
+        self.machine = machine
+
+    def receive_imu(self, sample):
+        self.machine._receive_imu(sample)
+
+
 class QemuFactory:
     """Explicit backend factory; static descriptions do not load native QMP."""
 
@@ -112,7 +122,7 @@ class QemuFactory:
                 if endpoint.node not in qemu_nodes:
                     continue
                 port = descriptions[endpoint.node].port(endpoint.port)
-                if port.protocol not in ('can', 'digital'):
+                if port.protocol not in ('can', 'digital', 'imu'):
                     raise ValueError(f'unsupported QEMU connection: {endpoint} ({port.protocol})')
                 if port.protocol != 'digital' and 'external_input' not in port.capabilities:
                     continue
@@ -136,6 +146,10 @@ class QemuMachine:
         # Connections attach before any process creation. Runtime owns the buses.
         self._can = {port: ctx.attach(port, _CanInput(self, port))
                      for port in self._can_ports}
+        self._imu_connected = 'imu' in ctx.connected_ports
+        self._imu = None
+        if self._imu_connected:
+            ctx.attach('imu', _ImuInput(self))
         digital_ports = tuple(port for port in ctx.connected_ports
                               if port == 'key' or port.startswith('gpio.'))
         self._digital_outputs = tuple(port for port in digital_ports if port.endswith('.out'))
@@ -202,7 +216,8 @@ class QemuMachine:
         except ValueError as exc:
             raise BackendUnavailable(str(exc)) from exc
         session_class = qmp_session_class(root)
-        sockets = ['qmp', *self._uarts, *(port.replace('fdcan', 'can') for port in self._can_ports)]
+        sockets = ['qmp', *(['cosim'] if self._imu_connected else []), *self._uarts,
+                   *(port.replace('fdcan', 'can') for port in self._can_ports)]
         command = qemu_command(self._firmware, qemu, sockets,
                                qmp_path=self._factory.qmp_path,
                                gdb_port=self._factory.gdb_port)
@@ -217,7 +232,9 @@ class QemuMachine:
         for port in sockets[1:]:
             sock = connect_unix(str(self._owner.sockets[port]), min(2.0, self._remaining()))
             self._peers.append((port, sock))
-            self._streams[port] = (CanStream if port.startswith('can') else StreamTransport)(sock)
+            stream_type = (StepFramedSocket if port == 'cosim' else
+                           CanStream if port.startswith('can') else StreamTransport)
+            self._streams[port] = stream_type(sock)
         self._board = QemuBoard(self._boundary)
         commands = self._query('query-commands')
         if not isinstance(commands, list) or not {'x-run-to-virtual-time', 'x-query-virtual-execution'} <= {
@@ -238,6 +255,10 @@ class QemuMachine:
         if snapshot['timestamp_ns'] != self._origin_ns:
             raise RuntimeError('native snapshot and execution origin disagree')
         self._complete_snapshot(snapshot, self._last_time_ns)
+        if self._imu_connected:
+            self._imu = QemuImuEndpoint(self._streams['cosim'], context=self._ctx,
+                                        check=self._check)
+            self._imu.start(self._origin_ns)
         for port in self._can_ports:
             wire = port.replace('fdcan', 'can')
             state = observe_initial_paused_can(
@@ -317,6 +338,8 @@ class QemuMachine:
             raise ValueError('QEMU step does not continue the current session')
         self._validate_cut()
         target = self._to_native(step.t_sim_ns)
+        if self._imu is not None:
+            self._imu.service(self._last_time_ns)
         self._query('x-run-to-virtual-time', {'target-ns': target})
         self._pending = step
 
@@ -327,6 +350,8 @@ class QemuMachine:
         target = self._to_native(step.t_sim_ns)
         previous = self._to_native(self._last_time_ns)
         while True:
+            if self._imu is not None:
+                self._imu.service(step.t_sim_ns)
             execution = self._query('x-query-virtual-execution')
             if not isinstance(execution, dict):
                 raise TypeError('invalid native execution observation')
@@ -343,6 +368,8 @@ class QemuMachine:
             previous = current
             select.select([], [], [], min(.001, self._remaining()))
         self._require_paused()
+        if self._imu is not None:
+            self._imu.service(step.t_sim_ns)
         uart_batches = self._collect(step.t_sim_ns)
         snapshot = self._board.snapshot()
         if snapshot['timestamp_ns'] != target:
@@ -416,6 +443,16 @@ class QemuMachine:
                        source_time_ns=stamp, mapped_time_ns=self._ctx.t_sim_ns,
                        delivery_time_ns=self._ctx.t_sim_ns, quality='exact')
 
+    def _receive_imu(self, sample):
+        self._check()
+        self._ctx.check_io()
+        if self._pending is not None or self._imu is None:
+            raise RuntimeError('IMU input requires a completed paused QEMU cut')
+        self._validate_cut()
+        # Native time admission precedes any protocol or transport effect.
+        self._to_native(self._ctx.t_sim_ns)
+        self._imu.receive_imu(sample)
+
     def input(self, port, payload):
         self._check()
         if self._pending is not None or self._board is None:
@@ -446,6 +483,11 @@ class QemuMachine:
             return
         self._closed = True
         errors = []
+        if self._imu is not None:
+            try:
+                self._imu.close()
+            except BaseException as exc:
+                errors.append(('IMU endpoint', exc))
         for label, peer in reversed(self._peers):
             try:
                 peer.close()

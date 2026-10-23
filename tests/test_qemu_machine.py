@@ -46,6 +46,10 @@ from sim.api import NodeSpec
 from sim.machines.qemu import QemuFactory
 value = QemuFactory(qemu='/missing').describe(NodeSpec('board', 'machine.qemu', {'firmware': sys.argv[1]}))
 assert value.port('fdcan3').protocol == 'can'
+assert value.port('imu').protocol == 'imu'
+assert value.port('imu').category == 'signal'
+assert value.port('imu').direction == 'in'
+assert 'external_input' not in value.port('imu').capabilities
 assert value.port('gpio.H15').category == 'signal'
 assert value.port('gpio.H15').direction == 'in'
 assert value.port('gpio.H15.out').direction == 'out'
@@ -527,3 +531,148 @@ def test_machine_uses_shared_startup_budget_above_ten_seconds(firmware, backend)
     assert len(starts) == 2
     assert all(10 < call[3] <= 20 for call in starts)
     sim.close()
+
+
+def imu_simulation(firmware, actions):
+    """A completed SI producer; the protocol endpoint is isolated separately."""
+    from sim.api import ImuSample, ImuSignalSample, StepResult
+
+    class Source:
+        def __init__(self, context):
+            self.context, self.cut = context, 0
+            context.attach('out', self)
+
+        def read_imu(self):
+            actions.append(('source', self.cut))
+            return ImuSignalSample(ImuSample((1., -2., 3.), (0., 0., 9.81)), None, self.cut)
+
+        def step(self, step):
+            self.cut = step.t_sim_ns
+            actions.append(('world', self.cut))
+            return StepResult('ok', self.cut)
+
+        def close(self):
+            actions.append(('source close', self.cut))
+
+    source = SimpleNamespace(
+        describe=lambda _: NodeDescription((PortSpec('out', 'imu', 'out', 'signal'),), {'step'}),
+        create=lambda _, context: Source(context))
+    registry = {**builtin_registry(), 'fixture.imu': source}
+    graph = Topology((NodeSpec('source', 'fixture.imu'),
+                      NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                      NodeSpec('wire', 'net.imu')),
+                     (LinkSpec('source.out', 'wire.signal'), LinkSpec('wire.signal', 'board.imu')))
+    return Simulation(graph, registry, quantum_ns=10, startup_timeout_s=20)
+
+
+def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=None):
+    """Replace only the independently tested protocol conversation."""
+    class Endpoint:
+        def __init__(self, stream, *, context, check):
+            assert isinstance(stream, adapter.StepFramedSocket)
+            self.stream, self.context, self.check = stream, context, check
+
+        def start(self, origin):
+            self.check()
+            actions.append(('imu start', origin, self.context.deadline_monotonic))
+            if start_error:
+                raise start_error
+
+        def receive_imu(self, sample):
+            self.check()
+            actions.append(('imu receive', sample.mapped_time_ns, backend.clients[-1].current))
+
+        def service(self, cut):
+            self.check()
+            actions.append(('imu service', cut))
+            if service_error and cut == 7:
+                raise service_error
+
+        def close(self):
+            actions.append(('imu close', self.stream.sock.fileno()))
+
+    return Endpoint
+
+
+def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware, backend, monkeypatch):
+    actions = []
+    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    sim = imu_simulation(firmware, actions)
+    with sim:
+        machine = sim.components['board']
+        assert tuple(machine.connection_info['sockets']) == ('qmp', 'cosim', 'uart1')
+        assert actions[0][:2] == ('imu start', 71)
+        # start() shares the startup deadline; successful startup then exposes
+        # the longer active deadline through the same live context property.
+        assert sim._deadline - actions[0][2] == sim.host_timeout_s - sim.startup_timeout_s
+        assert actions[1:] == [('source', 0), ('imu receive', 0, 71)]
+        assert not any(name == 'x-run-to-virtual-time' for name, _ in backend.commands)
+        with pytest.raises(ValueError, match='cannot accept external'):
+            sim.schedule_input('board.imu', (1, 2, 3))
+        actions.clear()
+        sim.step(7)
+        assert actions == [('imu service', 0), ('imu service', 7), ('imu service', 7),
+                           ('world', 7), ('source', 7), ('imu receive', 7, 78)]
+        actions.clear()
+        sim.step(3)
+        assert actions[-3:] == [('world', 10), ('source', 10), ('imu receive', 10, 81)]
+    assert actions[-2][0] == 'imu close' and actions[-2][1] >= 0
+    assert actions[-1] == ('source close', 10)
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+
+
+def test_unconnected_imu_does_not_construct_endpoint_or_open_cosim(firmware, backend, monkeypatch):
+    monkeypatch.setattr(adapter, 'QemuImuEndpoint', lambda *args, **kwargs: pytest.fail('unused IMU'))
+    with simulation(firmware) as sim:
+        sim.step(7)
+        assert tuple(sim.components['board'].connection_info['sockets']) == ('qmp', 'uart1')
+
+
+def test_imu_start_failure_preserves_primary_and_closes_all_owned_resources(firmware, backend, monkeypatch):
+    actions, primary = [], OSError('co-sim handshake failed')
+    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(
+        backend, actions, start_error=primary))
+    sim = imu_simulation(firmware, actions)
+    with pytest.raises(OSError) as caught:
+        sim.start()
+    assert caught.value is sim.failure is primary
+    assert sim.state == SimulationState.FAILED
+    assert any(action[0] == 'imu close' for action in actions)
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+    assert not any(name == 'x-run-to-virtual-time' for name, _ in backend.commands)
+    sim.close()
+
+
+def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware, backend, monkeypatch):
+    actions, primary = [], OSError('co-sim receive failed')
+    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(
+        backend, actions, service_error=primary))
+    with imu_simulation(firmware, actions) as sim:
+        actions.clear()
+        with pytest.raises(OSError) as caught:
+            sim.step(7)
+        assert caught.value is sim.failure is primary
+        assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 0
+        assert backend.clients[0].current == 78  # Native work already happened.
+        assert actions == [('imu service', 0), ('imu service', 7)]
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step(7)
+        assert backend.commands == before
+
+
+def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, monkeypatch):
+    actions = []
+    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    with imu_simulation(firmware, actions) as sim:
+        sim.step(7)
+        old = sim.components['board']
+        old_stream = old._streams['cosim']
+        actions.clear()
+        sim.reset()
+        assert old_stream.sock.fileno() == -1
+        assert sim.components['board'] is not old and sim.session.session_id == 2
+        assert [a for a in actions if a[0] == 'imu receive'] == [('imu receive', 0, 71)]
+        assert len([a for a in actions if a[0] == 'imu start']) == 1
