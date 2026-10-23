@@ -81,6 +81,9 @@ def test_rotor_plants_validate_without_physics_imports_or_resource_creation(tmp_
     path, document = write_scene(tmp_path, motor=True)
     document["nodes"]["motor0"]["plant"] = plant
     path.write_text(yaml.safe_dump(document, sort_keys=False))
+    # The registry now includes a pure physics factory. Rotor admission itself
+    # must still avoid importing physics implementations or creating resources.
+    registry = builtin_registry()
     original_import = builtins.__import__
 
     def refuse_physics(name, *args, **kwargs):
@@ -89,7 +92,6 @@ def test_rotor_plants_validate_without_physics_imports_or_resource_creation(tmp_
         return original_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", refuse_physics)
-    registry = builtin_registry()
     for factory in registry.values():
         monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("configuration had effects"))
     assert load_scene(path, registry).topology.nodes[-1].options["plant"] == plant
@@ -146,6 +148,33 @@ def test_missing_native_backend_is_blocked_and_preserves_report(tmp_path):
     assert cli.main(["run", str(path), "--report", str(report),
                      "--qemu", str(tmp_path / "missing")]) == 78
     assert report.read_bytes() == previous
+
+
+def test_native_backends_share_availability_type_and_missing_mujoco_is_blocked(tmp_path, monkeypatch):
+    from sim import cli
+    from sim.api import BackendUnavailable
+    from sim.machines.qemu.errors import BackendUnavailable as QemuUnavailable
+
+    assert QemuUnavailable is BackendUnavailable
+    model = tmp_path / "world.xml"
+    model.write_text("not compiled during validation")
+    scene = tmp_path / "scene.yaml"
+    scene.write_text(yaml.safe_dump({"schema": "sim/v1", "nodes": {
+        "world": {"kind": "physics.mujoco", "model": "world.xml",
+                  "joints": {"shaft": "drive"}}}}))
+    original = builtins.__import__
+
+    def missing(name, *args, **kwargs):
+        if name == "mujoco":
+            raise ModuleNotFoundError("missing optional MuJoCo", name="mujoco")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", missing)
+    assert cli.main(["validate", str(scene)]) == 0
+    report = tmp_path / "missing.json"
+    assert cli.main(["run", str(scene), "--report", str(report)]) == 78
+    result = json.loads(report.read_text())
+    assert result["status"] == "blocked" and "mujoco extra" in result["error"]
 
 
 def test_fixed_rotor_reuses_actual_protocol_and_timeout():

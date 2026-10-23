@@ -1,0 +1,12 @@
+schema: sim/v1
+runtime:
+  mode: interactive
+  quantum: 1ms
+  duration: 20ms
+nodes:
+  world:
+    kind: physics.mujoco
+    model: world.xml
+    joints:
+      j1: m1
+      j2: m2

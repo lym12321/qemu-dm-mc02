@@ -1,0 +1,20 @@
+<mujoco model="two independent hinges">
+  <!-- Uncalibrated fixture: literal Izz=.02, no damping, gravity or contacts.
+       Uses MuJoCo's native semi-implicit Euler, as the existing joint tests do. -->
+  <compiler angle="radian"/>
+  <option timestep="0.001" integrator="Euler" gravity="0 0 0"/>
+  <worldbody>
+    <body name="rotor1" pos="-1 0 0">
+      <joint name="j1" type="hinge" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.015 0.015 0.02"/>
+    </body>
+    <body name="rotor2" pos="1 0 0">
+      <joint name="j2" type="hinge" axis="0 0 1"/>
+      <inertial pos="0 0 0" mass="1" diaginertia="0.015 0.015 0.02"/>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="m1" joint="j1"/>
+    <motor name="m2" joint="j2"/>
+  </actuator>
+</mujoco>

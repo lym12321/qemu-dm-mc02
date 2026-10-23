@@ -4,8 +4,9 @@ from sim.core.participant import Session, StepContext, StepResult
 
 from .topology import Endpoint, LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
 from .events import Event, TimeQuality
+from .errors import BackendUnavailable
 
 __all__ = [
-    "Endpoint", "Event", "LinkSpec", "NodeDescription", "NodeSpec", "PortSpec",
+    "BackendUnavailable", "Endpoint", "Event", "LinkSpec", "NodeDescription", "NodeSpec", "PortSpec",
     "Session", "StepContext", "StepResult", "TimeQuality", "Topology",
 ]

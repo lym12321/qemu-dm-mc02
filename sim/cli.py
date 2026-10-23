@@ -202,7 +202,7 @@ def main(argv=None):
     except BaseException as caught:
         error = caught
         code = 130 if isinstance(caught, KeyboardInterrupt) else 1
-        from sim.machines.qemu import BackendUnavailable
+        from sim.api import BackendUnavailable
         if isinstance(caught, BackendUnavailable):
             code = 78
     finally:

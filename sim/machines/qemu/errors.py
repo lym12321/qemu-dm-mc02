@@ -1,5 +1,5 @@
-"""Native backend availability diagnostic, separate from execution failures."""
+"""QEMU uses the same availability diagnostic as other native backends."""
 
+from sim.api import BackendUnavailable
 
-class BackendUnavailable(RuntimeError):
-    """A required native binary, pinned source or capability is unavailable."""
+__all__ = ["BackendUnavailable"]

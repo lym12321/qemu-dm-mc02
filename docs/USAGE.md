@@ -40,6 +40,26 @@ python -m pytest -q tests/test_topology.py tests/test_simulation.py tests/test_q
 ```
 
 
+
+### 共享 MuJoCo 世界
+
+`physics.mujoco` 将具名原生世界作为独立 step 节点接入同一 Simulation。
+`model` 路径相对场景目录解析，`joints` 将关节名映射到执行器名。
+配置校验无需加载原生包；执行需要锁定的 `mujoco` extra。
+[双关节示例](../examples/shared-world/README.md)提供 CLI 和 Python 使用命令。
+
+`world.effort` 接收非空的 `{关节名: 转矩Nm}` 映射，整批校验后才写入控制量。
+部分更新保留其他关节的控制，reset 重建世界并清零。
+启动及每个完成切点，`world.state` 发布 `physics.state`，包含不可变的
+`JointState` 记录和原生浮点 `native_time_s`；事件使用 Simulation 整数切点、
+`sampled` 时间质量，不制造源时间戳。控制变化从交付切点之后影响积分，
+所有关节在每个区间共享一次世界推进。
+
+当前边界支持外部转矩输入与完成状态观测。电机到关节的拓扑绑定、IMU 和应用迁移
+需要独立消费者门。缺少原生依赖返回 `blocked`（退出码78），模型、绑定或运行错误
+返回 `failed`（退出码1）。示例参数未标定，不声明实时性能或 CPU/世界全局锁步。
+
+
 <a id="rotor-loop"></a>
 ### 单电机转子反馈闭环
 
