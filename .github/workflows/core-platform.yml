@@ -1,0 +1,84 @@
+name: Core platform only
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install base package and test runner
+        run: python -m pip install . 'pytest>=8,<9'
+      - name: Core runtime, fabric and pure adapter contracts
+        run: >-
+          python -m pytest -q
+          tests/test_topology.py tests/test_simulation.py
+          tests/test_simulation_inputs.py tests/test_can_fabric.py
+          tests/test_digital_fabric.py tests/test_uart_fabric.py
+          tests/test_edge_fabric.py tests/test_joint_execution.py
+          tests/test_qemu_machine.py tests/test_qemu_imu.py
+          tests/test_qmp_distribution.py tests/test_scene_cli.py
+          tests/test_simulation_digital.py tests/test_simulation_rotor.py
+      - name: Installed CLI and missing native backend
+        working-directory: /tmp
+        env:
+          PYTHONPATH: ''
+          PYTHONHOME: ''
+        run: |
+          python -I - <<'PY'
+          import importlib.abc
+          import importlib.metadata
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          optional = {'qemu', 'mujoco', 'numpy', 'mcap', 'crccheck', 'aiohttp', 'tools'}
+          class PureImports(importlib.abc.MetaPathFinder):
+              def find_spec(self, fullname, path=None, target=None):
+                  if fullname.split('.')[0] in optional:
+                      raise AssertionError('unexpected optional import: ' + fullname)
+          sys.meta_path.insert(0, PureImports())
+          import sim
+          from sim.cli import main
+          assert '/site-packages/' in str(Path(sim.__file__).resolve())
+          installed = {dist.metadata['Name'].lower() for dist in importlib.metadata.distributions()}
+          assert not (installed & (optional - {'tools'})), installed
+          try:
+              main(['--help'])
+          except SystemExit as result:
+              assert result.code == 0
+          with tempfile.TemporaryDirectory(prefix='sim.core-ci.') as name:
+              directory = Path(name)
+              pure_scene = directory / 'uart.yaml'
+              pure_scene.write_text('schema: sim/v1\nruntime:\n  duration: 2ms\nnodes:\n'
+                                    '  left:\n    kind: device.uart-echo\n'
+                                    '  right:\n    kind: device.uart-echo\n'
+                                    '  wire:\n    kind: net.uart\nlinks:\n'
+                                    '  - [left.uart, wire.uart]\n  - [right.uart, wire.uart]\n')
+              assert main(['validate', str(pure_scene)]) == 0
+              pure_report = directory / 'uart-report.json'
+              assert main(['run', str(pure_scene), '--report', str(pure_report)]) == 0
+              assert json.loads(pure_report.read_text()) == {
+                  'status': 'passed', 'result': {'time_ns': 2_000_000}}
+              (directory / 'firmware.elf').write_bytes(b'admission fixture; never executed')
+              scene = directory / 'scene.yaml'
+              scene.write_text('schema: sim/v1\nnodes:\n  main:\n'
+                               '    kind: machine.qemu\n    firmware: firmware.elf\nlinks: []\n')
+              report = directory / 'report.json'
+              result = subprocess.run([str(Path(sys.executable).with_name('sim')), 'run', str(scene),
+                                       '--qemu', str(directory / 'missing-qemu'), '--report', str(report)],
+                                      cwd='/tmp', capture_output=True, text=True, timeout=10)
+              assert result.returncode == 78, (result.returncode, result.stderr)
+              payload = json.loads(report.read_text())
+              assert payload['status'] == 'blocked' and payload['error_type'] == 'BackendUnavailable', payload
+              assert 'QEMU' in payload['error'] and 'missing-qemu' in payload['error'], payload
+          PY
