@@ -153,7 +153,8 @@ def test_coordinator_owns_native_physics_with_an_independent_logical_epoch():
     physics = rotor()
     participant = PhysicsParticipant(physics)
     coordinator = Coordinator({"world": participant})
-    origin_ns = (1 << 70) + 17
+    # Large, exactly preserved logical time within the public uint64 contract.
+    origin_ns = (1 << 63) + 17
     dt_ns, dt_s = 1_000_001, .001000001
     try:
         coordinator.reset(Session(7, origin_ns))
