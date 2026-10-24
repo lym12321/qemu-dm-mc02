@@ -6,16 +6,19 @@ from sim.boards.launch import UARTS, regular_file
 from sim.gpio import validate_gpio_pin
 
 CAN_PORTS = ('fdcan1', 'fdcan2', 'fdcan3')
+GENERIC_UARTS = tuple(port for port in UARTS if port != 'uart5')
 EXTERNAL_INPUT = frozenset({'external_input'})
 
 
 def admit_options(spec):
     options = spec.options
-    unknown = set(options) - {'model', 'firmware', 'uarts'}
+    unknown = set(options) - {'model', 'firmware', 'uarts', 'remote'}
     if unknown:
         raise ValueError(f'unknown QEMU machine options: {sorted(unknown)}')
     if options.get('model', 'dm-mc02') != 'dm-mc02':
         raise ValueError('unsupported QEMU model; expected dm-mc02')
+    if type(options.get('remote', False)) is not bool:
+        raise ValueError('QEMU remote must be a boolean')
     firmware = options.get('firmware')
     if not isinstance(firmware, (str, Path)) or not str(firmware) or '\0' in str(firmware):
         raise ValueError('QEMU machine firmware must be a nonempty path without NUL')
@@ -27,15 +30,17 @@ def admit_options(spec):
     if not isinstance(selected, (list, tuple)):
         raise ValueError('QEMU machine uarts must be a list')
     uarts = tuple(selected)
-    if (any(not isinstance(port, str) or port not in UARTS for port in uarts)
+    if (any(not isinstance(port, str) or port not in GENERIC_UARTS for port in uarts)
             or len(set(uarts)) != len(uarts)):
-        raise ValueError('UART endpoints must be distinct uart1/2/3/5/7/10')
+        raise ValueError('UART endpoints must be distinct uart1/2/3/7/10; UART5 belongs to remote')
     return path, uarts
 
 
 def describe(spec):
     _, uarts = admit_options(spec)
     ports = [PortSpec(port, 'uart', capabilities=EXTERNAL_INPUT) for port in uarts]
+    if spec.options.get('remote', False):
+        ports += [PortSpec('remote', 'remote', direction='in', capabilities=EXTERNAL_INPUT)]
     ports += [PortSpec(port, 'can') for port in CAN_PORTS]
     ports += [PortSpec('imu', 'imu', direction='in', category='signal')]
     ports += [PortSpec('key', 'digital', direction='in', category='signal',
@@ -67,6 +72,12 @@ def validate_input(spec, port, payload, *, connected_ports=()):
             raise TypeError('GPIO input must be an integer')
         if payload not in (0, 1):
             raise ValueError('GPIO input must be 0 or 1')
+        value = payload
+    elif port == 'remote' and spec.options.get('remote', False):
+        if type(payload) is not bytes:
+            raise TypeError('remote input must be raw bytes')
+        if len(payload) > 4096:
+            raise ValueError('one remote input is limited to 4096 bytes')
         value = payload
     elif port in uarts:
         if isinstance(payload, str):

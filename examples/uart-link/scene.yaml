@@ -1,0 +1,17 @@
+schema: sim/v1
+runtime:
+  mode: stepped
+  quantum: 1ms
+  duration: 40ms
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build/firmware.elf
+  echo:
+    kind: device.uart-echo
+  wire:
+    kind: net.uart
+links:
+  - [main.uart1, wire.uart]
+  - [wire.uart, echo.uart]

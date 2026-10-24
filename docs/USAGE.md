@@ -41,6 +41,30 @@ python -m pytest -q tests/test_topology.py tests/test_simulation.py tests/test_q
 
 
 
+### UART 字节流与遥控器 RX
+
+`net.uart` 连接两个双向 `uart` endpoint；`device.uart-echo` 是独立的无帧回显外设。
+字节保持有序，主机分片不代表消息边界；单次最多4096字节，默认待交付上限为256块、
+65536字节，`max_pending`、`max_pending_bytes`、`dispatch_budget` 和 `delay_ns` 可显式配置。
+队列耗尽、断连或部分写入失败会冻结本次执行，不重放；关闭网络不关闭借用的 endpoint。
+连入网络的机器端口拒绝额外的 `schedule_input`，没有隐式仲裁。
+
+```bash
+cmake -S examples/uart-link -B examples/uart-link/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build examples/uart-link/build
+sim validate examples/uart-link/scene.yaml
+bash tools/run-simulation-smoke.sh --case uart-link
+bash tools/run-simulation-smoke.sh --case uart-link --build-type Release
+```
+
+验收检查真实固件的二进制请求、双向交付、实际 RX 后的校验和与 GPIO 变化。
+原生 UART 事件的时间是完成切点的读取上界；交付只表示 transport 接受，不表示固件已消费。
+这里不模拟波特率、逐位时刻或电气波形。
+
+DM-MC02 的 UART5 只引出遥控器 RX。机器配置 `remote: true` 暴露专用的 `main.remote`
+原始 `bytes` 输入；`uarts` 只接受 uart1/2/3/7/10。remote 不提供 TX、文本转换或
+`net.uart` 连线，也尚不提供 SBUS-A/DR16 编码与反相电平模型。
+
 ### 共享 MuJoCo 世界
 
 `physics.mujoco` 将具名原生世界作为独立 step 节点接入同一 Simulation。

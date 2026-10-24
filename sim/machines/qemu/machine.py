@@ -59,6 +59,14 @@ class _CanInput:
         self.machine._receive_can(self.port, frame)
 
 
+class _UartInput:
+    def __init__(self, machine, port):
+        self.machine, self.port = machine, port
+
+    def receive_uart(self, data):
+        self.machine.input(self.port, data)
+
+
 class _DigitalOutput:
     def __init__(self, machine, port):
         self.machine, self.port = machine, port
@@ -122,7 +130,7 @@ class QemuFactory:
                 if endpoint.node not in qemu_nodes:
                     continue
                 port = descriptions[endpoint.node].port(endpoint.port)
-                if port.protocol not in ('can', 'digital', 'imu'):
+                if port.protocol not in ('can', 'digital', 'imu', 'uart'):
                     raise ValueError(f'unsupported QEMU connection: {endpoint} ({port.protocol})')
                 if port.protocol != 'digital' and 'external_input' not in port.capabilities:
                     continue
@@ -141,11 +149,14 @@ class QemuMachine:
 
     def __init__(self, spec, ctx, factory):
         self._firmware, self._uarts = admit_options(spec)
+        self._remote = spec.options.get('remote', False)
         self._ctx, self._factory = ctx, factory
         self._can_ports = tuple(port for port in CAN_PORTS if port in ctx.connected_ports)
         # Connections attach before any process creation. Runtime owns the buses.
         self._can = {port: ctx.attach(port, _CanInput(self, port))
                      for port in self._can_ports}
+        self._uart = {port: ctx.attach(port, _UartInput(self, port))
+                      for port in self._uarts if port in ctx.connected_ports}
         self._imu_connected = 'imu' in ctx.connected_ports
         self._imu = None
         if self._imu_connected:
@@ -215,8 +226,9 @@ class QemuMachine:
                                 or root / 'build/qemu/qemu-system-arm')
         except ValueError as exc:
             raise BackendUnavailable(str(exc)) from exc
-        session_class = qmp_session_class(root)
+        session_class = qmp_session_class()
         sockets = ['qmp', *(['cosim'] if self._imu_connected else []), *self._uarts,
+                   *(['uart5'] if self._remote else []),
                    *(port.replace('fdcan', 'can') for port in self._can_ports)]
         command = qemu_command(self._firmware, qemu, sockets,
                                qmp_path=self._factory.qmp_path,
@@ -376,6 +388,9 @@ class QemuMachine:
             raise RuntimeError('native snapshot moved outside the completed target')
         self._complete_snapshot(snapshot, step.t_sim_ns)
         for port, payload in uart_batches:
+            if port in self._uart:
+                self._uart[port].send(payload, source_time_ns=target,
+                                      mapped_time_ns=step.t_sim_ns, quality='upper_bound')
             self._ctx.emit(port, 'uart', payload, source_time_ns=target,
                            mapped_time_ns=step.t_sim_ns, delivery_time_ns=step.t_sim_ns,
                            quality='upper_bound')
@@ -467,7 +482,15 @@ class QemuMachine:
                 raise TypeError('UART input must be bytes')
             if len(payload) > 4096:
                 raise ValueError('one UART input is limited to 4096 bytes')
-            self._streams[port].send(payload)
+            if payload:
+                self._streams[port].send(payload)
+        elif port == 'remote' and self._remote:
+            if type(payload) is not bytes:
+                raise TypeError('remote input must be raw bytes')
+            if len(payload) > 4096:
+                raise ValueError('one remote input is limited to 4096 bytes')
+            if payload:
+                self._streams['uart5'].send(payload)
         else:
             raise ValueError(f'QEMU input port is not supported or opened: {port}')
         self._check()

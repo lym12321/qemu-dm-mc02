@@ -668,3 +668,77 @@ def test_imu_observation_projects_frozen_envelopes_without_serializing_backend_o
         "sample": {"gyro_rad_s": [0.0, 0.0, 0.0], "accel_m_s2": [0.0, 0.0, 9.81]},
         "source_time_ns": None, "mapped_time_ns": 10_000_000}
     json.dumps(observations.report())
+
+
+def _uart_link_observations():
+    observations = smoke.Observations()
+    observations.uart.extend(bytes.fromhex('007f80ff35a61053') +
+        b'SIM_READY uart-link\nUART_RX sum=033c n=8\nUART_PASS\n')
+    observations.snapshots = [
+        {'source': 'main', 'mapped_time_ns': cut, 'native_timestamp_ns': 71 + cut,
+         'event_sequence': sequence, 'b0_output': True, 'b0': level}
+        for cut, sequence, level in ((0, 0, 0), (6_000_000, 1, 0),
+                                     (7_000_000, 20, 1), (40_000_000, 30, 1))]
+    # Independent fragments in each direction; no packet boundary assumptions.
+    for sequence, source, data, cut in (
+            (0, 'main.uart1', bytes(observations.uart[:2]), 6_000_000),
+            (1, 'main.uart1', bytes(observations.uart[2:8]), 6_000_000),
+            (2, 'echo.uart', bytes(observations.uart[:4]), 6_000_000),
+            (3, 'echo.uart', bytes(observations.uart[4:8]), 6_000_000),
+            (4, 'main.uart1', bytes(observations.uart[8:]), 12_000_000),
+            (5, 'echo.uart', bytes(observations.uart[8:]), 12_000_000)):
+        stamp = {'source': 'wire', 'endpoint': 'uart', 'mapped_time_ns': cut,
+                 'delivery_time_ns': cut, 'event_sequence': 2 + sequence,
+                 'source_time_ns': 71 + cut if source == 'main.uart1' else None,
+                 'quality': 'upper_bound' if source == 'main.uart1' else 'sampled'}
+        payload = {'source': source, 'sequence': sequence, 'due_ns': cut, 'data_hex': data.hex()}
+        observations.uart_net.append({**stamp, 'kind': 'net.uart.sent', 'payload': payload})
+        observations.uart_net.append({**stamp, 'kind': 'net.uart.delivery', 'payload': {
+            **payload, 'destination': 'echo.uart' if source == 'main.uart1' else 'main.uart1'}})
+    return observations
+
+
+def test_uart_link_acceptance_handles_binary_fragmentation_and_independent_echo():
+    observations = _uart_link_observations()
+    report = observations.verify('uart-link')
+    assert report['uart_consumption']['computed_sum'] == 828
+    assert report['uart_consumption']['gpio_response_ns'] == 7_000_000
+    json.dumps(report)
+
+
+def test_uart_link_rejects_skip_rx_despite_same_correct_checksum_and_pass():
+    observations = _uart_link_observations()
+    for row in observations.snapshots:
+        row['b0'] = 0
+    with pytest.raises(AssertionError, match='RX-dependent GPIO'):
+        observations.verify('uart-link')
+
+
+def test_uart_link_rejects_transport_only_or_rewritten_time_evidence():
+    observations = _uart_link_observations()
+    observations.uart_net = [row for row in observations.uart_net
+                             if row['payload']['source'] != 'echo.uart']
+    with pytest.raises(AssertionError, match='echo deliveries'):
+        observations.verify('uart-link')
+    observations = _uart_link_observations()
+    observations.uart_net[1]['source_time_ns'] = 0
+    with pytest.raises(AssertionError, match='provenance'):
+        observations.verify('uart-link')
+
+
+def test_uart_link_build_and_scene_use_real_elf_and_independent_python_echo(tmp_path):
+    if any(shutil.which(program) is None for program in ('cmake', 'arm-none-eabi-gcc')):
+        pytest.skip('optional ARM cross compiler/CMake are unavailable')
+    result = smoke.build_example('uart-link', build_dir=tmp_path / 'firmware')
+    assert '-DSIM_UART_SKIP_RX_TEST=OFF' in result['build'][0]['command']
+    from sim.composition import builtin_registry
+    from sim.config.scene import load_scene
+
+    scene_file = tmp_path / 'scene.yaml'
+    scene_file.write_text((ROOT / 'examples/uart-link/scene.yaml').read_text().replace(
+        './build/firmware.elf', result['elf']))
+    scene = load_scene(scene_file, builtin_registry())
+    assert (scene.quantum_ns, scene.duration_ns) == (1_000_000, 40_000_000)
+    assert [(node.name, node.kind) for node in scene.topology.nodes] == [
+        ('main', 'machine.qemu'), ('echo', 'device.uart-echo'), ('wire', 'net.uart')]
+    assert smoke.NATIVE_CASES == ('minimal-board', 'can-motor', 'pulse', 'digital-link', 'rotor-loop')

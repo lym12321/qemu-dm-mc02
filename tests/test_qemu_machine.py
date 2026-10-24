@@ -74,7 +74,9 @@ assert not any(name.startswith('qemu.qmp') for name in sys.modules)
     ({'model': 'other'}, 'model'),
     ({'uarts': ['uart1', 'uart1']}, 'UART'),
     ({'uarts': ['uart4']}, 'UART'),
+    ({'uarts': ['uart5']}, 'remote'),
     ({'uarts': 'uart1'}, 'list'),
+    ({'remote': 1}, 'boolean'),
     ({'unknown': True}, 'unknown'),
 ])
 def test_invalid_options_reject_before_native_acquisition(firmware, options, match):
@@ -192,7 +194,7 @@ def test_unsupported_interfaces_name_endpoint_and_reject_before_acquisition(firm
 
 
 @pytest.mark.parametrize('port, protocol, category', [
-    ('uart1', 'uart', 'protocol'), ('snapshot', 'snapshot', 'signal'),
+    ('snapshot', 'snapshot', 'signal'),
 ])
 def test_described_but_unimplemented_connections_reject_explicitly_before_acquisition(
         firmware, backend, port, protocol, category):
@@ -278,7 +280,7 @@ def backend(monkeypatch, tmp_path):
 
     monkeypatch.setattr(adapter, 'resolve_backend_root', lambda _root: tmp_path)
     monkeypatch.setattr(adapter, 'resolve_qemu', lambda value: Path(value))
-    monkeypatch.setattr(adapter, 'qmp_session_class', lambda _root: Qmp)
+    monkeypatch.setattr(adapter, 'qmp_session_class', lambda: Qmp)
     monkeypatch.setattr(adapter, 'running_qemu', owner)
     monkeypatch.setattr(adapter, 'connect_unix', connect)
     yield SimpleNamespace(calls=calls, clients=clients, sockets=sockets, commands=commands, state=state)
@@ -431,6 +433,62 @@ def test_inputs_only_change_admitted_public_board_ports(firmware, backend):
     assert ('qom-set', {'path': '/machine', 'property': 'gpio-input', 'value': 'A0=1'}) in backend.commands
     assert backend.sockets[0][2].recv(4096) == b'hello'
     sim.close()
+
+
+def test_connected_uart_uses_existing_single_reader_and_independent_python_echo(firmware, backend):
+    graph = Topology((NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                      NodeSpec('wire', 'net.uart'), NodeSpec('echo', 'device.uart-echo')),
+        (LinkSpec('board.uart1', 'wire.uart'), LinkSpec('echo.uart', 'wire.uart')))
+    with Simulation(graph, builtin_registry(), quantum_ns=1000) as sim:
+        _, host, peer = backend.sockets[0]
+        assert tuple(sim.components['board'].connection_info['sockets']) == ('qmp', 'uart1')
+        peer.sendall(b'\x00\x7f\x80\xff')
+        sim.step(1000)
+        assert peer.recv(4096) == b'\x00\x7f\x80\xff'
+        rows = [row for row in sim.events if row.kind == 'net.uart.delivery']
+        original = next(row for row in rows if row.payload['source'] == 'board.uart1')
+        assert (original.source_time_ns, original.mapped_time_ns,
+                original.delivery_time_ns, original.quality) == (1071, 1000, 1000, 'upper_bound')
+        echoed = next(row for row in rows if row.payload['source'] == 'echo.uart')
+        assert (echoed.source_time_ns, echoed.mapped_time_ns,
+                echoed.delivery_time_ns, echoed.quality) == (None, 1000, 1000, 'sampled')
+        with pytest.raises(ValueError, match='owned by a connection'):
+            sim.schedule_input('board.uart1', b'external')
+    assert host.fileno() == -1
+
+
+def test_remote_is_explicit_raw_input_only_and_maps_to_native_uart5(firmware, backend):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'uarts': [], 'remote': True})
+    factory = QemuFactory()
+    description = factory.describe(spec)
+    remote = description.port('remote')
+    assert remote.direction == 'in' and 'external_input' in remote.capabilities
+    with pytest.raises(ValueError, match='unknown port'):
+        description.port('uart5')
+    assert factory.validate_input(spec, 'remote', b'\x00\xff') == b'\x00\xff'
+    for value, error in [('text', TypeError), (bytearray(b'x'), TypeError),
+                          (b'x' * 4097, ValueError)]:
+        with pytest.raises(error):
+            factory.validate_input(spec, 'remote', value)
+    with Simulation(Topology((spec,), ()), {'machine.qemu': factory}) as sim:
+        assert tuple(sim.components['board'].connection_info['sockets']) == ('qmp', 'uart5')
+        sim.schedule_input('board.remote', b'')
+        sim.schedule_input('board.remote', b'\x00\xff')
+        sim.step(1000)
+        assert backend.sockets[0][2].recv(4096) == b'\x00\xff'
+        assert not any(row.kind == 'uart' for row in sim.events)
+    with pytest.raises(ValueError, match='cannot accept'):
+        factory.validate_input(NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                               'remote', b'x')
+
+
+def test_remote_cannot_attach_to_uart_net_before_native_acquisition(firmware, backend):
+    graph = Topology((NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'remote': True}),
+                      NodeSpec('wire', 'net.uart'), NodeSpec('echo', 'device.uart-echo')),
+        (LinkSpec('board.remote', 'wire.uart'), LinkSpec('echo.uart', 'wire.uart')))
+    with pytest.raises(ValueError, match='protocol mismatch'):
+        Simulation(graph, builtin_registry())
+    assert backend.calls == backend.commands == backend.sockets == []
 
 
 def test_rejected_scheduled_inputs_do_not_touch_started_machine_and_allow_recovery(firmware, backend):

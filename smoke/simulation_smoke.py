@@ -63,6 +63,8 @@ class Observations:
         self.joint_consumption = None
         self.imu = []
         self.imu_readbacks = []
+        self.uart_net = []
+        self.uart_consumption = None
         self.last_sequence = -1
 
     def __call__(self, event):
@@ -96,6 +98,14 @@ class Observations:
                 "key": digital_level("gpio.A15", snapshot),
                 "b0": digital_level("gpio.B0", snapshot),
                 "b0_output": bool(snapshot["gpio"]["B"]["output_mask"] & 1)})
+        elif event.kind in ("net.uart.sent", "net.uart.delivery"):
+            payload = dict(event.payload)
+            data = payload.pop("data")
+            if type(data) is not bytes:
+                raise TypeError("UART net event data must be bytes")
+            self.uart_net.append({**stamp, "source": event.source_node,
+                "endpoint": event.source_port, "kind": event.kind,
+                "payload": {**payload, "data_hex": data.hex()}})
         elif event.kind in ("net.digital.sample", "net.digital.delivery"):
             self.digital.append({**stamp, "source": event.source_node,
                 "endpoint": event.source_port, "kind": event.kind, "payload": _plain(event.payload)})
@@ -147,6 +157,9 @@ class Observations:
             return self.report()
         if case == "imu-readback":
             self._verify_imu(ready)
+            return self.report()
+        if case == "uart-link":
+            self._verify_uart_link(ready)
             return self.report()
         if case in ("minimal-board", "hal-gpio", "pulse", "digital-link"):
             if case in ("minimal-board", "pulse", "digital-link"):
@@ -535,6 +548,58 @@ class Observations:
             "coast_intervals": (end_ns - zero_ns) // 1_000_000,
             "expected_j1_position_rad": position, "expected_j1_velocity_rad_s": velocity}
 
+    def _verify_uart_link(self, ready):
+        """Literal bytes, actual echo deliveries and later RX-dependent GPIO."""
+        challenge = bytes.fromhex("007f80ff35a61053")
+        uart = bytes(self.uart)
+        if not uart.startswith(challenge) or ready not in uart[len(challenge):]:
+            raise AssertionError("actual guest binary UART challenge is missing")
+        if b"UART_RX sum=033c n=8\nUART_PASS\n" not in uart:
+            raise AssertionError("actual guest RX-dependent computed checksum is missing")
+        origin = next(row["native_timestamp_ns"] for row in self.snapshots
+                      if row["source"] == "main" and row["mapped_time_ns"] == 0)
+        sent = {row["payload"]["sequence"]: row for row in self.uart_net
+                if row["kind"] == "net.uart.sent"}
+        deliveries = [row for row in self.uart_net if row["kind"] == "net.uart.delivery"]
+        streams = {"main.uart1": bytearray(), "echo.uart": bytearray()}
+        response_bound = None
+        for row in deliveries:
+            payload = row["payload"]
+            source = payload["source"]
+            destination = "echo.uart" if source == "main.uart1" else "main.uart1"
+            emitted = sent.get(payload["sequence"])
+            if (source not in streams or payload["destination"] != destination
+                    or emitted is None or emitted["payload"] != {
+                        key: value for key, value in payload.items() if key != "destination"}
+                    or any(row[key] != emitted[key] for key in
+                           ("source_time_ns", "mapped_time_ns", "quality"))
+                    or row["delivery_time_ns"] < payload["due_ns"]
+                    or payload["due_ns"] < row["mapped_time_ns"]):
+                raise AssertionError("UART byte delivery provenance is invalid")
+            if source == "main.uart1":
+                if (row["quality"] != "upper_bound"
+                        or row["source_time_ns"] != origin + row["mapped_time_ns"]):
+                    raise AssertionError("native UART read upper bound was discarded")
+            elif row["source_time_ns"] is not None or row["quality"] != "sampled":
+                raise AssertionError("Python echo must not invent a native byte timestamp")
+            streams[source].extend(bytes.fromhex(payload["data_hex"]))
+            if source == "echo.uart" and response_bound is None and len(streams[source]) >= 8:
+                response_bound = row
+        if (bytes(streams["main.uart1"]) != uart or bytes(streams["echo.uart"]) != uart
+                or response_bound is None):
+            raise AssertionError("actual independent Python UART echo deliveries are incomplete")
+        consumed = [row for row in self.snapshots if row["source"] == "main"
+                    and row["b0_output"] and row["b0"] == 1
+                    and row["mapped_time_ns"] > response_bound["delivery_time_ns"]
+                    and row["event_sequence"] > response_bound["event_sequence"]]
+        if not consumed:
+            raise AssertionError("actual RX-dependent GPIO response after echo delivery is missing")
+        self.uart_consumption = {
+            "challenge_hex": challenge.hex(), "computed_sum": 828, "received_bytes": 8,
+            "echo_delivery_ns": response_bound["delivery_time_ns"],
+            "gpio_response_ns": consumed[0]["mapped_time_ns"],
+            "limits": "GPIO follows actual fixture RDR reads; delivery alone is not consumption."}
+
     def _verify_imu(self, ready):
         """Independent Bosch bins plus actual UART/consumption attribution."""
         cuts = list(range(0, 100_000_001, 10_000_000))
@@ -756,6 +821,7 @@ class Observations:
                 "rotor_state": self.rotor_state, "rotor_consumption": self.rotor_consumption,
                 "physics_states": self.physics_states, "joint_consumption": self.joint_consumption,
                 "imu": self.imu, "imu_readbacks": self.imu_readbacks,
+                "uart_net": self.uart_net, "uart_consumption": self.uart_consumption,
                 "imu_pending": self._imu_pending()}
 
     def _imu_pending(self):
@@ -765,7 +831,8 @@ class Observations:
                 and (row["payload"]["session_id"], row["payload"]["step_id"]) not in completed]
 
 
-def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=False):
+def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=False,
+                  uart_skip_rx=False):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
@@ -781,6 +848,8 @@ def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=Fal
         variant.append("-DSIM_JOINT_LOOP_TEST=" + ("ON" if case == "joint-loop" else "OFF"))
     if source.name == "imu-readback":
         variant.append("-DSIM_IMU_SKIP_GYRO_TEST=" + ("ON" if imu_skip_gyro else "OFF"))
+    if source.name == "uart-link":
+        variant.append("-DSIM_UART_SKIP_RX_TEST=" + ("ON" if uart_skip_rx else "OFF"))
     commands = (["cmake", "-S", str(source), "-B", str(build), f"-DCMAKE_BUILD_TYPE={build_type}", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
@@ -813,7 +882,7 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
                            (case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"), registry)
-        if case == "imu-readback" and firmware is not None:
+        if case in ("imu-readback", "uart-link") and firmware is not None:
             from sim.api import NodeSpec, Topology
             from sim.config.scene import Scene
 
@@ -919,7 +988,7 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "imu-readback", "all"), default="all")
+    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "imu-readback", "uart-link", "all"), default="all")
     parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",
