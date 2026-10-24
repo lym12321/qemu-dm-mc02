@@ -13,7 +13,9 @@ from sim.composition import builtin_registry
 from sim.fabric.digital import DigitalSample
 from sim.machines.qemu import BackendUnavailable, QemuFactory
 from sim.machines.qemu import machine as adapter
+from sim.machines.qemu import profile as dm_profile
 from sim.runtime import Simulation, SimulationState
+from sim.transports import StreamTransport
 
 
 def snapshot(timestamp):
@@ -86,7 +88,7 @@ def test_invalid_options_reject_before_native_acquisition(firmware, options, mat
 
 def test_firmware_resolves_against_manifest_directory(firmware):
     spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware.name}, base_dir=firmware.parent)
-    assert adapter.admit_options(spec)[0] == firmware
+    assert dm_profile.admit_options(spec)[0] == firmware
     description = QemuFactory().describe(NodeSpec('board', 'machine.qemu',
                                                  {'firmware': firmware, 'uarts': []}))
     with pytest.raises(ValueError, match='unknown port'):
@@ -325,14 +327,14 @@ def test_unified_simulation_samples_completed_gpio_then_drives_physical_key_and_
         firmware, backend, monkeypatch):
     backend.state.read_snapshot = native_digital_snapshots
     projections = []
-    public_projection = adapter.digital_level
+    public_projection = dm_profile.digital_level
 
     def project(endpoint, value):
         assert isinstance(value, dict)  # Projection precedes immutable publication.
         projections.append((endpoint, value['timestamp_ns']))
         return public_projection(endpoint, value)
 
-    monkeypatch.setattr(adapter, 'digital_level', project)
+    monkeypatch.setattr(dm_profile, 'digital_level', project)
     with digital_simulation(firmware) as sim:
         assert not any(name == 'qom-set' for name, _ in backend.commands)
         assert sim.components['wire'].observe()['active'] is False
@@ -627,7 +629,7 @@ def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=
     """Replace only the independently tested protocol conversation."""
     class Endpoint:
         def __init__(self, stream, *, context, check):
-            assert isinstance(stream, adapter.StepFramedSocket)
+            assert isinstance(stream, dm_profile.StepFramedSocket)
             self.stream, self.context, self.check = stream, context, check
 
         def start(self, origin):
@@ -654,7 +656,7 @@ def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=
 
 def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware, backend, monkeypatch):
     actions = []
-    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
     sim = imu_simulation(firmware, actions)
     with sim:
         machine = sim.components['board']
@@ -681,7 +683,7 @@ def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware,
 
 
 def test_unconnected_imu_does_not_construct_endpoint_or_open_cosim(firmware, backend, monkeypatch):
-    monkeypatch.setattr(adapter, 'QemuImuEndpoint', lambda *args, **kwargs: pytest.fail('unused IMU'))
+    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', lambda *args, **kwargs: pytest.fail('unused IMU'))
     with simulation(firmware) as sim:
         sim.step(7)
         assert tuple(sim.components['board'].connection_info['sockets']) == ('qmp', 'uart1')
@@ -689,7 +691,7 @@ def test_unconnected_imu_does_not_construct_endpoint_or_open_cosim(firmware, bac
 
 def test_imu_start_failure_preserves_primary_and_closes_all_owned_resources(firmware, backend, monkeypatch):
     actions, primary = [], OSError('co-sim handshake failed')
-    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(
+    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(
         backend, actions, start_error=primary))
     sim = imu_simulation(firmware, actions)
     with pytest.raises(OSError) as caught:
@@ -705,7 +707,7 @@ def test_imu_start_failure_preserves_primary_and_closes_all_owned_resources(firm
 
 def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware, backend, monkeypatch):
     actions, primary = [], OSError('co-sim receive failed')
-    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(
+    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(
         backend, actions, service_error=primary))
     with imu_simulation(firmware, actions) as sim:
         actions.clear()
@@ -723,7 +725,7 @@ def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware,
 
 def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, monkeypatch):
     actions = []
-    monkeypatch.setattr(adapter, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
     with imu_simulation(firmware, actions) as sim:
         sim.step(7)
         old = sim.components['board']
@@ -734,3 +736,159 @@ def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, mon
         assert sim.components['board'] is not old and sim.session.session_id == 2
         assert [a for a in actions if a[0] == 'imu receive'] == [('imu receive', 0, 71)]
         assert len([a for a in actions if a[0] == 'imu start']) == 1
+
+
+class FakeProfile:
+    """A test profile using the same backend; it models no real board."""
+
+    def __init__(self):
+        self.actions = []
+        self.close_error = None
+        self.adapters = []
+
+    def describe(self, spec):
+        assert not spec.options
+        return NodeDescription((PortSpec('feed', 'bytes', direction='in',
+            capabilities={'external_input'}), PortSpec('observation', 'bytes', direction='out')),
+            {'machine', 'input'})
+
+    def validate_input(self, spec, port, payload, *, connected_ports=()):
+        if port != 'feed' or type(payload) is not bytes:
+            raise ValueError('fake input requires bytes on feed')
+        return payload
+
+    def validate_connections(self, node, topology, descriptions):
+        if topology.links:
+            raise ValueError('fake profile has no connected ports')
+
+    def create_adapter(self, spec, context, backend):
+        profile = self
+
+        class FakeAdapter:
+            stream_types = {'data': StreamTransport}
+
+            def __init__(self):
+                self.completed = None
+
+            def launch_command(self, qemu, sockets, *, qmp_path, gdb_port):
+                from sim.boards.launch import native_qemu_command
+                assert sockets == ['qmp', 'data']
+                return native_qemu_command(qemu, sockets,
+                    machine_arguments=('-machine', 'fixture-board'), serial_slots=('data',),
+                    qmp_path=qmp_path, gdb_port=gdb_port)
+
+            def start(self):
+                profile.actions.append(('start', backend.native_origin_ns))
+                self.completed = (0, b'')
+
+            def service(self, cut):
+                profile.actions.append(('service', cut))
+
+            def complete_cut(self, cut, target):
+                stream = backend.streams['data']
+                stream.flush()
+                stream.read_once()
+                self.completed = (cut, bytes(stream.buffer))
+                stream.buffer.clear()
+                context.emit('observation', 'fake.bytes', self.completed[1],
+                    source_time_ns=target, mapped_time_ns=cut, quality='upper_bound')
+
+            def input(self, port, data):
+                assert port == 'feed'
+                backend.streams['data'].send(data)
+
+            def observe(self):
+                return self.completed
+
+            def close(self):
+                profile.actions.append(('close',))
+                if profile.close_error:
+                    raise profile.close_error
+
+        result = FakeAdapter()
+        self.adapters.append(result)
+        return result
+
+
+def test_injected_profile_uses_same_native_target_lifecycle_without_dm_queries(backend, monkeypatch):
+    profile = FakeProfile()
+    monkeypatch.setattr(adapter, 'resolve_backend_root',
+                        lambda _: pytest.fail('explicit QEMU must not require a checkout'))
+    graph = Topology((NodeSpec('cpu', 'fixture.qemu'),), ())
+    with Simulation(graph, {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')}) as sim:
+        machine = sim.components['cpu']
+        assert machine.observe() == (0, b'')
+        assert machine.to_native(19) == 90 and machine.to_sim(90) == 19
+        backend.sockets[0][2].sendall(b'opaque\0\xff')
+        sim.schedule_input('cpu.feed', b'input\0')
+        sim.step(19)
+        assert backend.sockets[0][2].recv(4096) == b'input\0'
+        assert machine.observe() == (19, b'opaque\0\xff')
+        assert sim.events[-1].kind == 'fake.bytes'
+        assert sim.events[-1].source_time_ns == 90
+        command = backend.calls[0][1]
+        assert command[command.index('-machine') + 1] == 'fixture-board'
+        assert '-kernel' not in command
+        assert all(name not in ('qom-list', 'qom-get', 'qom-set') for name, _ in backend.commands)
+        previous = sim.components['cpu']
+        sim.reset()
+        assert previous is not sim.components['cpu']
+        assert len(profile.adapters) == 2
+    assert profile.actions.count(('close',)) == 2
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+
+
+def test_profile_cleanup_error_still_closes_every_native_owner(backend):
+    profile = FakeProfile()
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),), ()),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')})
+    sim.start()
+    profile.close_error = OSError('profile cleanup failed')
+    with pytest.raises(OSError) as caught:
+        sim.close()
+    assert caught.value is profile.close_error
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+    assert backend.sockets[0][1].fileno() == -1
+
+
+def test_invalid_profile_adapter_is_closed_before_process_acquisition(backend):
+    profile = FakeProfile()
+    invalid = SimpleNamespace(close=lambda: profile.actions.append(('invalid close',)))
+    profile.create_adapter = lambda *_: invalid
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),), ()),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')})
+    with pytest.raises(TypeError, match='profile adapter lacks'):
+        sim.start()
+    assert profile.actions == [('invalid close',)]
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+def test_missing_default_native_executable_is_backend_unavailable_before_io(backend, monkeypatch):
+    monkeypatch.delenv('QEMU_SYSTEM_ARM', raising=False)
+    monkeypatch.setattr(adapter, 'resolve_backend_root', lambda _: None)
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),), ()),
+        {'fixture.qemu': QemuFactory(profile=FakeProfile())})
+    with pytest.raises(BackendUnavailable, match='supply --qemu'):
+        sim.start()
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+@pytest.mark.parametrize('stream_types', [{'qmp': StreamTransport}, {'bad name': StreamTransport},
+                                         {'data': None}])
+def test_profile_stream_admission_closes_returned_adapter_before_io(backend, stream_types):
+    profile = FakeProfile()
+    original = profile.create_adapter
+
+    def invalid(*args):
+        result = original(*args)
+        result.stream_types = stream_types
+        return result
+
+    profile.create_adapter = invalid
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),), ()),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')})
+    with pytest.raises(TypeError, match='short names'):
+        sim.start()
+    assert profile.actions == [('close',)]
+    assert backend.calls == backend.commands == backend.sockets == []

@@ -40,7 +40,7 @@ def _parser():
     run = commands.add_parser('run', help='run a sim/v1 scene through Simulation')
     run.add_argument('scene', type=Path)
     run.add_argument('--qemu', help='native QEMU executable (or QEMU_SYSTEM_ARM)')
-    run.add_argument('--backend-root', type=Path, help='canonical backend checkout when installed outside it')
+    run.add_argument('--backend-root', type=Path, help='optional checkout for the default native executable')
     run.add_argument('--timeout', type=_seconds, help='total host budget including startup')
     run.add_argument('--startup-timeout', type=_seconds, default=10.0)
     run.add_argument('--gdb-port', type=_port, help='single machine native GDB port')

@@ -43,11 +43,21 @@ def qmp_socket_path(path) -> Path | None:
 
 
 def qemu_command(firmware, qemu, sockets, *, qmp_path=None, gdb_port=None):
-    """Compose native serial slots in their existing fixed board order."""
-    command = [str(qemu), "-machine", "dm-mc02,fdcan-host-ack=on", "-kernel", str(firmware),
+    """The shared DM-MC02 launcher, using its profile's native slot map."""
+    from sim.machines.qemu.profile import DmMc02Profile
+
+    return native_qemu_command(qemu, sockets,
+        machine_arguments=DmMc02Profile.machine_arguments(firmware),
+        serial_slots=DmMc02Profile.serial_slots, qmp_path=qmp_path, gdb_port=gdb_port)
+
+
+def native_qemu_command(qemu, sockets, *, machine_arguments, serial_slots,
+                        qmp_path=None, gdb_port=None):
+    """Compose native process/debug channels from an admitted machine profile."""
+    command = [str(qemu), *machine_arguments,
                "-nodefaults", "-display", "none", "-monitor", "none", "-S",
                "-qmp", "unix:{qmp},server=on,wait=off"]
-    for port in ("cosim", *UARTS, *CANS):
+    for port in serial_slots:
         if port in sockets:
             command += ["-chardev", f"socket,id={port},path={{{port}}},server=on,wait=off",
                         "-serial", f"chardev:{port}"]

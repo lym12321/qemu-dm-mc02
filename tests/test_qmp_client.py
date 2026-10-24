@@ -1,5 +1,6 @@
 """Tool boundary tests: fragmented messages, events, IDs and error replies."""
 import asyncio
+import importlib.metadata
 from contextlib import contextmanager
 from pathlib import Path
 import json
@@ -14,10 +15,32 @@ import time
 import unittest
 from unittest.mock import patch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tools"))
-from dm_mc02_qmp import QmpSession
+import pytest
+
+try:
+    importlib.metadata.version('qemu')
+except importlib.metadata.PackageNotFoundError:
+    pytest.skip('the optional pinned QEMU Python wheel is not installed', allow_module_level=True)
+
+from sim.machines.qemu.qmp import qmp_session_class
+
+QmpSession = qmp_session_class()
 from qemu.qmp import QMPClient
 from qemu.qmp.message import Message
+
+
+def test_namespace_shadow_is_rejected_before_its_init_can_execute(tmp_path, monkeypatch):
+    from sim.api import BackendUnavailable
+    from sim.machines.qemu.qmp import qmp_client_provenance
+
+    root = Path(qmp_client_provenance()['package_root'])
+    shadow = tmp_path / 'qemu'
+    shadow.mkdir()
+    (shadow / '__init__.py').write_text('raise AssertionError("shadow package executed")')
+    (shadow / 'qmp').symlink_to(root / 'qmp', target_is_directory=True)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    with pytest.raises(BackendUnavailable, match='shadowed'):
+        qmp_client_provenance()
 
 
 @contextmanager

@@ -10,6 +10,12 @@
 MuJoCo、Trace、Referee 分别使用 `mujoco`、`trace`、`referee` extra。
 Linux 是当前原生运行平台。
 
+`QemuFactory(profile=...)` 显式注入板级描述、输入/连接准入和外设 adapter。
+QEMU Backend 独占进程、QMP、socket、虚拟时间请求/完成与清理；adapter 借用这些资源，
+提供 launch 参数、外设连接、完成态观测和输入转换，不能推进 CPU。
+默认 `DmMc02Profile` 包含板级串口槽位、引脚极性、CAN QOM 与 BMI088 STEP 约定。
+测试中的 Fake Profile 复用同一后端合同，但不代表第二颗 MCU 已获支持。
+
 ```bash
 python3 -m venv .venv
 . .venv/bin/activate
@@ -23,9 +29,31 @@ sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
 先按[构建](#build)得到当前子模块的项目 QEMU。默认使用 `build/qemu/qemu-system-arm`，
 也可设置 `QEMU_SYSTEM_ARM` 或传 `--qemu`。原生后端要求 `x-run-to-virtual-time`、
 `x-query-virtual-execution` 和当前 CAN execution QOM 接口；旧二进制会明确报错。
-wheel 安装在 checkout 外时，原生执行还须 `--backend-root /path/to/checkout`，
-借用其已初始化的 `qemu/upstream/python` 中唯一 QMP 实现。
+原生执行使用安装的固定 QEMU Python wheel；基础包不会安装它。
+给出 `--qemu /path/to/qemu-system-arm` 后可在 checkout 外运行，无需 `--backend-root`。
+后者仅用于查找默认二进制，不再从源码目录加载 QMP client。
 配置校验只检查资源和拓扑，不能证明 ELF 能运行或后端二进制能力完备。
+
+从当前固定子模块构建完整上游 Python 包及其许可证：
+
+```bash
+uv venv build/qmp-package-env --python 3.11
+uv pip install --python build/qmp-package-env/bin/python setuptools==75.8.0 wheel==0.45.1
+python tools/dm_mc02_qemu_bundle.py build --python build/qmp-package-env/bin/python --output build/qemu-bundle
+python tools/dm_mc02_qemu_bundle.py verify build/qemu-bundle
+uv pip install --python .venv/bin/python build/qemu-bundle/python/qemu-*.whl
+```
+
+构建器要求 `uv`，输出目录必须不存在。client 来自子模块提交
+`263bfd8adf272be63177dafc6b5f1dd41e0a1389` 的完整 `qemu` Python distribution，
+包括现有有界 grouped-command 扩展；运行时检查版本和源码指纹，不复制私有 QMP 实现，
+也不接受任意同名 PyPI 包。升级原生 fork 时须同时更新固定来源并重跑协议与原生门。
+二进制仍须含本项目 DM-MC02 模型及所需能力，普通系统 QEMU 不能替代。
+
+可选 `--qemu BIN --binary-provenance FILE` 把二进制装入 bundle；provenance JSON 要求
+`schema: dm-mc02/qemu-binary/1`、固定 `source_commit` 及实际 `sha256`。
+它记录调用者提供的构建来源并校验选定字节，不代替原生构建验收。
+bundle 清单保存命令、哈希和许可证；Linux 动态运行库需由部署环境提供。
 
 `examples/minimal-board` 是真实 Cortex-M7 裸机固件：SysTick、USART1 和 A15→B0。
 `examples/can-motor` 使用相同构建命令，将目录名替换即可；固件通过真实 FDCAN1
@@ -220,7 +248,7 @@ FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot
 同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
 
 当前执行 CAN、采样数字 GPIO、完成态 SI IMU，以及 M3508 到共享 MuJoCo World 的关节绑定。
-UART 可作机器外部输入和观测；跨节点 UART、SPI/I2C/ADC 连接尚未接入统一运行时，
+UART 可作机器外部输入、观测或跨节点字节流连线；SPI/I2C/ADC 连接尚未接入统一运行时，
 不支持的连接在创建资源前拒绝。第二种真实 MCU 和跨板事件级锁步尚未实现；
 DM-MC02 是首个真实 profile，不能靠 YAML 声明额外板卡。
 `api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
