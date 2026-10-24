@@ -53,8 +53,9 @@ class CanBus:
 
     A step dispatches at most ``dispatch_budget`` queued broadcasts, including
     callback-generated broadcasts. Remaining frames are visible through
-    ``pending``. Late input is delivered at the current bus time. Callback errors
-    propagate; an already popped broadcast is not replayed or rolled back.
+    ``pending``. Late input is delivered at the current bus time. Capacity and
+    callback failures freeze delivery until reset, retaining the first error and
+    queued frames. An already popped broadcast is not replayed or rolled back.
     """
 
     def __init__(self, *, delay_ns: int = 0, loopback: bool = False,
@@ -86,6 +87,11 @@ class CanBus:
         self._started = False
         self._dispatching = False
         self._closed = False
+        self._failed: BaseException | None = None
+
+    def _check_failed(self) -> None:
+        if self._failed is not None:
+            raise self._failed
 
     @property
     def delay_ns(self) -> int:
@@ -94,6 +100,7 @@ class CanBus:
 
     @delay_ns.setter
     def delay_ns(self, value: int) -> None:
+        self._check_failed()
         check_can_time(value)
         if self._dispatching:
             raise RuntimeError("CAN delay cannot be changed from a delivery callback")
@@ -106,10 +113,13 @@ class CanBus:
     @property
     def next_due_ns(self) -> int | None:
         """Earliest queued delivery time, without advancing or consuming work."""
+        if not self._closed:
+            self._check_failed()
         return self._queue[0][0] if self._queue else None
 
     def has_due(self, t_sim_ns: int) -> bool:
         """Query due work without consuming frames or advancing virtual time."""
+        self._check_failed()
         check_can_time(t_sim_ns)
         return bool(self._queue and self._queue[0][0] <= t_sim_ns)
 
@@ -142,6 +152,7 @@ class CanBus:
         """
         if self._closed:
             raise RuntimeError("CAN bus is closed")
+        self._check_failed()
         attached = self._endpoints.get(id(source))
         if attached is None or attached.endpoint is not source:
             raise ValueError("CAN source is not attached")
@@ -152,7 +163,8 @@ class CanBus:
         due_ns = max(frame.timestamp_ns, not_before_ns or 0) + self.delay_ns
         check_can_time(due_ns)
         if len(self._queue) >= self.max_pending:
-            raise BufferError("CAN pending frame capacity exhausted")
+            self._failed = BufferError("CAN pending frame capacity exhausted")
+            raise self._failed
         heapq.heappush(self._queue, (due_ns, self._sequence, attached, frame))
         self._sequence += 1
         self._started = True
@@ -165,6 +177,7 @@ class CanBus:
         """
         if self._closed:
             raise RuntimeError("CAN bus is closed")
+        self._check_failed()
         check_can_time(t_sim_ns, self.t_sim_ns)
         if max_dispatch is not None and (type(max_dispatch) is not int or max_dispatch < 0):
             raise ValueError("max_dispatch must be a nonnegative integer or None")
@@ -187,13 +200,20 @@ class CanBus:
                         continue
                     dropped = bool(self.drop and self.drop(
                         source.endpoint, destination.endpoint, original))
+                    self._check_failed()
                     if self.log is not None:
                         self.log(CanDelivery(
                             source.name, destination.name, original, sequence,
                             original.timestamp_ns, due_ns, delivered_ns,
                             due_ns < delivered_ns, dropped))
+                        self._check_failed()
                     if not dropped:
                         destination.receive(frame)
+                        self._check_failed()
+        except BaseException as error:
+            if self._failed is None:
+                self._failed = error
+            raise self._failed
         finally:
             self._dispatching = False
         return dispatched
@@ -208,6 +228,7 @@ class CanBus:
         self._queue.clear()
         self._sequence = 0
         self.t_sim_ns = t_sim_ns
+        self._failed = None
 
     def close(self) -> None:
         """Release owned pending frames; borrowed endpoints are never closed."""

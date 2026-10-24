@@ -418,7 +418,9 @@ def test_single_bus_target_overflow_rejects_before_start_command_or_device(strea
         with pytest.raises(ValueError, match="unsigned 64-bit"):
             runtime.step(1 << 64)
         assert runtime.bus.pending == 1 and runtime.bus.t_sim_ns == 0
-        assert device.commands == device.steps == [] and runtime.coordinator.failed
+        assert device.commands == device.steps == [] and not runtime.coordinator.failed
+        runtime.step(1)
+        assert len(device.steps) == len(device.commands) == 1
     finally:
         runtime.close()
 
@@ -664,7 +666,10 @@ def test_multibus_all_time_admission_precedes_any_dispatch_or_device(invalid):
             coordinator.step(dt)
         assert buses[0].pending == 1 and buses[0].t_sim_ns == 0
         assert all(device.steps == [] and device.commands == [] for device in devices)
-        assert coordinator.failed and coordinator.t_sim_ns == 0
+        assert coordinator.failed == (invalid == "later_clock") and coordinator.t_sim_ns == 0
+        if invalid == "target_overflow":
+            coordinator.step(1)
+            assert all(len(device.steps) == 1 for device in devices)
     finally:
         coordinator.close()
 

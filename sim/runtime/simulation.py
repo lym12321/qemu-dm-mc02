@@ -152,6 +152,12 @@ class Simulation:
     run. Machine capability requires request_step/finish_step; step capability
     requires step. Both return exact-target StepResult values. Every instance
     requires close(). No implicit retries or cross-component rollback occur.
+
+    initial_session fixes the first ID and reset-relative origin. Reset retains
+    that configured origin while incrementing the ID. A caller may explicitly
+    lend an absolute host deadline to start(); subsequent execution/reset calls
+    must then supply their current deadline. This replaces the default host
+    caps and never changes simulation time or retries an expired operation.
     """
 
     def __init__(self, topology: Topology, registry: Mapping[str, Any], *,
@@ -159,7 +165,8 @@ class Simulation:
                  startup_timeout_s: float = 10, host_timeout_s: float | None = None,
                  max_pending_inputs: int = 256, dispatch_budget: int = 4096,
                  event_history: int = 256,
-                 on_event: Callable[[Event], None] | None = None):
+                 on_event: Callable[[Event], None] | None = None,
+                 initial_session: Session | None = None):
         if not isinstance(topology, Topology):
             raise TypeError("Simulation requires a Topology")
         check_timestamp(quantum_ns)
@@ -180,6 +187,9 @@ class Simulation:
                 raise ValueError(f"{name} must be a positive integer")
         if on_event is not None and not callable(on_event):
             raise TypeError("on_event must be callable or None")
+        if initial_session is not None and not isinstance(initial_session, Session):
+            raise TypeError("initial_session must be a Session or None")
+        self._initial_session = Session(1) if initial_session is None else initial_session
         self.topology = topology
         self.registry = MappingProxyType(dict(registry))
         self.quantum_ns = quantum_ns
@@ -210,6 +220,7 @@ class Simulation:
         self.events_dropped = 0
         self._deadline = math.inf
         self._host_deadline = math.inf
+        self._borrowed_deadline = False
         self._dispatch_time_ns = 0
         self._not_before_ns = 0
         self._phase = "new"
@@ -255,8 +266,19 @@ class Simulation:
         return tuple(self._events)
 
     def _check_deadline(self) -> None:
+        if self.state == SimulationState.FAILED and self.failure is not None:
+            raise self.failure
         if monotonic() >= self._deadline:
             raise TimeoutError(f"simulation host deadline exceeded during {self._phase}")
+
+    def _freeze_failure(self, error: BaseException) -> BaseException:
+        if self.state == SimulationState.FAILED and self.failure is not None:
+            if error is not self.failure:
+                self.failure.add_note(f"later simulation failure: {type(error).__name__}: {error}")
+        else:
+            self.failure = error
+        self.state = SimulationState.FAILED
+        return self.failure
 
     def check_deadline(self) -> None:
         """Check the same host budget used by stepped and interactive execution."""
@@ -265,9 +287,7 @@ class Simulation:
         try:
             self._check_deadline()
         except BaseException as exc:
-            self.failure = exc
-            self.state = SimulationState.FAILED
-            raise
+            raise self._freeze_failure(exc)
 
     def _emit(self, node: str, port: str | None, kind: str, payload: Any, *,
               source_time_ns: int | None = None, mapped_time_ns: int | None = None,
@@ -275,6 +295,7 @@ class Simulation:
               quality: TimeQuality | str = TimeQuality.EXACT) -> Event:
         if self.session is None:
             raise RuntimeError("observations require an active session")
+        self._check_deadline()
         mapped = self._dispatch_time_ns if mapped_time_ns is None else mapped_time_ns
         delivery = self._dispatch_time_ns if delivery_time_ns is None else delivery_time_ns
         event = Event(self.session.session_id, self.events_total, node, port, kind,
@@ -285,6 +306,7 @@ class Simulation:
         self.events_total += 1
         if self.on_event is not None:
             self.on_event(event)
+            self._check_deadline()
         return event
 
     def _create_resources(self) -> None:
@@ -345,23 +367,46 @@ class Simulation:
         self._phase = "initial delivery"
         self._settle(self.t_sim_ns)
 
-    def start(self) -> None:
+    @staticmethod
+    def _absolute_deadline(value: float) -> float:
+        try:
+            valid = (not isinstance(value, bool) and isinstance(value, (int, float))
+                     and math.isfinite(value) and value > 0)
+        except OverflowError:
+            valid = False
+        if not valid:
+            raise ValueError("deadline_monotonic must be a finite positive absolute deadline")
+        return value
+
+    def _operation_deadline(self, value: float | None) -> None:
+        if self._borrowed_deadline:
+            if value is None:
+                raise ValueError("borrowed deadline requires deadline_monotonic for each operation")
+            self._deadline = self._host_deadline = self._absolute_deadline(value)
+        elif value is not None:
+            raise ValueError("absolute deadlines require start(deadline_monotonic=...)")
+
+    def start(self, *, deadline_monotonic: float | None = None) -> None:
         if self.state != SimulationState.NEW or self._phase != "new":
             raise RuntimeError("start requires a new Simulation")
         # Startup and active host budgets include the first resource creation.
-        begun = monotonic()
-        self._host_deadline = begun + self.host_timeout_s
-        self._deadline = min(self._host_deadline, begun + self.startup_timeout_s)
-        self.session = Session(1)
+        if deadline_monotonic is not None:
+            self._deadline = self._host_deadline = self._absolute_deadline(deadline_monotonic)
+            self._borrowed_deadline = True
+        else:
+            begun = monotonic()
+            self._host_deadline = begun + self.host_timeout_s
+            self._deadline = min(self._host_deadline, begun + self.startup_timeout_s)
+        self.session = self._initial_session
+        self.t_sim_ns = self._dispatch_time_ns = self._not_before_ns = self.session.t_sim_ns
         try:
             self._create_resources()
             self._check_deadline()
         except BaseException as exc:
-            self.failure = exc
-            self.state = SimulationState.FAILED
-            self._close_owned(exc)
+            primary = self._freeze_failure(exc)
+            self._close_owned(primary)
             self._phase = "failed"
-            raise
+            raise primary
         self._deadline = self._host_deadline
         self._phase = "paused"
         self.state = SimulationState.PAUSED
@@ -535,17 +580,16 @@ class Simulation:
                 "substeps_completed": completed, "components": results,
             })
         except BaseException as exc:
-            exc.add_note(f"simulation failed during {self._phase}, step {self.step_id + 1}; completed time remains {self.t_sim_ns}")
-            self.failure = exc
-            self.state = SimulationState.FAILED
-            raise
+            primary = self._freeze_failure(exc)
+            primary.add_note(f"simulation failed during {self._phase}, step {self.step_id + 1}; completed time remains {self.t_sim_ns}")
+            raise primary
         finally:
             self._stepping = False
             if self.state == SimulationState.RUNNING:
                 self.state = SimulationState.PAUSED
                 self._phase = "paused"
 
-    def step(self, dt_ns: int | None = None) -> StepResult:
+    def step(self, dt_ns: int | None = None, *, deadline_monotonic: float | None = None) -> StepResult:
         if self.state != SimulationState.PAUSED:
             raise RuntimeError("step requires a paused, healthy Simulation")
         dt_ns = self.quantum_ns if dt_ns is None else dt_ns
@@ -554,14 +598,16 @@ class Simulation:
             raise ValueError("dt_ns must be positive")
         target = self.t_sim_ns + dt_ns
         check_timestamp(target)
+        self._operation_deadline(deadline_monotonic)
         return self._advance_to(target)
 
-    def run_until(self, target_ns: int) -> StepResult:
+    def run_until(self, target_ns: int, *, deadline_monotonic: float | None = None) -> StepResult:
         if self.state != SimulationState.PAUSED:
             raise RuntimeError("run_until requires a paused, healthy Simulation")
         check_timestamp(target_ns)
         if target_ns < self.t_sim_ns:
             raise ValueError("run target must not precede completed simulation time")
+        self._operation_deadline(deadline_monotonic)
         return self._advance_to(target_ns)
 
     def pause(self) -> None:
@@ -592,30 +638,31 @@ class Simulation:
         self._closing = False
         return primary
 
-    def reset(self) -> None:
-        """Destroy and recreate every owned instance; failed runs require a new object."""
+    def reset(self, *, deadline_monotonic: float | None = None) -> None:
+        """Recreate at the configured origin; failed runs require a new object."""
         if self.state != SimulationState.PAUSED or self._stepping:
             raise RuntimeError("reset requires a paused, healthy Simulation")
+        self._operation_deadline(deadline_monotonic)
+        self.check_deadline()
         previous_session = self.session.session_id
         self.state = SimulationState.RUNNING
         primary = self._close_owned()
         if primary is not None:
-            self.failure = primary
-            self.state = SimulationState.FAILED
-            raise primary
+            raise self._freeze_failure(primary)
         self._inputs.clear()
-        self.t_sim_ns = self.step_id = self._dispatch_time_ns = self._not_before_ns = 0
-        self.session = Session(previous_session + 1)
-        self._deadline = min(self._host_deadline, monotonic() + self.startup_timeout_s)
+        self.step_id = 0
+        self.session = Session(previous_session + 1, self._initial_session.t_sim_ns)
+        self.t_sim_ns = self._dispatch_time_ns = self._not_before_ns = self.session.t_sim_ns
+        self._deadline = (self._host_deadline if self._borrowed_deadline else
+                          min(self._host_deadline, monotonic() + self.startup_timeout_s))
         try:
             self._create_resources()
             self._check_deadline()
         except BaseException as exc:
-            self.failure = exc
-            self.state = SimulationState.FAILED
-            self._close_owned(exc)
+            primary = self._freeze_failure(exc)
+            self._close_owned(primary)
             self._phase = "failed"
-            raise
+            raise primary
         self._deadline = self._host_deadline
         self._phase = "paused"
         self.state = SimulationState.PAUSED

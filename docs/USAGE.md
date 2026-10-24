@@ -224,6 +224,13 @@ with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
     simulation.run_until(scene.duration_ns)
 ```
 
+嵌入现有原生会话时，可显式传入 `initial_session=Session(id, origin_ns)`；
+首轮使用该会话，reset 重建资源、递增 ID，并回到配置的 origin（默认0）。
+`start(deadline_monotonic=...)` 可借用调用方的有限绝对 host 期限；此后每次
+`step`、`run_until`、`reset` 都必须显式提供自己的 `deadline_monotonic`。
+该模式替换默认启动/运行预算，过期即冻结；未选择该模式时仍使用原有总预算。
+期限不会推进仿真时间，失败也不会重试已经执行的步骤。
+
 factory 的 `describe(spec)` 纯校验并返回 `NodeDescription`/`PortSpec`，
 `create(spec, context)` 返回唯一 owned 实例；构造失败时 factory 负责未返回的部分资源。
 可选纯 `validate_topology(topology, descriptions, registry)` 在创建前校验组件间约束。
@@ -3047,7 +3054,8 @@ CAN保留来源时间并应用区间末下限和链路延迟，UART保持读取�
 
 外部输入在`schedule_input()`入队前完成纯准入：端口必须声明`external_input`能力，
 工厂提供`validate_input(spec, port, payload, *, connected_ports)`并返回规范化数据。
-方向、类型、时间和容量错误不执行设备操作、不污染队列，也不令健康Simulation失败。
+方向、类型、时间错误在纯准入阶段拒绝，不执行设备操作，也不令健康Simulation失败。
+执行队列容量耗尽则冻结Simulation，保留此前效果和原异常；回调捕获异常也不能继续交付。
 内部连接能力与外部注入独立；QEMU的FDCAN端口仅接受总线连接，不能通过inject直接输入。
 QEMU按键要求bool，GPIO要求整数0/1，UART接受bytes或UTF-8字符串（编码后最多4096字节，
 保留NUL）。连接占用的输入及物理别名拒绝外部注入。交互inject同样使用工厂准入，

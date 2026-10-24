@@ -95,11 +95,16 @@ class UartNet:
 
     @property
     def next_due_ns(self):
+        self._raise_failure()
         return self._queue[0][0] if self._queue else None
 
     def _check(self):
         if self._closed or not self._initialized or self._failed is not None:
             raise RuntimeError('UART net requires a successful reset and healthy open state')
+
+    def _raise_failure(self):
+        if self._failed is not None:
+            raise self._failed
 
     def reset(self, session):
         if self._closed or self._dispatching:
@@ -124,6 +129,7 @@ class UartNet:
                            source_time_ns=chunk.source_time_ns,
                            mapped_time_ns=chunk.mapped_time_ns,
                            delivery_time_ns=cut, quality=chunk.quality)
+        self._raise_failure()
 
     def _send(self, name, data, context, *, source_time_ns, mapped_time_ns, quality):
         self._check()
@@ -156,8 +162,9 @@ class UartNet:
             self._last_mapped[name] = mapped
             self._emit('net.uart.sent', chunk, sequence, due, context.t_sim_ns)
         except BaseException as error:
-            self._failed = error
-            raise
+            if self._failed is None:
+                self._failed = error
+            raise self._failed
 
     def dispatch(self, cut, budget):
         self._check()
@@ -178,12 +185,14 @@ class UartNet:
                 count += 1
                 destination = next(name for name in self._endpoints if name != chunk.source)
                 self._endpoints[destination][1](chunk.data)
+                self._raise_failure()
                 self._emit('net.uart.delivery', chunk, sequence, due, cut, destination)
             return count
         except BaseException as error:
-            self._failed = error
-            error.add_note(f'UART delivery failed at {cut} ns; partial effects are not replayed')
-            raise
+            if self._failed is None:
+                self._failed = error
+            self._failed.add_note(f'UART delivery failed at {cut} ns; partial effects are not replayed')
+            raise self._failed
         finally:
             self._dispatching = False
 

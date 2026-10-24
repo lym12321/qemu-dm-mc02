@@ -241,18 +241,27 @@ def test_caller_dispatch_cap_precedes_side_effects_and_preserves_bus_budget():
     assert (first.seen, second.seen, bus.pending) == ([2, 4], [1, 3], 1)
 
 
-def test_capacity_rejection_preserves_existing_pending_frame():
+def test_capacity_rejection_retains_pending_but_freezes_until_reset():
     bus = CanBus(max_pending=1)
     source, sink = Sink("source"), Sink("sink")
     bus.attach(source)
     bus.attach(sink)
     first = CanFrame(1)
     bus.send(source, first)
-    with pytest.raises(BufferError, match="capacity exhausted"):
+    with pytest.raises(BufferError, match="capacity exhausted") as caught:
         bus.send(source, CanFrame(2))
     assert bus.pending == 1
+    for operation in (lambda: bus.send(source, CanFrame(3)), lambda: bus.step(0),
+                      lambda: bus.next_due_ns, lambda: bus.has_due(0)):
+        with pytest.raises(BufferError) as repeated:
+            operation()
+        assert repeated.value is caught.value
+    assert sink.frames == [] and bus.pending == 1
+    bus.reset()
+    assert bus.pending == 0 and bus.next_due_ns is None
+    bus.send(source, CanFrame(3))
     assert bus.step(0) == 1
-    assert sink.frames == [first]
+    assert sink.frames == [CanFrame(3)]
 
 
 def test_reset_clears_pending_clock_sequence_and_retains_wiring_and_delay():
@@ -321,8 +330,11 @@ def test_registration_and_send_admission_have_no_partial_effects():
 
 @pytest.mark.parametrize("failed_callback", ["drop", "log", "receive"])
 def test_callback_failure_propagates_and_retains_remaining_queue(failed_callback):
+    primary, calls = OSError("callback failed"), []
+
     def fail(*args):
-        raise OSError("callback failed")
+        calls.append(args)
+        raise primary
 
     bus = CanBus(**({failed_callback: fail} if failed_callback != "receive" else {}))
     source, sink = Sink("source"), Sink("sink")
@@ -332,9 +344,60 @@ def test_callback_failure_propagates_and_retains_remaining_queue(failed_callback
     bus.attach(sink)
     bus.send(source, CanFrame(1))
     bus.send(source, CanFrame(2))
-    with pytest.raises(OSError, match="callback failed"):
+    with pytest.raises(OSError, match="callback failed") as caught:
         bus.step(0)
-    assert bus.pending == 1
+    assert caught.value is primary and bus.pending == 1
+    with pytest.raises(OSError) as repeated:
+        bus.step(0)
+    assert repeated.value is primary and len(calls) == 1
+    bus.close()
+    assert bus.pending == 0 and bus.next_due_ns is None
+
+
+@pytest.mark.parametrize("callback", ["drop", "log", "receive", "replacement"])
+def test_swallowed_callback_capacity_error_stops_delivery_and_preserves_first_error(callback):
+    bus = CanBus(max_pending=1)
+    source, first, second = (Sink(name) for name in ("source", "first", "second"))
+    caught_errors = []
+
+    def exhaust(*args):
+        bus.send(source, CanFrame(2))
+        try:
+            bus.send(source, CanFrame(3))
+        except BufferError as error:
+            caught_errors.append(error)
+        if callback == "replacement":
+            raise RuntimeError("replacement callback error")
+        return False
+
+    if callback == "drop":
+        bus.drop = exhaust
+    elif callback == "log":
+        bus.log = exhaust
+    else:
+        def receive(frame):
+            first.frames.append(frame)
+            if frame.can_id == 1:
+                exhaust()
+        first.receive = receive
+    for endpoint in (source, first, second):
+        bus.attach(endpoint, endpoint.name)
+    bus.send(source, CanFrame(1))
+    with pytest.raises(BufferError) as caught:
+        bus.step(0)
+    assert caught.value is caught_errors[0]
+    assert first.frames == ([CanFrame(1)] if callback in ("receive", "replacement") else [])
+    assert second.frames == [] and bus.pending == 1
+    with pytest.raises(BufferError) as repeated:
+        bus.step(0)
+    assert repeated.value is caught.value and len(caught_errors) == 1
+    bus.reset()
+    bus.drop = bus.log = None
+    bus.send(source, CanFrame(4))
+    # Reset removes the retained frame rather than replaying either broadcast.
+    assert bus.step(0) == 1
+    assert second.frames == [CanFrame(4)]
+    bus.close()
 
 
 @pytest.mark.parametrize("operation", ["step", "reset", "delay"])

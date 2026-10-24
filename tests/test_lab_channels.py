@@ -178,9 +178,11 @@ def test_can_capacity_is_explicit_without_unbounded_host_queue():
         lab = LabChannels(cans={"can": stream})
         for _ in range(256):
             lab.send_can("can", CanFrame(1, timestamp_ns=100))
-        with pytest.raises(BufferError, match="capacity"):
+        with pytest.raises(BufferError, match="capacity") as caught:
             lab.send_can("can", CanFrame(2, timestamp_ns=100))
-        assert lab.service(99) == []
+        with pytest.raises(BufferError) as repeated:
+            lab.service(99)
+        assert repeated.value is caught.value
         no_bytes(peer)
         lab.reset(100)
         assert lab.service(100) == []

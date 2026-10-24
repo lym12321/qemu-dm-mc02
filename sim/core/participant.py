@@ -16,7 +16,7 @@ class Session:
             raise ValueError("session_id must be a positive integer")
         check_time(self.t_sim_ns, None)
         if self.t_sim_ns > 0xFFFFFFFFFFFFFFFF:
-            raise ValueError("session time must fit unsigned64 nanoseconds")
+            raise ValueError("session time must fit unsigned 64-bit nanoseconds")
 
 
 @dataclass(frozen=True)

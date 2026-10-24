@@ -204,7 +204,7 @@ def test_session_and_step_time_fit_unsigned64_without_float_conversion():
     assert StepContext(1, 1, limit, 1).t_sim_ns == limit
     for create in (lambda: Session(1, limit + 1),
                    lambda: StepContext(1, 1, limit + 1, 1)):
-        with pytest.raises(ValueError, match="unsigned64"):
+        with pytest.raises(ValueError, match="unsigned 64-bit"):
             create()
 
 

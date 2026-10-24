@@ -127,6 +127,34 @@ def input_scene(**kwargs):
     return simulation, factory
 
 
+@pytest.mark.parametrize('replacement', [False, True])
+def test_step_component_cannot_hide_terminal_input_capacity_failure(replacement):
+    simulation, factory = input_scene(max_pending_inputs=1)
+    caught_errors = []
+    with simulation:
+        owner = factory.instances[0]
+        calls = []
+        def step(context):
+            calls.append(context)
+            simulation.schedule_input('plant.key', True)
+            try:
+                simulation.schedule_input('plant.key', False)
+            except BufferError as error:
+                caught_errors.append(error)
+                if replacement:
+                    raise OSError('replacement step failure') from error
+            return StepResult('ok', context.t_sim_ns)
+        owner.step = step
+        with pytest.raises(BufferError) as raised:
+            simulation.run_until(20)
+        assert raised.value is simulation.failure is caught_errors[0]
+        if replacement:
+            assert any('OSError: replacement step failure' in note
+                       for note in simulation.failure.__notes__)
+        assert simulation.state == 'failed' and simulation.t_sim_ns == simulation.step_id == 0
+        assert len(calls) == 1 and not owner.inputs
+
+
 def test_generic_connection_owners_sample_all_sources_before_dispatching_sinks():
     trace = []
 
@@ -799,7 +827,8 @@ def test_input_self_excitation_is_bounded_and_failure_not_replayed():
         assert simulation.t_sim_ns == 0
 
 
-def test_can_self_excitation_and_queue_capacity_are_bounded():
+@pytest.mark.parametrize("failure", ["self-excitation", "capacity"])
+def test_can_self_excitation_and_queue_capacity_are_bounded(failure):
     class Echo(Component):
         def __init__(self, spec, context):
             super().__init__(spec, context)
@@ -813,10 +842,17 @@ def test_can_self_excitation_and_queue_capacity_are_bounded():
     simulation = Simulation(topology, {"bus": CanBusFactory(), "echo": factory})
     with simulation:
         factory.instances[0].link.send(CanFrame(1))
-        with pytest.raises(BufferError):
-            factory.instances[0].link.send(CanFrame(2))
-        with pytest.raises(RuntimeError, match="dispatch budget"):
-            simulation.step()
+        if failure == "capacity":
+            with pytest.raises(BufferError) as caught:
+                factory.instances[0].link.send(CanFrame(2))
+            with pytest.raises(BufferError) as repeated:
+                simulation.step()
+            assert repeated.value is caught.value
+        else:
+            with pytest.raises(RuntimeError, match="dispatch budget"):
+                simulation.step()
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.t_sim_ns == 0
         assert simulation.components["bus"].pending == 1
 
 

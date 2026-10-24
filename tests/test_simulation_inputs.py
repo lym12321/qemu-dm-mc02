@@ -123,3 +123,39 @@ def test_device_failure_after_admission_freezes_without_replay_and_closes():
             sim.step()
         assert factory.instance.applied == [("value", 1)]
     assert factory.instance.closed
+
+
+@pytest.mark.parametrize('surface', ['event', 'component'])
+@pytest.mark.parametrize('replacement', [False, True])
+def test_caught_capacity_failure_still_stops_dispatch_and_preserves_primary(surface, replacement):
+    caught_errors = []
+    def exhaust():
+        sim.schedule_input('n.value', 0, at_ns=5)
+        try:
+            sim.schedule_input('n.value', 1, at_ns=5)
+        except BufferError as error:
+            caught_errors.append(error)
+            if replacement:
+                raise OSError('replacement input failure') from error
+    def observe(event):
+        if surface == 'event' and event.kind == 'input.delivered':
+            exhaust()
+    sim, factory = simulation(max_pending_inputs=1, quantum_ns=10, on_event=observe)
+    with sim:
+        owner = factory.instance
+        if surface == 'component':
+            original = owner.input
+            def consume(port, value):
+                original(port, value)
+                exhaust()
+            owner.input = consume
+        sim.schedule_input('n.value', 1, at_ns=3)
+        with pytest.raises(BufferError) as raised:
+            sim.run_until(20)
+        assert raised.value is sim.failure is caught_errors[0]
+        if replacement:
+            assert any('OSError: replacement input failure' in note
+                       for note in sim.failure.__notes__)
+        assert sim.state == 'failed' and sim.t_sim_ns == sim.step_id == 0
+        assert owner.applied == [('value', 1)]
+        assert len(sim.events) == (1 if surface == 'event' else 0)

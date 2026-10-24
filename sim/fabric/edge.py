@@ -90,6 +90,7 @@ class DigitalEdgeNet:
 
     @property
     def next_due_ns(self):
+        self._raise_failure()
         return self._queue[0][0] if self._queue else None
 
     @property
@@ -112,6 +113,10 @@ class DigitalEdgeNet:
         if self._closed or not self._initialized or self._failed is not None:
             raise RuntimeError('digital-edge net requires a healthy open session')
 
+    def _raise_failure(self):
+        if self._failed is not None:
+            raise self._failed
+
     def _send(self, edge, floor):
         self._check()
         try:
@@ -129,8 +134,9 @@ class DigitalEdgeNet:
             self._sequence += 1
             self._last_edge = edge
         except BaseException as error:
-            self._failed = error
-            raise
+            if self._failed is None:
+                self._failed = error
+            raise self._failed
 
     def dispatch(self, cut, budget):
         self._check()
@@ -148,15 +154,18 @@ class DigitalEdgeNet:
                 count += 1
                 for name, receive in self._sinks:
                     receive(edge)
+                    self._raise_failure()
                     self._context.emit('signal', 'net.digital-edge.delivery', {
                         'source': self._source, 'destination': name, 'level': edge.level,
                         'sequence': sequence, 'due_ns': due,
                     }, source_time_ns=edge.source_time_ns, mapped_time_ns=edge.mapped_time_ns,
                         delivery_time_ns=cut, quality='exact')
+                    self._raise_failure()
             return count
         except BaseException as error:
-            self._failed = error
-            raise
+            if self._failed is None:
+                self._failed = error
+            raise self._failed
         finally:
             self._busy = False
 

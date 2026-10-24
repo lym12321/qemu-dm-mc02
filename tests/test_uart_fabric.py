@@ -129,6 +129,52 @@ def test_sink_partial_failure_is_not_replayed_and_close_never_closes_borrow():
     assert not any(peer.closed for peer in peers)
 
 
+@pytest.mark.parametrize('boundary', ['receiver', 'sent', 'delivery', 'replacement'])
+def test_caught_callback_overflow_stops_active_io_and_preserves_error(boundary):
+    net, context, peers, (handle, _) = connected(max_pending=1)
+    errors = []
+
+    def overflow():
+        # Keep the first queued response; a rejected second response freezes it.
+        if boundary != 'sent':
+            handle.send(b'queued')
+        try:
+            handle.send(b'rejected')
+        except BufferError as error:
+            errors.append(error)
+
+    if boundary in ('receiver', 'replacement'):
+        def receive(data):
+            peers[1].received.append(data)
+            overflow()
+            if boundary == 'replacement':
+                raise OSError('later receiver error')
+        net._endpoints['right.uart'] = (peers[1], receive)
+    else:
+        emit = context.emit
+        def observe(port, kind, payload, **stamp):
+            emit(port, kind, payload, **stamp)
+            if kind == f'net.uart.{boundary}':
+                overflow()
+        context.emit = observe
+    if boundary == 'sent':
+        with pytest.raises(BufferError) as caught:
+            handle.send(b'first')
+        assert peers[1].received == []
+    else:
+        handle.send(b'first')
+        with pytest.raises(BufferError) as caught:
+            net.dispatch(0, 10)
+        assert peers[1].received == [b'first']
+    assert caught.value is errors[0] and net.pending == 1
+    with pytest.raises(BufferError) as retained:
+        _ = net.next_due_ns
+    assert retained.value is errors[0]
+    with pytest.raises(RuntimeError):
+        net.dispatch(1, 10)
+    assert len(peers[1].received) == (0 if boundary == 'sent' else 1)
+
+
 def topology(count=2, direction='inout', **options):
     nodes = (NodeSpec('wire', 'net.uart', options),) + tuple(
         NodeSpec(f'peer{i}', 'fixture.peer') for i in range(count))

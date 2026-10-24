@@ -72,7 +72,7 @@ def test_failure_freezes_without_replaying_delivered_or_pending_edges(failure):
                 source.output.send(DigitalEdge(0, 5000, 2))
         else:
             source.output.send(DigitalEdge(1, 5000, 0))
-        with pytest.raises((RuntimeError, OSError)):
+        with pytest.raises((BufferError, ValueError, OSError)):
             sim.run_until(1)
         assert sim.state == SimulationState.FAILED
         assert sim.t_sim_ns == 0
@@ -92,6 +92,45 @@ def test_reset_reconstructs_owners_and_invalidates_old_output_handle():
             source.output.send(DigitalEdge(0, 5001, 101))
         sim.step()
         assert len(sim.components['sink'].received) == 4
+
+
+@pytest.mark.parametrize('boundary', ['receiver', 'observer', 'replacement'])
+def test_caught_callback_overflow_stops_delivery_and_freezes_original_error(boundary):
+    with DEMO['simulation']() as sim:
+        source, sink, wire = (sim.components[name] for name in ('source', 'sink', 'wire'))
+        source.sent = True
+        wire.max_pending = 1
+        errors = []
+
+        def overflow():
+            source.output.send(DigitalEdge(0, 5000, 0))
+            try:
+                source.output.send(DigitalEdge(1, 5000, 0))
+            except BufferError as error:
+                errors.append(error)
+
+        if boundary in ('receiver', 'replacement'):
+            receive = sink.receive_edge
+
+            def receive_then_overflow(edge):
+                receive(edge)
+                overflow()
+                if boundary == 'replacement':
+                    raise OSError('later receiver error')
+
+            wire._sinks[0] = ('sink.in', receive_then_overflow)
+        else:
+            sim.on_event = lambda event: overflow() if event.kind == 'net.digital-edge.delivery' else None
+        source.output.send(DigitalEdge(1, 5000, 0))
+        with pytest.raises(BufferError) as caught:
+            sim.run_until(10)
+        assert caught.value is errors[0]
+        assert sink.received == [(1, 5000, 0, 0)]
+        assert wire.pending == 1
+        assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 0
+        with pytest.raises(RuntimeError):
+            sim.run_until(10)
+        assert len(sink.received) == 1
 
 
 def test_due_edges_created_by_receiver_are_bounded_without_replay():
