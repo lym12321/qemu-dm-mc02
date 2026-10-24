@@ -614,7 +614,7 @@ def test_interval_floor_precedes_link_delay_and_sampling_cut():
         assert plants.instances[0].integrated_controls == [0, 0, 7, 7]
 
 
-def test_inputs_stable_ties_deep_snapshot_capacity_and_pause_at_completed_cut():
+def test_inputs_stable_ties_deep_snapshot_and_pause_at_completed_cut():
     simulation, machines, _, _ = scene()
     with simulation:
         simulation.max_pending_inputs = 2
@@ -622,8 +622,6 @@ def test_inputs_stable_ties_deep_snapshot_capacity_and_pause_at_completed_cut():
         simulation.schedule_input("first.key", payload, at_ns=0)
         payload["value"].append(9)
         simulation.schedule_input("first.key", {"value": [2]}, at_ns=0)
-        with pytest.raises(BufferError, match="input capacity"):
-            simulation.schedule_input("first.key", 3)
         simulation.step()
         assert [item[1]["value"] for item in machines.instances[0].input_values] == [(1,), (2,)]
         with pytest.raises(ValueError, match="current dispatch cut"):
@@ -632,6 +630,24 @@ def test_inputs_stable_ties_deep_snapshot_capacity_and_pause_at_completed_cut():
         simulation.run_until(100)
         assert simulation.t_sim_ns == 20
         assert simulation.state == SimulationState.PAUSED
+
+
+def test_input_queue_exhaustion_freezes_without_delivering_or_replaying_queued_inputs():
+    simulation, factory = input_scene()
+    with simulation:
+        simulation.max_pending_inputs = 1
+        simulation.schedule_input("plant.key", 1)
+        with pytest.raises(BufferError, match="input capacity") as caught:
+            simulation.schedule_input("plant.key", 2)
+        assert simulation.failure is caught.value
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.t_sim_ns == simulation.step_id == 0
+        assert factory.instances[0].inputs == []
+        for operation in (lambda: simulation.step(), lambda: simulation.run_until(0),
+                          lambda: simulation.schedule_input("plant.key", 3), simulation.reset):
+            with pytest.raises(RuntimeError):
+                operation()
+    assert factory.instances[0].close_count == 1
 
 
 def test_bounded_event_history_full_callback_and_immutable_payload():

@@ -159,24 +159,39 @@ factory 的 `describe(spec)` 纯校验并返回 `NodeDescription`/`PortSpec`，
 `--qmp /tmp/sim-user-qmp.sock` 暴露单机器的原生接口，仍受同一 host 期限。
 手动 GDB 运行/暂停会影响切点前提；应通过 Runtime 的 run/step 推进，不能另开 CPU 时间 owner。
 
-每步先在 t 交付到期输入，再让机器和同步组件前进到 t+dt；plant 使用区间开始时已生效的控制量。
-区间末收集到的机器 CAN 输出最早在 t+dt 加链路延迟后交付，不能回写过去积分。
+一次非零区间从已完成的切点 `t` 开始，顺序固定：
+
+1. `settle(t)`：按入队顺序应用同时间外部输入，再按连接 Owner 的声明顺序派发到期工作；
+   回调新建的当前到期事件在同一有限预算内继续处理。
+2. 下一切点取目标、`t + quantum`、已排定输入与 Owner 已知传输截止时间的最小值；
+   settle 后仍报告不晚于 `t` 的截止时间属于错误，不能生成零步长或回退。
+3. 请求全部 Machine，然后逐个完成到该精确目标；随后推进非 Machine 执行组件。
+4. 采样全部已完成源状态，派发目标切点的输入/连接事件，最后提交 Simulation 时间和 step ID。
+
+Owner 分组先构造连接、再构造 binding owner、最后构造其他节点；每组内保留场景声明顺序。
+初始化完成后只采样一次。plant 使用区间开始时已生效的控制量；本区间生成的 CAN/IMU/GPIO
+最早在区间末切点交付，CAN 还需加链路延迟，因此只能影响下一段 CPU 或物理执行。
+已知的窄外部脉冲会分割区间；仅查询 GPIO 快照无法重建两个采样点间的未知脉冲，缩小 quantum
+也不能补出缺失的原生边沿来源。当前数字连接不提供同切点组合逻辑闭包。
 所有观测含 session、稳定 sequence、来源 node/port、原始 source time、映射时间、交付时间和
 `exact/sampled/lower_bound/upper_bound` 质量。CAN 保留 guest wire 时间；UART 取 read 后
 原生暂停快照作为观察上界。`can-input-processed` 只证明 native transport 处理，
 FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot` 可由 Python 回调观察。
 默认只保留最近 256 个事件，丢弃数公开；回调可消费完整流并自行有界记录。
 
-失败保留部分效果并进入 FAILED，关闭后新建 Simulation，不隐式回滚/重试。
+非法类型、时间或未获准的外部输入在入队前拒绝；执行队列耗尽与运行错误进入 FAILED，
+保留部分效果，关闭后新建 Simulation，不隐式回滚/重试。全局派发预算默认 4096，
+外部待处理输入默认最多 256；Owner 还各自执行有限派发预算，回调不能无限自激。
 健康且暂停时 `reset()` 销毁并重建全部 owned 组件，session 递增，原 host 总预算不重启。
 `close()` 独立尝试所有资源；CLI 在清理成功后才报告 passed，报告路径拒绝覆盖。
 缺失可选后端返回 78，执行失败 1，中断 130。
 同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
 
-当前执行CAN与数字GPIO连接。UART可作机器外部输入和观测，跨节点UART、SPI/I2C/ADC、
-physics-binding尚不支持，在资源创建前拒绝未知端口或不支持的连接。第二种真实MCU、
-完整动力学组合及跨板事件级锁步尚未实现。DM-MC02是首个真实profile，不能靠YAML
-声明额外板卡。`api/runtime/config/fabric`不导入任何具体板卡、DJI或物理后端。
+当前执行 CAN、采样数字 GPIO、完成态 SI IMU，以及 M3508 到共享 MuJoCo World 的关节绑定。
+UART 可作机器外部输入和观测；跨节点 UART、SPI/I2C/ADC 连接尚未接入统一运行时，
+不支持的连接在创建资源前拒绝。第二种真实 MCU 和跨板事件级锁步尚未实现；
+DM-MC02 是首个真实 profile，不能靠 YAML 声明额外板卡。
+`api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
 
 Lab、Robot、Arena、Scenario 及原有 MuJoCo/Gazebo/Trace 组合仍是**尚未迁移的应用**，
 下面的相关命令统一使用 `tools/sim-unmigrated`；它们的旧 runner 不属于新 Simulation 支持范围。

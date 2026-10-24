@@ -62,12 +62,12 @@ def test_invalid_admission_does_not_enqueue_apply_or_freeze(endpoint, value):
     assert factory.instance.closed
 
 
-def test_interactive_recovers_from_payload_capability_and_capacity_errors(tmp_path, monkeypatch, capsys):
+def test_interactive_recovers_from_payload_and_capability_errors(tmp_path, monkeypatch, capsys):
     import sys
     from sim.cli import _interactive
     source = tmp_path / "commands"
     source.write_text("inject n.value true\ninject n.internal 1\ninject n.value 1\n"
-                      "inject n.value 0\nstep 1ns\ninject n.value 0\nstep 1ns\nquit\n")
+                      "step 1ns\ninject n.value 0\nstep 1ns\nquit\n")
     sim, factory = simulation(max_pending_inputs=1)
     with sim, source.open() as stream:
         monkeypatch.setattr(sys, "stdin", stream)
@@ -75,16 +75,29 @@ def test_interactive_recovers_from_payload_capability_and_capacity_errors(tmp_pa
         assert sim.state == SimulationState.PAUSED
         assert factory.instance.applied == [("value", 1), ("value", 0)]
     error = capsys.readouterr().err
-    assert "integer" in error and "external input" in error and "capacity" in error
+    assert "integer" in error and "external input" in error
 
 
-def test_repeated_inputs_keep_order_and_capacity_rejection_keeps_existing_work():
+def test_interactive_capacity_failure_escapes_before_any_input_is_applied(tmp_path, monkeypatch):
+    import sys
+    from sim.cli import _interactive
+    source = tmp_path / "commands"
+    source.write_text("inject n.value 1\ninject n.value 0\nstep 1ns\n")
+    sim, factory = simulation(max_pending_inputs=1)
+    with sim, source.open() as stream:
+        monkeypatch.setattr(sys, "stdin", stream)
+        with pytest.raises(BufferError, match="input capacity"):
+            _interactive(sim, None)
+        assert sim.state == SimulationState.FAILED
+        assert factory.instance.applied == []
+    assert factory.instance.closed
+
+
+def test_repeated_inputs_keep_order_without_reapplying_at_same_cut():
     sim, factory = simulation(max_pending_inputs=2, quantum_ns=10)
     with sim:
         sim.schedule_input("n.value", 1, at_ns=3)
         sim.schedule_input("n.value", 1, at_ns=3)
-        with pytest.raises(BufferError):
-            sim.schedule_input("n.value", 0, at_ns=4)
         assert sim.state == SimulationState.PAUSED
         sim.step(10)
         assert factory.instance.applied == [("value", 1), ("value", 1)]

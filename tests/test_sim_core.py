@@ -181,7 +181,7 @@ def test_physics_coordinator_preserves_origin_calls_and_aliased_native_seconds()
     assert physics.events == ["time_s"]
 
     coordinator = Coordinator({"world": participant})
-    origin = 10**30 + 17
+    origin = 0xFFFFFFFFFFFF0000 + 17
     coordinator.reset(Session(11, origin))
     assert physics.events == ["time_s", "reset", "time_s"]
     assert participant.t_sim_ns == coordinator.t_sim_ns == origin
@@ -196,6 +196,16 @@ def test_physics_coordinator_preserves_origin_calls_and_aliased_native_seconds()
     coordinator.close()
     coordinator.close()
     assert physics.events[-1] == "close" and physics.events.count("close") == 1
+
+
+def test_session_and_step_time_fit_unsigned64_without_float_conversion():
+    limit = 0xFFFFFFFFFFFFFFFF
+    assert Session(1, limit).t_sim_ns == limit
+    assert StepContext(1, 1, limit, 1).t_sim_ns == limit
+    for create in (lambda: Session(1, limit + 1),
+                   lambda: StepContext(1, 1, limit + 1, 1)):
+        with pytest.raises(ValueError, match="unsigned64"):
+            create()
 
 
 def test_physics_bad_context_and_reset_type_reject_before_effects():

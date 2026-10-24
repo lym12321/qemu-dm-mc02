@@ -387,7 +387,10 @@ class Simulation:
         value = immutable(self.registry[spec.kind].validate_input(
             spec, endpoint.port, payload, connected_ports=connected))
         if len(self._inputs) >= self.max_pending_inputs:
-            raise BufferError("simulation input capacity exhausted")
+            error = BufferError("simulation input capacity exhausted")
+            self.failure = error
+            self.state = SimulationState.FAILED
+            raise error
         heapq.heappush(self._inputs, (when, self._input_sequence, _Input(endpoint, value)))
         self._input_sequence += 1
 
@@ -519,6 +522,9 @@ class Simulation:
                     if "dispatch" in self._descriptions[name].capabilities:
                         due = self._next_due(name, component)
                         if due is not None:
+                            if due <= self.t_sim_ns:
+                                raise RuntimeError(f"dispatcher {name} reported unsettled work at {due} ns "
+                                                   f"after settling {self.t_sim_ns} ns")
                             cut = min(cut, due)
                 results = self._step(cut)
                 completed += 1

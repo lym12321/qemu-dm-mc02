@@ -122,12 +122,14 @@ def _interactive(simulation, scene):
                     if not separator:
                         raise ValueError('inject requires ENDPOINT JSON')
                     payload = json.loads(encoded)
-                    # Admission mutates only the bounded input queue. Applying
-                    # the input happens inside step, where errors are terminal.
+                    # Invalid payloads are recoverable; exhaustion of the
+                    # execution queue is terminal even before input delivery.
                     simulation.schedule_input(endpoint, payload, at_ns=simulation.t_sim_ns)
                 elif arguments or command not in ('', 'quit', 'run', 'pause', 'state', 'reset'):
                     raise ValueError('unknown command or arguments')
             except (ValueError, TypeError, KeyError, BufferError) as error:
+                if simulation.state == 'failed':
+                    raise
                 print(f'error: {error}', file=sys.stderr, flush=True)
             else:
                 # Execution errors must escape to the common cleanup/report
