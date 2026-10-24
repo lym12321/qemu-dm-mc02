@@ -142,6 +142,29 @@ M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换�
 缺少原生依赖返回 `blocked`（退出码78），模型、绑定或运行错误
 返回 `failed`（退出码1）。示例参数未标定，不声明实时性能或 CPU/世界全局锁步。
 
+### 有限实验与断言
+
+`sim.apps.experiment.run_experiment(scene, registry, inputs=..., assertions=...)`
+在同一个 Simulation 上运行单板、外设或多节点实验。`scene` 接受 `Scene` 或现有
+sim/v1 文件；输入使用 `ExperimentInput(at_ns, "node.port", payload)`，按原顺序交付同时间输入。
+断言复用现有 `before` + `uart_contains` / `digital_equals` / `can_seen` 格式，
+endpoint 使用完整节点端口名；不新增配置格式或执行器。
+
+```bash
+cmake -S examples/minimal-board -B build/experiment-firmware -DCMAKE_BUILD_TYPE=Debug
+cmake --build build/experiment-firmware
+python examples/experiment/main.py --qemu build/qemu/qemu-system-arm \
+  --firmware build/experiment-firmware/firmware.elf
+```
+
+示例用真实固件响应和 GPIO 观测验证按键输入。结果仅在资源清理完成后返回，
+包含各断言状态、失败说明以及匹配事件的 source/mapped/delivery 时间和质量。
+UART/CAN 入队通知不能满足断言；严格截止断言拒绝仅有时间下界的观察证据。
+UART 跨块匹配只保留必要后缀，网络交付仍不证明固件消费。
+每个实验最多63个用户节点、1024条输入和1024条断言；只支持有限 stepped 场景，
+时间原点为 Simulation 的0，不等待应用 ready。ready 相对时间、ADC/VIN、原交互/Web、
+trace/capture 和故障脚本的完整迁移尚未完成，旧入口继续承载这些独特能力。
+
 
 <a id="rotor-loop"></a>
 ### 单电机转子反馈闭环

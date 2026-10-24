@@ -19,12 +19,13 @@ jobs:
         run: >-
           python -m pytest -q
           tests/test_topology.py tests/test_simulation.py
-          tests/test_simulation_inputs.py tests/test_can_fabric.py
+          tests/test_simulation_inputs.py tests/test_simulation_session.py tests/test_can_fabric.py
           tests/test_digital_fabric.py tests/test_uart_fabric.py
           tests/test_edge_fabric.py tests/test_joint_execution.py
           tests/test_qemu_machine.py tests/test_qemu_imu.py
           tests/test_qmp_distribution.py tests/test_scene_cli.py
           tests/test_simulation_digital.py tests/test_simulation_rotor.py
+          tests/test_sim_experiment.py tests/test_lab_experiment.py
       - name: Installed CLI and missing native backend
         working-directory: /tmp
         env:

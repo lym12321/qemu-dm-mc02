@@ -160,11 +160,13 @@ def _stimulus(value, index: int) -> Stimulus:
     return Stimulus(at_ns, endpoint, "gpio", _integer(item["value"], 1, label + ".value"))
 
 
-def parse_assertion(value, index: int) -> Assertion:
+def parse_assertion(value, index: int, *, endpoint_validator=None) -> Assertion:
     """Admit one Lab condition without reading files or importing runtime IO.
 
     ``index`` is its zero-based position for contextual diagnostics. The caller
     owns list quotas, duration limits and which endpoints its runtime observes.
+    A pure ``endpoint_validator(kind, endpoint)`` may replace native Lab endpoint
+    admission while retaining the same condition payload and deadline parsing.
     """
     label = f"assertions[{index}]"
     kinds = ("uart_contains", "digital_equals", "can_seen")
@@ -179,14 +181,20 @@ def parse_assertion(value, index: int) -> Assertion:
         ("endpoint", "id", "flags", "dlc", "data_hex"))
     required = ("endpoint", "id") if kind == "can_seen" else fields
     condition = _fields(item[kind], fields, required, label + "." + kind)
+    endpoint = condition["endpoint"]
+    if endpoint_validator is not None:
+        endpoint = endpoint_validator(kind, endpoint)
     if kind == "uart_contains":
-        endpoint = _endpoint(condition["endpoint"], _UARTS, label)
+        if endpoint_validator is None:
+            endpoint = _endpoint(endpoint, _UARTS, label)
         expected = _text(condition["text"], label + ".text")
     elif kind == "digital_equals":
-        endpoint = _digital_endpoint(condition["endpoint"], label, led=True)
+        if endpoint_validator is None:
+            endpoint = _digital_endpoint(endpoint, label, led=True)
         expected = _integer(condition["value"], 1, label + ".value")
     else:
-        endpoint = _endpoint(condition["endpoint"], _CANS, label)
+        if endpoint_validator is None:
+            endpoint = _endpoint(endpoint, _CANS, label)
         expected = _can({key: val for key, val in condition.items() if key != "endpoint"},
                         label + ".can_seen", match=True)
     return Assertion(before_ns, endpoint, kind, expected)
