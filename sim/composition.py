@@ -4,6 +4,7 @@
 def builtin_registry(*, qemu=None, backend_root=None, gdb_port=None, qmp_path=None):
     from sim.fabric import CanBusFactory
     from sim.fabric.digital import DigitalNetFactory
+    from sim.fabric.edge import DigitalEdgeNetFactory
     from sim.fabric.imu import ImuNetFactory
     from sim.fabric.uart import UartNetFactory
     from sim.devices.uart_echo import UartEchoFactory
@@ -12,6 +13,7 @@ def builtin_registry(*, qemu=None, backend_root=None, gdb_port=None, qmp_path=No
     from sim.physics.factory import MujocoFactory
     return {'bus.can': CanBusFactory(),
             'net.digital': DigitalNetFactory(),
+            'net.digital-edge': DigitalEdgeNetFactory(),
             'net.imu': ImuNetFactory(),
             'net.uart': UartNetFactory(),
             'device.uart-echo': UartEchoFactory(),

@@ -93,6 +93,29 @@ DM-MC02 的 UART5 只引出遥控器 RX。机器配置 `remote: true` 暴露专�
 原始 `bytes` 输入；`uarts` 只接受 uart1/2/3/7/10。remote 不提供 TX、文本转换或
 `net.uart` 连线，也尚不提供 SBUS-A/DR16 编码与反相电平模型。
 
+### 数字电平与时间戳边沿
+
+`net.digital` 读取每个完成切点的 GPIO 电平；两个快照之间的短脉冲可能完全不可见。
+缩小 quantum 不能恢复后端没有记录的边沿。
+
+独立的 `net.digital-edge` 只接受声明 `event-output` 的显式事件源，连接一个输出和至少一个输入。
+源发送 `DigitalEdge(level, source_time_ns, mapped_time_ns)`，接收端实现 `receive_edge(edge)`。
+源负责时钟映射和观测依据；网络按单调时间及入队序号保留每个事件，同时间的事件不合并。
+公开 delivery 事件另记实际 `delivery_time_ns`，其下限为发现事件时已经完成的 CPU 切点，
+因此历史源时间不能追溯影响已完成的区间。`exact` 表示显式事件源提供的时间，不能用于 GPIO 快照推断。
+默认容量256个事件、每切点 dispatch budget256，最多256个 endpoint；耗尽或接收失败会冻结，
+不重放部分交付。close 不关闭借用的源和接收端。
+
+```bash
+python examples/edge-events/main.py
+python -m pytest -q tests/test_edge_fabric.py
+```
+
+示例的纯 Python 源在同一1ms区间产生四次翻转（含相邻及同时间事件），全部在完成切点有序交付。
+当前 QEMU 仅公开完成态 GPIO 快照，没有可信原生边沿通道，因此不提供 GPIO `event-output`；
+原生边沿验收为 BLOCKED，需先增加并独立验证 QEMU 观察 hook。
+电气网络、开漏争用、PWM 负载和 GPIO bit-banging 均不在此能力内。
+
 ### 共享 MuJoCo 世界
 
 `physics.mujoco` 将具名原生世界作为独立 step 节点接入同一 Simulation。
