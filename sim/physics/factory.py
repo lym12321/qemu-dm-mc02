@@ -9,6 +9,7 @@ from sim.api import (BackendUnavailable, ImuSignalSample, NodeDescription, PortS
 from sim.config.yaml import fields, file_path, text_bytes
 
 from .binding import JointDriveBinding
+from .joints import JointExecution
 from .participant import PhysicsParticipant
 
 
@@ -119,8 +120,8 @@ class _MujocoWorld:
             raise ValueError(f"unbound joint: {endpoint.joint}")
         if any(binding.joint == endpoint.joint for binding in self._bindings):
             raise ValueError("each world joint must have one driver")
-        if self._bindings and endpoint.builder is not self._bindings[0].builder:
-            raise ValueError("world requires one joint driver family")
+        if any(binding.driver is endpoint.driver for binding in self._bindings):
+            raise ValueError("each driver must have one joint binding")
         self._bindings.append(endpoint)
         return endpoint
 
@@ -129,10 +130,7 @@ class _MujocoWorld:
         if self._bound and self._executor is None:
             if not self._bindings:
                 raise ValueError("bound world requires joint drivers")
-            self._executor = self._bindings[0].builder.build(self._physics, tuple(self._bindings))
-            if any(not callable(getattr(self._executor, method, None))
-                   for method in ("reset", "step", "close")):
-                raise TypeError("joint executor requires reset, step and close")
+            self._executor = JointExecution(self._physics, tuple(self._bindings))
         self._executor.reset(session)
         self._completed_cut = session.t_sim_ns
 
@@ -234,7 +232,7 @@ class MujocoFactory:
         specs = {node.name: node for node in topology.nodes}
         nodes = {node.name for node in topology.nodes
                  if isinstance(registry[node.kind], MujocoFactory)}
-        occupied, families = set(), {}
+        occupied = set()
         for link in topology.links:
             if link.source.node not in nodes and link.target.node not in nodes:
                 continue
@@ -252,17 +250,13 @@ class MujocoFactory:
             if (descriptor.category != "binding" or descriptor.protocol != "joint-drive"
                     or descriptor.direction != "inout" or not callable(hook)):
                 raise ValueError("world drives require a described joint-drive binding")
-            joint, builder = hook(specs[peer.node], peer.port)
-            if (not isinstance(joint, str) or joint not in spec.options["joints"]
-                    or not callable(getattr(builder, "build", None))):
+            joint = hook(specs[peer.node], peer.port)
+            if not isinstance(joint, str) or joint not in spec.options["joints"]:
                 raise ValueError(f"invalid world joint binding: {joint}")
             identity = (world.node, joint)
             if identity in occupied:
                 raise ValueError("each world joint must have one driver")
             occupied.add(identity)
-            if world.node in families and families[world.node] is not builder:
-                raise ValueError("world requires one joint driver family")
-            families[world.node] = builder
 
     def create(self, spec, context):
         path, joints, imus = _configuration(spec)

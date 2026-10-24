@@ -11,7 +11,7 @@ def _configuration(spec):
     joint = options.get("plant") == "joint"
     state_fields = {"joint"} if joint else {"position_rad", "velocity_rad_s"}
     fields(options, {"motor_id", "plant", "position_rad", "velocity_rad_s",
-                     "joint", "command_timeout", "feedback_period", "temperature_c"},
+                     "joint", "gear_ratio", "command_timeout", "feedback_period", "temperature_c"},
            {"motor_id", "plant"} | state_fields, spec.name)
     if options["plant"] not in ("fixed-rotor", "rigid-rotor", "joint"):
         raise ValueError(f"{spec.name}: plant must be fixed-rotor, rigid-rotor or joint")
@@ -21,8 +21,19 @@ def _configuration(spec):
         text_bytes(options["joint"], "joint name")
         if "\0" in options["joint"]:
             raise ValueError("joint name must not contain NUL")
+        ratio = options.get("gear_ratio", 3591 / 187)
+        try:
+            valid_ratio = type(ratio) in (float, int) and math.isfinite(ratio) and ratio > 0
+        except OverflowError:
+            valid_ratio = False
+        if not valid_ratio:
+            raise ValueError("gear_ratio must be positive and finite")
+        if not math.isfinite(.4 * ratio):
+            raise ValueError("maximum joint effort must be finite")
     elif "joint" in options:
         raise ValueError("joint name requires plant joint")
+    elif "gear_ratio" in options:
+        raise ValueError("gear_ratio requires plant joint")
     motor_id = options["motor_id"]
     if type(motor_id) is not int or not 1 <= motor_id <= 8:
         raise ValueError("motor_id must be an integer in 1..8")
@@ -89,30 +100,20 @@ class FixedRotor:
         self.device.close()
 
 
-class _JointBuilder:
-    def build(self, physics, bindings):
-        from .joints import M3508JointExecution
-
-        if len({id(binding.driver) for binding in bindings}) != len(bindings):
-            raise ValueError("each M3508 device must have one joint binding")
-        return M3508JointExecution(physics,
-                                  {binding.driver: binding.joint for binding in bindings})
-
-
-_JOINT_BUILDER = _JointBuilder()
-
-
 class _JointMotor:
     """Own one device; the bound world exclusively resets and advances it."""
 
     def __init__(self, spec, context, options):
         from sim.physics.binding import JointDriveBinding
         from .device import M3508Device
+        from .joints import M3508JointDriver
 
         self.device = M3508Device(_BorrowedPort(context), name=spec.name, **options)
         try:
+            self.driver = M3508JointDriver(self.device,
+                                          gear_ratio=spec.options.get("gear_ratio", 3591 / 187))
             self.binding = context.attach("joint", JointDriveBinding(
-                spec.options["joint"], self.device, _JOINT_BUILDER))
+                spec.options["joint"], self.driver))
         except BaseException as primary:
             try:
                 self.device.close()
@@ -138,7 +139,7 @@ class M3508Factory:
         _configuration(spec)
         if spec.options["plant"] != "joint" or port != "joint":
             raise ValueError("M3508 joint binding requires the joint motor port")
-        return spec.options["joint"], _JOINT_BUILDER
+        return spec.options["joint"]
 
     def create(self, spec, context):
         options = _configuration(spec)

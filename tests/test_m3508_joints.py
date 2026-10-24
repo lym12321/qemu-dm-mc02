@@ -15,10 +15,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sim.core import Coordinator, Session, StepContext
-from sim.devices.dji import M3508, M3508Device, M3508JointExecution, M3508JointPlant
+from sim.devices.dji import M3508, M3508Device, M3508JointDriver, M3508JointPlant
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.fabric.runtime import CanParticipant
 from sim.physics import JointState, MujocoPhysics
+from sim.physics.binding import JointDriveBinding
+from sim.physics.joints import JointExecution
 
 
 class Host(VirtualCanDevice):
@@ -60,7 +62,8 @@ def test_borrowed_execution_closes_only_its_execution_state(monkeypatch):
     devices = (M3508Device(bus, 1), M3508Device(bus, 2))
     closed = []
     monkeypatch.setattr(native, "close", lambda: closed.append("physics"))
-    execution = M3508JointExecution(native, dict(zip(devices, ("j1", "j2"))))
+    execution = JointExecution(native, tuple(JointDriveBinding(name, M3508JointDriver(device))
+                                             for device, name in zip(devices, ("j1", "j2"))))
     execution.reset(Session(1))
     execution.step(StepContext(1, 1, 1_000_000, 1_000_000))
     execution.close()
@@ -70,7 +73,8 @@ def test_borrowed_execution_closes_only_its_execution_state(monkeypatch):
     with pytest.raises(RuntimeError, match="closed"):
         execution.reset(Session(2))
     # Their resource owners can reset/reassign the still-open borrows.
-    replacement = M3508JointExecution(native, dict(zip(devices, ("j1", "j2"))))
+    replacement = JointExecution(native, tuple(JointDriveBinding(name, M3508JointDriver(device))
+                                             for device, name in zip(devices, ("j1", "j2"))))
     replacement.reset(Session(2))
     replacement.close()
     assert all(not device.closed for device in devices)
@@ -91,7 +95,7 @@ def test_borrowed_failed_execution_freezes_without_closing_resources(monkeypatch
         raise primary
 
     monkeypatch.setattr(native, "step", fail)
-    execution = M3508JointExecution(native, {device: "j1"})
+    execution = JointExecution(native, (JointDriveBinding("j1", M3508JointDriver(device)),))
     execution.reset(Session(1))
     context = StepContext(1, 1, 1_000_000, 1_000_000)
     with pytest.raises(RuntimeError) as caught:
@@ -151,7 +155,7 @@ def test_bus_local_identity_admission_precedes_native_effects(monkeypatch):
     calls = track_physics(monkeypatch, native)
     try:
         for bindings, message in (
-                ({devices[0]: "j1", devices[1]: "j1"}, "one M3508 owner"),
+                ({devices[0]: "j1", devices[1]: "j1"}, "one driver"),
                 ({devices[0]: "j1", duplicate: "j2"}, "unique motor IDs")):
             with pytest.raises(ValueError, match=message):
                 M3508JointPlant(native, bindings)
@@ -372,7 +376,8 @@ def test_all_target_samples_are_admitted_before_any_device_completion(monkeypatc
     plant.reset(Session(1))
     getter = native.get_joint_state
     monkeypatch.setattr(native, "get_joint_state", lambda name:
-                        JointState(float("nan"), 0) if name == "j2" else getter(name))
+                        JointState(float("nan"), 0) if name == "j2" and native.time_s > 0
+                        else getter(name))
     ctx = StepContext(1, 1, 1_000_000, 1_000_000)
     with pytest.raises(ValueError, match="joint position"):
         plant.step(ctx)
@@ -421,7 +426,7 @@ def test_invalid_bindings_have_no_reset_control_or_advance_effects(monkeypatch):
     duplicate = M3508Device(bus, 1, name="duplicate-id")
     for bindings, message in (
             ({}, "nonempty"),
-            ({devices[0]: "j1", devices[1]: "j1"}, "one M3508 owner"),
+            ({devices[0]: "j1", devices[1]: "j1"}, "one driver"),
             ({devices[0]: "j1", duplicate: "j2"}, "unique motor IDs"),
             ({devices[0]: "missing"}, "unbound joint")):
         with pytest.raises(ValueError, match=message):

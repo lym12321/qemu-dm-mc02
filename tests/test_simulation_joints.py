@@ -6,6 +6,7 @@ for Izz=.02 supply expectations independently of the production plant helpers.
 
 import builtins
 from pathlib import Path
+import runpy
 
 import pytest
 
@@ -85,13 +86,13 @@ def states(simulation):
 def capture_native(monkeypatch):
     from sim.physics.mujoco import MujocoPhysics
 
-    created, calls = [], {"reset": [], "step": [], "close": []}
+    created, calls = [], {"reset": [], "step": [], "close": [], "set_joint_effort": []}
     load = MujocoPhysics.from_xml_path
 
     def capture(*args, **kwargs):
         physics = load(*args, **kwargs)
         created.append(physics)
-        for method in ("reset", "step", "close"):
+        for method in calls:
             original = getattr(physics, method)
 
             def observed(*values, method=method, original=original):
@@ -122,9 +123,8 @@ def test_joint_topology_admission_is_pure_and_nodes_have_one_execution_owner(mon
         descriptions["world"].port("effort")
     assert descriptions["motor1"].capabilities == set()
     assert descriptions["motor1"].port("joint").min_connections == 1
-    # Separate factory instances and aliases use one canonical builder family.
-    assert registry["motor"].describe_joint_binding(topology.nodes[-2], "joint")[1] is (
-        registry["motor-alias"].describe_joint_binding(topology.nodes[-1], "joint")[1])
+    assert registry["motor"].describe_joint_binding(topology.nodes[-2], "joint") == "j1"
+    assert registry["motor-alias"].describe_joint_binding(topology.nodes[-1], "joint") == "j2"
 
 
 @pytest.mark.parametrize("changes,error", [
@@ -143,23 +143,93 @@ def test_invalid_joint_graph_rejects_before_any_create(changes, error):
         Simulation(topology, registry)
 
 
-def test_mixed_driver_builders_and_missing_joint_link_reject_before_acquisition():
-    class OtherMotor(M3508Factory):
-        def describe_joint_binding(self, spec, port):
-            joint, _ = super().describe_joint_binding(spec, port)
-            return joint, self
-
-        def build(self, *args):
-            pytest.fail("mixed driver reached build")
-
-    topology, registry = scene(registry={"motor-alias": OtherMotor()})
-    with pytest.raises(ValueError, match="one joint driver family"):
-        Simulation(topology, registry)
+def test_missing_joint_link_rejects_before_acquisition():
     topology, registry = scene()
     topology = Topology(topology.nodes, tuple(link for link in topology.links
                                             if str(link.source) != "motor2.joint"))
     with pytest.raises(ValueError, match="requires at least 1"):
         Simulation(topology, registry)
+
+
+def mixed_scene():
+    example = runpy.run_path(str(ROOT / "examples/shared-world/mixed_drivers.py"))
+    return example["mixed_scene"]()
+
+
+def test_mixed_driver_topology_admits_without_loading_native_and_rejects_joint_conflict(monkeypatch):
+    original = builtins.__import__
+
+    def guarded(name, *args, **kwargs):
+        if name == "mujoco" or name.startswith("mujoco."):
+            pytest.fail("mixed topology admission loaded MuJoCo")
+        return original(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", guarded)
+    topology, registry = mixed_scene()
+    Simulation(topology, registry).validate()
+    nodes = tuple(NodeSpec(node.name, node.kind, {**node.options, "joint": "j1"})
+                  if node.name == "ideal" else node for node in topology.nodes)
+    with pytest.raises(ValueError, match="one driver"):
+        Simulation(Topology(nodes, topology.links), registry)
+
+
+def test_native_mixed_drivers_share_union_expiry_reset_failure_and_cleanup(monkeypatch):
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    created, calls = capture_native(monkeypatch)
+    topology, registry = mixed_scene()
+    simulation = Simulation(topology, registry, quantum_ns=10_000_000)
+    with simulation:
+        motor, ideal = simulation.components["motor"], simulation.components["ideal"]
+        simulation.schedule_input("ideal.effort", -.4)
+        result = simulation.step()
+        # Izz=.02. JointA: +.2Nm for3ms. JointB: -.4Nm for7ms.
+        # Native semi-implicit Euler over3/4/3ms gives these literal targets.
+        final = states(simulation)[-1].payload
+        assert final["joints"] == {
+            "j1": JointState(pytest.approx(.00030), pytest.approx(.03)),
+            "j2": JointState(pytest.approx(-.00116), pytest.approx(-.14))}
+        assert final["native_time_s"] == pytest.approx(.01)
+        assert motor.device.get_rotor_state() == pytest.approx((.00060, .06))
+        assert ideal.driver.observation == final["joints"]["j2"]
+        assert [entry[1] for entry in calls["step"]] == [3_000_000, 4_000_000, 3_000_000]
+        assert [entry[1:] for entry in calls["set_joint_effort"]] == [
+            ("j1", .2), ("j2", -.4), ("j1", 0), ("j2", -.4),
+            ("j1", 0), ("j2", 0)]
+        assert result.diagnostics["components"]["world"].diagnostics == {"physics_segments": 3}
+        assert [(frame.can_id, frame.timestamp_ns, frame.data)
+                for frame in simulation.components["command"].frames] == [
+                    (0x201, 10_000_000, bytes.fromhex("0000 0001 0000 1900"))]
+        simulation.step()
+        assert states(simulation)[-1].payload["joints"] == {
+            "j1": JointState(pytest.approx(.00060), pytest.approx(.03)),
+            "j2": JointState(pytest.approx(-.00256), pytest.approx(-.14))}
+        simulation.reset()
+        assert motor.device.closed and ideal.closed
+        assert len(created) == len(calls["reset"]) == 2 and len(calls["close"]) == 1
+        assert states(simulation)[-1].payload["native_time_s"] == 0
+        current_motor, current_ideal = simulation.components["motor"], simulation.components["ideal"]
+        assert current_ideal.driver.observation == JointState(0, 0)
+        assert current_motor.device.get_rotor_state() == (0, 0)
+        primary = RuntimeError("ideal feedback failed after native target")
+
+        def fail(*_):
+            raise primary
+
+        monkeypatch.setattr(current_ideal.driver, "complete_step", fail)
+        simulation.schedule_input("ideal.effort", -.4)
+        with pytest.raises(RuntimeError) as caught:
+            simulation.step()
+        assert caught.value is primary and simulation.failure is primary
+        assert simulation.state is SimulationState.FAILED and simulation.t_sim_ns == 0
+        assert created[-1].time_s == pytest.approx(.01)
+        assert current_motor.device.t_sim_ns == 10_000_000
+        assert current_ideal.driver.t_sim_ns == 0
+        assert len(states(simulation)) == 4  # Initial,10ms,20ms,reset; no failed target.
+        assert simulation.components["command"].frames == []
+        with pytest.raises(RuntimeError):
+            simulation.step()
+        assert len(calls["step"]) == 7  #3segments + coast +3failed-target segments.
+    assert len(calls["close"]) == 2 and current_motor.device.closed and current_ideal.closed
 
 
 def test_motor_address_admission_includes_independent_rotor_modes_and_aliases():
@@ -299,7 +369,7 @@ def test_partial_native_failure_freezes_session_without_feedback_or_replay(monke
     assert len(calls["close"]) == 1
 
 
-@pytest.mark.parametrize("failure_stage", ["attach", "builder"])
+@pytest.mark.parametrize("failure_stage", ["attach", "executor"])
 def test_partial_motor_or_executor_construction_cleans_each_resource_once(monkeypatch, failure_stage):
     pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
     from sim.devices.dji import M3508Device
@@ -325,12 +395,12 @@ def test_partial_motor_or_executor_construction_cleans_each_resource_once(monkey
 
         monkeypatch.setattr(ComponentContext, "attach", fail)
     else:
-        builder = registry["motor"].describe_joint_binding(topology.nodes[-2], "joint")[1]
+        import sim.physics.factory as world_factory
 
         def fail(*args):
             raise primary
 
-        monkeypatch.setattr(builder, "build", fail)
+        monkeypatch.setattr(world_factory, "JointExecution", fail)
     simulation = Simulation(topology, registry)
     with pytest.raises(RuntimeError) as caught:
         simulation.start()
