@@ -1,6 +1,6 @@
 """Independent board exchanges around one owned joint world.
 
-The runtime borrows board endpoints and all nonblocking streams. One Coordinator
+The runtime borrows board endpoints and all nonblocking streams. One Simulation
 owns the existing CAN/plant participant and optional referee engines; referee
 endpoints have a separate sequence lifecycle. This is a synchronous host
 composition. Explicit execution bindings additionally coordinate native CPU
@@ -22,7 +22,7 @@ from typing import Callable
 from sim.boards import (
     drain_paused_can, observe_initial_paused_can, wait_paused_can_input,
 )
-from sim.core import Coordinator, Session
+from sim.api import NodeDescription, NodeSpec, Session, StepResult, Topology
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
 from sim.devices.dji.protocol import validate_motor_id
@@ -31,6 +31,7 @@ from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import check_can_time
 from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.fabric.runtime import CanParticipant
+from sim.runtime import Simulation
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import (
     QemuTimestampMapper, StepFramedSocket, V2SessionReset,
@@ -90,6 +91,72 @@ class _MotorFeedbackPolicy:
     blocked: set[int]
 
 
+class _ParticipantFactory:
+    """Own an admitted participant until its one transfer to Simulation."""
+
+    def __init__(self, participant):
+        self.pending = participant
+
+    def describe(self, spec):
+        return NodeDescription(capabilities=frozenset({'step'}))
+
+    def create(self, spec, context):
+        if self.pending is None:
+            raise RuntimeError('shared world participant ownership was already transferred')
+        participant, self.pending = self.pending, None
+        return participant
+
+    def close_pending(self):
+        participant, self.pending = self.pending, None
+        if participant is not None:
+            participant.close()
+
+
+class _BoardExecutionGroup:
+    """Own one requested board group; QMP and streams remain borrowed."""
+
+    def __init__(self, runtime, context):
+        self.runtime = runtime
+        self.context = context
+        self.pending = None
+        self.closed = False
+
+    def request_step(self, context):
+        if self.closed or self.pending is not None:
+            raise RuntimeError('board execution group requires no pending request')
+        targets = tuple(mapper.unmap(context.t_sim_ns, mapper.qemu_origin_ns)
+                        for mapper in self.runtime._mappers)
+        self.pending = (context, targets, None, None)
+        starts, commands = self.runtime._request_cpus(targets, self.context.deadline_monotonic)
+        self.pending = (context, targets, starts, commands)
+
+    def finish_step(self, context):
+        if self.closed or self.pending is None or self.pending[0] is not context:
+            raise RuntimeError('board execution completion requires its pending request')
+        _, targets, starts, commands = self.pending
+        deadline = self.context.deadline_monotonic
+        self.runtime._finish_cpus(targets, starts, commands, deadline)
+        self.runtime._service(deadline, 0)
+        self.runtime._guard(deadline)
+        self.pending = None
+        return StepResult('ok', context.t_sim_ns)
+
+    def close(self):
+        self.closed = True
+        self.pending = None
+
+
+class _BoardGroupFactory:
+    def __init__(self, runtime):
+        self.runtime = runtime
+
+    def describe(self, spec):
+        return NodeDescription(capabilities=frozenset({'machine'}))
+
+    def create(self, spec, context):
+        return _BoardExecutionGroup(self.runtime, context)
+
+
 def _finite_seconds(value, label):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be finite")
@@ -105,7 +172,7 @@ def _finite_seconds(value, label):
 class SharedWorldRuntime:
     """Own one plant and optional referees, borrowing board/UART transports.
 
-    Each referee engine shares the sole Coordinator's Session and StepContext.
+    Each referee engine shares the sole Simulation's Session and StepContext.
     Endpoint sequence reset is separate; startup preserves its current sequence
     and physical queued bytes. No snapshot is sent automatically. After observing
     firmware UART readiness, the caller explicitly publishes a completed state.
@@ -223,12 +290,15 @@ class SharedWorldRuntime:
                             bus.dispatch_budget != budget):
                         raise RuntimeError(
                             "shared world execution CAN wiring or dispatch budget changed")
-        coordinator = Coordinator({"can": CanParticipant(buses, (plant,)),
-                                   **{"referee:" + item.name: item.engine for item in referees}})
+        factories = {'can': _ParticipantFactory(CanParticipant(buses, (plant,))),
+                     **{f'referee_{index}': _ParticipantFactory(item.engine)
+                        for index, item in enumerate(referees)}}
         self.bindings = bindings
         self.referees = referees
         self.plant = plant
-        self._coordinator = coordinator
+        self._participant_factories = factories
+        self._simulation = None
+        self._closed = False
         self._check_running = check_running
         self._on_response = on_response
         self._attempted = False
@@ -245,11 +315,11 @@ class SharedWorldRuntime:
 
     @property
     def t_sim_ns(self):
-        return self._coordinator.t_sim_ns
+        return 0 if self._simulation is None else self._simulation.t_sim_ns
 
     @property
     def step_id(self):
-        return self._coordinator.step_id
+        return 0 if self._simulation is None else self._simulation.step_id
 
     @property
     def failed(self):
@@ -257,7 +327,7 @@ class SharedWorldRuntime:
 
     @property
     def closed(self):
-        return self._coordinator.closed
+        return self._closed
 
     @property
     def can_input_states(self):
@@ -332,7 +402,7 @@ class SharedWorldRuntime:
             raise RuntimeError("shared world CAN input drop count moved backwards")
         return rx
 
-    def _run_cpus(self, targets, deadline):
+    def _request_cpus(self, targets, deadline):
         # Revalidate the previous cut before any new CPU is released. The first
         # cut has idle/no-target semantics, not a fabricated reached target.
         starts = tuple(mapper.unmap(self.t_sim_ns, mapper.qemu_origin_ns)
@@ -357,6 +427,9 @@ class SharedWorldRuntime:
         # asking any board whether its native run actually reached that target.
         for command, target in zip(commands, targets):
             command("x-run-to-virtual-time", {"target-ns": target})
+        return starts, commands
+
+    def _finish_cpus(self, targets, starts, commands, deadline):
         pending = set(range(len(self.bindings)))
         previous = list(starts)
         while pending:
@@ -521,7 +594,12 @@ class SharedWorldRuntime:
             for item, mapper in zip(self.bindings, mappers):
                 item.endpoint.bind_mapper(mapper)
             self._guard(deadline)
-            self._coordinator.reset(session)
+            factories = ({'boards': _BoardGroupFactory(self)} if self._exact_execution else {})
+            factories.update(self._participant_factories)
+            topology = Topology(tuple(NodeSpec(name, name) for name in factories))
+            self._simulation = Simulation(topology, factories, quantum_ns=codec.UINT64_MAX,
+                                          initial_session=session)
+            self._simulation.start(deadline_monotonic=deadline)
             for item in self.referees:
                 self._guard(deadline)
                 # Logical reset preserves configured sequence and physical
@@ -713,11 +791,7 @@ class SharedWorldRuntime:
             self._guard(deadline)
             self._service(deadline, 0)
             self._guard(deadline)
-            if self._exact_execution:
-                self._run_cpus(targets, deadline)
-                self._service(deadline, 0)
-                self._guard(deadline)
-            self._coordinator.step(dt_ns)
+            self._simulation.step(dt_ns, deadline_monotonic=deadline)
             self._guard(deadline)
             # Collect every completed IMU and encode every outgoing frame
             # before sending any STEP; a later bad source cannot publish half
@@ -761,6 +835,7 @@ class SharedWorldRuntime:
             raise RuntimeError("shared world callbacks must not reenter cleanup")
         if self.closed:
             return
+        self._closed = True
         self._failed = True
         self._busy = True
         primary = None
@@ -776,7 +851,8 @@ class SharedWorldRuntime:
                         for note in (() if exc is primary else tuple(getattr(exc, "__notes__", ()))):
                             primary.add_note(note)
             try:
-                self._coordinator.close()
+                if self._simulation is not None:
+                    self._simulation.close()
             except BaseException as exc:
                 if primary is None:
                     primary = exc
@@ -784,6 +860,17 @@ class SharedWorldRuntime:
                     primary.add_note(f"shared world participants close failed: {type(exc).__name__}: {exc}")
                     for note in (() if exc is primary else tuple(getattr(exc, "__notes__", ()))):
                         primary.add_note(note)
+            for name, factory in reversed(tuple(self._participant_factories.items())):
+                try:
+                    factory.close_pending()
+                except BaseException as exc:
+                    if primary is None:
+                        primary = exc
+                    else:
+                        primary.add_note(f'shared world pending {name} close failed: {type(exc).__name__}: {exc}')
+                        if exc is not primary:
+                            for note in tuple(getattr(exc, '__notes__', ())):
+                                primary.add_note(note)
             for name, policy in reversed(tuple(self._motor_feedback_policies.items())):
                 try:
                     if policy.bus.drop is not policy.drop:

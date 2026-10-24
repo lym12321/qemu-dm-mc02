@@ -31,6 +31,7 @@ from sim.core import Session
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.fabric import CanBus
 from sim.machines.qemu.endpoints import QemuCanEndpoint
+from sim.machines.qemu.qmp import qmp_client_provenance
 from sim.physics import MujocoPhysics
 from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
 from sim.transports.can_codec import WIRE_SIZE, unpack_wire_frame
@@ -64,13 +65,15 @@ def starttime(pid):
 def source_origins():
     """Cumulative currently loaded sources, not first-import times or coverage."""
     result = {}
+    client_root = Path(qmp_client_provenance()['package_root'])
     for name, module in sorted(sys.modules.items()):
         if name == "__main__" or name.startswith(("sim.", "tools.", "dm_mc02_", "qemu.")):
             value = getattr(module, "__file__", None)
             if value is None:
                 continue
             path = Path(value).resolve()
-            if not path.is_relative_to(ROOT):
+            owner = client_root if name.startswith('qemu.') else ROOT
+            if not path.is_relative_to(owner):
                 raise AssertionError(f"actual native module outside checkout: {name} {path}")
             result[name] = {"path": str(path), "sha256": sha(path)}
     return result
@@ -244,6 +247,7 @@ def main(args):
                          for corner in CORNERS) if args.two_chassis
                    else ("j1", "j2", "j3", "j4"))
     report = {"status": "running", "mode": args.mode, "stage": "admission",
+              "qmp_client": qmp_client_provenance(),
               "scene": "two-chassis" if args.two_chassis else "four-hinge",
               "native_calls": {"reset": 0, "step_ns": [], "close": 0},
               "responses": [], "commands": [], "cleanup": [], "uart": ["", ""],

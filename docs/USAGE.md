@@ -142,6 +142,12 @@ M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换�
 缺少原生依赖返回 `blocked`（退出码78），模型、绑定或运行错误
 返回 `failed`（退出码1）。示例参数未标定，不声明实时性能或 CPU/世界全局锁步。
 
+现有 Arena 的共享世界路径也由 Simulation 调度原生 CPU request/finish、CAN/plant
+和 referee；实际 participant 的资源所有权一次转交，借用连接仍由原调用方清理。
+reset、成员提前退出或清理错误使当前运行失败，不重步或发布成功。
+旧 CAN worker/`CanRuntime` 的跨 RESET 重建合同，以及独特的 Lab/Gazebo 应用能力
+尚未迁完，仍保留原入口；这不代表旧执行路径已全部删除。
+
 ### 有限实验与断言
 
 `sim.apps.experiment.run_experiment(scene, registry, inputs=..., assertions=...)`

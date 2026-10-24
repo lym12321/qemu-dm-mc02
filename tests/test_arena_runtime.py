@@ -27,7 +27,9 @@ from sim.arena import runtime
 from sim.arena.manifest import load_manifest
 from sim.boards import qemu as board_qmp
 from sim.boards.channels import ChannelEvent
-from sim.core import Coordinator, Session, StepContext
+from sim.core import Session, StepContext
+from sim.runtime import Simulation
+from sim.runtime import simulation as simulation_runtime
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.referee import Hit, RefereeEngine, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.fabric import CanBus
@@ -132,6 +134,7 @@ class Environment:
                                 monotonic_ns=lambda: round(self.clock * 1e9))
         for module in (runtime, shared_world, board_qmp, cosim, rtf, qmp_deadline):
             monkeypatch.setattr(module, "time", clock)
+        monkeypatch.setattr(simulation_runtime, 'monotonic', clock.monotonic)
         monkeypatch.setattr(runtime, "select", SimpleNamespace(select=self.select), raising=False)
 
     def create_plant(self, manifest):
@@ -328,13 +331,13 @@ def environment(tmp_path, monkeypatch):
 
 def watch_referees(environment, monkeypatch):
     """Observe real owners once per call; retain original state machines and IO."""
-    observed = SimpleNamespace(engines=[], endpoints=[], worlds=[], coordinators=[], channels=[],
+    observed = SimpleNamespace(engines=[], endpoints=[], worlds=[], simulations=[], channels=[],
                                services=[], resets=[], steps=[], queues=[], attempts=[], publications=[], closes=[],
                                close_failures={})
     for owner, collection in ((RefereeEngine, observed.engines),
                               (RefereeUartEndpoint, observed.endpoints),
                               (shared_world.SharedWorldRuntime, observed.worlds),
-                              (Coordinator, observed.coordinators)):
+                              (Simulation, observed.simulations)):
         original = owner.__init__
         def initialize(value, *args, original=original, collection=collection, **kwargs):
             original(value, *args, **kwargs)
@@ -1918,7 +1921,7 @@ def test_can_delay_dispatch_follows_queued_referee_reset_and_completed_target_st
         result = environment.run(arena, duration=.001, referee_period_ns=1_000_000,
             referee_events=(("east", events),), can_delays=((0, "east", 17), (1_000_000, "east", 0)))
     environment.assert_clean()
-    assert len(referees.worlds) == len(referees.coordinators) == 1
+    assert len(referees.worlds) == len(referees.simulations) == 1
     assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
     assert len(referees.queues) == 1 and referees.queues[0][1] is events
     assert not any(event.endswith(" cont") for event in observed.calls[0][4])
@@ -2506,9 +2509,10 @@ def test_ready_uart7_borrows_one_transport_and_scoped_literal_batches_from_one_c
         result = environment.run(arena, duration=.001, referee_period_ns=1_000_000,
                                  referee_events=(("east", events),) if queued else ())
     environment.assert_clean()
-    assert len(observed.worlds) == len(observed.coordinators) == 1
+    assert len(observed.worlds) == len(observed.simulations) == 1
     assert observed.services and not any(observed.services)
-    assert list(observed.coordinators[0].participants) == ["can", "referee:east", "referee:west"]
+    assert [node.name for node in observed.simulations[0].topology.nodes] == [
+        'boards', 'can', 'referee_0', 'referee_1']
     assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
     assert len(observed.resets) == 2 and observed.resets[0][1] is observed.resets[1][1]
     assert [(session.session_id, session.t_sim_ns) for _, session in observed.resets] == [(1, 0), (1, 0)]

@@ -186,6 +186,43 @@ def start(runtime):
     return runtime.start(Session(7, 500), (71, 72), deadline=time.monotonic() + 1)
 
 
+def test_shared_world_transfers_real_participants_and_projects_one_clock(setup):
+    from sim.runtime import Simulation
+    runtime, _, native, _, _, _ = setup
+    assert runtime._simulation is None
+    start(runtime)
+    simulation = runtime._simulation
+    assert isinstance(simulation, Simulation)
+    assert simulation.session == Session(7, 500)
+    assert all(factory.pending is None for factory in runtime._participant_factories.values())
+    assert tuple(simulation.components) == ('can',)
+    runtime.step(10_000_000, deadline=time.monotonic() + 1)
+    assert runtime.t_sim_ns == simulation.t_sim_ns == 10_000_500
+    assert runtime.step_id == simulation.step_id == 1
+    assert native.steps == [10_000_000]
+    runtime.close()
+    assert simulation.state == 'closed' and native.closed == 1
+
+
+def test_partial_factory_creation_closes_transferred_and_pending_owners(referee_setup, monkeypatch):
+    runtime, _, native, bindings, _, _, referees, _ = referee_setup
+    primary = RuntimeError('later referee construction refused')
+    def fail(*_args):
+        raise primary
+    monkeypatch.setattr(runtime._participant_factories['referee_1'], 'create', fail)
+    with pytest.raises(RuntimeError) as caught:
+        start(runtime)
+    assert caught.value is primary
+    assert native.closed == 1 and referees[0].engine.closed
+    assert not referees[1].engine.closed
+    runtime.close()
+    assert referees[1].engine.closed and all(item.endpoint.closed for item in referees)
+    assert all(item.cosim.sock.fileno() >= 0 and item.endpoint.stream.sock.fileno() >= 0
+               for item in bindings)
+    runtime.close()
+    assert native.closed == 1
+
+
 def test_binding_and_endpoint_are_fixed_borrowed_queries(setup):
     runtime, _, native, bindings, _, _ = setup
     assert runtime.failed and not runtime.closed
@@ -1511,7 +1548,7 @@ def test_later_referee_overflow_retains_first_participant_effects_without_board_
     before = overflow.get_state()
     with pytest.raises(OverflowError) as caught:
         runtime.step(1_000_000_000, deadline=time.monotonic() + 1)
-    assert "participant referee:right failed at step 1" in caught.value.__notes__
+    assert "simulation failed during component step, step 1; completed time remains 500" in caught.value.__notes__
     assert runtime.failed and native.steps == [1_000_000_000]
     assert runtime.step_id == 0 and runtime.t_sim_ns == 500
     assert referees[0].engine.t_sim_ns == 1_000_000_500
@@ -1835,6 +1872,27 @@ def exact_setup(exact_world_resources):
     runtime = SharedWorldRuntime(plant, bindings, check_running=boards, on_response=observe)
     stack.callback(runtime.close)
     return runtime, boards, native, bindings, cpus, events
+
+
+def test_native_cpu_requests_and_completion_use_simulation_machine_phases(exact_setup, monkeypatch):
+    runtime, _, native, _, cpus, _ = exact_setup
+    start(runtime)
+    simulation = runtime._simulation
+    assert tuple(simulation.components) == ('boards', 'can')
+    phases = []
+    request, finish = runtime._request_cpus, runtime._finish_cpus
+    def requesting(*args):
+        phases.append((simulation._phase, len(native.steps)))
+        return request(*args)
+    def finishing(*args):
+        phases.append((simulation._phase, len(native.steps)))
+        return finish(*args)
+    monkeypatch.setattr(runtime, '_request_cpus', requesting)
+    monkeypatch.setattr(runtime, '_finish_cpus', finishing)
+    runtime.step(10_000_000, deadline=time.monotonic() + 1)
+    assert phases == [('machine request', 0), ('machine completion', 0)]
+    assert all(len(cpu.requests) == 1 for cpu in cpus)
+    assert native.steps == [10_000_000] and simulation.step_id == 1
 
 
 def assert_exact_frozen(runtime, native, cpus):
