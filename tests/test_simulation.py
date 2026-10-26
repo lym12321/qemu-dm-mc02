@@ -127,6 +127,141 @@ def input_scene(**kwargs):
     return simulation, factory
 
 
+class BatchedInput(InputPlant):
+    def __init__(self, spec, context):
+        super().__init__(spec, context)
+        self.pending = []
+        self.committed = []
+
+    def input(self, port, payload):
+        super().input(port, payload)
+        self.pending.append(payload)
+
+    def commit_inputs(self, cut):
+        self.committed.append((cut, tuple(self.pending)))
+        self.pending.clear()
+        self.context.emit(None, "inputs.committed", cut)
+
+
+def batched_scene(**kwargs):
+    factory = Factory(BatchedInput, {"step", "input", "input_commit"},
+                      (PortSpec("key", "digital", "in", "signal", capabilities={"external_input"}),))
+    return Simulation(Topology((NodeSpec("plant", "plant"),)),
+                      {"plant": factory}, quantum_ns=10, **kwargs), factory
+
+
+def test_input_commit_follows_same_cut_callbacks_and_does_not_seal_public_cut():
+    simulation, factory = batched_scene()
+    with simulation:
+        plant = factory.instances[0]
+        assert plant.committed == [(0, ())]
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        def add_same_cut(event):
+            if event.kind == "input.delivered" and event.payload == 1:
+                simulation.schedule_input("plant.key", 2)
+        simulation.on_event = add_same_cut
+        simulation.run_until(3)
+        assert plant.committed == [(0, ()), (0, ()), (3, (1, 2))]
+        assert plant.intervals == [(1, 0, 3, 0)]
+        # A completed cut is still usable by normal, unbatched external input.
+        simulation.schedule_input("plant.key", 3)
+        simulation.run_until(3)
+        assert plant.committed[-1] == (3, (3,))
+        assert plant.intervals == [(1, 0, 3, 0)]
+
+
+@pytest.mark.parametrize("at_ns", [None, 0, 3])
+def test_caught_input_commit_reentrancy_freezes_before_time_commit(at_ns):
+    simulation, factory = batched_scene()
+    caught = []
+    with simulation:
+        def reinject(event):
+            if event.kind == "inputs.committed" and event.payload == 3:
+                try:
+                    simulation.schedule_input("plant.key", 99, at_ns=at_ns)
+                except RuntimeError as exc:
+                    caught.append(exc)
+        simulation.on_event = reinject
+        with pytest.raises(RuntimeError, match="active input commit cut") as raised:
+            simulation.run_until(3)
+        assert raised.value is simulation.failure is caught[0]
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.t_sim_ns == simulation.step_id == 0
+        assert factory.instances[0].inputs == []
+    assert factory.instances[0].close_count == 1
+
+
+def test_input_commit_callback_can_schedule_future_cut():
+    simulation, factory = batched_scene()
+    with simulation:
+        def future(event):
+            if event.kind == "inputs.committed" and event.payload == 3:
+                simulation.schedule_input("plant.key", 8, at_ns=4)
+        simulation.on_event = future
+        simulation.schedule_input("plant.key", 1, at_ns=3)
+        simulation.run_until(5)
+        assert factory.instances[0].committed[-2:] == [(4, (8,)), (5, ())]
+        assert factory.instances[0].intervals == [(1, 0, 3, 0), (2, 3, 4, 1), (3, 4, 5, 8)]
+
+
+def test_input_commit_capability_admits_method_and_releases_failed_resource():
+    factory = Factory(Component, {"input_commit"})
+    simulation = Simulation(Topology((NodeSpec("plant", "plant"),)), {"plant": factory})
+    with pytest.raises(TypeError, match="commit_inputs"):
+        simulation.start()
+    assert factory.instances[0].close_count == 1
+
+
+def test_input_commit_failure_does_not_replay_completed_io():
+    simulation, factory = batched_scene()
+    failure = OSError("batch transport failed after write")
+    with simulation:
+        plant = factory.instances[0]
+        writes = []
+        def fail(cut):
+            writes.append(cut)
+            raise failure
+        plant.commit_inputs = fail
+        with pytest.raises(OSError) as raised:
+            simulation.run_until(5)
+        assert raised.value is failure
+        with pytest.raises(RuntimeError, match="healthy"):
+            simulation.run_until(5)
+        assert writes == [0]
+        assert simulation.t_sim_ns == 0
+
+
+@pytest.mark.parametrize("operation", ["start", "reset", "close"])
+def test_initial_input_commit_cannot_reenter_lifecycle(operation):
+    simulation, factory = batched_scene()
+    def reenter(event):
+        if event.kind == "inputs.committed":
+            getattr(simulation, operation)()
+    simulation.on_event = reenter
+    with pytest.raises(RuntimeError):
+        simulation.start()
+    assert simulation.state == SimulationState.FAILED
+    assert factory.instances[0].close_count == 1
+    assert not simulation.components
+
+
+def test_input_commit_host_timeout_freezes_without_logical_commit(monkeypatch):
+    now = [100.0]
+    monkeypatch.setattr(runtime, "monotonic", lambda: now[0])
+    simulation, factory = batched_scene(host_timeout_s=1)
+    with simulation:
+        calls = []
+        def timeout_after_effect(cut):
+            calls.append(cut)
+            now[0] += 2
+        factory.instances[0].commit_inputs = timeout_after_effect
+        with pytest.raises(TimeoutError, match="input commit"):
+            simulation.run_until(10)
+        assert calls == [0]
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.t_sim_ns == simulation.step_id == 0
+
+
 @pytest.mark.parametrize('replacement', [False, True])
 def test_step_component_cannot_hide_terminal_input_capacity_failure(replacement):
     simulation, factory = input_scene(max_pending_inputs=1)

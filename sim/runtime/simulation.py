@@ -227,6 +227,7 @@ class Simulation:
         self._stepping = False
         self._closing = False
         self._pause_requested = False
+        self._committing_cut: int | None = None
 
     def _validate_execution(self) -> None:
         for name, description in self._descriptions.items():
@@ -332,6 +333,8 @@ class Simulation:
                 methods += ["step"]
             if "input" in caps:
                 methods += ["input"]
+            if "input_commit" in caps:
+                methods += ["commit_inputs"]
             if "connection" in caps or "binding_owner" in caps:
                 methods += ["attach_port"]
             if "dispatch" in caps:
@@ -412,7 +415,12 @@ class Simulation:
         self.state = SimulationState.PAUSED
 
     def schedule_input(self, endpoint: Endpoint | str, payload: Any, *, at_ns: int | None = None) -> None:
-        if self.state not in (SimulationState.PAUSED, SimulationState.RUNNING):
+        when = self._dispatch_time_ns if at_ns is None else at_ns
+        check_timestamp(when)
+        if self._committing_cut is not None and when <= self._committing_cut:
+            raise self._freeze_failure(RuntimeError("inputs cannot target the active input commit cut"))
+        if (self.state not in (SimulationState.PAUSED, SimulationState.RUNNING)
+                and not (self.state == SimulationState.NEW and self._committing_cut is not None)):
             raise RuntimeError("inputs require a started, healthy Simulation")
         endpoint = Endpoint.parse(endpoint)
         if endpoint.node not in self._descriptions:
@@ -422,8 +430,6 @@ class Simulation:
         if ("input" not in description.capabilities or port.direction == "out"
                 or "external_input" not in port.capabilities):
             raise ValueError(f"endpoint cannot accept external inputs: {endpoint}")
-        when = self._dispatch_time_ns if at_ns is None else at_ns
-        check_timestamp(when)
         if when < self._dispatch_time_ns:
             raise ValueError("input time must not precede the current dispatch cut")
         spec = next(node for node in self.topology.nodes if node.name == endpoint.node)
@@ -500,7 +506,29 @@ class Simulation:
             if (not (self._inputs and self._inputs[0][0] <= cut)
                     and not any((due := self._next_due(name, component)) is not None and due <= cut
                                 for name, component in dispatchers)):
+                self._commit_inputs(cut)
                 return
+
+    def _commit_inputs(self, cut: int) -> None:
+        """Flush admitted protocol batches after all delivery at this cut.
+
+        A hook may enqueue future inputs. Reopening its own cut would make
+        earlier I/O depend on owner iteration order, so that attempt freezes
+        the run, even when its callback catches the exception. A later public
+        operation may still settle ordinary inputs at the completed cut.
+        """
+        previous_phase = self._phase
+        self._phase = "input commit"
+        self._committing_cut = cut
+        try:
+            for name, component in self._owned:
+                if "input_commit" in self._descriptions[name].capabilities:
+                    self._check_deadline()
+                    component.commit_inputs(cut)
+                    self._check_deadline()
+        finally:
+            self._committing_cut = None
+            self._phase = previous_phase
 
     @staticmethod
     def _reached(name: str, result: Any, ctx: StepContext) -> None:
@@ -670,7 +698,7 @@ class Simulation:
     def close(self) -> None:
         if self.state == SimulationState.CLOSED:
             return
-        if (self._stepping or self._closing
+        if (self._stepping or self._closing or self._committing_cut is not None
                 or self._phase in ("creating", "initializing", "initial sample", "initial delivery")):
             raise RuntimeError("close cannot interrupt active construction, execution or cleanup")
         self._phase = "cleanup"

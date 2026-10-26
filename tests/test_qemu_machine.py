@@ -57,7 +57,7 @@ assert value.port('gpio.H15').direction == 'in'
 assert value.port('gpio.H15.out').direction == 'out'
 assert 'external_input' not in value.port('gpio.H15.out').capabilities
 assert value.port('snapshot').direction == 'out'
-assert value.capabilities == frozenset({'machine', 'input'})
+assert value.capabilities == frozenset({'machine', 'input', 'input_commit'})
 assert 'external_input' in value.port('key').capabilities
 assert 'external_input' in value.port('gpio.H15').capabilities
 assert 'external_input' in value.port('uart1').capabilities
@@ -118,6 +118,55 @@ def test_input_admission_does_not_recheck_admitted_firmware(firmware):
     firmware.unlink()
     assert factory.validate_input(spec, 'key', True) is True
     assert factory.validate_input(spec, 'uart1', 'é\0') == b'\xc3\xa9\0'
+
+
+def test_adc_ports_and_input_batches_are_pure_and_opt_in(firmware, backend):
+    factory = QemuFactory(qemu='/missing')
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'adc': True})
+    description = factory.describe(spec)
+    assert [p.name for p in description.ports if p.protocol == 'adc'] == [
+        f'adc1.ch{channel}' for channel in range(32)]
+    assert description.port('adc1.ch31').direction == 'in'
+    assert factory.validate_input(spec, 'adc1.ch0', {'raw': 65535}) == {'raw': 65535}
+    assert factory.validate_input(spec, 'adc1.ch31', {'voltage_uv': 3300000}) == {'voltage_uv': 3300000}
+    factory.validate_inputs(spec, ((0, 'adc1.ch0', {'raw': 1}),), origin_ns=None)
+    factory.validate_inputs(spec, ((0, 'adc1.ch0', {'raw': 1}),), origin_ns=7)
+    with pytest.raises(ValueError, match='session origin'):
+        factory.validate_inputs(spec, ((0, 'adc1.ch0', {'raw': 1}),), origin_ns=0)
+    with pytest.raises(ValueError, match='duplicate ADC'):
+        factory.validate_inputs(spec, ((1, 'adc1.ch0', {'raw': 1}),
+                                       (1, 'adc1.ch0', {'voltage_uv': 2})), origin_ns=0)
+    with pytest.raises(ValueError, match='capacity per cut is 16'):
+        factory.validate_inputs(spec, tuple((1, f'adc1.ch{i}', {'raw': i}) for i in range(17)))
+    with pytest.raises(ValueError, match='cannot accept'):
+        factory.validate_input(NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                               'adc1.ch0', {'raw': 1})
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+@pytest.mark.parametrize('payload,error', [
+    ({}, ValueError), ({'raw': 1, 'voltage_uv': 2}, ValueError),
+    ({'other': 1}, ValueError), ({'raw': True}, TypeError),
+    ({'raw': 1.0}, TypeError), ({'raw': -1}, ValueError),
+    ({'raw': 65536}, ValueError), ({'voltage_uv': 3300001}, ValueError)])
+def test_adc_invalid_payloads_reject_before_native_acquisition(firmware, backend, payload, error):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'adc': True})
+    with pytest.raises(error):
+        QemuFactory().validate_input(spec, 'adc1.ch0', payload)
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+def test_adc_network_links_reject_before_acquisition(firmware, backend):
+    owner = SimpleNamespace(
+        describe=lambda _: NodeDescription((PortSpec('signal', 'adc', category='signal'),),
+                                            {'connection'}),
+        create=lambda *_: pytest.fail('ADC links must reject before acquisition'))
+    graph = Topology((NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'adc': True}),
+                      NodeSpec('wire', 'fixture.owner')),
+                     (LinkSpec('board.adc1.ch0', 'wire.signal'),))
+    with pytest.raises(ValueError, match='unsupported QEMU connection'):
+        Simulation(graph, {'machine.qemu': QemuFactory(), 'fixture.owner': owner})
+    assert backend.calls == backend.commands == backend.sockets == []
 
 
 @pytest.mark.parametrize('port, payload, error, match', [
@@ -593,7 +642,7 @@ def test_machine_uses_shared_startup_budget_above_ten_seconds(firmware, backend)
     sim.close()
 
 
-def imu_simulation(firmware, actions):
+def imu_simulation(firmware, actions, *, adc=False):
     """A completed SI producer; the protocol endpoint is isolated separately."""
     from sim.api import ImuSample, ImuSignalSample, StepResult
 
@@ -619,7 +668,7 @@ def imu_simulation(firmware, actions):
         create=lambda _, context: Source(context))
     registry = {**builtin_registry(), 'fixture.imu': source}
     graph = Topology((NodeSpec('source', 'fixture.imu'),
-                      NodeSpec('board', 'machine.qemu', {'firmware': firmware}),
+                      NodeSpec('board', 'machine.qemu', {'firmware': firmware, 'adc': adc}),
                       NodeSpec('wire', 'net.imu')),
                      (LinkSpec('source.out', 'wire.signal'), LinkSpec('wire.signal', 'board.imu')))
     return Simulation(graph, registry, quantum_ns=10, startup_timeout_s=20)
@@ -628,9 +677,10 @@ def imu_simulation(firmware, actions):
 def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=None):
     """Replace only the independently tested protocol conversation."""
     class Endpoint:
-        def __init__(self, stream, *, context, check):
+        def __init__(self, stream, *, context, check, imu, adc):
             assert isinstance(stream, dm_profile.StepFramedSocket)
             self.stream, self.context, self.check = stream, context, check
+            self.imu, self.adc = imu, adc
 
         def start(self, origin):
             self.check()
@@ -641,6 +691,14 @@ def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=
         def receive_imu(self, sample):
             self.check()
             actions.append(('imu receive', sample.mapped_time_ns, backend.clients[-1].current))
+
+        def receive_adc(self, channel, payload):
+            self.check()
+            actions.append(('adc receive', channel, dict(payload), self.context.t_sim_ns))
+
+        def commit_inputs(self, cut):
+            self.check()
+            actions.append(('imu commit', cut, backend.clients[-1].current))
 
         def service(self, cut):
             self.check()
@@ -656,7 +714,7 @@ def recording_imu_endpoint(backend, actions, *, start_error=None, service_error=
 
 def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware, backend, monkeypatch):
     actions = []
-    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', recording_imu_endpoint(backend, actions))
     sim = imu_simulation(firmware, actions)
     with sim:
         machine = sim.components['board']
@@ -665,17 +723,19 @@ def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware,
         # start() shares the startup deadline; successful startup then exposes
         # the longer active deadline through the same live context property.
         assert sim._deadline - actions[0][2] == sim.host_timeout_s - sim.startup_timeout_s
-        assert actions[1:] == [('source', 0), ('imu receive', 0, 71)]
+        assert actions[1:] == [('source', 0), ('imu receive', 0, 71), ('imu commit', 0, 71)]
         assert not any(name == 'x-run-to-virtual-time' for name, _ in backend.commands)
         with pytest.raises(ValueError, match='cannot accept external'):
             sim.schedule_input('board.imu', (1, 2, 3))
         actions.clear()
         sim.step(7)
-        assert actions == [('imu service', 0), ('imu service', 7), ('imu service', 7),
-                           ('world', 7), ('source', 7), ('imu receive', 7, 78)]
+        assert actions == [('imu commit', 0, 71), ('imu service', 0), ('imu service', 7), ('imu service', 7),
+                           ('world', 7), ('source', 7), ('imu receive', 7, 78),
+                           ('imu commit', 7, 78)]
         actions.clear()
         sim.step(3)
-        assert actions[-3:] == [('world', 10), ('source', 10), ('imu receive', 10, 81)]
+        assert actions[-4:] == [('world', 10), ('source', 10), ('imu receive', 10, 81),
+                                ('imu commit', 10, 81)]
     assert actions[-2][0] == 'imu close' and actions[-2][1] >= 0
     assert actions[-1] == ('source close', 10)
     assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
@@ -683,7 +743,7 @@ def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware,
 
 
 def test_unconnected_imu_does_not_construct_endpoint_or_open_cosim(firmware, backend, monkeypatch):
-    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', lambda *args, **kwargs: pytest.fail('unused IMU'))
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', lambda *args, **kwargs: pytest.fail('unused co-sim'))
     with simulation(firmware) as sim:
         sim.step(7)
         assert tuple(sim.components['board'].connection_info['sockets']) == ('qmp', 'uart1')
@@ -691,7 +751,7 @@ def test_unconnected_imu_does_not_construct_endpoint_or_open_cosim(firmware, bac
 
 def test_imu_start_failure_preserves_primary_and_closes_all_owned_resources(firmware, backend, monkeypatch):
     actions, primary = [], OSError('co-sim handshake failed')
-    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', recording_imu_endpoint(
         backend, actions, start_error=primary))
     sim = imu_simulation(firmware, actions)
     with pytest.raises(OSError) as caught:
@@ -707,7 +767,7 @@ def test_imu_start_failure_preserves_primary_and_closes_all_owned_resources(firm
 
 def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware, backend, monkeypatch):
     actions, primary = [], OSError('co-sim receive failed')
-    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', recording_imu_endpoint(
         backend, actions, service_error=primary))
     with imu_simulation(firmware, actions) as sim:
         actions.clear()
@@ -716,7 +776,7 @@ def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware,
         assert caught.value is sim.failure is primary
         assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 0
         assert backend.clients[0].current == 78  # Native work already happened.
-        assert actions == [('imu service', 0), ('imu service', 7)]
+        assert actions == [('imu commit', 0, 71), ('imu service', 0), ('imu service', 7)]
         before = list(backend.commands)
         with pytest.raises(RuntimeError, match='healthy'):
             sim.step(7)
@@ -725,7 +785,7 @@ def test_imu_service_failure_stops_before_world_step_and_never_replays(firmware,
 
 def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, monkeypatch):
     actions = []
-    monkeypatch.setattr(dm_profile, 'QemuImuEndpoint', recording_imu_endpoint(backend, actions))
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', recording_imu_endpoint(backend, actions))
     with imu_simulation(firmware, actions) as sim:
         sim.step(7)
         old = sim.components['board']
@@ -736,6 +796,70 @@ def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, mon
         assert sim.components['board'] is not old and sim.session.session_id == 2
         assert [a for a in actions if a[0] == 'imu receive'] == [('imu receive', 0, 71)]
         assert len([a for a in actions if a[0] == 'imu start']) == 1
+
+
+@pytest.mark.parametrize('with_imu', [False, True])
+def test_real_shared_cosim_socket_through_machine_commit_and_cleanup(
+        firmware, backend, monkeypatch, with_imu):
+    # This is a native-acquisition double, not firmware evidence. The actual
+    # profile, endpoint, canonical framing, runtime and borrowed sockets run.
+    from test_qemu_imu import Peer
+    from sim.machines.qemu.cosim import QemuCosimEndpoint
+    from sim.transports import step_codec as wire
+
+    peers = []
+
+    def endpoint(stream, **kwargs):
+        peer_socket = next(peer for name, host, peer in backend.sockets
+                           if name == 'cosim' and host is stream.sock)
+        peer_socket.setblocking(True)
+
+        def respond(peer, frame):
+            if frame.header.kind == wire.RESET:
+                peer.reset_ack(frame, capabilities=11, native=71)
+            else:
+                peer.ack(frame)
+                if any(s.type == wire.STEP_SECTION_IMU_SAMPLE
+                       for s in wire.decode_step_payload(frame.payload)):
+                    peer.done(frame)
+
+        peers.append(Peer(peer_socket, respond))
+        return QemuCosimEndpoint(stream, **kwargs)
+
+    monkeypatch.setattr(dm_profile, 'QemuCosimEndpoint', endpoint)
+    sim = imu_simulation(firmware, [], adc=True) if with_imu else simulation(firmware, adc=True)
+    try:
+        sim.start()
+        assert len(peers) == 1
+        sim.schedule_input('board.adc1.ch0', {'raw': 12345}, at_ns=7)
+        sim.schedule_input('board.adc1.ch1', {'voltage_uv': 1650000}, at_ns=7)
+        sim.step(7)
+        frames = peers[0].frames
+        assert [(f.header.kind, f.header.step_id, f.header.t_sim_ns, f.header.dt_ns)
+                for f in frames] == [(wire.RESET, 0, 0, 0), (wire.STEP, 1, 7, 7)]
+        sections = wire.decode_step_payload(frames[1].payload)
+        assert [s.type for s in sections] == ([1] if with_imu else []) + [3, 4]
+        adc_events = [e for e in sim.events if e.kind == 'adc-input-accepted']
+        assert [(e.source_port, dict(e.payload['input']), e.delivery_time_ns)
+                for e in adc_events] == [('adc1.ch0', {'raw': 12345}, 7),
+                                         ('adc1.ch1', {'voltage_uv': 1650000}, 7)]
+        assert all(e.payload['step_id'] == 1 for e in adc_events)
+        assert backend.clients[0].current == 78
+        # Ordinary inputs can still be applied at this committed co-sim cut.
+        sim.schedule_input('board.key', True)
+        sim.step(1)
+        assert any(name == 'qom-set' and arguments.get('property') == 'user-key'
+                   for name, arguments in backend.commands)
+        assert len(frames) == (3 if with_imu else 2)
+    finally:
+        for peer in peers:
+            peer.stopping = True
+        sim.close()
+        for peer in peers:
+            peer.thread.join(1)
+            assert not peer.thread.is_alive() and not peer.errors
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+    assert backend.calls[-2:] == ['QMP close', 'process close']
 
 
 class FakeProfile:
@@ -861,6 +985,19 @@ def test_invalid_profile_adapter_is_closed_before_process_acquisition(backend):
     with pytest.raises(TypeError, match='profile adapter lacks'):
         sim.start()
     assert profile.actions == [('invalid close',)]
+    assert backend.calls == backend.commands == backend.sockets == []
+
+
+def test_advertised_profile_commit_requires_adapter_method_before_acquisition(backend):
+    profile = FakeProfile()
+    original = profile.describe
+    profile.describe = lambda spec: NodeDescription(
+        original(spec).ports, {'machine', 'input', 'input_commit'})
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),), ()),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')})
+    with pytest.raises(TypeError, match='advertised commit_inputs'):
+        sim.start()
+    assert profile.actions == [('close',)]
     assert backend.calls == backend.commands == backend.sockets == []
 
 

@@ -941,6 +941,34 @@ def test_response_validator_allows_ack_pipeline_but_keeps_done_ordered():
                                  _step_done_payload()))
 
 
+def test_ack_only_transactions_do_not_obstruct_strict_imu_done_fifo_or_retain_history():
+    rx = protocol.StepSessionValidator.qemu_to_host()
+    rx.begin_reset(0, 0)
+    rx.accept(_directional_frame(protocol.RESET_ACK, 0, 0, payload=_reset_ack_payload()))
+    rx.accept(_directional_frame(protocol.STEP_ACK, 1, 10, 10, _step_ack_payload()))
+    rx.accept(_directional_frame(protocol.STEP_ACK, 2, 20, 10, _step_ack_payload()),
+              expect_step_done=False)
+    rx.accept(_directional_frame(protocol.STEP_ACK, 3, 30, 10, _step_ack_payload()))
+    with pytest.raises(protocol.StepProtocolError, match='out of order'):
+        rx.accept(_directional_frame(protocol.STEP_DONE, 3, 30, 10, _step_done_payload()))
+    rx.accept(_directional_frame(protocol.STEP_DONE, 1, 10, 10, _step_done_payload()))
+    rx.accept(_directional_frame(protocol.STEP_DONE, 3, 30, 10, _step_done_payload()))
+    with pytest.raises(protocol.StepProtocolError, match='no outstanding'):
+        rx.accept(_directional_frame(protocol.STEP_DONE, 2, 20, 10, _step_done_payload()))
+    assert rx._pending_responses == rx._optional_ack_history == []
+    assert rx._optional_done_history == set()
+
+
+def test_ack_only_override_rejects_other_frames_and_nonboolean_flags():
+    rx = protocol.StepSessionValidator.qemu_to_host()
+    frame = _directional_frame(protocol.RESET_ACK, 0, 0, payload=_reset_ack_payload())
+    with pytest.raises(ValueError, match='response STEP_ACK'):
+        rx.accept(frame, expect_step_done=False)
+    ack = _directional_frame(protocol.STEP_ACK, 1, 10, 10, _step_ack_payload())
+    with pytest.raises(ValueError, match='response STEP_ACK'):
+        rx.accept(ack, expect_step_done=0)
+
+
 def test_session_accepts_step_done():
     validator = protocol.StepSessionValidator()
     validator.accept(protocol.StepFrame(

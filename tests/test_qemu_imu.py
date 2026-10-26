@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from sim.api import BackendUnavailable, Event, ImuSample, ImuSignalSample
-from sim.machines.qemu.imu import QemuImuEndpoint
+from sim.machines.qemu.cosim import QemuCosimEndpoint
 from sim.transports import step_codec as wire
 from sim.transports.cosim import StepFramedSocket
 
@@ -84,20 +84,20 @@ class Context:
 
 
 @contextmanager
-def endpoint(respond=None, *, origin=0, native=0, check=None, socket_wrapper=None):
+def endpoint(respond=None, *, origin=0, native=0, check=None, socket_wrapper=None, imu=True, adc=False):
     left, right = socket.socketpair()
     left.setblocking(False)
     context = Context(origin)
 
     def default(peer, frame):
         if frame.header.kind == wire.RESET:
-            peer.reset_ack(frame, native=native)
+            peer.reset_ack(frame, native=native, capabilities=wire.CAP_STEP | (wire.CAP_IMU if imu else 0) | (wire.CAP_ADC if adc else 0))
         else:
             peer.ack(frame)
 
     peer = Peer(right, respond or default)
     stream = StepFramedSocket(left if socket_wrapper is None else socket_wrapper(left))
-    receiver = QemuImuEndpoint(stream, context=context, check=check or (lambda: None))
+    receiver = QemuCosimEndpoint(stream, context=context, check=check or (lambda: None), imu=imu, adc=adc)
     try:
         yield receiver, peer, context, stream
     finally:
@@ -118,6 +118,7 @@ def sample(cut, *, source=None, gyro=(0.0, 0.0, 0.0), accel=(0.0, 0.0, 9.81)):
 def deliver(receiver, context, cut, **kwargs):
     context.t_sim_ns = cut
     receiver.receive_imu(sample(cut, **kwargs))
+    receiver.commit_inputs(cut)
 
 
 def events(context, kind):
@@ -148,7 +149,7 @@ def test_zero_cut_is_observation_only_then_signed_axes_have_literal_wire_units()
         assert accepted.source_time_ns is None
         assert accepted.mapped_time_ns == accepted.delivery_time_ns == 10_000_000
         assert accepted.quality == 'sampled'
-        assert context.io_checks == 2
+        assert context.io_checks == 3
 
 
 def test_nonzero_epochs_offgrid_cuts_and_float32_metadata_are_independent():
@@ -165,6 +166,127 @@ def test_nonzero_epochs_offgrid_cuts_and_float32_metadata_are_independent():
         assert metadata['wire']['accel_g'][2] == 1.0003416538238525
         assert metadata['input']['accel_m_s2'][2] == 9.81
         assert metadata['wire']['sensor_time_ns'] == 903
+
+
+def test_adc_and_imu_stage_without_io_then_share_one_step_and_acceptance_identity():
+    def respond(peer, frame):
+        if frame.header.kind == wire.RESET:
+            peer.reset_ack(frame, capabilities=wire.CAP_STEP | wire.CAP_IMU | wire.CAP_ADC)
+        else:
+            peer.ack(frame)
+            peer.done(frame)
+
+    with endpoint(respond, adc=True) as (receiver, peer, context, _):
+        receiver.start(0)
+        context.t_sim_ns = 10
+        receiver.receive_adc(7, {'raw': 12345})
+        receiver.receive_imu(sample(10, source=3))
+        receiver.receive_adc(31, {'voltage_uv': 1650000})
+        assert len(peer.frames) == 1 and context.events == []
+        receiver.commit_inputs(10)
+        receiver.commit_inputs(10)
+        assert len(peer.frames) == 2
+        frame = peer.frames[-1]
+        sections = wire.decode_step_payload(frame.payload)
+        assert [section.type for section in sections] == [1, 3, 4]
+        assert sections[1].payload == bytes.fromhex('0700393000000000')
+        assert sections[2].payload == bytes.fromhex('1f000000502d190000000000')
+        adc_events = events(context, 'adc-input-accepted')
+        assert [(e.source_port, e.payload['input']) for e in adc_events] == [
+            ('adc1.ch7', {'raw': 12345}), ('adc1.ch31', {'voltage_uv': 1650000})]
+        imu_event = events(context, 'imu-input-accepted')[0]
+        for event in adc_events:
+            assert tuple(event.payload[key] for key in ('session_id', 'step_id', 't_sim_ns', 'dt_ns')) == (
+                frame.header.session_id, 1, 10, 10)
+            assert event.source_time_ns is None
+            assert event.mapped_time_ns == event.delivery_time_ns == 10
+            assert event.payload['step_id'] == imu_event.payload['step_id']
+
+
+def test_adc_only_ack_retires_transactions_and_allows_more_than_64_cuts_without_done():
+    with endpoint(imu=False, adc=True) as (receiver, peer, context, _):
+        receiver.start(0)
+        for cut in range(1, 70):
+            context.t_sim_ns = cut
+            receiver.receive_adc(0, {'raw': cut})
+            receiver.commit_inputs(cut)
+        assert len(peer.frames) == 70
+        assert [e.payload['input']['raw'] for e in events(context, 'adc-input-accepted')] == list(range(1, 70))
+        assert not events(context, 'imu-input-accepted')
+        assert receiver._pending == {} and receiver._rx._pending_responses == []
+        assert receiver._rx._optional_ack_history == []
+
+
+def test_adc_only_between_imu_inputs_keeps_actual_done_identity_and_fifo():
+    def respond(peer, frame):
+        if frame.header.kind == wire.RESET:
+            peer.reset_ack(frame, capabilities=11)
+        else:
+            peer.ack(frame)
+            if frame.header.step_id == 3:
+                peer.done(peer.frames[1])
+                peer.done(frame)
+
+    with endpoint(respond, adc=True) as (receiver, _, context, _):
+        receiver.start(0)
+        deliver(receiver, context, 10)
+        context.t_sim_ns = 12
+        receiver.receive_adc(1, {'raw': 1})
+        receiver.commit_inputs(12)
+        deliver(receiver, context, 20)
+        # Service consumes only already-completed responses, without a new STEP.
+        receiver._wait(lambda: len(events(context, 'imu-consumption')) == 2, 20)
+        assert [(e.payload['step_id'], e.mapped_time_ns, e.delivery_time_ns)
+                for e in events(context, 'imu-consumption')] == [(1, 10, 20), (3, 20, 20)]
+
+
+@pytest.mark.parametrize('mode', ['origin', 'duplicate', 'mixed-duplicate', 'capacity', 'after-commit'])
+def test_adc_cut_faults_freeze_and_never_send_another_step(mode):
+    with endpoint(imu=False, adc=True) as (receiver, peer, context, _):
+        receiver.start(0)
+        context.t_sim_ns = 0 if mode == 'origin' else 10
+        if mode == 'capacity':
+            for channel in range(16):
+                receiver.receive_adc(channel, {'raw': channel})
+        elif mode != 'origin':
+            receiver.receive_adc(0, {'raw': 1})
+            if mode == 'after-commit':
+                receiver.commit_inputs(10)
+        with pytest.raises((ValueError, BufferError)):
+            receiver.receive_adc(16 if mode == 'capacity' else 0,
+                                 {'voltage_uv': 2} if mode == 'mixed-duplicate' else {'raw': 2})
+        before = len(peer.frames)
+        with pytest.raises(RuntimeError, match='frozen'):
+            receiver.commit_inputs(context.t_sim_ns)
+        assert len(peer.frames) == before == (2 if mode == 'after-commit' else 1)
+
+
+def test_all_16_adc_channels_with_imu_fit_native_payload_and_preserve_order():
+    with endpoint(adc=True) as (receiver, peer, context, _):
+        receiver.start(0)
+        context.t_sim_ns = 9
+        receiver.receive_imu(sample(9))
+        for channel in reversed(range(16)):
+            receiver.receive_adc(channel, {'voltage_uv': channel})
+        receiver.commit_inputs(9)
+        frame = peer.frames[-1]
+        assert len(frame.payload) == 392 <= 512
+        assert [wire.decode_adc_voltage_v2(s.payload).channel
+                for s in wire.decode_step_payload(frame.payload)[1:]] == list(reversed(range(16)))
+
+
+@pytest.mark.parametrize('imu,adc,caps,passes', [
+    (False, True, 9, True), (True, False, 3, True), (True, True, 11, True),
+    (False, True, 3, False), (True, False, 9, False), (True, True, 9, False)])
+def test_handshake_requires_only_enabled_input_capabilities(imu, adc, caps, passes):
+    with endpoint(lambda peer, frame: peer.reset_ack(frame, capabilities=caps),
+                  imu=imu, adc=adc) as (receiver, peer, _, _):
+        if passes:
+            receiver.start(0)
+        else:
+            with pytest.raises(BackendUnavailable):
+                receiver.start(0)
+        assert len(peer.frames) == 1
 
 
 @pytest.mark.parametrize('status, capabilities, native, error', [
@@ -372,6 +494,7 @@ def test_partial_received_ack_survives_until_actual_suffix():
         def deliver_in_thread():
             try:
                 receiver.receive_imu(sample(10))
+                receiver.commit_inputs(10)
                 outcome.append('accepted')
             except BaseException as exc:
                 outcome.append(exc)

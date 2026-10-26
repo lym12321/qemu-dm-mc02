@@ -12,26 +12,30 @@ from sim.transports.can_stream import CanStream
 from sim.transports.cosim import StepFramedSocket
 
 from .errors import BackendUnavailable
-from .imu import QemuImuEndpoint
+from .cosim import QemuCosimEndpoint, admit_adc
 
 from sim.api import NodeDescription, PortSpec
+from sim.api.events import check_timestamp
 from sim.boards.launch import UARTS, regular_file
 from sim.gpio import validate_gpio_pin
 
 CAN_PORTS = ('fdcan1', 'fdcan2', 'fdcan3')
+ADC_PORTS = tuple(f'adc1.ch{channel}' for channel in range(32))
 GENERIC_UARTS = tuple(port for port in UARTS if port != 'uart5')
 EXTERNAL_INPUT = frozenset({'external_input'})
 
 
 def admit_options(spec):
     options = spec.options
-    unknown = set(options) - {'model', 'firmware', 'uarts', 'remote'}
+    unknown = set(options) - {'model', 'firmware', 'uarts', 'remote', 'adc'}
     if unknown:
         raise ValueError(f'unknown QEMU machine options: {sorted(unknown)}')
     if options.get('model', 'dm-mc02') != 'dm-mc02':
         raise ValueError('unsupported QEMU model; expected dm-mc02')
     if type(options.get('remote', False)) is not bool:
         raise ValueError('QEMU remote must be a boolean')
+    if type(options.get('adc', False)) is not bool:
+        raise ValueError('QEMU adc must be a boolean')
     firmware = options.get('firmware')
     if not isinstance(firmware, (str, Path)) or not str(firmware) or '\0' in str(firmware):
         raise ValueError('QEMU machine firmware must be a nonempty path without NUL')
@@ -54,6 +58,10 @@ def describe(spec):
     ports = [PortSpec(port, 'uart', capabilities=EXTERNAL_INPUT) for port in uarts]
     if spec.options.get('remote', False):
         ports += [PortSpec('remote', 'remote', direction='in', capabilities=EXTERNAL_INPUT)]
+    if spec.options.get('adc', False):
+        ports += [PortSpec(port, 'adc', direction='in',
+                           category='signal', capabilities=EXTERNAL_INPUT)
+                  for port in ADC_PORTS]
     ports += [PortSpec(port, 'can') for port in CAN_PORTS]
     ports += [PortSpec('imu', 'imu', direction='in', category='signal')]
     ports += [PortSpec('key', 'digital', direction='in', category='signal',
@@ -64,7 +72,14 @@ def describe(spec):
               for bank in 'ABCDEFGH' for pin in range(16)]
     ports += [PortSpec(f'gpio.{bank}{pin}.out', 'digital', direction='out', category='signal')
               for bank in 'ABCDEFGH' for pin in range(16)]
-    return NodeDescription(ports=tuple(ports), capabilities=frozenset({'machine', 'input'}))
+    return NodeDescription(ports=tuple(ports),
+                           capabilities=frozenset({'machine', 'input', 'input_commit'}))
+
+
+def _adc_channel(port):
+    if port in ADC_PORTS:
+        return int(port[7:])
+    raise ValueError(f'unsupported ADC input port: {port}')
 
 
 def input_identity(port):
@@ -75,7 +90,9 @@ def input_identity(port):
 def validate_input(spec, port, payload, *, connected_ports=()):
     """Validate payloads using a spec already admitted by describe(), without IO."""
     uarts = tuple(spec.options.get('uarts', ('uart1',)))
-    if port == 'key':
+    if port.startswith('adc1.') and spec.options.get('adc', False):
+        _, value = admit_adc(_adc_channel(port), payload)
+    elif port == 'key':
         if type(payload) is not bool:
             raise TypeError('key input must be a boolean')
         value = payload
@@ -111,6 +128,30 @@ def validate_input(spec, port, payload, *, connected_ports=()):
     return value
 
 
+def validate_inputs(spec, entries, *, origin_ns=None):
+    """Pure batch admission; a ready-dependent origin is checked when known."""
+    if origin_ns is not None:
+        check_timestamp(origin_ns)
+    cuts = {}
+    for at_ns, port, payload in entries:
+        if not port.startswith('adc1.'):
+            continue
+        check_timestamp(at_ns)
+        validate_input(spec, port, payload)
+        if origin_ns is not None:
+            absolute = origin_ns + at_ns
+            check_timestamp(absolute)
+            if absolute == 0:
+                raise ValueError('ADC input must follow the Simulation session origin')
+        channels = cuts.setdefault(at_ns, set())
+        channel = _adc_channel(port)
+        if channel in channels:
+            raise ValueError('duplicate ADC channel at one cut')
+        if len(channels) >= 16:
+            raise ValueError('ADC channel capacity per cut is 16')
+        channels.add(channel)
+
+
 class DmMc02Profile:
     """Fixed board admission and wire adapters, independent of process ownership."""
 
@@ -122,6 +163,7 @@ class DmMc02Profile:
 
     describe = staticmethod(describe)
     validate_input = staticmethod(validate_input)
+    validate_inputs = staticmethod(validate_inputs)
 
     @staticmethod
     def validate_connections(node, topology, descriptions):
@@ -193,13 +235,14 @@ class DmMc02Adapter:
     def __init__(self, spec, ctx, backend):
         self._firmware, self._uarts = admit_options(spec)
         self._remote = spec.options.get('remote', False)
+        self._adc = spec.options.get('adc', False)
         self._ctx, self._backend = ctx, backend
         self._can_ports = tuple(port for port in CAN_PORTS if port in ctx.connected_ports)
         self._can = {port: ctx.attach(port, _CanInput(self, port)) for port in self._can_ports}
         self._uart = {port: ctx.attach(port, _UartInput(backend, port))
                       for port in self._uarts if port in ctx.connected_ports}
         self._imu_connected = 'imu' in ctx.connected_ports
-        self._imu = None
+        self._cosim = None
         if self._imu_connected:
             ctx.attach('imu', _ImuInput(self))
         digital_ports = tuple(port for port in ctx.connected_ports
@@ -214,7 +257,7 @@ class DmMc02Adapter:
         self._can_state = {}
         self._closed = False
         self.stream_types = {}
-        if self._imu_connected:
+        if self._imu_connected or self._adc:
             self.stream_types['cosim'] = StepFramedSocket
         self.stream_types.update({port: StreamTransport for port in self._uarts})
         if self._remote:
@@ -239,10 +282,11 @@ class DmMc02Adapter:
         if snapshot['timestamp_ns'] != origin:
             raise RuntimeError('native snapshot and execution origin disagree')
         self._complete_snapshot(snapshot, self._backend.t_sim_ns)
-        if self._imu_connected:
-            self._imu = QemuImuEndpoint(self._streams['cosim'], context=self._ctx,
-                                        check=self._backend.check)
-            self._imu.start(origin)
+        if self._imu_connected or self._adc:
+            self._cosim = QemuCosimEndpoint(self._streams['cosim'], context=self._ctx,
+                                           check=self._backend.check,
+                                           imu=self._imu_connected, adc=self._adc)
+            self._cosim.start(origin)
         for port in self._can_ports:
             wire = port.replace('fdcan', 'can')
             self._can_state[port] = observe_initial_paused_can(
@@ -254,8 +298,19 @@ class DmMc02Adapter:
                        delivery_time_ns=self._backend.t_sim_ns, quality='exact')
 
     def service(self, cut_ns):
-        if self._imu is not None:
-            self._imu.service(cut_ns)
+        if self._cosim is not None:
+            self._cosim.service(cut_ns)
+
+    def commit_inputs(self, cut_ns):
+        if self._cosim is not None:
+            self._backend.check()
+            if self._backend.pending is not None:
+                raise RuntimeError('co-sim commit requires a completed paused QEMU cut')
+            if cut_ns != self._backend.t_sim_ns:
+                raise ValueError('co-sim commit must match the native completed cut')
+            self._backend.validate_cut()
+            self._backend.to_native(cut_ns)
+            self._cosim.commit_inputs(cut_ns)
 
     def complete_cut(self, cut_ns, target_ns):
         uart_batches = self._collect(cut_ns)
@@ -361,15 +416,17 @@ class DmMc02Adapter:
     def _receive_imu(self, sample):
         self._backend.check()
         self._ctx.check_io()
-        if self._backend.pending is not None or self._imu is None:
+        if self._backend.pending is not None or self._cosim is None:
             raise RuntimeError('IMU input requires a completed paused QEMU cut')
         self._backend.validate_cut()
         # Native time admission precedes any protocol or transport effect.
         self._backend.to_native(self._ctx.t_sim_ns)
-        self._imu.receive_imu(sample)
+        self._cosim.receive_imu(sample)
 
     def input(self, port, payload):
-        if port == 'key':
+        if port.startswith('adc1.') and self._adc:
+            self._cosim.receive_adc(_adc_channel(port), payload)
+        elif port == 'key':
             self._board.set_key(payload)
         elif port.startswith('gpio.'):
             self._board.set_gpio(port[5:], payload)
@@ -400,5 +457,5 @@ class DmMc02Adapter:
         if self._closed:
             return
         self._closed = True
-        if self._imu is not None:
-            self._imu.close()
+        if self._cosim is not None:
+            self._cosim.close()

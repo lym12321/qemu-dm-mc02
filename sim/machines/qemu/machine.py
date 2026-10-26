@@ -55,6 +55,11 @@ class QemuFactory:
     def validate_input(self, spec, port, payload, *, connected_ports=()):
         return self.profile.validate_input(spec, port, payload, connected_ports=connected_ports)
 
+    def validate_inputs(self, spec, entries, *, origin_ns=None):
+        validate = getattr(self.profile, 'validate_inputs', None)
+        if validate is not None:
+            validate(spec, entries, origin_ns=origin_ns)
+
     def validate_topology(self, topology, descriptions, registry):
         owners = {'gdb_port': {}, 'qmp_path': {}}
         for node in topology.nodes:
@@ -78,7 +83,8 @@ class QemuMachine:
     """Sole native process/connection/target owner, independent of board ports.
 
     The profile adapter provides stream_types, launch_command, start, service,
-    complete_cut, input, observe and close. It borrows this owner's command,
+    complete_cut, input, observe and close, plus commit_inputs if advertised.
+    It borrows this owner's command,
     deadline, stream and epoch-mapping boundary and must never advance a CPU.
     """
 
@@ -98,6 +104,9 @@ class QemuMachine:
             if any(not callable(getattr(self._adapter, name, None)) for name in
                    ('launch_command', 'start', 'service', 'complete_cut', 'input', 'observe', 'close')):
                 raise TypeError('QEMU profile adapter lacks required lifecycle or boundary methods')
+            if ('input_commit' in factory.describe(spec).capabilities and
+                    not callable(getattr(self._adapter, 'commit_inputs', None))):
+                raise TypeError('QEMU profile adapter lacks advertised commit_inputs method')
             self._stream_types = dict(self._adapter.stream_types)
             if (any(type(name) is not str or name == 'qmp'
                     or re.fullmatch(r'[a-z][a-z0-9_]{0,15}', name) is None
@@ -295,6 +304,13 @@ class QemuMachine:
             raise RuntimeError('QEMU input requires a completed paused cut')
         self.validate_cut()
         self._adapter.input(port, payload)
+        self.check()
+
+    def commit_inputs(self, cut_ns):
+        self.check()
+        if self._pending is not None or self._owner is None:
+            raise RuntimeError('QEMU input commit requires a completed paused cut')
+        self._adapter.commit_inputs(cut_ns)
         self.check()
 
     def observe(self):

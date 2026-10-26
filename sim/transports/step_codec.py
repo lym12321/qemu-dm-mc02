@@ -755,7 +755,7 @@ class StepSessionValidator:
         self._accept_monotonic_input(header)
 
     def _accept_qemu_to_host(self, header: StepHeader,
-                             payload: bytes) -> None:
+                             payload: bytes, *, expect_step_done: bool | None = None) -> None:
         if header.kind == RESET:
             self._start_reset(header.step_id, header.t_sim_ns,
                               header.session_id)
@@ -829,7 +829,11 @@ class StepSessionValidator:
             self.last_step_id = header.step_id
             self.last_t_sim_ns = header.t_sim_ns
             if ack.status == V2_STATUS_OK:
-                if self.require_step_done:
+                if expect_step_done is False:
+                    # A known ACK-only transaction (for example ADC input)
+                    # creates neither a DONE obligation nor optional history.
+                    pass
+                elif self.require_step_done:
                     self._pending_responses.append(record)
                 else:
                     self._optional_ack_history.append(record)
@@ -937,7 +941,17 @@ class StepSessionValidator:
         self.last_step_id = header.step_id
         self.last_t_sim_ns = header.t_sim_ns
 
-    def accept(self, frame: StepFrame) -> None:
+    def accept(self, frame: StepFrame, *, expect_step_done: bool | None = None) -> None:
+        """Accept a frame; an explicitly ACK-only input need not emit DONE.
+
+        The override applies only to this response ACK. The strict default
+        and FIFO matching for other inputs remain unchanged; no history is
+        retained for an ACK-only input and a later DONE is rejected.
+        """
+        if (expect_step_done is not None and
+                (type(expect_step_done) is not bool or
+                 self.direction != DIRECTION_QEMU_TO_HOST or frame.header.kind != STEP_ACK)):
+            raise ValueError('expect_step_done is only valid for a response STEP_ACK')
         validate_step_frame(frame)
         header = frame.header
         self._accept_session_id(header)
@@ -946,7 +960,7 @@ class StepSessionValidator:
         if self.direction == DIRECTION_HOST_TO_QEMU:
             self._accept_host_to_qemu(header, frame.payload)
         elif self.direction == DIRECTION_QEMU_TO_HOST:
-            self._accept_qemu_to_host(header, frame.payload)
+            self._accept_qemu_to_host(header, frame.payload, expect_step_done=expect_step_done)
         else:
             self._accept_auto(header, frame.payload)
 
