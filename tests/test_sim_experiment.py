@@ -7,8 +7,8 @@ import json
 import pytest
 
 from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, StepResult, Topology
-from sim.apps.experiment import ExperimentInput, run_experiment
-from sim.config.scene import Scene
+from sim.apps.experiment import ExperimentInput, ExperimentReady, run_experiment
+from sim.config.scene import ExperimentSpec, Scene
 from sim.fabric import CanFrame
 from sim.fabric.factory import CanBusFactory
 from sim.fabric.uart import UartNetFactory
@@ -54,6 +54,10 @@ class Peripheral:
             if stamp == cut:
                 self.context.emit("can", "can-tx", frame, source_time_ns=frame.timestamp_ns,
                                   mapped_time_ns=frame.timestamp_ns - 700, delivery_time_ns=cut)
+        for stamp, data in self.spec.options.get("uart_observations", ()):
+            if stamp == cut:
+                self.context.emit("uart", "uart", data, source_time_ns=700 + cut,
+                                  mapped_time_ns=cut, quality="upper_bound")
 
     def close(self):
         self.factory.closed.append(self)
@@ -331,3 +335,201 @@ for name in sys.modules:
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+def test_ready_fragments_set_relative_origin_and_exclude_the_whole_matching_cut():
+    configured, registry, factory = scene(quantum=10, duration=20,
+        options={"uart_observations": ((10, b"R"), (20, b"EADY startup"))})
+    events = []
+    result = run_experiment(configured, registry, ready=ExperimentReady("board.uart", "READY"),
+        inputs=(ExperimentInput(0, "board.uart", b"same-cut"),
+                ExperimentInput(3, "board.uart", b"active")),
+        assertions=(uart_assert("board.uart", "startup", "10ns"),
+                    uart_assert("board.uart", "same-cut", "10ns"),
+                    uart_assert("board.uart", "active", "10ns")), on_event=events.append)
+    assert result.origin_ns == 20 and result.end_ns == 40
+    assert result.status == ("fail", "fail", "pass") and result.delivered_inputs == 2
+    assert factory.created[0].calls == [(20, "uart", b"same-cut"), (23, "uart", b"active")]
+    receipt = result.ready_receipt
+    original = next(event for event in events if event.sequence == receipt.event_sequence)
+    assert original.payload == b"EADY startup" and original.session_id == 1
+    assert (receipt.source_time_ns, receipt.mapped_time_ns, receipt.delivery_time_ns,
+            receipt.quality) == (720, 20, 20, "upper_bound")
+    assert result.matches[0].source_time_ns == 723
+    assert result.matches[0].mapped_time_ns == 23
+    assert factory.closed == factory.created
+    json.dumps(asdict(result))
+
+
+def test_ready_at_zero_defers_enqueue_until_start_completes():
+    configured, registry, factory = scene(duration=10,
+        options={"uart_observations": ((0, b"READY"),)})
+    result = run_experiment(configured, registry, ready=ExperimentReady("board.uart", b"READY"),
+        inputs=(ExperimentInput(0, "board.level", 1),),
+        assertions=({"before": "10ns", "digital_equals": {"endpoint": "board.gpio.B0", "value": 1}},))
+    assert result.origin_ns == 0 and result.ready_receipt.mapped_time_ns == 0
+    assert factory.created[0].calls == [(0, "level", 1)]
+    # The initial matching cut is excluded; a later completed sample is needed.
+    assert result.status == ("fail",) and result.delivered_inputs == 1
+
+
+def test_ready_zero_offset_input_reaches_input_commit_before_target_commit():
+    class CommitPeripheral(Peripheral):
+        def __init__(self, *args):
+            super().__init__(*args)
+            self.commits = []
+
+        def commit_inputs(self, cut):
+            self.commits.append((cut, self.level))
+
+    class CommitFactory(PeripheralFactory):
+        def describe(self, spec):
+            return NodeDescription(super().describe(spec).ports, {"sample", "input", "input_commit"})
+
+        def create(self, spec, context):
+            instance = CommitPeripheral(spec, context, self)
+            self.created.append(instance)
+            return instance
+
+    factory = CommitFactory()
+    configured = Scene(Topology((NodeSpec("board", "fixture", {
+        "uart_observations": ((10, b"READY"),)}),)), quantum_ns=10, duration_ns=10)
+    result = run_experiment(configured, {"fixture": factory},
+        ready=ExperimentReady("board.uart", "READY"), inputs=(ExperimentInput(0, "board.level", 1),))
+    assert result.passed and result.origin_ns == 10 and result.end_ns == 20
+    assert factory.created[0].calls == [(10, "level", 1)]
+    assert (10, 1) in factory.created[0].commits
+
+
+def test_ready_wrong_endpoint_never_joins_fragments_and_tail_stays_bounded():
+    from sim.api import Event
+    from sim.apps.experiment import _Consumer
+
+    consumer = _Consumer((), 10, {}, {"board.uart": "uart", "peer.uart": "uart"},
+                         ready=ExperimentReady("board.uart", "READY"))
+    def observe(index, node, data):
+        consumer(Event(1, index, node, "uart", "uart", data, 700 + index,
+                       index, index, "upper_bound"))
+    observe(0, "board", b"x" * 4096 + b"RE")
+    assert len(consumer._ready_tail) == 4
+    observe(1, "peer", b"ADY")
+    assert consumer.origin_ns is None
+    observe(2, "board", b"ADY")
+    assert consumer.origin_ns == 2 and consumer._ready_tail == b""
+
+
+def test_ready_rejects_lower_bound_and_acceptance_notifications():
+    from sim.api import Event
+    from sim.apps.experiment import _Consumer
+
+    consumer = _Consumer((), 10, {}, {"board.uart": "uart"},
+                         ready=ExperimentReady("board.uart", "READY"))
+    consumer(Event(1, 0, "board", "uart", "input.delivered", b"READY", 0, 0, 0, "exact"))
+    assert consumer.origin_ns is None
+    with pytest.raises(ValueError, match="upper bound"):
+        consumer(Event(1, 1, "board", "uart", "uart", b"READY", 700, 0, 0, "lower_bound"))
+    assert consumer.origin_ns is None and consumer.ready_receipt is None
+
+
+def test_ready_and_acquisition_share_startup_deadline_and_keep_total_deadline(monkeypatch):
+    import sim.apps.experiment as experiment
+    import sim.runtime.simulation as runtime
+
+    clock = {"now": 100.0}
+    monkeypatch.setattr(experiment, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(runtime, "monotonic", lambda: clock["now"])
+    deadlines = []
+
+    class ClockPeripheral(Peripheral):
+        def sample(self, cut):
+            deadlines.append(self.context.deadline_monotonic)
+            clock["now"] += .004
+            super().sample(cut)
+
+    class ClockFactory(PeripheralFactory):
+        def create(self, spec, context):
+            # Resource construction consumes the same startup budget.
+            clock["now"] += .003
+            instance = ClockPeripheral(spec, context, self)
+            self.created.append(instance)
+            return instance
+
+    factory = ClockFactory()
+    configured = Scene(Topology((NodeSpec("board", "fixture", {
+        "uart_observations": ((10, b"READY"),)}),)), quantum_ns=10, duration_ns=10)
+    result = run_experiment(configured, {"fixture": factory}, ready=ExperimentReady("board.uart", "READY"),
+                            startup_timeout_s=.012, host_timeout_s=.02)
+    assert result.origin_ns == 10 and deadlines == [100.012, 100.012, 100.02]
+    assert factory.closed == factory.created
+
+    clock["now"] = 200.0
+    factory = ClockFactory()
+    absent = Scene(Topology((NodeSpec("board", "fixture"),)), quantum_ns=10, duration_ns=10)
+    with pytest.raises(TimeoutError, match="deadline"):
+        run_experiment(absent, {"fixture": factory}, ready=ExperimentReady("board.uart", "NEVER"),
+                       startup_timeout_s=.01, host_timeout_s=1)
+    assert factory.closed == factory.created
+
+
+def test_declared_experiment_runs_canonical_values_and_rejects_python_override():
+    configured, registry, factory = scene()
+    declared = Scene(configured.topology, duration_ns=30, quantum_ns=10,
+        experiment=ExperimentSpec(inputs=(ExperimentInput(3, "board.uart", b"OK"),),
+                                  assertions=(uart_assert("board.uart"),)))
+    with pytest.raises(ValueError, match="overridden"):
+        run_experiment(declared, registry, inputs=(ExperimentInput(1, "board.level", 1),))
+    assert factory.created == []
+    result = run_experiment(declared, registry)
+    assert result.passed and result.origin_ns == 0 and result.ready_receipt is None
+    assert factory.created[0].calls == [(3, "uart", b"OK")]
+
+
+def test_optional_factory_batch_admission_is_pure_and_rechecks_actual_origin():
+    class BatchFactory(PeripheralFactory):
+        def __init__(self):
+            super().__init__()
+            self.batches = []
+
+        def validate_inputs(self, spec, entries, *, origin_ns=None):
+            self.batches.append((origin_ns, entries))
+            if len({(at, port) for at, port, value in entries}) < len(entries):
+                raise ValueError("duplicate cut")
+
+    configured, _, _ = scene(options={"uart_observations": ((10, b"READY"),)})
+    factory = BatchFactory()
+    inputs = (ExperimentInput(2, "board.level", 1), ExperimentInput(0, "board.uart", b"OK"))
+    result = run_experiment(configured, {"fixture": factory}, ready=ExperimentReady("board.uart", "READY"),
+                            inputs=inputs)
+    assert result.origin_ns == 10
+    assert [origin for origin, _ in factory.batches] == [None, 10]
+    assert factory.batches[0][1] == ((2, "level", 1), (0, "uart", b"OK"))
+    factory = BatchFactory()
+    with pytest.raises(ValueError, match="duplicate cut"):
+        run_experiment(configured, {"fixture": factory}, inputs=(inputs[0], inputs[0]))
+    assert factory.created == []
+
+
+def test_yaml_host_can_input_uses_real_shared_bus_and_matches_delivery(tmp_path):
+    import yaml
+    from sim.composition import builtin_registry
+
+    path = tmp_path / "experiment.yaml"
+    path.write_text(yaml.safe_dump({"schema": "sim/v1",
+        "runtime": {"quantum": "10ns", "duration": "20ns"},
+        "nodes": {"host": {"kind": "device.can-host"},
+                  "peer": {"kind": "device.can-host"},
+                  "bus": {"kind": "bus.can", "delay_ns": 2}},
+        "links": [["host.can", "bus.can"], ["peer.can", "bus.can"]],
+        "experiment": {"inputs": [{"at": "3ns", "endpoint": "host.tx", "value": {
+            "id": 0x321, "dlc": 2, "data_hex": "00ff"}}],
+            "assertions": [{"before": "10ns", "can_seen": {
+                "endpoint": "host.can", "id": 0x321, "flags": 0, "dlc": 2, "data_hex": "00ff"}}]}}))
+    events = []
+    result = run_experiment(path, builtin_registry(), on_event=events.append)
+    assert result.passed and result.delivered_inputs == 1 and result.end_ns == 20
+    receipt = result.matches[0]
+    assert (receipt.kind, receipt.source_node, receipt.source_time_ns,
+            receipt.mapped_time_ns, receipt.delivery_time_ns) == ("can.delivery", "host", 3, 3, 5)
+    received = next(event for event in events if event.kind == "can-host.received")
+    assert received.source_node == "peer"
+    assert received.payload["frame"] == CanFrame(0x321, dlc=2, data=b"\0\xff", timestamp_ns=5)

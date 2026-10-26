@@ -114,7 +114,13 @@ def test_core_static_import_direction():
 
 
 def test_help_and_validate_refuse_optional_imports_in_fresh_process(tmp_path):
-    path, _ = write_scene(tmp_path)
+    path, document = write_scene(tmp_path)
+    document["experiment"] = {
+        "ready": {"endpoint": "main.uart1", "text": "READY"},
+        "inputs": [{"at": "1ms", "endpoint": "main.uart1", "value": "hello\0é"}],
+        "assertions": [{"before": "10ms", "uart_contains": {"endpoint": "main.uart1", "text": "OK"}}],
+    }
+    path.write_text(yaml.safe_dump(document))
     program = '''
 import importlib.abc, sys
 sys.path.insert(0, sys.argv[1])
@@ -135,6 +141,276 @@ raise SystemExit(main(sys.argv[2:]))
     assert result.returncode == 0, result.stderr
     assert "validate" in result.stdout and "run" in result.stdout
     assert "robot" not in result.stdout and "lab" not in result.stdout
+
+
+def test_scene_experiment_pure_admission_canonicalizes_inputs_and_freezes_order(tmp_path, monkeypatch):
+    path, document = write_scene(tmp_path)
+    document["experiment"] = {
+        "ready": {"endpoint": "main.uart1", "text": "就绪\0"},
+        "inputs": [{"at": "2ms", "endpoint": "main.uart1", "value": "one\0é"},
+                   {"at": "2ms", "endpoint": "main.key", "value": True},
+                   {"at": "0ns", "endpoint": "main.gpio.B0", "value": 1}],
+        "assertions": [{"before": "10ms", "digital_equals": {"endpoint": "main.led", "value": 1}}],
+    }
+    path.write_text(yaml.safe_dump(document))
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("static scene acquired resources"))
+    configured = load_scene(path, registry)
+    experiment = configured.experiment
+    assert str(experiment.ready.endpoint) == "main.uart1"
+    assert experiment.ready.text == "就绪\0".encode()
+    assert [(item.at_ns, str(item.endpoint), item.payload) for item in experiment.inputs] == [
+        (2_000_000, "main.uart1", b"one\0\xc3\xa9"),
+        (2_000_000, "main.key", True), (0, "main.gpio.B0", 1)]
+    with pytest.raises(TypeError):
+        experiment.assertions[0]["before"] = "1ns"
+
+
+@pytest.mark.parametrize("experiment", [
+    {"unknown": True},
+    {"ready": {"endpoint": "main.uart1", "text": ""}},
+    {"ready": {"endpoint": "main.key", "text": "READY"}},
+    {"ready": {"endpoint": "absent.uart1", "text": "READY"}},
+    {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": 1}]},
+    {"inputs": [{"at": "151ms", "endpoint": "main.key", "value": True}]},
+    {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": True, "extra": 1}]},
+    {"inputs": [{"at": "1ms", "endpoint": "main.key"}]},
+    {"inputs": [{"at": "0ns", "endpoint": "main.key", "value": True} for _ in range(1025)]},
+    {"assertions": [{"before": "151ms", "uart_contains": {"endpoint": "main.uart1", "text": "OK"}}]},
+    {"assertions": [{"before": "1ms", "uart_contains": {"endpoint": "main.key", "text": "OK"}}]},
+])
+def test_bad_scene_experiment_rejects_before_any_component_creation(tmp_path, monkeypatch, experiment):
+    path, document = write_scene(tmp_path)
+    document["experiment"] = experiment
+    path.write_text(yaml.safe_dump(document))
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("invalid scene acquired resources"))
+    with pytest.raises((ValueError, TypeError)):
+        load_scene(path, registry)
+
+
+def test_scene_adc_batches_validate_before_io_and_distinguish_ready_origin(tmp_path, monkeypatch):
+    path, document = write_scene(tmp_path)
+    document["nodes"]["main"]["adc"] = True
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("ADC admission acquired resources"))
+    input_at_zero = {"at": "0ns", "endpoint": "main.adc1.ch4", "value": {"raw": 12345}}
+    document["experiment"] = {"inputs": [input_at_zero]}
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="origin"):
+        load_scene(path, registry)
+    document["experiment"]["ready"] = {"endpoint": "main.uart1", "text": "READY"}
+    path.write_text(yaml.safe_dump(document))
+    configured = load_scene(path, registry)
+    assert configured.experiment.inputs[0].payload == {"raw": 12345}
+    document["experiment"]["inputs"] = [input_at_zero, {
+        "at": "0ns", "endpoint": "main.adc1.ch4", "value": {"voltage_uv": 1650000}}]
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="duplicate|conflict"):
+        load_scene(path, registry)
+    document["experiment"]["inputs"] = [{"at": "1ms", "endpoint": f"main.adc1.ch{index}",
+                                          "value": {"raw": 1}} for index in range(17)]
+    path.write_text(yaml.safe_dump(document))
+    with pytest.raises(ValueError, match="16"):
+        load_scene(path, registry)
+
+
+def _cli_experiment(tmp_path, monkeypatch, *, payload="OK", close_error=None):
+    from sim import composition
+
+    report = tmp_path / "report.json"
+    closed, delivered = [], []
+
+    class Producer:
+        def __init__(self, context):
+            self.context = context
+
+        def sample(self, cut):
+            fragment = {10: b"R", 20: b"EADY OK"}.get(cut)
+            if fragment is not None:
+                self.publish(fragment)
+
+        def publish(self, value):
+            cut = self.context.t_sim_ns
+            self.context.emit("uart", "uart", value, source_time_ns=700 + cut,
+                              mapped_time_ns=cut, quality="upper_bound")
+
+        def input(self, port, value):
+            delivered.append((self.context.t_sim_ns, value))
+            self.publish(value)
+
+        def close(self):
+            assert not report.exists(), "report was published before resource cleanup"
+            closed.append(True)
+            if close_error is not None:
+                raise close_error
+
+    class Factory:
+        def describe(self, spec):
+            return NodeDescription((PortSpec("uart", "uart", capabilities={"external_input"}),),
+                                   {"sample", "input"})
+
+        def validate_input(self, spec, port, value, *, connected_ports=()):
+            if type(value) is str:
+                value = value.encode("utf-8")
+            if type(value) is not bytes or len(value) > 4096:
+                raise ValueError("bounded UART bytes required")
+            return value
+
+        def create(self, spec, context):
+            return Producer(context)
+
+    monkeypatch.setattr(composition, "builtin_registry", lambda **kwargs: {"producer": Factory()})
+    path = tmp_path / "cli-experiment.yaml"
+    path.write_text(yaml.safe_dump({"schema": "sim/v1", "runtime": {
+        "quantum": "10ns", "duration": "20ns"}, "nodes": {"port": {"kind": "producer"}},
+        "experiment": {"ready": {"endpoint": "port.uart", "text": "READY"},
+            "inputs": [{"at": "3ns", "endpoint": "port.uart", "value": payload}],
+            "assertions": [{"before": "10ns", "uart_contains": {
+                "endpoint": "port.uart", "text": "OK"}}]}}))
+    return path, report, closed, delivered
+
+
+@pytest.mark.parametrize("payload,expected_code,status", [("OK", 0, "passed"), ("BAD", 1, "failed")])
+def test_cli_experiment_reports_real_ready_relative_assertions_after_cleanup(
+        tmp_path, monkeypatch, capsys, payload, expected_code, status):
+    from sim import cli
+
+    path, report, closed, delivered = _cli_experiment(tmp_path, monkeypatch, payload=payload)
+    assert cli.main(["run", str(path), "--report", str(report)]) == expected_code
+    result = json.loads(report.read_text())
+    assert result["status"] == status and closed == [True]
+    assert delivered == [(23, payload.encode())]
+    assert result["result"]["origin_ns"] == 20 and result["result"]["end_ns"] == 40
+    assert result["result"]["delivered_inputs"] == 1
+    ready = result["result"]["ready_receipt"]
+    assert (ready["source_time_ns"], ready["mapped_time_ns"], ready["delivery_time_ns"]) == (720, 20, 20)
+    assert result["result"]["status"] == (["pass"] if expected_code == 0 else ["fail"])
+    assert f"{status}: time_ns=40" in capsys.readouterr().out
+
+
+def test_cli_experiment_cleanup_failure_never_publishes_pass(tmp_path, monkeypatch, capsys):
+    from sim import cli
+
+    path, report, closed, _ = _cli_experiment(tmp_path, monkeypatch, close_error=OSError("close failed"))
+    assert cli.main(["run", str(path), "--report", str(report)]) == 1
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and result["error_type"] == "OSError"
+    assert result["error"] == "close failed" and closed == [True]
+    assert "passed:" not in capsys.readouterr().out
+
+
+def test_cli_experiment_sink_interrupt_preserves_primary_and_cleanup_notes(tmp_path, monkeypatch, capsys):
+    from sim import cli
+
+    path, report, closed, _ = _cli_experiment(tmp_path, monkeypatch, close_error=OSError("close failed"))
+    primary = KeyboardInterrupt("sink interrupted")
+    def interrupted(event):
+        if event.kind == "uart" and event.payload == b"OK":
+            raise primary
+    monkeypatch.setattr(cli, "_emit", interrupted)
+    assert cli.main(["run", str(path), "--report", str(report)]) == 130
+    result = json.loads(report.read_text())
+    assert result["status"] == "failed" and result["error_type"] == "KeyboardInterrupt"
+    assert result["error"] == "sink interrupted" and closed == [True]
+    assert "close failed" in "\n".join(result["notes"])
+    assert "close failed" in "\n".join(primary.__notes__)
+    assert "passed:" not in capsys.readouterr().out
+
+
+def test_teaching_scene_admits_qualified_key_inputs_without_native_acquisition(tmp_path, monkeypatch):
+    document = yaml.safe_load((ROOT / "examples/teaching/gpio-key.yaml").read_text())
+    firmware = tmp_path / "lesson.elf"
+    firmware.write_bytes(b"static admission only")
+    document["nodes"]["main"]["firmware"] = str(firmware)
+    path = tmp_path / "lesson.yaml"
+    path.write_text(yaml.safe_dump(document))
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("lesson admission acquired resources"))
+    scene = load_scene(path, registry)
+    assert scene.duration_ns == 800_000_000 and scene.quantum_ns == 1_000_000
+    assert scene.topology.nodes[0].options["uarts"] == ()
+    assert scene.experiment.ready is None
+    assert [(item.at_ns, str(item.endpoint), item.payload) for item in scene.experiment.inputs] == [
+        (100_000_000, "main.key", True), (600_000_000, "main.key", False)]
+    assert scene.experiment.assertions == ({"before": "500ms", "digital_equals": {
+        "endpoint": "main.gpio.B0", "value": 1}},)
+
+
+@pytest.mark.parametrize("constant_low", [False, True])
+def test_teaching_automatic_consumer_uses_real_simulation_cli_and_report(
+        tmp_path, monkeypatch, constant_low):
+    from contextlib import redirect_stderr, redirect_stdout
+    from io import StringIO
+    from sim import cli, composition
+    from smoke import dm_mc02_teaching_smoke as teaching
+
+    firmware = tmp_path / "lesson.elf"
+    firmware.write_bytes(b"pure consumer fixture")
+    report = tmp_path / "simulation-result.json"
+    delivered, closed = [], []
+    admission = builtin_registry()["machine.qemu"]
+
+    class GpioFixture:
+        level = 0
+
+        def __init__(self, context):
+            self.context = context
+
+        def input(self, port, value):
+            delivered.append((self.context.t_sim_ns, port, value))
+            self.level = 0 if constant_low else int(value)
+
+        def sample(self, cut):
+            state = {"schema": 1, "timestamp_ns": cut, "board": "fixture", "vin_mv": 24000,
+                "gpio": {bank: {"moder": 0, "sampled": self.level if bank == "B" else 0,
+                                  "odr": 0, "output_mask": 0} for bank in "ABCDEFGH"},
+                "key": {"pin": "A15", "pressed": False, "level": 1},
+                "led": {"pin": "A7", "rgb": 0, "brightness": 0, "source": "gpio-latch"}}
+            self.context.emit("snapshot", "snapshot", state, source_time_ns=cut,
+                              mapped_time_ns=cut, quality="exact")
+
+        def close(self):
+            assert not report.exists(), "teaching report preceded cleanup"
+            closed.append(True)
+
+    class Factory:
+        def describe(self, spec):
+            description = admission.describe(spec)
+            return NodeDescription(description.ports,
+                (description.capabilities - {"input_commit"}) | {"sample"})
+
+        def validate_input(self, *args, **kwargs):
+            return admission.validate_input(*args, **kwargs)
+
+        def create(self, spec, context):
+            assert spec.options["firmware"] == str(firmware)
+            return GpioFixture(context)
+
+    monkeypatch.setattr(composition, "builtin_registry", lambda **kwargs: {"machine.qemu": Factory()})
+
+    def command(argv, deadline, record):
+        assert argv[:3] == [sys.executable, str(ROOT / "tools/sim"), "run"]
+        out, err = StringIO(), StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main(argv[2:])
+        record.update(argv=argv, returncode=code, stdout=out.getvalue(), stderr=err.getvalue())
+        return record
+
+    monkeypatch.setattr(teaching, "command", command)
+    record = {}
+    teaching.simulation_cli(firmware, tmp_path / "unused-qemu",
+        ROOT / "examples/teaching/gpio-key.yaml", tmp_path, record, expect_failure=constant_low)
+    assert closed == [True]
+    assert delivered == [(100_000_000, "key", True), (600_000_000, "key", False)]
+    result = record["report"]["result"]
+    assert result["status"] == (["fail"] if constant_low else ["pass"])
+    if not constant_low:
+        assert result["matches"][0]["delivery_time_ns"] == 100_000_000
 
 
 def test_missing_native_backend_is_blocked_and_preserves_report(tmp_path):

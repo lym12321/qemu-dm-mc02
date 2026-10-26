@@ -192,15 +192,24 @@ def main(argv=None):
                 node.kind == 'machine.qemu' for node in scene.topology.nodes) != 1:
             raise ValueError('--gdb-port/--qmp require exactly one QEMU machine')
         timeout = args.timeout or (300.0 if scene.mode == 'interactive' else 30.0)
-        simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
-                                mode=scene.mode, host_timeout_s=timeout,
-                                startup_timeout_s=args.startup_timeout, on_event=_emit)
-        simulation.start()
-        if scene.mode == 'interactive':
-            _interactive(simulation, scene)
+        if scene.experiment is not None:
+            from sim.apps.experiment import run_experiment
+            experiment = run_experiment(scene, registry, host_timeout_s=timeout,
+                                        startup_timeout_s=args.startup_timeout, on_event=_emit)
+            result = _json(experiment)
+            code = 0 if experiment.passed else 1
+            for failure in experiment.failures:
+                print(f'assertion failed: {failure}', file=sys.stderr)
         else:
-            simulation.run_until(scene.duration_ns)
-        result = {'time_ns': simulation.t_sim_ns}
+            simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
+                                    mode=scene.mode, host_timeout_s=timeout,
+                                    startup_timeout_s=args.startup_timeout, on_event=_emit)
+            simulation.start()
+            if scene.mode == 'interactive':
+                _interactive(simulation, scene)
+            else:
+                simulation.run_until(scene.duration_ns)
+            result = {'time_ns': simulation.t_sim_ns}
     except BaseException as caught:
         error = caught
         code = 130 if isinstance(caught, KeyboardInterrupt) else 1
@@ -218,7 +227,7 @@ def main(argv=None):
                 else:
                     error.add_note(f'Simulation cleanup: {type(cleanup).__name__}: {cleanup}')
         signal.signal(signal.SIGTERM, previous)
-    payload = ({'status': 'passed', 'result': result} if error is None else
+    payload = ({'status': 'passed' if code == 0 else 'failed', 'result': result} if error is None else
                {'status': 'blocked' if code == 78 else 'failed', 'error': str(error),
                 'error_type': type(error).__name__, 'notes': getattr(error, '__notes__', [])})
     if args.command == 'run' and args.report:
@@ -237,5 +246,6 @@ def main(argv=None):
         for note in getattr(error, '__notes__', ()):
             print(note, file=sys.stderr)
     else:
-        print(f"passed: time_ns={result['time_ns']}")
+        stamp = result['time_ns'] if 'time_ns' in result else result['end_ns']
+        print(f"{payload['status']}: time_ns={stamp}")
     return code
