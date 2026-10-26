@@ -20,6 +20,7 @@ jobs:
           python -m pytest -q
           tests/test_topology.py tests/test_simulation.py
           tests/test_simulation_inputs.py tests/test_simulation_session.py tests/test_can_fabric.py
+          tests/test_can_host.py tests/test_scene_admission.py
           tests/test_can_bridge.py tests/test_can_endpoints.py tests/test_worker_transport.py
           tests/test_digital_fabric.py tests/test_uart_fabric.py
           tests/test_edge_fabric.py tests/test_joint_execution.py
@@ -27,6 +28,7 @@ jobs:
           tests/test_qmp_distribution.py tests/test_scene_cli.py
           tests/test_simulation_digital.py tests/test_simulation_rotor.py
           tests/test_sim_experiment.py tests/test_lab_experiment.py
+          tests/test_lab_manifest.py tests/test_automatic_lab_smoke.py
       - name: Installed CLI and missing native backend
         working-directory: /tmp
         env:
@@ -71,6 +73,22 @@ jobs:
               assert main(['run', str(pure_scene), '--report', str(pure_report)]) == 0
               assert json.loads(pure_report.read_text()) == {
                   'status': 'passed', 'result': {'time_ns': 2_000_000}}
+              experiment = directory / 'experiment.yaml'
+              experiment.write_text('schema: sim/v1\nruntime: {duration: 2ms}\nnodes:\n'
+                                    '  host: {kind: device.can-host}\n'
+                                    '  peer: {kind: device.can-host}\n'
+                                    '  bus: {kind: bus.can}\nlinks:\n'
+                                    '  - [host.can, bus.can]\n  - [peer.can, bus.can]\n'
+                                    'experiment:\n  inputs:\n'
+                                    '    - {at: 1ms, endpoint: host.tx, value: {id: 291, dlc: 1, data_hex: "42"}}\n'
+                                    '  assertions:\n    - before: 2ms\n'
+                                    '      can_seen: {endpoint: host.can, id: 291, data_hex: "42"}\n')
+              experiment_report = directory / 'experiment-report.json'
+              assert main(['validate', str(experiment)]) == 0
+              assert main(['run', str(experiment), '--report', str(experiment_report)]) == 0
+              observed = json.loads(experiment_report.read_text())
+              assert observed['status'] == 'passed' and observed['result']['status'] == ['pass']
+              assert observed['result']['delivered_inputs'] == 1
               (directory / 'firmware.elf').write_bytes(b'admission fixture; never executed')
               scene = directory / 'scene.yaml'
               scene.write_text('schema: sim/v1\nnodes:\n  main:\n'

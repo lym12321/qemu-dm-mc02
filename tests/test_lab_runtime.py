@@ -9,14 +9,6 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sim.lab import runtime
-from sim.lab.manifest import load_manifest
-
-
-def manifest(tmp_path, body=""):
-    (tmp_path / "guest.elf").write_bytes(b"fixture")
-    path = tmp_path / "lab.yaml"
-    path.write_text("schema: 1\nname: fixture\nboard: dm-mc02\nfirmware: guest.elf\nduration: 10ms\n" + body)
-    return load_manifest(path)
 
 
 def snapshot(time_ns, level=0):
@@ -136,34 +128,6 @@ def test_peer_cleanup_attempts_all_and_preserves_interrupt(tmp_path, monkeypatch
     assert "Lab cleanup QMP failed" in "\n".join(failure.value.__notes__)
 
 
-def test_run_manifest_returns_after_owner_cleanup_and_retains_dispatch_time(tmp_path, monkeypatch):
-    spec = manifest(tmp_path, "stimulus:\n  - at: 2ms\n    endpoint: key\n    pressed: true\nassertions:\n  - before: 8ms\n    digital_equals: {endpoint: led, value: 1}\n")
-    calls = []
-    states = iter((snapshot(100), snapshot(3_000_100), snapshot(7_000_100, 1),
-                   snapshot(10_000_100, 1), snapshot(10_500_100, 1)))
-    lab = SimpleNamespace(snapshot=lambda **kwargs: snapshot(100),
-                          pump=lambda **kwargs: (next(states), []),
-                          board=SimpleNamespace(resume=lambda: calls.append("cont"),
-                                                pause=lambda: calls.append("stop")),
-                          call=lambda callback, **kwargs: callback(),
-                          inject=lambda stimulus: calls.append(stimulus.endpoint) or 3_500_100,
-                          wait=lambda **kwargs: None)
-
-    @contextmanager
-    def open_lab(*args, **kwargs):
-        try:
-            yield lab
-        finally:
-            calls.append("cleanup")
-
-    monkeypatch.setattr(runtime, "open_lab", open_lab)
-    result = runtime.run_manifest(spec)
-    assert calls == ["cont", "key", "stop", "cleanup"]
-    assert result.passed and result.status == ("pass",)
-    assert result.dispatched == ((2_000_000, 3_500_100, "key"),)
-    assert result.end_ns == 10_500_100
-
-
 def test_adc_waits_for_genuine_native_time_not_fabricated_increment():
     stamps = iter((10, 10, 12))
     sent = []
@@ -178,24 +142,3 @@ def test_adc_waits_for_genuine_native_time_not_fabricated_increment():
     assert lab.inject(Stimulus(0, "adc1.ch4", "adc_raw", 12345)) == 12
     assert waits == [True, True]
     assert sent == [(4, {"timestamp_ns": 12, "raw": 12345})]
-
-
-def test_interruption_in_output_sink_still_releases_owner(tmp_path, monkeypatch):
-    spec = manifest(tmp_path)
-    released = []
-    lab = SimpleNamespace(snapshot=lambda **kwargs: snapshot(0),
-                          call=lambda callback, **kwargs: callback(),
-                          board=SimpleNamespace(resume=lambda: None),
-                          pump=lambda **kwargs: (snapshot(1), [object()]))
-    @contextmanager
-    def owner(*args, **kwargs):
-        try:
-            yield lab
-        finally:
-            released.append(True)
-    monkeypatch.setattr(runtime, "open_lab", owner)
-    def interrupted(event):
-        raise KeyboardInterrupt()
-    with pytest.raises(KeyboardInterrupt):
-        runtime.run_manifest(spec, emit=interrupted)
-    assert released == [True]

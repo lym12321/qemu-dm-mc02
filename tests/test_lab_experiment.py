@@ -12,17 +12,16 @@ from sim.boards.channels import ChannelEvent
 from sim.fabric import CanFrame
 from sim.fabric.frame import WIRE_FD, WIRE_BRS
 from sim.lab.experiment import LabExperiment
-from sim.lab.manifest import load_manifest
+from sim.lab.manifest import LabManifest, parse_assertion
+import yaml
 
 
 def manifest(tmp_path, body):
-    # Parse the actual production YAML loader rather than mirroring admission.
-    (tmp_path / "fw.elf").write_bytes(b"test-only firmware input")
-    path = tmp_path / "lab.yaml"
-    path.write_text("schema: 1\nname: experiment\nboard: dm-mc02\n"
-                    "firmware: fw.elf\nduration: 100ns\n" + dedent(body),
-                    encoding="utf-8")
-    return load_manifest(path)
+    document = yaml.safe_load(dedent(body)) or {}
+    assertions = tuple(parse_assertion(value, index) for index, value in
+                       enumerate(document.get("assertions", ())))
+    return LabManifest(tmp_path / "fixture", "observation", "dm-mc02",
+                       tmp_path / "fw.elf", 100, (), assertions)
 
 
 def state(timestamp, *, gpio=0, key=0, rgb=0):
@@ -45,27 +44,6 @@ def uart(time, data, endpoint="uart1"):
 
 def can(time, *, flags=0, dlc=1, payload=b"\xff", endpoint="can1"):
     return ChannelEvent(endpoint, time, CanFrame(0x123, flags, dlc, payload, time))
-
-
-def test_take_due_stable_once_including_exact_duration(tmp_path):
-    config = manifest(tmp_path, """
-        stimulus:
-          - {at: 20ns, endpoint: uart1, bytes: first}
-          - {at: 0ns, endpoint: key, pressed: true}
-          - {at: 20ns, endpoint: gpio.A0, value: 1}
-          - {at: 100ns, endpoint: can1, frame: {id: 0x123, dlc: 1, data_hex: ff}}
-    """)
-    experiment = LabExperiment(config, 1000)
-    assert experiment.take_due(1000) == (config.stimulus[1],)
-    assert experiment.take_due(1019) == ()
-    assert experiment.take_due(1020) == (config.stimulus[0], config.stimulus[2])
-    assert experiment.take_due(1020) == ()
-    assert experiment.take_due(1100) == (config.stimulus[3],)
-    assert experiment.take_due(1100) == ()
-    assert config.stimulus[3].value.timestamp_ns == 0
-    assert experiment.finish(1100) == () and experiment.all_passed
-    with pytest.raises(RuntimeError, match="finished"):
-        experiment.take_due(1100)
 
 
 def test_uart_split_matches_only_endpoint_with_post_read_bound(tmp_path):
@@ -146,7 +124,6 @@ def test_can_original_time_late_arrival_can_match_before_first_failure(tmp_path)
           - {before: 50ns, can_seen: {endpoint: can1, id: 0x123, data_hex: ff}}
     """)
     experiment = LabExperiment(config, 1000)
-    experiment.take_due(1055)  # Scheduling does not pre-expire observation gates.
     experiment.observe(state(1055), [can(1049)], 1055)
     assert experiment.status == ("pass",)
     failed = LabExperiment(config, 1000)
@@ -199,9 +176,6 @@ def test_clock_admission_preserves_pending_inputs_and_assertions(tmp_path, inval
         LabExperiment(config, invalid)
     experiment = LabExperiment(config, 1000)
     with pytest.raises((TypeError, ValueError)):
-        experiment.take_due(invalid)
-    assert experiment.take_due(1000) == config.stimulus
-    with pytest.raises((TypeError, ValueError)):
         experiment.observe(state(invalid), [], invalid)
     assert experiment.status == ("pending",)
 
@@ -213,7 +187,7 @@ def test_reverse_bounds_and_bad_batch_are_rejected_before_matching(tmp_path):
     experiment = LabExperiment(config, 1000)
     experiment.observe(state(1001), [], 1001)
     with pytest.raises(ValueError):
-        experiment.take_due(1000)
+        experiment.advance(1000)
     with pytest.raises(ValueError, match="post-read"):
         experiment.observe(state(1001), [uart(1001, b"OK")], 1002)
     with pytest.raises(ValueError, match="later"):

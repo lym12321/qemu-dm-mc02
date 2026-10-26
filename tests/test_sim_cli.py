@@ -19,8 +19,6 @@ from sim.arena import manifest as arena_manifest_module
 from sim.arena import runtime as arena_runtime
 from sim.boards.channels import ChannelEvent
 from sim.fabric import CanFrame
-from sim.lab import manifest as manifest_module
-from sim.lab import runtime
 from sim.robots import manifest as robot_manifest_module
 from sim.robots import runtime as robot_runtime
 from sim.scenario import manifest as scenario_manifest_module
@@ -28,8 +26,7 @@ from sim.scenario import runtime as scenario_runtime
 
 
 def manifest_runtime(group):
-    return {"lab": (manifest_module, runtime),
-            "robot": (robot_manifest_module, robot_runtime),
+    return {"robot": (robot_manifest_module, robot_runtime),
             "arena": (arena_manifest_module, arena_runtime),
             "scenario": (scenario_manifest_module, scenario_runtime)}[group]
 
@@ -40,10 +37,10 @@ def isolated(tmp_path, *arguments):
 
 
 def test_isolated_entry_help_and_module_help(tmp_path):
-    result = isolated(tmp_path, "lab", "run", "--help")
+    result = isolated(tmp_path, "lab", "interactive", "--help")
     assert result.returncode == 0, result.stderr
     assert "--startup-timeout" in result.stdout
-    assert "--gdb-port" in result.stdout and "--report" in result.stdout
+    assert "--gdb-port" in result.stdout and "--elf" in result.stdout
     result = isolated(tmp_path, "board", "run", "--help")
     assert result.returncode == 0, result.stderr
     assert "Ctrl-a c" in result.stdout and "--elf" in result.stdout
@@ -53,7 +50,7 @@ def test_isolated_entry_help_and_module_help(tmp_path):
     assert all(group in result.stdout for group in ("board", "lab", "robot", "arena", "scenario"))
 
 
-@pytest.mark.parametrize("group", ["lab", "robot", "arena", "scenario"])
+@pytest.mark.parametrize("group", ["robot", "arena", "scenario"])
 def test_invalid_manifest_rejected_before_qemu_effect(tmp_path, group):
     manifest = tmp_path / "invalid.yaml"
     manifest.write_text("schema: 99\n", encoding="utf-8")
@@ -79,9 +76,9 @@ def test_cli_option_admission_precedes_loading(monkeypatch, options):
     def forbidden(*_args, **_kwargs):
         pytest.fail("manifest was loaded before CLI option admission")
 
-    monkeypatch.setattr(manifest_module, "load_manifest", forbidden)
+    monkeypatch.setattr(robot_manifest_module, "load_manifest", forbidden)
     with pytest.raises(SystemExit) as caught:
-        cli.main(["lab", "run", "unused.yaml", *options])
+        cli.main(["robot", "run", "unused.yaml", *options])
     assert caught.value.code == 2
 
 
@@ -102,37 +99,8 @@ def test_board_run_forwards_native_options_without_reinterpreting(monkeypatch):
     assert calls == [(launcher, [launcher, *options])]
 
 
-def test_lab_runtime_options_safe_stream_output_and_success_report(monkeypatch, tmp_path, capsys):
-    admitted = object()
-    monkeypatch.setattr(manifest_module, "load_manifest", lambda path: admitted)
-    calls = []
-
-    def run(manifest, **options):
-        calls.append((manifest, options))
-        options["emit"](ChannelEvent("uart1", 8, b"hello\n\x1b[2J\xff"))
-        options["emit"](ChannelEvent("can1", 9, CanFrame(0x321, data=b"A", timestamp_ns=9)))
-        return runtime.LabResult("fixture", 1, 10, ("pass",), (), ((2, 3, "key"),), 4)
-
-    monkeypatch.setattr(runtime, "run_manifest", run)
-    report = tmp_path / "result.json"
-    assert cli.main(["lab", "run", "fixture.yaml", "--qemu", "native-qemu",
-                     "--timeout", "20", "--startup-timeout", "2", "--qmp", "native.sock",
-                     "--gdb-port", "1235", "--paused", "--report", str(report)]) == 0
-    manifest, options = calls[0]
-    assert manifest is admitted
-    assert {name: value for name, value in options.items() if name != "emit"} == {
-        "paused": True, "qemu": "native-qemu", "startup_timeout": 2.0,
-        "timeout": 20.0, "qmp_path": "native.sock", "gdb_port": 1235,
-    }
-    output = capsys.readouterr().out
-    assert "poll_sample_ns=8" in output and "\\x1b[2J" in output
-    assert "\x1b" not in output and "native_timestamp_ns=9" in output and "data=41" in output
-    result = json.loads(report.read_text())
-    assert result["status"] == "passed" and result["result"]["status"] == ["pass"]
-
-
 @pytest.mark.parametrize("interrupt", [False, True])
-@pytest.mark.parametrize("group", ["lab", "robot", "arena", "scenario"])
+@pytest.mark.parametrize("group", ["robot", "arena", "scenario"])
 def test_runtime_failure_and_cleanup_notes_remain_failed(monkeypatch, tmp_path, capsys, interrupt, group):
     loader, runner = manifest_runtime(group)
     monkeypatch.setattr(loader, "load_manifest", lambda path: object())
@@ -154,17 +122,7 @@ def test_runtime_failure_and_cleanup_notes_remain_failed(monkeypatch, tmp_path, 
     assert "passed" not in output.out
 
 
-def test_assertion_failure_is_nonzero(monkeypatch, tmp_path, capsys):
-    monkeypatch.setattr(manifest_module, "load_manifest", lambda path: object())
-    monkeypatch.setattr(runtime, "run_manifest", lambda *_args, **_kwargs:
-                        runtime.LabResult("fixture", 1, 10, ("fail",), ("KEY missing",), (), 1))
-    report = tmp_path / "failed.json"
-    assert cli.main(["lab", "run", "fixture.yaml", "--report", str(report)]) == 1
-    assert json.loads(report.read_text())["status"] == "failed"
-    assert "KEY missing" in capsys.readouterr().err
-
-
-@pytest.mark.parametrize("group", ["lab", "robot", "arena", "scenario"])
+@pytest.mark.parametrize("group", ["robot", "arena", "scenario"])
 def test_sigterm_unwinds_runtime_and_restores_callers_handler(monkeypatch, tmp_path, group):
     loader, runner = manifest_runtime(group)
     monkeypatch.setattr(loader, "load_manifest", lambda path: object())
@@ -314,12 +272,11 @@ def test_manifest_run_option_admission_precedes_manifest_loading(monkeypatch, gr
     assert caught.value.code == 2
 
 
-@pytest.mark.parametrize("group", ["lab", "robot", "arena", "scenario"])
+@pytest.mark.parametrize("group", ["robot", "arena", "scenario"])
 def test_report_write_failure_cannot_publish_passed(monkeypatch, tmp_path, capsys, group):
     loader, runner = manifest_runtime(group)
     monkeypatch.setattr(loader, "load_manifest", lambda path: object())
-    result = {"lab": runtime.LabResult("fixture", 1, 10, ("pass",), (), (), 1),
-              "robot": robot_runtime.RobotResult("four-wheel", "not requested", 1, 2, 1, ()),
+    result = {"robot": robot_runtime.RobotResult("four-wheel", "not requested", 1, 2, 1, ()),
               "arena": arena_runtime.ArenaResult("two-wheel", 1, 2, 1, (), ()),
               "scenario": arena_runtime.ArenaResult("two-wheel", 1, 2, 1, (), ())}[group]
     monkeypatch.setattr(runner, "run_manifest", lambda *_args, **_kwargs: result)

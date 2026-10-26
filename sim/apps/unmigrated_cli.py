@@ -66,14 +66,8 @@ def _parser() -> argparse.ArgumentParser:
     boards = board.add_subparsers(dest="action", required=True)
     boards.add_parser("run", help="forward all options to tools/run-qemu.sh",
                       add_help=False)
-    lab = groups.add_parser("lab", help="manifest experiments and interactive public board IO")
+    lab = groups.add_parser("lab", help="native interactive public board IO")
     labs = lab.add_subparsers(dest="action", required=True)
-    run = labs.add_parser("run", help="apply a Lab manifest and report its assertions",
-                         description="Run one YAML Lab manifest with native QEMU observations.")
-    run.add_argument("manifest", metavar="PATH", type=Path,
-                     help="YAML manifest; firmware paths are relative to its directory")
-    _runtime_options(run, timeout=30.0)
-    run.add_argument("--report", type=Path, metavar="PATH", help="write JSON result, including failures")
     interactive = labs.add_parser("interactive", help="observe UART/CAN and enter GPIO/key/ADC commands",
                                   description="Use a pipe or TTY for commands; enter help to list commands.")
     interactive.add_argument("--elf", required=True, type=Path, metavar="PATH", help="firmware ELF")
@@ -154,42 +148,6 @@ def _diagnose(error: BaseException) -> None:
     print(f"error: {error}", file=sys.stderr)
     for note in getattr(error, "__notes__", ()):
         print(note, file=sys.stderr)
-
-
-def _run_lab(args) -> int:
-    code = 1
-    try:
-        # Help and the native board launcher need no Lab/YAML dependencies.
-        from sim.lab.manifest import load_manifest
-        from sim.lab.runtime import run_manifest
-
-        manifest = load_manifest(args.manifest)
-        result = run_manifest(
-            manifest, emit=_emit, paused=args.paused, qemu=args.qemu,
-            startup_timeout=args.startup_timeout, timeout=args.timeout,
-            qmp_path=args.qmp, gdb_port=args.gdb_port)
-        # run_manifest returns only after every connection/process cleanup.
-        payload = {"status": "passed" if result.passed else "failed",
-                   "result": asdict(result)}
-        code = 0 if result.passed else 1
-        for failure in result.failures:
-            print(f"assertion failed: {failure}", file=sys.stderr)
-    except (Exception, KeyboardInterrupt) as error:
-        _diagnose(error)
-        payload = {"status": "failed", "error": str(error),
-                   "error_type": type(error).__name__,
-                   "notes": list(getattr(error, "__notes__", ()))}
-        code = 130 if isinstance(error, KeyboardInterrupt) else 1
-    if args.report is not None:
-        try:
-            _write_report(args.report, payload)
-        except (Exception, KeyboardInterrupt) as error:
-            _diagnose(error)
-            return 130 if isinstance(error, KeyboardInterrupt) else 1
-    if "result" in payload:
-        print(f"Lab {result.name!r}: {payload['status']} "
-              f"({len(result.status)} assertions)", flush=True)
-    return code
 
 
 def _interrupted(signum, _frame) -> None:
@@ -358,7 +316,7 @@ def main(argv=None) -> int:
             return _run_scenario_replay(args)
         if args.group in ("arena", "scenario"):
             return _run_arena(args)
-        return _run_lab(args) if args.action == "run" else _run_interactive(args)
+        return _run_interactive(args)
     finally:
         signal.signal(signal.SIGTERM, previous)
 

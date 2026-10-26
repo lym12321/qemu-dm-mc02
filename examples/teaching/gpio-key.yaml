@@ -1,10 +1,14 @@
-schema: 1
-name: gpio-key-lesson
-board: dm-mc02
-firmware: ../../build/teaching/Debug/gpio_key.elf
-duration: 800ms
-stimulus:
-  - {at: 100ms, endpoint: key, pressed: true}
-  - {at: 600ms, endpoint: key, pressed: false}
-assertions:
-  - {before: 500ms, digital_equals: {endpoint: gpio.B0, value: 1}}
+schema: sim/v1
+runtime: {duration: 800ms, quantum: 1ms}
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ../../build/teaching/Debug/gpio_key.elf
+    uarts: []
+experiment:
+  inputs:
+    - {at: 100ms, endpoint: main.key, value: true}
+    - {at: 600ms, endpoint: main.key, value: false}
+  assertions:
+    - {before: 500ms, digital_equals: {endpoint: main.gpio.B0, value: 1}}

@@ -1,4 +1,4 @@
-"""Consume Lab manifest stimuli and observations without owning IO or clocks.
+"""Consume actual Lab observations without owning IO or clocks.
 
 The native Lab adapter supplies QEMU times; Simulation supplies public Event
 times. UART assertions use a post-read QMP upper bound; CAN assertions retain
@@ -15,7 +15,7 @@ from sim.boards import digital_level
 from sim.fabric import CanFrame
 from sim.fabric.can import check_can_time
 
-from .manifest import Assertion, LabManifest, Stimulus
+from .manifest import Assertion, LabManifest
 
 if TYPE_CHECKING:
     from sim.boards.channels import ChannelEvent
@@ -164,9 +164,8 @@ class LabExperiment(AssertionEvaluator):
     consume a late-arriving frame whose original wire time precedes its deadline.
     Once passed or failed, an assertion never changes again.
 
-    ``take_due`` returns each stimulus once in stable timestamp order, including
-    actions exactly at duration. It does not assess deadlines or synthesize an
-    execution time. The runner owns input dispatch, readiness and resource cleanup.
+    This adapter only projects native snapshots/channel batches for existing
+    Scenario/replay consumers. Finite input scheduling belongs to Simulation.
     """
 
     def __init__(self, manifest: LabManifest, origin_ns: int):
@@ -174,22 +173,6 @@ class LabExperiment(AssertionEvaluator):
             raise TypeError("LabExperiment requires a validated LabManifest")
         super().__init__(manifest.assertions, manifest.duration_ns, origin_ns)
         self.manifest = manifest
-        self._stimulus = tuple(sorted(manifest.stimulus, key=lambda item: item.at_ns))
-        self._next_stimulus = 0
-
-    def take_due(self, timestamp_ns: int) -> tuple[Stimulus, ...]:
-        """Return newly due stimuli once; the caller supplies their dispatch time."""
-        self._check_clock(timestamp_ns)
-        if self._finished:
-            raise RuntimeError("Lab experiment is finished")
-        end = self._next_stimulus
-        while (end < len(self._stimulus) and
-               self.origin_ns + self._stimulus[end].at_ns <= timestamp_ns):
-            end += 1
-        due = self._stimulus[self._next_stimulus:end]
-        self._next_stimulus = end
-        self._time_ns = timestamp_ns
-        return due
 
     def observe(self, snapshot: dict, events: list[ChannelEvent],
                 uart_bound_ns: int) -> None:

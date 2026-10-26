@@ -7,7 +7,7 @@ an observation, not a CPU or peripheral barrier. No guest memory is accessed.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 import select
 import time
@@ -23,8 +23,7 @@ from tools.dm_mc02_qmp import QmpSession
 from tools.dm_mc02_sim_worker import CanStream, FramedSocket, TELEMETRY
 from tools.dm_mc02_test_harness import running_qemu
 
-from .experiment import LabExperiment
-from .manifest import LabManifest, Stimulus
+from .manifest import Stimulus
 
 
 class ConnectedLab:
@@ -174,87 +173,3 @@ def open_lab(firmware, *, qemu=None, uarts=(), cans=(), adc=False,
                     BaseException.add_note(error, f"Lab cleanup {label} failed: {exc}")
                 if primary is None:
                     raise error
-
-
-@dataclass(frozen=True)
-class LabResult:
-    name: str
-    origin_ns: int
-    end_ns: int
-    status: tuple[str, ...]
-    failures: tuple[str, ...]
-    dispatched: tuple[tuple[int, int, str], ...]
-    observation_batches: int
-
-    @property
-    def passed(self) -> bool:
-        return not self.failures and all(status == "pass" for status in self.status)
-
-
-def run_manifest(manifest: LabManifest, *, emit=None, paused=False, **options) -> LabResult:
-    """Run one manifest; return only after protocol and process cleanup succeeds."""
-    if not isinstance(manifest, LabManifest) or type(paused) is not bool:
-        raise TypeError("LabManifest and a boolean paused option are required")
-    if emit is not None and not callable(emit):
-        raise TypeError("Lab output sink must be callable")
-    if paused and options.get("gdb_port") is None:
-        raise ValueError("paused Lab run requires a native GDB port")
-    endpoints = {item.endpoint for item in (*manifest.stimulus, *manifest.assertions)}
-    if manifest.ready is not None:
-        endpoints.add(manifest.ready.endpoint)
-    batches = 0
-    with open_lab(manifest.firmware, uarts=tuple(port for port in UARTS if port in endpoints),
-                  cans=tuple(port for port in CANS if port in endpoints),
-                  adc=any(port.startswith("adc1.") for port in endpoints), **options) as lab:
-        origin = lab.snapshot(startup=True)["timestamp_ns"]
-        if paused:
-            while not lab.call(lambda: lab.qmp.command("query-status"), startup=True)["running"]:
-                lab.wait(startup=True)
-        else:
-            lab.call(lab.board.resume, startup=True)
-        if manifest.ready is not None:
-            tail = b""
-            while True:
-                state, events = lab.pump(startup=True)
-                batches += 1
-                ready = False
-                for event in events:
-                    if emit is not None:
-                        emit(event)
-                    if event.endpoint == manifest.ready.endpoint:
-                        combined = tail + event.data
-                        ready |= manifest.ready.text in combined
-                        tail = combined[-(len(manifest.ready.text) - 1):] if len(manifest.ready.text) > 1 else b""
-                if ready:
-                    origin = state["timestamp_ns"]
-                    break
-                lab.wait(startup=True)
-        experiment = LabExperiment(manifest, origin)
-        dispatched = []
-        while True:
-            state, events = lab.pump()
-            batches += 1
-            if emit is not None:
-                for event in events:
-                    emit(event)
-            stamp = state["timestamp_ns"]
-            experiment.observe(state, events, stamp)
-            for stimulus in experiment.take_due(stamp):
-                actual = lab.inject(stimulus)
-                dispatched.append((stimulus.at_ns, actual, stimulus.endpoint))
-            if stamp - origin >= manifest.duration_ns:
-                # Flush final at=duration injections without pretending an
-                # additional CPU observation window exists.
-                state, events = lab.pump()
-                batches += 1
-                if emit is not None:
-                    for event in events:
-                        emit(event)
-                experiment.observe(state, events, state["timestamp_ns"])
-                experiment.finish(state["timestamp_ns"])
-                break
-            lab.wait()
-        lab.call(lab.board.pause)
-        result = LabResult(manifest.name, origin, state["timestamp_ns"], experiment.status,
-                           experiment.failures, tuple(dispatched), batches)
-    return result

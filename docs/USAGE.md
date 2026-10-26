@@ -145,7 +145,7 @@ M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换�
 现有 Arena 的共享世界路径也由 Simulation 调度原生 CPU request/finish、CAN/plant
 和 referee；实际 participant 的资源所有权一次转交，借用连接仍由原调用方清理。
 reset、成员提前退出或清理错误使当前运行失败，不重步或发布成功。
-CAN worker 的跨 RESET 资源重建也已迁入 Simulation。独特的 Lab/Gazebo 应用能力
+CAN worker 的跨 RESET 资源重建也已迁入 Simulation。有限自动 Lab 实验已迁入 Simulation；原生交互/Web/GDB 自由运行和独特的 Gazebo 应用能力
 仍保留原入口；这不代表旧执行路径已全部删除。
 
 ### 有限实验与断言
@@ -168,8 +168,10 @@ python examples/experiment/main.py --qemu build/qemu/qemu-system-arm \
 UART/CAN 入队通知不能满足断言；严格截止断言拒绝仅有时间下界的观察证据。
 UART 跨块匹配只保留必要后缀，网络交付仍不证明固件消费。
 每个实验最多63个用户节点、1024条输入和1024条断言；只支持有限 stepped 场景，
-时间原点为 Simulation 的0，不等待应用 ready。ready 相对时间、ADC/VIN、原交互/Web、
-trace/capture 和故障脚本的完整迁移尚未完成，旧入口继续承载这些独特能力。
+未声明 ready 时，实验原点为 Simulation 的0；声明 `experiment.ready` 后，用实际 UART 观察
+的交付切点作为相对原点，输入及断言平移，Session/Event/native 时钟保持不变。包含 ready
+的整个切点属于启动观察，不参与断言。ready 与资源创建共用 startup host 期限，总期限
+不会重新计时。ADC1 输入已接入；VIN、原交互/Web、trace/capture 与故障脚本仍由旧入口承载。
 
 
 <a id="rotor-loop"></a>
@@ -310,13 +312,14 @@ FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot
 同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
 
 当前执行 CAN、采样数字 GPIO、完成态 SI IMU，以及 M3508 到共享 MuJoCo World 的关节绑定。
-UART 可作机器外部输入、观测或跨节点字节流连线；SPI/I2C/ADC 连接尚未接入统一运行时，
+UART 可作机器外部输入、观测或跨节点字节流连线；ADC1 可作显式外部输入，
+SPI/I2C/ADC 网络连接尚未接入统一运行时，
 不支持的连接在创建资源前拒绝。第二种真实 MCU 和跨板事件级锁步尚未实现；
 DM-MC02 是首个真实 profile，不能靠 YAML 声明额外板卡。
 `api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
 
-Lab、Robot、Arena、Scenario 及原有 MuJoCo/Gazebo/Trace 组合仍是**尚未迁移的应用**，
-下面的相关命令统一使用 `tools/sim-unmigrated`；它们的旧 runner 不属于新 Simulation 支持范围。
+自动单板 Lab 使用 `sim run`。原生交互/Web、Robot/Arena/Scenario 的独特应用及
+Gazebo/Trace 路径仍有未迁移部分，相关入口使用 `tools/sim-unmigrated`。
 迁移时须保留各自底层和直接消费者回归，通过 factory/公开事件接入同一 Runtime，不能新增 scheduler。
 
 ## 原生板级接口与既有应用
@@ -367,12 +370,10 @@ ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(ti
 可运行 `tools/run-lab-channels-smoke.sh` 验证真实固件 UART/CAN/ADC 与按键驱动 LED；
 该裸机测试夹具是数字模型消费者，不代表实板校准或完整 HAL 初始化。
 
-Lab 配置使用锁定的 PyYAML 6.0.3；运行 Python 工具前执行 `uv sync --frozen`。
-`sim.lab.load_manifest(path)` 读取 schema 1 YAML，固件路径相对 manifest 目录；时间使用
-整数 `ns`/`us`/`ms`/`s` 字符串。省略 `duration` 时取最大的 stimulus `at` 或 assertion
-`before`。未知字段、重复 key、错误类型和不支持的端点直接拒绝；不支持 YAML anchor/alias。
-配置文件最多 1 MiB，stimulus/assertions 各最多 1024 条，文本最多 4096 UTF-8 字节，
-虚拟时间最多 3600 秒。`at=duration` 可做最终发送，响应没有额外等待窗口。
+自动实验使用下面的 `sim/v1` 场景；原 schema1 自动 Lab loader 和 `lab run` 已删除。
+配置复用锁定的 PyYAML 6.0.3：拒绝未知/重复字段、类型错误、anchor/alias及资源超限。
+文件最多1MiB，输入/断言各最多1024条，文本最多4096 UTF-8字节，配置时长最多3600秒。
+`at=duration` 只做最终交付，没有额外响应窗口。
 
 Python 调用者可用 `sim.lab.parse_assertion(value, index)` 单独解析一个同格式的断言，
 返回冻结的 `Assertion`；`index` 为诊断使用的零基位置。解析不读取文件或导入板卡运行层。
@@ -397,7 +398,7 @@ B0 是本课观察的数字输出；板载 A7 是 WS2812 数据线，普通 GPIO
 uv sync --frozen
 cmake -S examples/teaching -B build/teaching/Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/teaching/Debug
-uv run tools/sim-unmigrated lab run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
+uv run tools/sim run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
 ```
 
 Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同命令，
@@ -461,60 +462,62 @@ GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字�
 当前只交付第一课；UART、ADC、CAN 实验将沿用同一工程逐课增加。
 
 <a id="virtual-lab"></a>
-## Virtual Lab（尚未迁移）
+<a id="virtual-lab"></a>
+## Virtual Lab
 
-先安装固定 Python 依赖，再运行实验：
+有限自动实验使用同一 Simulation：
 
 ```bash
-uv sync --frozen
-uv run tools/sim-unmigrated lab run path/to/lab.yaml --report build/lab-result.json
-# 验证公共示例，自动编译专用裸机测试固件：
+uv run tools/sim validate path/to/scene.yaml
+uv run tools/sim run path/to/scene.yaml --report build/lab-result.json
+# 自动编译真实专用固件，保留直接通道及原生交互/GDB验收：
 nix develop -c bash tools/run-lab-channels-smoke.sh
 ```
 
 [board-io.yaml](../examples/labs/board-io.yaml) 展示 UART、按键/LED、GPIO、CAN 和 ADC1。
-`firmware` 相对 YAML 目录，普通固件应填写自身实际输出的 `ready` 文本；省略 ready 时以
-QEMU 首次恢复前的虚拟快照作为时间起点，不判断应用已就绪。显式 ready 的时间起点取读取
-该串口批次后的 QMP 上界，可能晚于真正的 ready 字节。实验只连接配置引用的端点。
+`firmware` 相对 YAML 目录；ready 必须是应用真实输出，不以 socket 出现或发送成功代替。
+UART 分片保留最小匹配后缀，ready 原点取读后观察的交付切点，可能晚于实际字节产生。
 
 ```yaml
-schema: 1
-name: uart-check
-board: dm-mc02
-firmware: build/student.elf
-stimulus:
-  - {at: 100ms, endpoint: uart1, bytes: hello}
-assertions:
-  - before: 200ms
-    uart_contains: {endpoint: uart2, text: received 5 bytes}
-  - before: 250ms
-    digital_equals: {endpoint: led, value: 1}
+schema: sim/v1
+runtime: {duration: 250ms, quantum: 1ms}
+nodes:
+  main: {kind: machine.qemu, firmware: build/student.elf, uarts: [uart1, uart2]}
+experiment:
+  ready: {endpoint: main.uart1, text: READY}
+  inputs:
+    - {at: 100ms, endpoint: main.uart1, value: hello}
+  assertions:
+    - before: 200ms
+      uart_contains: {endpoint: main.uart2, text: received 5 bytes}
+    - before: 250ms
+      digital_equals: {endpoint: main.led, value: 1}
 ```
 
-UART 端点为 `uart1/2/3/5/7/10`，CAN 为 `can1/2/3`。输入还支持 `key`+`pressed`、
-`gpio.A0`+`value`、`adc1.ch4`+`raw` 或 `voltage_uv`，CAN 使用 `frame` 的 `id/flags/dlc/data_hex`。
-CAN 断言 `can_seen` 要求 `endpoint/id`，可再指定精确 flags、DLC 和完整 data_hex；输出 payload
-较短时沿用既有 wire 零填充。UART 文本使用 UTF-8。ADC2 注入和自动 IMU 环境尚未支持。
+输入端口使用 qualified `main.key`（布尔）、`main.gpio.B0`（0/1）、`main.uart1`（UTF-8或Python bytes）。
+UART5 只由 `remote: true` 暴露为 `main.remote` 遥控器 RX 原始字节输入；不提供 TX 或 SBUS/DR16解析。
+CAN 刺激使用 `device.can-host` 的 `tx`，其 `can` 与机器 `fdcan1/2/3` 连接同一 `bus.can`；
+值为 `{id: 0x321, flags: 0, dlc: 2, data_hex: '4142'}`。它复用总线队列，发送时间取实际交付切点。
+`can_seen` 可约束 ID/flags/DLC/完整数据，接收固件证据需依赖实际 guest 应答。
 
-`--qemu` 覆盖 QEMU 路径；`--timeout` 默认 30 秒，`--startup-timeout` 默认 10 秒，都从
-启动前开始计入。QMP 连接和实际 ready 等待共用 startup 期限，不能以 socket 出现代替 ready。
-输入在观测到 QEMU 时间到期后发送，存在轮询延迟；报告保留计划时间和发送时的观测样本。
-串口显示 polling sample，CAN 显示原生 wire 时间。实验失败、进程退出、中断或清理失败都非零。
-这些检查证明声明的数字边界，不建立 CPU/plant 全局锁步或物理真实性。
+机器 `adc: true` 启用 `main.adc1.ch0` 至 `ch31` 外部输入，值为恰好一个
+`{raw: 12345}` 或 `{voltage_uv: 1650000}`，范围分别0..65535、0..3300000。
+同切点每通道最多一次，最多16通道；与 `net.imu` 的同切点样本合并为唯一 v2 STEP，
+最大payload512字节。ADC不能在绝对Session原点0提交，也不能重开已发送STEP的切点，
+不伪造+1ns。ADC-only ACK只证明native输入准入；IMU DONE需另观察实际die消费。
+[adc-imu-readback](../examples/adc-imu-readback/scene.yaml) 用真实DR/SPI/sensortime及DONE验证联合输入。
+ADC2、ADC网络互连及精确GPIO边沿未支持。
+
+`--timeout` 默认30秒、`--startup-timeout` 默认10秒，均包含资源创建；ready不重启总预算。
+报告只在清理结束后创建，拒绝覆盖；状态为passed/failed/blocked，断言失败退出1、缺后端78。
+报告保留相对原点、ready receipt及匹配事件source/mapped/delivery/quality，不把ACK等同于应用消费。
+不提供CPU/plant全局锁步或实板校准保证。
+
+原生自由运行、手动GDB与交互仍使用已有连接owner：
 
 ```bash
-# Lab 内部 monitor 与用户 QMP 独立；GDB 使用 QEMU 原生 server：
-uv run tools/sim-unmigrated lab run lab.yaml --qmp /tmp/student-qmp.sock --gdb-port 1234 --paused
-# 在 startup 期限内从 GDB 恢复，或增大 --startup-timeout/--timeout：
-arm-none-eabi-gdb build/student.elf
-# (gdb) target remote 127.0.0.1:1234
-# (gdb) continue
-# 原生 UART terminal、monitor mux、GDB 和 QMP 仍可直接使用：
 uv run tools/sim-unmigrated board run --elf build/student.elf --debug --qmp /tmp/student-qmp.sock
 ```
-
-从仓库根目录可用 `uv run python -m sim`；`tools/sim` 也可从任意目录启动，或将 `tools`
-加入 PATH 后直接使用 `sim`。`board run` 原样调用现有 launcher，不重建调试协议。
 
 交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
 

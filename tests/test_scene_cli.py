@@ -382,7 +382,7 @@ def test_teaching_automatic_consumer_uses_real_simulation_cli_and_report(
         def describe(self, spec):
             description = admission.describe(spec)
             return NodeDescription(description.ports,
-                (description.capabilities - {"input_commit"}) | {"sample"})
+                (description.capabilities - {"machine", "input_commit"}) | {"sample"})
 
         def validate_input(self, *args, **kwargs):
             return admission.validate_input(*args, **kwargs)
@@ -410,7 +410,8 @@ def test_teaching_automatic_consumer_uses_real_simulation_cli_and_report(
     result = record["report"]["result"]
     assert result["status"] == (["fail"] if constant_low else ["pass"])
     if not constant_low:
-        assert result["matches"][0]["delivery_time_ns"] == 100_000_000
+        # A cut's input cannot alter the snapshot already sampled at that cut.
+        assert result["matches"][0]["delivery_time_ns"] == 101_000_000
 
 
 def test_missing_native_backend_is_blocked_and_preserves_report(tmp_path):

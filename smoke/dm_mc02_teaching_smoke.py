@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Actual Lab/GDB consumers of the first GPIO teaching lesson.
+"""Actual Simulation and Lab/GDB consumers of the first GPIO teaching lesson.
 
 Only public native board snapshots establish the ordered key/output sequence.
 The YAML consumer is a separate entry-point check: `before` assertions alone
@@ -204,27 +204,34 @@ def direct(elf, qemu, gdb, record):
                 BaseException.add_note(primary, str(error))
 
 
-def lab_cli(elf, qemu, manifest_path, directory, record, *, expect_failure=False):
+def simulation_cli(elf, qemu, manifest_path, directory, record, *, expect_failure=False):
     import yaml
 
     document = yaml.safe_load(manifest_path.read_text())
-    document["firmware"] = str(elf)
+    document["nodes"]["main"]["firmware"] = str(elf)
     manifest = directory / "lesson.yaml"
     manifest.write_text(yaml.safe_dump(document, sort_keys=False))
-    report = directory / "lab-result.json"
-    result = command([sys.executable, str(ROOT / "tools/sim-unmigrated"), "lab", "run", str(manifest),
+    report = directory / "simulation-result.json"
+    result = command([sys.executable, str(ROOT / "tools/sim"), "run", str(manifest),
                       "--qemu", str(qemu), "--startup-timeout", "10", "--timeout", "15",
                       "--report", str(report)], time.monotonic() + 20.0, record)
     record["report"] = json.loads(report.read_text())
+    payload = record["report"]
+    summary = payload.get("result")
+    if (not isinstance(summary, dict) or summary.get("end_ns") != 800_000_000
+            or summary.get("origin_ns") != 0 or summary.get("ready_receipt") is not None
+            or summary.get("delivered_inputs") != 2):
+        raise AssertionError(f"Simulation CLI did not complete the GPIO lesson: {record!r}")
     if expect_failure:
-        payload = record["report"]
         if (result["returncode"] != 1 or payload["status"] != "failed"
-                or not any("digital_equals gpio.B0 did not match before" in item
+                or summary.get("status") != ["fail"]
+                or not any("digital_equals main.gpio.B0 did not match before" in item
                            for item in payload["result"]["failures"])
                 or "failed" not in result["stdout"] or "passed" in result["stdout"]):
-            raise AssertionError(f"constant-low Lab CLI unexpectedly passed: {record!r}")
-    elif result["returncode"] != 0 or record["report"]["status"] != "passed":
-        raise AssertionError(f"Lab CLI lesson failed: {record!r}")
+            raise AssertionError(f"constant-low Simulation CLI unexpectedly passed: {record!r}")
+    elif (result["returncode"] != 0 or payload["status"] != "passed"
+            or summary.get("status") != ["pass"]):
+        raise AssertionError(f"Simulation CLI lesson failed: {record!r}")
     # This entrypoint gate does not claim its `before` assertions prove order.
 
 
@@ -341,7 +348,7 @@ def main():
     args = parser.parse_args()
     elfs = {name: regular_file(path, f"{name} lesson ELF") for name, path in (
         ("Debug", args.debug_elf), ("Release", args.release_elf), ("constant-low", args.bad_elf))}
-    manifest = regular_file(args.manifest, "teaching Lab manifest")
+    manifest = regular_file(args.manifest, "teaching scene")
     qemu = resolve_qemu(args.qemu)
     selected = args.gdb or shutil.which("arm-none-eabi-gdb") or shutil.which("gdb-multiarch")
     if selected is None:
@@ -355,13 +362,13 @@ def main():
     code = 1
     try:
         for profile in ("Debug", "Release"):
-            for name, function in (("direct-and-native-gdb", direct), ("lab-cli", lab_cli),
+            for name, function in (("direct-and-native-gdb", direct), ("simulation-cli", simulation_cli),
                                    ("interactive-cli", interactive)):
                 record = {"profile": profile, "case": name, "status": "failed", "stages": []}
                 report["cases"].append(record)
                 if function is direct:
                     function(elfs[profile], qemu, gdb, record)
-                elif function is lab_cli:
+                elif function is simulation_cli:
                     directory = args.output / profile
                     directory.mkdir()
                     function(elfs[profile], qemu, manifest, directory, record)
@@ -384,12 +391,12 @@ def main():
                           error_type=type(error).__name__, notes=list(getattr(error, "__notes__", ())))
         else:
             raise AssertionError("constant-low firmware unexpectedly passed the original acceptance")
-        record = {"profile": "constant-low", "case": "same-lab-cli-assertion",
+        record = {"profile": "constant-low", "case": "same-simulation-cli-assertion",
                   "status": "failed", "stages": []}
         report["cases"].append(record)
         directory = args.output / "constant-low"
         directory.mkdir()
-        lab_cli(elfs["constant-low"], qemu, manifest, directory, record, expect_failure=True)
+        simulation_cli(elfs["constant-low"], qemu, manifest, directory, record, expect_failure=True)
         record["status"] = "expected-failure"
         if {path: sha(path) for path in protected} != protected:
             raise AssertionError("teaching consumer inputs changed during the gate")
