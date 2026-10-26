@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import replace
 from typing import Protocol
 
-from sim.fabric.can import CanBus, check_can_time
+from sim.fabric.can import CanPort, check_can_port, check_can_time
 from sim.fabric.frame import CanFrame
 
 
@@ -29,10 +29,9 @@ class TimestampMapper(Protocol):
 class QemuCanEndpoint:
     """Translate fixed-record transport timestamps to/from one CAN bus epoch."""
 
-    def __init__(self, bus: CanBus, stream: QemuCanStream,
+    def __init__(self, bus: CanPort, stream: QemuCanStream,
                  name: str = "qemu"):
-        if not isinstance(bus, CanBus):
-            raise TypeError("QEMU CAN endpoint requires a CanBus")
+        check_can_port(bus)
         send = getattr(stream, "send", None)
         if not callable(send):
             raise TypeError("QEMU CAN stream requires callable send")

@@ -20,6 +20,20 @@ class CanEndpoint(Protocol):
     def receive(self, frame: CanFrame) -> None: ...
 
 
+class CanPort(Protocol):
+    """Borrowed attachment and send contract, without queue ownership."""
+
+    def attach(self, endpoint: CanEndpoint, name: str | None = None) -> None: ...
+
+    def send(self, source: CanEndpoint, frame: CanFrame) -> None: ...
+
+
+def check_can_port(port: CanPort) -> None:
+    if any(not callable(getattr(port, method, None))
+           for method in ("attach", "send")):
+        raise TypeError("CAN port requires callable attach and send")
+
+
 @dataclass(frozen=True)
 class CanDelivery:
     """One destination decision; ``frame`` retains its original timestamp."""

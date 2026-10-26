@@ -5,6 +5,26 @@ from sim.api import NodeDescription, PortSpec
 from .can import CanBus, check_can_time
 
 
+class BorrowedCanPort:
+    """Adapt one protocol endpoint to an admitted Simulation connection."""
+
+    def __init__(self, context, port="can"):
+        self._context = context
+        self._port = port
+        self._endpoint = self._connection = None
+
+    def attach(self, endpoint, name=None):
+        if self._endpoint is not None:
+            raise ValueError("CAN port already has an endpoint")
+        connection = self._context.attach(self._port, endpoint)
+        self._endpoint, self._connection = endpoint, connection
+
+    def send(self, source, frame):
+        if source is not self._endpoint or self._connection is None:
+            raise ValueError("unbound CAN source")
+        self._connection.send(frame)
+
+
 class CanConnection:
     """Borrow one CAN endpoint; every send obeys the active cut floor."""
 
@@ -25,9 +45,10 @@ class CanConnection:
 class CanNetwork:
     """Own the existing sole CAN queue, adapting the generic dispatch contract."""
 
-    def __init__(self, spec, context):
+    def __init__(self, spec, context, *, drop=None, on_delivery=None):
         self._sources = {}
-        self.bus = CanBus(**spec.options, log=self._log)
+        self._on_delivery = on_delivery
+        self.bus = CanBus(**spec.options, drop=drop, log=self._log)
 
     @property
     def dispatch_budget(self):
@@ -58,6 +79,9 @@ class CanNetwork:
         }, source_time_ns=delivery.timestamp_ns,
             mapped_time_ns=delivery.timestamp_ns,
             delivery_time_ns=delivery.delivered_ns)
+        if self._on_delivery is not None:
+            self._on_delivery(delivery)
+            context.check_deadline()
 
     def reset(self, session):
         self.bus.reset(session.t_sim_ns)
@@ -70,6 +94,12 @@ class CanNetwork:
 
 
 class CanBusFactory:
+    def __init__(self, *, drop=None, on_delivery=None):
+        for name, callback in (("drop", drop), ("on_delivery", on_delivery)):
+            if callback is not None and not callable(callback):
+                raise TypeError(f"CAN {name} must be callable or None")
+        self._drop, self._on_delivery = drop, on_delivery
+
     @staticmethod
     def describe(spec):
         allowed = {"delay_ns", "loopback", "max_pending", "dispatch_budget"}
@@ -98,6 +128,6 @@ class CanBusFactory:
                         or descriptor.direction != "inout"):
                     raise ValueError("CAN connections require inout CAN protocol ports")
 
-    @staticmethod
-    def create(spec, context):
-        return CanNetwork(spec, context)
+    def create(self, spec, context):
+        return CanNetwork(spec, context, drop=self._drop,
+                          on_delivery=self._on_delivery)

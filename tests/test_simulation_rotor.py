@@ -88,7 +88,11 @@ def test_rigid_rotor_reuses_m3508_and_cut_delivered_commands_affect_next_interva
                                     {"position_rad": 10 ** 400},
                                     {"velocity_rad_s": float("inf")}, {"temperature_c": 256},
                                     {"command_timeout": "0ms"}, {"feedback_period": "0ms"},
-                                    {"inertia": .02}, {"torque_per_amp": .02}])
+                                    {"inertia": .02}, {"torque_per_amp": True},
+                                    {"torque_per_amp": -.01},
+                                    {"torque_per_amp": float("nan")},
+                                    {"torque_per_amp": 10 ** 400},
+                                    {"torque_per_amp": 1e308}])
 def test_rigid_configuration_refuses_invalid_or_unexposed_options_before_create(change):
     from sim.devices.dji.factory import M3508Factory
 
@@ -102,6 +106,20 @@ def test_rigid_configuration_refuses_invalid_or_unexposed_options_before_create(
                         (LinkSpec("motor.can", "bus.can"),))
     with pytest.raises(ValueError):
         Simulation(topology, {**builtin_registry(), "motor": NoCreate()})
+
+
+@pytest.mark.parametrize("torque_per_amp,expected", [(0, (0, 0)), (.04, (.00001, .01))])
+def test_rigid_factory_applies_configured_torque_to_actual_rotor(torque_per_amp, expected):
+    topology = Topology((NodeSpec("host", "source"), NodeSpec("bus", "bus.can"),
+                         NodeSpec("motor", "device.dji-m3508", {
+                             "motor_id": 1, "plant": "rigid-rotor", "position_rad": 0,
+                             "velocity_rad_s": 0, "torque_per_amp": torque_per_amp})),
+                        (LinkSpec("host.can", "bus.can"), LinkSpec("motor.can", "bus.can")))
+    with Simulation(topology, {**builtin_registry(), "source": SourceFactory()}) as simulation:
+        simulation.run_until(2_000_000)
+        motor = simulation.components["motor"]
+        assert motor.current_raw == 4096  # C620 raw4096 =5A, including zero kt.
+        assert motor.get_rotor_state() == pytest.approx(expected, abs=1e-14)
 
 
 def test_rigid_feedback_failure_keeps_completed_plant_and_freezes_without_retry():

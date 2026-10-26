@@ -141,12 +141,36 @@ class _MujocoWorld:
             self._completed_cut = context.t_sim_ns
         return result
 
+    def _check_completed(self):
+        self._context.check_io()
+        if (self._closed or self._completed_cut is None or self._executor is None
+                or self._executor.closed or self._executor.failed):
+            raise RuntimeError("world reads require a completed healthy open world")
+
+    @property
+    def time_s(self):
+        """Completed native seconds, independent of Simulation's integer epoch."""
+        self._check_completed()
+        return self._physics.time_s
+
+    def get_joint_state(self, name):
+        """Read one completed native joint state without advancing the world."""
+        self._check_completed()
+        return self._physics.get_joint_state(name)
+
+    def get_body_pose(self, name):
+        """Read one completed native body pose without advancing the world."""
+        self._check_completed()
+        return self._physics.get_body_pose(name)
+
+    def get_imu(self, name):
+        """Read completed site-local SI without stepping or forwarding native state."""
+        self._check_completed()
+        return self._physics.get_imu(name)
+
     def _read_imu(self, name):
         """Pull completed native SI directly, even before the state event samples."""
-        self._context.check_io()
-        if self._closed or self._completed_cut is None:
-            raise RuntimeError("IMU source requires a completed open world")
-        return ImuSignalSample(self._physics.get_imu(name), None, self._completed_cut)
+        return ImuSignalSample(self.get_imu(name), None, self._completed_cut)
 
     def input(self, port, payload):
         if self._bound or not self._joints or port != "effort":
@@ -161,7 +185,8 @@ class _MujocoWorld:
             physics.set_joint_effort(name, value)
 
     def sample(self, cut):
-        if self._closed or cut != self._completed_cut:
+        self._check_completed()
+        if cut != self._completed_cut:
             raise RuntimeError("world sample requires its completed cut")
         physics = self._physics
         payload = {

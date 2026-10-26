@@ -132,6 +132,7 @@ def test_joint_topology_admission_is_pure_and_nodes_have_one_execution_owner(mon
     ({2: {"joint": "missing"}}, "invalid world joint"),
     ({2: {"motor_id": 1}}, "duplicate M3508 motor_id"),
     ({1: {"position_rad": 0}}, "initial state"),
+    ({1: {"torque_per_amp": .1, "gear_ratio": 1e308}}, "maximum joint effort"),
 ])
 def test_invalid_joint_graph_rejects_before_any_create(changes, error):
     class NoWorld(MujocoFactory):
@@ -275,6 +276,34 @@ def test_native_two_motor_world_reuses_one_executor_and_native_resource(monkeypa
                     (None, cut, "sampled") for cut in range(0, 10_000_001, 1_000_000)]
         assert all(not device.closed for device in devices)
     assert len(calls["close"]) == 1 and all(device.closed for device in devices)
+
+
+def test_native_joint_factory_admits_and_applies_actual_torque_coefficient(monkeypatch):
+    pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
+    from sim.physics.mujoco import MujocoPhysics
+
+    checks = []
+    validate = MujocoPhysics.validate_joint_effort
+
+    def observed(physics, name, value):
+        checks.append((name, value))
+        return validate(physics, name, value)
+
+    monkeypatch.setattr(MujocoPhysics, "validate_joint_effort", observed)
+    topology, registry = scene(changes={1: {"torque_per_amp": .04, "gear_ratio": 2},
+                                       2: {"torque_per_amp": 0}})
+    with Simulation(topology, registry) as simulation:
+        # Full +/-20A admission uses kt=.04 and gear2, while kt0 admits zero.
+        assert checks[:6] == [("j1", 1.6), ("j1", -1.6), ("j1", 0),
+                              ("j2", 0), ("j2", 0), ("j2", 0)]
+        simulation.schedule_input("host.can", command())
+        simulation.step()
+        # raw4096=5A, .04Nm/A, gear2, Izz=.02 -> alpha20rad/s².
+        assert states(simulation)[-1].payload["joints"] == {
+            "j1": JointState(pytest.approx(.00002), pytest.approx(.02)),
+            "j2": JointState(0, 0)}
+        assert [frame.data[4:6] for frame in simulation.components["host"].frames] == [
+            bytes.fromhex("1000"), bytes.fromhex("f800")]
 
 
 def test_differing_command_expiries_split_one_world_at_union_only(monkeypatch):

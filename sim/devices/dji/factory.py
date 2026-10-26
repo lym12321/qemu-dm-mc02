@@ -4,6 +4,7 @@ import math
 
 from sim.api import NodeDescription, PortSpec
 from sim.config.yaml import fields, parse_time, text_bytes
+from sim.fabric.factory import BorrowedCanPort
 
 
 def _configuration(spec):
@@ -11,10 +12,22 @@ def _configuration(spec):
     joint = options.get("plant") == "joint"
     state_fields = {"joint"} if joint else {"position_rad", "velocity_rad_s"}
     fields(options, {"motor_id", "plant", "position_rad", "velocity_rad_s",
-                     "joint", "gear_ratio", "command_timeout", "feedback_period", "temperature_c"},
+                     "joint", "gear_ratio", "torque_per_amp", "command_timeout",
+                     "feedback_period", "temperature_c"},
            {"motor_id", "plant"} | state_fields, spec.name)
     if options["plant"] not in ("fixed-rotor", "rigid-rotor", "joint"):
         raise ValueError(f"{spec.name}: plant must be fixed-rotor, rigid-rotor or joint")
+    torque = options.get("torque_per_amp", .02)
+    try:
+        if type(torque) not in (float, int):
+            raise ValueError("torque_per_amp must be finite and nonnegative")
+        torque = float(torque)
+    except OverflowError as error:
+        raise ValueError("torque_per_amp must be finite and nonnegative") from error
+    if not math.isfinite(torque) or torque < 0:
+        raise ValueError("torque_per_amp must be finite and nonnegative")
+    if not math.isfinite(20 * torque):
+        raise ValueError("torque_per_amp must support finite +/-20 A torque")
     if joint:
         if "position_rad" in options or "velocity_rad_s" in options:
             raise ValueError("joint motor initial state belongs to its world")
@@ -28,7 +41,7 @@ def _configuration(spec):
             valid_ratio = False
         if not valid_ratio:
             raise ValueError("gear_ratio must be positive and finite")
-        if not math.isfinite(.4 * ratio):
+        if not math.isfinite(20 * torque * float(ratio)):
             raise ValueError("maximum joint effort must be finite")
     elif "joint" in options:
         raise ValueError("joint name requires plant joint")
@@ -48,7 +61,7 @@ def _configuration(spec):
     temperature = options.get("temperature_c", 25)
     if type(temperature) is not int or not 0 <= temperature <= 255:
         raise ValueError("temperature_c must be an integer in 0..255")
-    result = {"motor_id": motor_id,
+    result = {"motor_id": motor_id, "torque_per_amp": torque,
             "command_timeout_ns": parse_time(options.get("command_timeout", "100ms"),
                                              "command_timeout", zero=False),
             "feedback_period_ns": parse_time(options.get("feedback_period", "1ms"),
@@ -60,25 +73,6 @@ def _configuration(spec):
     return result
 
 
-class _BorrowedPort:
-    """Forward admission to Simulation's connection; own no bus or queue."""
-
-    def __init__(self, context):
-        self.context = context
-        self.endpoint = self.connection = None
-
-    def attach(self, endpoint, name=None):
-        if self.endpoint is not None:
-            raise ValueError("M3508 already has an endpoint")
-        self.endpoint = endpoint
-        self.connection = self.context.attach("can", endpoint)
-
-    def send(self, source, frame):
-        if source is not self.endpoint:
-            raise ValueError("unbound CAN source")
-        self.connection.send(frame)
-
-
 class FixedRotor:
     """Own one protocol device with configured, unchanging rotor state."""
 
@@ -87,7 +81,7 @@ class FixedRotor:
         options = _configuration(spec)
         self.position = options.pop("position_rad")
         self.velocity = options.pop("velocity_rad_s")
-        self.device = M3508Device(_BorrowedPort(context), name=spec.name, **options)
+        self.device = M3508Device(BorrowedCanPort(context), name=spec.name, **options)
 
     def reset(self, session):
         self.device.reset(session, position_rad=self.position, velocity_rad_s=self.velocity)
@@ -108,7 +102,7 @@ class _JointMotor:
         from .device import M3508Device
         from .joints import M3508JointDriver
 
-        self.device = M3508Device(_BorrowedPort(context), name=spec.name, **options)
+        self.device = M3508Device(BorrowedCanPort(context), name=spec.name, **options)
         try:
             self.driver = M3508JointDriver(self.device,
                                           gear_ratio=spec.options.get("gear_ratio", 3591 / 187))
@@ -152,7 +146,7 @@ class M3508Factory:
 
         rotor = Rotor(initial_position=options.pop("position_rad"),
                       initial_velocity=options.pop("velocity_rad_s"))
-        return M3508(_BorrowedPort(context), rotor=rotor, name=spec.name, **options)
+        return M3508(BorrowedCanPort(context), rotor=rotor, name=spec.name, **options)
 
     def validate_topology(self, topology, descriptions, registry):
         """C620 motor addresses must be unique on each connected bus."""

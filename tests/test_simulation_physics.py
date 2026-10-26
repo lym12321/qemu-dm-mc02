@@ -555,15 +555,39 @@ def test_direct_rotated_imu_uses_completed_cuts_and_readers_never_advance_native
     created = _capture_physics(monkeypatch)
     spec = _imu_rotor(tmp_path, site_quat="0.7071067811865476 0.7071067811865476 0 0")
     topology, registry = _imu_topology(spec)
-    with Simulation(topology, registry) as simulation:
+    observed = []
+
+    def observe(event):
+        if event.kind == "physics.state":
+            world = simulation.components["world"]
+            observed.append((simulation.t_sim_ns, world.time_s,
+                             world.get_joint_state("shaft"), world.get_imu("body")))
+
+    simulation = Simulation(topology, registry, on_event=observe)
+    with simulation:
+        world = simulation.components["world"]
         receiver = simulation.components["sink"]
         assert len(receiver.samples) == 1
         assert receiver.samples[0].sample.accel_m_s2 == pytest.approx((0, 9.81, 0), abs=1e-12)
         baseline = dict(counts)
         for _ in range(3):
-            created[0].get_imu("body")
+            assert world.get_imu("body") == receiver.samples[0].sample
+            assert world.get_joint_state("shaft") == JointState(0, 0)
+            assert world.get_body_pose("rotor").position_m == (0, 0, 0)
+            assert world.time_s == 0
         simulation.run_until(0)
         assert counts == baseline  # Reads and reentering a cut do not forward or integrate.
+        native_step = created[0].step
+
+        def during_step(dt):
+            for read in (lambda: world.time_s, lambda: world.get_imu("body"),
+                         lambda: world.get_joint_state("shaft"),
+                         lambda: world.get_body_pose("rotor")):
+                with pytest.raises(RuntimeError, match="completed"):
+                    read()
+            return native_step(dt)
+
+        monkeypatch.setattr(created[0], "step", during_step)
         simulation.schedule_input("world.effort", {"shaft": .4})
         simulation.schedule_input("world.effort", {"shaft": 0}, at_ns=1_500_000)
         simulation.run_until(2_000_000)
@@ -580,6 +604,12 @@ def test_direct_rotated_imu_uses_completed_cuts_and_readers_never_advance_native
         assert [event.mapped_time_ns for event in worlds] == [0, 1_000_000, 1_500_000, 2_000_000]
         assert worlds[-1].payload["imus"]["body"] == receiver.samples[-1].sample
         assert worlds[-1].payload["native_time_s"] == pytest.approx(.002, abs=1e-15)
+        assert observed[-1][0] == 1_500_000  # Getter reads target before public cut commits.
+        assert observed[-1][1:] == (pytest.approx(.002),
+                                   worlds[-1].payload["joints"]["shaft"],
+                                   receiver.samples[-1].sample)
+        assert world.get_body_pose("rotor").quaternion_wxyz == pytest.approx(
+            (math.cos(.00005 / 2), 0, 0, math.sin(.00005 / 2)), abs=1e-12)
         deliveries = [event for event in simulation.events if event.kind == "net.imu.delivery"]
         assert [(event.source_time_ns, event.mapped_time_ns, event.delivery_time_ns,
                  str(event.quality)) for event in deliveries] == [
@@ -588,6 +618,10 @@ def test_direct_rotated_imu_uses_completed_cuts_and_readers_never_advance_native
             worlds[0].payload["imus"]["body"] = receiver.samples[-1].sample
         with pytest.raises(FrozenInstanceError):
             receiver.samples[0].sample.accel_m_s2 = (0, 0, 0)
+    for read in (lambda: world.time_s, lambda: world.get_imu("body"),
+                 lambda: world.get_joint_state("shaft"), lambda: world.get_body_pose("rotor")):
+        with pytest.raises(RuntimeError):
+            read()
 
 
 def test_imu_only_freefall_delivers_identical_samples_and_reset_recreates_source(tmp_path, monkeypatch):
@@ -605,6 +639,7 @@ def test_imu_only_freefall_delivers_identical_samples_and_reset_recreates_source
         "model": path, "imus": {"body": ["gyro sensor", "accel sensor"]}})
     topology, registry = _imu_topology(world)
     with Simulation(topology, registry) as simulation:
+        original_world = simulation.components["world"]
         receiver = simulation.components["sink"]
         simulation.run_until(3_000_000)
         assert [item.mapped_time_ns for item in receiver.samples] == [0, 1_000_000, 2_000_000, 3_000_000]
@@ -612,14 +647,18 @@ def test_imu_only_freefall_delivers_identical_samples_and_reset_recreates_source
         assert all(item.sample.accel_m_s2 == pytest.approx((0, 0, 0), abs=1e-12)
                    for item in receiver.samples)
         assert _world_events(simulation)[-1].payload["joints"] == {}
-        assert created[0].get_body_pose("falling").position_m[2] < 3
+        assert original_world.get_body_pose("falling").position_m[2] < 3
         simulation.reset()
         assert len(created) == 2 and simulation.components["sink"] is not receiver
         with pytest.raises(RuntimeError, match="closed"):
             created[0].get_imu("body")
+        for read in (lambda: original_world.time_s, lambda: original_world.get_imu("body"),
+                     lambda: original_world.get_body_pose("falling")):
+            with pytest.raises(RuntimeError):
+                read()
         reset_receiver = simulation.components["sink"]
         assert [item.mapped_time_ns for item in reset_receiver.samples] == [0]
-        assert created[1].get_body_pose("falling").position_m == (1, 2, 3)
+        assert simulation.components["world"].get_body_pose("falling").position_m == (1, 2, 3)
         simulation.step()
         assert [item.mapped_time_ns for item in reset_receiver.samples] == [0, 1_000_000]
 
@@ -695,6 +734,12 @@ def test_failed_native_imu_cut_keeps_primary_and_never_delivers_or_replays(
         assert simulation.state is SimulationState.FAILED and simulation.t_sim_ns == 0
         assert physics.time_s == pytest.approx(.001, abs=1e-15)
         assert [item.mapped_time_ns for item in receiver.samples] == [0]
+        world = simulation.components["world"]
+        for read in (lambda: world.time_s, lambda: world.get_imu("body"),
+                     lambda: world.get_joint_state("shaft"),
+                     lambda: world.get_body_pose("rotor")):
+            with pytest.raises(RuntimeError, match="healthy"):
+                read()
         previous = list(calls)
         for retry in (simulation.step, simulation.reset):
             with pytest.raises(RuntimeError):
