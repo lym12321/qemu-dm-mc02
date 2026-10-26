@@ -1,0 +1,38 @@
+# Deterministic host CAN experiment; no QEMU, firmware or physics required.
+# Run: tools/sim run examples/can-faults/host-only.yaml --report NEW_REPORT.json
+# Tests additionally inspect each recipient's actual delivery/drop receipts.
+schema: sim/v1
+runtime: {quantum: 10ns, duration: 30ns}
+nodes:
+  host: {kind: device.can-host}
+  peer: {kind: device.can-host}
+  tap: {kind: device.can-host}
+  can0:
+    kind: bus.can
+    delay_ns: 2
+    fault_profiles:
+      delayed: {delay_ns: 12}
+      selective:
+        drop:
+          - {source: host.can, destination: peer.can, can_id: 0x321}
+links:
+  - [host.can, can0.can]
+  - [peer.can, can0.can]
+  - [tap.can, can0.can]
+experiment:
+  inputs:
+    - {at: 1ns, endpoint: host.tx, value: {id: 0x321, dlc: 1, data_hex: aa}}
+    - {at: 4ns, endpoint: can0.fault, value: delayed}
+    - {at: 5ns, endpoint: host.tx, value: {id: 0x321, dlc: 1, data_hex: bb}}
+    - {at: 7ns, endpoint: can0.fault, value: selective}
+    - {at: 8ns, endpoint: host.tx, value: {id: 0x321, dlc: 1, data_hex: cc}}
+    - {at: 9ns, endpoint: tap.tx, value: {id: 0x321, dlc: 1, data_hex: dd}}
+    - {at: 10ns, endpoint: host.tx, value: {id: 0x322, dlc: 1, data_hex: ee}}
+    - {at: 18ns, endpoint: can0.fault, value: normal}
+    - {at: 19ns, endpoint: host.tx, value: {id: 0x321, dlc: 1, data_hex: ff}}
+  assertions:
+    - {before: 4ns, can_seen: {endpoint: host.can, id: 0x321, data_hex: aa}}
+    - {before: 12ns, can_seen: {endpoint: tap.can, id: 0x321, data_hex: dd}}
+    - {before: 14ns, can_seen: {endpoint: host.can, id: 0x322, data_hex: ee}}
+    - {before: 18ns, can_seen: {endpoint: host.can, id: 0x321, data_hex: bb}}
+    - {before: 23ns, can_seen: {endpoint: host.can, id: 0x321, data_hex: ff}}
