@@ -3124,6 +3124,68 @@ key外部输入为pressed布尔值，线传递的是整数电平：低电平按�
 QEMU factory端点，不共享单一GDB/QMP路径。
 
 
+### CAN 故障实验
+
+`bus.can` 可以预声明故障策略，通过同一 Simulation 输入队列定时切换。下面的策略只阻断
+`host.can` 到 `main.fdcan1` 的 ID `0x321`，其他接收端和 CAN ID 继续交付：
+
+```yaml
+nodes:
+  can0:
+    kind: bus.can
+    fault_profiles:
+      delayed:
+        delay_ns: 7000000
+      receive_loss:
+        drop:
+          - {source: host.can, destination: main.fdcan1, can_id: 801}
+# 其余节点与 CAN links 按普通场景配置。
+experiment:
+  inputs:
+    - {at: 20ms, endpoint: can0.fault, value: receive_loss}
+    - {at: 50ms, endpoint: can0.fault, value: normal}
+    - {at: 60ms, endpoint: can0.fault, value: delayed}
+    - {at: 80ms, endpoint: can0.fault, value: normal}
+```
+
+每条总线最多声明 16 个策略，所有策略合计最多 64 条丢弃规则。策略名遵循节点名的 ASCII
+identifier 规则，`normal` 是保留的恢复名称。策略可省略 `delay_ns` 或 `drop`，分别使用
+总线初始延迟和空规则；每次切换都完整替换声明式策略。健康 Simulation reset 后也恢复初始状态。
+Python 中同样使用 `simulation.schedule_input("can0.fault", "receive_loss", at_ns=...)`。
+
+规则只接受 `source`、`destination` 和 `can_id`，至少指定一项；同一规则内取“且”，多条规则取“或”。
+端点必须实际连接在该总线上，未知或跨总线端点在静态校验时拒绝。`can_id` 精确比较数值 ID，
+不区分相同数值的标准帧和扩展帧，也不改写 flags、DLC 或数据。`fault` 是外部控制端口，不能接内部连线。
+原有 Python drop callback 继续逐目标执行一次，与声明式规则取“或”；`normal` 不撤销该 callback。
+
+时间语义沿用总线合同：延迟只影响切换之后入队的帧，已经排队的 due time 不变；后发帧可能先到。
+丢弃在 dispatch 时判断，所以切换也会影响尚未交付的旧 pending。相同时刻外部输入按声明/入队顺序执行，
+然后 dispatch；若 host 帧要使用新延迟，应先排策略输入再排发送输入。该切点之前 CPU 区间产生、
+已经入队的帧仍使用旧延迟，但可受新丢弃策略影响。恢复不补发已丢弃帧，不追溯影响已完成的 CPU。
+
+`can.fault.applied` 记录实际应用的策略与切点；`can.delivery` 保留逐目标 `dropped` 和原始帧、due、
+source/mapped/delivery 时间。`input.delivered` 或发送成功只证明输入处理，不能证明固件消费。
+当前 `can_seen` 不表达指定目标的一段静默期；故障验收检查逐目标交付记录和实际接收端响应。
+容量、callback 或 I/O 失败会冻结当前 Simulation，不重放已有副作用。
+
+无需原生依赖的三端点实例：
+
+```bash
+sim validate examples/can-faults/host-only.yaml
+sim run examples/can-faults/host-only.yaml --report build/can-fault-host.json
+```
+
+真实固件门使用 ARM GCC、CMake 和项目 QEMU，分别验证 Debug/Release 的实际 CAN 序号应答、
+心跳超时、恢复及不匹配 ID 的持续通信，不需要 MuJoCo：
+
+```bash
+bash tools/run-simulation-smoke.sh --case can-faults --build-type Debug --qemu /path/to/qemu-system-arm
+bash tools/run-simulation-smoke.sh --case can-faults --build-type Release --qemu /path/to/qemu-system-arm
+```
+
+这是主机通信交付层的确定性故障，未模拟电气仲裁、ACK 错误、错误计数器或 bus-off，也不证明物理校准、
+持续实时性能或 CPU/World 全局屏障。原 Scenario 的其他独特能力仍保留。
+
 ### CAN worker sessions
 
 `tools/run-can-worker.py` and `tools/run-chassis-worker.py` now use the same

@@ -1,0 +1,78 @@
+# Fixed host-origin heartbeat/challenge fixture; no motor/physical policy.
+schema: sim/v1
+runtime: {mode: stepped, quantum: 1ms, duration: 120ms}
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build/Debug/firmware.elf
+  can0:
+    kind: bus.can
+    fault_profiles:
+      missing-heartbeat:
+        drop: [{source: heartbeat.can, destination: main.fdcan1, can_id: 0x321}]
+      delayed: {delay_ns: 7000000}
+  heartbeat: {kind: device.can-host}
+  diagnostic: {kind: device.can-host}
+  observer: {kind: device.can-host}
+links:
+  - [main.fdcan1, can0.can]
+  - [heartbeat.can, can0.can]
+  - [diagnostic.can, can0.can]
+  - [observer.can, can0.can]
+experiment:
+  ready: {endpoint: main.uart1, text: "SIM_READY can-faults\n"}
+  inputs:
+    - {at: 0ms, endpoint: can0.fault, value: normal}
+    - {at: 5ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'eea55c132d3306b6'}}
+    - {at: 5ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '12d510c0d1434a65'}}
+    - {at: 10ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'fdaf61133e393bb6'}}
+    - {at: 10ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '17da1fc0d44c4565'}}
+    - {at: 15ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '0cba6613cf2c3cb6'}}
+    - {at: 15ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '1cdf2ec0df497465'}}
+    - {at: 20ms, endpoint: can0.fault, value: missing-heartbeat}
+    - {at: 20ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '1bc46b13d85231b6'}}
+    - {at: 20ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '21e43dc0e2726765'}}
+    - {at: 25ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '2ace7013e9582ab6'}}
+    - {at: 25ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '26e94cc0e57f1665'}}
+    - {at: 30ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '39d87513fa4e2fb6'}}
+    - {at: 30ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '2bee5bc0e8780165'}}
+    - {at: 35ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '48e27a138b7420b6'}}
+    - {at: 35ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '30f36ac0f3653065'}}
+    - {at: 40ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '57ec7f13947a25b6'}}
+    - {at: 40ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '35f879c0f66e2365'}}
+    - {at: 45ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '66f68413a560deb6'}}
+    - {at: 45ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '3afd88c0f96bd265'}}
+    - {at: 50ms, endpoint: can0.fault, value: normal}
+    - {at: 50ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '75008a13b696d0b6'}}
+    - {at: 50ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '3f0298c0fc94c265'}}
+    - {at: 55ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '840a8f13479cd5b6'}}
+    - {at: 55ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '4407a7c08791fd65'}}
+    - {at: 60ms, endpoint: can0.fault, value: delayed}
+    - {at: 60ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '931494135082ceb6'}}
+    - {at: 60ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '490cb6c08a9aec65'}}
+    - {at: 65ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'a21e99136188c3b6'}}
+    - {at: 65ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '4e11c5c08d879f65'}}
+    - {at: 70ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'b1289e1372bec4b6'}}
+    - {at: 70ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '5316d4c090808e65'}}
+    - {at: 75ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'c032a31303a4f9b6'}}
+    - {at: 75ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '581be3c09b8db965'}}
+    - {at: 80ms, endpoint: can0.fault, value: normal}
+    - {at: 80ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'cf3ca8130caaf2b6'}}
+    - {at: 80ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '5d20f2c09eb6a865'}}
+    - {at: 85ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'de46ad131dd0f7b6'}}
+    - {at: 85ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '622501c1a1b35b64'}}
+    - {at: 90ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'ed50b2132ec6e8b6'}}
+    - {at: 90ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '672a10c1a4bc4a64'}}
+    - {at: 95ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'fc5ab7133fccedb6'}}
+    - {at: 95ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '6c2f1fc1afb94564'}}
+    - {at: 100ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '0b65bc13c8f3e6b6'}}
+    - {at: 100ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '71342ec1b2a27464'}}
+    - {at: 105ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: '1a6fc113d9f99bb6'}}
+    - {at: 105ms, endpoint: diagnostic.tx, value: {id: 0x322, dlc: 8, data_hex: '76393dc1b5af6764'}}
+  assertions:
+    - {before: 20ms, uart_contains: {endpoint: main.uart1, text: 'HB_ACTIVE'}}
+    - {before: 45ms, uart_contains: {endpoint: main.uart1, text: 'HB_TIMEOUT'}}
+    - {before: 65ms, uart_contains: {endpoint: main.uart1, text: 'HB_RECOVERED'}}
+    - {before: 120ms, uart_contains: {endpoint: main.uart1, text: 'CAN_FAULT_PASS'}}
+    - {before: 45ms, digital_equals: {endpoint: main.gpio.B0, value: 1}}

@@ -1,0 +1,11 @@
+cmake_minimum_required(VERSION 3.20)
+if(NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE "${CMAKE_CURRENT_LIST_DIR}/../minimal-board/arm-none-eabi.cmake"
+        CACHE FILEPATH "ARM bare-metal toolchain")
+endif()
+project(sim_can_faults LANGUAGES C)
+option(SIM_CAN_SKIP_RX_TEST "Test-only mutant: claim recovery without reading CAN RX" OFF)
+include("${CMAKE_CURRENT_LIST_DIR}/../minimal-board/firmware.cmake")
+if(SIM_CAN_SKIP_RX_TEST)
+    target_compile_definitions(firmware PRIVATE SIM_CAN_SKIP_RX_TEST=1)
+endif()

@@ -21,6 +21,7 @@ jobs:
           tests/test_topology.py tests/test_simulation.py
           tests/test_simulation_inputs.py tests/test_simulation_session.py tests/test_can_fabric.py
           tests/test_can_host.py tests/test_scene_admission.py
+          tests/test_can_faults.py tests/test_can_fault_experiment.py tests/test_can_fault_smoke.py
           tests/test_can_bridge.py tests/test_can_endpoints.py tests/test_worker_transport.py
           tests/test_digital_fabric.py tests/test_uart_fabric.py
           tests/test_edge_fabric.py tests/test_joint_execution.py
@@ -36,8 +37,10 @@ jobs:
           PYTHONHOME: ''
         run: |
           python -I - <<'PY'
+          import contextlib
           import importlib.abc
           import importlib.metadata
+          import io
           import json
           import os
           from pathlib import Path
@@ -74,21 +77,35 @@ jobs:
               assert json.loads(pure_report.read_text()) == {
                   'status': 'passed', 'result': {'time_ns': 2_000_000}}
               experiment = directory / 'experiment.yaml'
-              experiment.write_text('schema: sim/v1\nruntime: {duration: 2ms}\nnodes:\n'
+              experiment.write_text('schema: sim/v1\nruntime: {duration: 4ms}\nnodes:\n'
                                     '  host: {kind: device.can-host}\n'
                                     '  peer: {kind: device.can-host}\n'
-                                    '  bus: {kind: bus.can}\nlinks:\n'
+                                    '  bus:\n    kind: bus.can\n    fault_profiles:\n'
+                                    '      loss:\n        drop:\n'
+                                    '          - {source: host.can, destination: peer.can, can_id: 292}\nlinks:\n'
                                     '  - [host.can, bus.can]\n  - [peer.can, bus.can]\n'
                                     'experiment:\n  inputs:\n'
-                                    '    - {at: 1ms, endpoint: host.tx, value: {id: 291, dlc: 1, data_hex: "42"}}\n'
-                                    '  assertions:\n    - before: 2ms\n'
+                                    '    - {at: 0ms, endpoint: bus.fault, value: loss}\n'
+                                    '    - {at: 1ms, endpoint: host.tx, value: {id: 292, dlc: 1, data_hex: "99"}}\n'
+                                    '    - {at: 2ms, endpoint: bus.fault, value: normal}\n'
+                                    '    - {at: 3ms, endpoint: host.tx, value: {id: 291, dlc: 1, data_hex: "42"}}\n'
+                                    '  assertions:\n    - before: 4ms\n'
                                     '      can_seen: {endpoint: host.can, id: 291, data_hex: "42"}\n')
               experiment_report = directory / 'experiment-report.json'
               assert main(['validate', str(experiment)]) == 0
-              assert main(['run', str(experiment), '--report', str(experiment_report)]) == 0
+              captured = io.StringIO()
+              with contextlib.redirect_stdout(captured):
+                  assert main(['run', str(experiment), '--report', str(experiment_report)]) == 0
               observed = json.loads(experiment_report.read_text())
               assert observed['status'] == 'passed' and observed['result']['status'] == ['pass']
-              assert observed['result']['delivered_inputs'] == 1
+              assert observed['result']['delivered_inputs'] == 4
+              events = [json.loads(line) for line in captured.getvalue().splitlines() if line.startswith('{')]
+              assert [(event['payload']['frame']['can_id'], event['payload']['dropped'],
+                       event['payload']['destination'], event['delivery_time_ns'])
+                      for event in events if event['kind'] == 'can.delivery'] == [
+                          (292, True, 'peer.can', 1_000_000), (291, False, 'peer.can', 3_000_000)]
+              assert [event['payload']['profile'] for event in events
+                      if event['kind'] == 'can.fault.applied'] == ['loss', 'normal']
               (directory / 'firmware.elf').write_bytes(b'admission fixture; never executed')
               scene = directory / 'scene.yaml'
               scene.write_text('schema: sim/v1\nnodes:\n  main:\n'

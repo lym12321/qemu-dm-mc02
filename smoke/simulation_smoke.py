@@ -33,6 +33,8 @@ class Blocked(RuntimeError):
 
 
 def _plain(value):
+    if isinstance(value, bytes):
+        return {"bytes_hex": value.hex()}
     if isinstance(value, Mapping):
         return {key: _plain(item) for key, item in value.items()}
     if isinstance(value, tuple):
@@ -45,7 +47,8 @@ def _plain(value):
 class Observations:
     """Bound actual events; keep native source clocks separate from delivery."""
 
-    def __init__(self):
+    def __init__(self, *, capture_can_faults=False):
+        self.fault_events = [] if capture_can_faults else None
         self.total = 0
         self.uart = bytearray()
         self.peer_uart = bytearray()
@@ -74,6 +77,8 @@ class Observations:
         if event.sequence <= self.last_sequence:
             raise ValueError("observation sequence did not increase")
         self.last_sequence = event.sequence
+        if self.fault_events is not None:
+            self.fault_events.append(_plain(event))
         stamp = {"event_sequence": event.sequence, "source_time_ns": event.source_time_ns,
                  "mapped_time_ns": event.mapped_time_ns,
                  "delivery_time_ns": event.delivery_time_ns,
@@ -811,7 +816,7 @@ class Observations:
                 raise AssertionError(f"guest GPIO response missing at pulse cut {cut}: {(key, b0)}")
 
     def report(self):
-        return {"events": self.total,
+        result = {"events": self.total,
                 "uart": bytes(self.uart).decode("ascii", errors="backslashreplace"),
                 "peer_uart": bytes(self.peer_uart).decode("ascii", errors="backslashreplace"),
                 "snapshots": self.snapshots, "can": self.can,
@@ -823,6 +828,9 @@ class Observations:
                 "imu": self.imu, "imu_readbacks": self.imu_readbacks,
                 "uart_net": self.uart_net, "uart_consumption": self.uart_consumption,
                 "imu_pending": self._imu_pending()}
+        if self.fault_events is not None:
+            result["can_fault_events"] = self.fault_events
+        return result
 
     def _imu_pending(self):
         completed = {(row["payload"]["session_id"], row["payload"]["step_id"])
@@ -831,13 +839,241 @@ class Observations:
                 and (row["payload"]["session_id"], row["payload"]["step_id"]) not in completed]
 
 
+def verify_can_faults(observations, experiment):
+    """Host-origin challenges, actual per-peer policy, then real guest replies.
+
+    These fixed values describe this fixture, not CAN IRQ/consumption times.
+    Guest source timestamps and later UART observation bounds stay distinct.
+    """
+    events = observations.fault_events
+    origin = experiment.origin_ns
+    if (not experiment.passed or experiment.delivered_inputs != 47 or origin <= 0
+            or experiment.ready_receipt is None):
+        raise AssertionError("CAN fault experiment lacks its complete actual-ready inputs/assertions")
+    uart = bytes(observations.uart)
+    cursor = 0
+    for marker in (b"SIM_READY can-faults\n", b"HB_ACTIVE\n", b"HB_TIMEOUT\n",
+                   b"HB_RECOVERED\n", b"CAN_FAULT_PASS\n"):
+        found = uart.find(marker, cursor)
+        if found < 0 or b"FAIL" in uart:
+            raise AssertionError("ordered actual CAN timeout/recovery/PASS UART evidence missing")
+        cursor = found + len(marker)
+    if uart.count(b"HB_TIMEOUT\n") != 1 or uart.count(b"HB_RECOVERED\n") != 1:
+        raise AssertionError("the fixed directional drop needs exactly one timeout and recovery")
+
+    applied = [event for event in events if event["kind"] == "can.fault.applied"]
+    changes = ((0, "normal", 0), (20, "missing-heartbeat", 0), (50, "normal", 0),
+               (60, "delayed", 7_000_000), (80, "normal", 0))
+    rule = {"source": "heartbeat.can", "destination": "main.fdcan1", "can_id": 0x321}
+    if len(applied) != len(changes):
+        raise AssertionError("five actual fault input applications are required")
+    previous = "normal"
+    for event, (ms, profile, delay) in zip(applied, changes):
+        payload = event["payload"]
+        cut = origin + ms * 1_000_000
+        if (event["source_node"] != "can0" or event["source_port"] != "fault"
+                or event["source_time_ns"] != cut or event["mapped_time_ns"] != cut
+                or event["delivery_time_ns"] != cut
+                or payload != {"previous_profile": previous, "profile": profile,
+                    "delay_ns": delay, "drop": [rule] if profile == "missing-heartbeat" else [],
+                    "cut_ns": cut}):
+            raise AssertionError("fault applications lost their profile or actual delivery cut")
+        previous = profile
+
+    delivery_events = [event for event in events if event["kind"] == "can.delivery"]
+    host_received = [event for event in events if event["kind"] == "can-host.received"
+                     and event["source_node"] == "observer"]
+    challenges, expected_replies = [], []
+    for source, can_id, initial, stride in (("heartbeat", 0x321, 0x13579bdf, 0x10203),
+                                           ("diagnostic", 0x322, 0xc001d00d, 0x30101)):
+        for ms in range(5, 106, 5):
+            nonce = initial + ms * stride
+            raw = (nonce.to_bytes(4, "little") + (nonce ^ 0xa55a96c3).to_bytes(4, "little")).hex()
+            cut = origin + ms * 1_000_000
+            due = cut + (7_000_000 if 60 <= ms < 80 else 0)
+            destinations = {"main.fdcan1", "observer.can",
+                            "diagnostic.can" if source == "heartbeat" else "heartbeat.can"}
+            rows = [event for event in delivery_events if event["source_node"] == source
+                    and event["payload"]["frame"]["data"] == {"bytes_hex": raw}]
+            if len(rows) != 3 or {row["payload"]["destination"] for row in rows} != destinations:
+                raise AssertionError("host challenge lacks exactly one delivery decision per recipient")
+            main = None
+            for row in rows:
+                payload, frame = row["payload"], row["payload"]["frame"]
+                dropped = source == "heartbeat" and 20 <= ms < 50 and payload["destination"] == "main.fdcan1"
+                if (frame != {"can_id": can_id, "flags": 0, "dlc": 8,
+                              "data": {"bytes_hex": raw}, "timestamp_ns": cut}
+                        or row["source_time_ns"] != cut or row["mapped_time_ns"] != cut
+                        or row["delivery_time_ns"] != due or payload["due_ns"] != due
+                        or payload["late"] or payload["dropped"] != dropped):
+                    raise AssertionError("CAN per-recipient drop, immutable due time or source provenance differs")
+                if payload["destination"] == "main.fdcan1":
+                    main = row
+            received = [event for event in host_received if event["payload"]["frame"]["data"] == {"bytes_hex": raw}]
+            if (len(received) != 1 or received[0]["delivery_time_ns"] != due
+                    or received[0]["source_time_ns"] != due
+                    or received[0]["mapped_time_ns"] != due
+                    or received[0]["payload"]["frame"]["timestamp_ns"] != due):
+                raise AssertionError("unaffected host observer did not receive the complete original stream")
+            challenges.append({"source": source, "can_id": can_id, "nonce": nonce,
+                "source_ns": cut, "due_ns": due, "main_dropped": main["payload"]["dropped"]})
+            if not main["payload"]["dropped"]:
+                # Independent fixed challenge protocol: little-endian XOR and
+                # rotate/add words. No production codec/driver computes expected.
+                response = ((nonce ^ 0x6d2b79f5).to_bytes(4, "little") +
+                    ((((nonce << 7) | (nonce >> 25)) + can_id) & 0xffffffff).to_bytes(4, "little")).hex()
+                expected_replies.append((can_id + 0x100, response, main))
+
+    replies = [row for row in observations.can if row["source"] == "main"]
+    if len(replies) != len(expected_replies):
+        raise AssertionError("actual nonce-derived CAN RX replies are missing")
+    matched = []
+    for can_id, raw, delivered in expected_replies:
+        rows = [row for row in replies if row["can_id"] == can_id and row["data"] == raw]
+        if (len(rows) != 1 or rows[0]["flags"] or rows[0]["dlc"] != 8
+                or rows[0]["source_time_ns"] != rows[0]["wire_timestamp_ns"]
+                or rows[0]["quality"] != "exact"
+                or rows[0]["source_time_ns"] <= delivered["delivery_time_ns"]
+                or rows[0]["event_sequence"] <= delivered["sequence"]):
+            raise AssertionError("actual nonce-derived CAN RX reply differs from its prior challenge")
+        matched.append({"can_id": can_id, "data_hex": raw,
+            "challenge_source_ns": delivered["source_time_ns"],
+            "challenge_delivery_ns": delivered["delivery_time_ns"],
+            "guest_reply_source_ns": rows[0]["source_time_ns"]})
+    main_deliveries = sorted((row for row in delivery_events
+        if row["payload"]["destination"] == "main.fdcan1" and not row["payload"]["dropped"]),
+        key=lambda row: row["sequence"])
+    receipts = observations.receipts
+    if len(receipts) != len(main_deliveries):
+        raise AssertionError("native CAN input completion receipts are incomplete")
+    for index, (delivery, receipt) in enumerate(zip(main_deliveries, receipts)):
+        next_sequence = main_deliveries[index + 1]["sequence"] if index + 1 < len(main_deliveries) else math.inf
+        if (receipt["payload"] != {"completed_frames": index + 1, "rx_dropped": 0, "partial_bytes": 0}
+                or receipt["mapped_time_ns"] != delivery["delivery_time_ns"]
+                or not delivery["sequence"] < receipt["event_sequence"] < next_sequence):
+            raise AssertionError("native per-frame receipt lost its matching successful delivery")
+
+    def marker_bound(marker):
+        end, length = uart.index(marker) + len(marker), 0
+        for batch in observations.uart_batches:
+            if batch["source"] == "main":
+                length += len(bytes.fromhex(batch["data_hex"]))
+                if length >= end:
+                    if batch["quality"] != "upper_bound":
+                        raise AssertionError("UART marker lacks native observation upper bound")
+                    return batch
+        raise AssertionError("UART marker observation bytes are incomplete")
+
+    timeout = marker_bound(b"HB_TIMEOUT\n")
+    recovery = marker_bound(b"HB_RECOVERED\n")
+    last_good = origin + 15_000_000
+    restored = origin + 50_000_000
+    if not last_good + 14_000_000 <= timeout["mapped_time_ns"] < restored < recovery["mapped_time_ns"]:
+        raise AssertionError("actual heartbeat watchdog timeout/recovery does not follow the drop interval")
+    high = [row for row in observations.snapshots if row["source"] == "main" and row["b0_output"]
+            and row["b0"] == 1 and last_good + 14_000_000 <= row["mapped_time_ns"] < restored]
+    low = [row for row in observations.snapshots if row["source"] == "main" and row["b0_output"]
+           and row["b0"] == 0 and restored < row["mapped_time_ns"] <= recovery["mapped_time_ns"]]
+    diagnostic_during_drop = [row for row in matched if row["can_id"] == 0x422
+        and origin + 20_000_000 <= row["challenge_source_ns"] < restored]
+    heartbeat_recovery = [row for row in matched if row["can_id"] == 0x421
+                         and row["challenge_source_ns"] == restored]
+    if (not high or not low or len(diagnostic_during_drop) != 6 or len(heartbeat_recovery) != 1
+            or heartbeat_recovery[0]["guest_reply_source_ns"] >= recovery["mapped_time_ns"]):
+        raise AssertionError("actual GPIO watchdog and diagnostic/heartbeat recovery evidence is missing")
+    return {"host_fixture": "heartbeat/challenge and diagnostic, not guest motor commands",
+        "heartbeat_period_ns": 5_000_000, "guest_watchdog_ms": 14,
+        "challenges": challenges, "computed_replies": matched,
+        "observer_challenges": len(challenges), "dropped_main_heartbeats": 6,
+        "diagnostic_replies_during_drop": len(diagnostic_during_drop),
+        "timeout_uart_upper_bound_ns": timeout["mapped_time_ns"],
+        "recovery_uart_upper_bound_ns": recovery["mapped_time_ns"],
+        "timeout_gpio_cut_ns": high[0]["mapped_time_ns"],
+        "recovered_gpio_cut_ns": low[0]["mapped_time_ns"],
+        "limits": "Computed replies prove actual RX data use; delivery/receipt and sampled GPIO/UART are not exact IRQ consumption timestamps."}
+
+
+def run_can_faults(*, qemu, firmware):
+    import yaml
+    from sim.apps.experiment import run_experiment
+    from sim.composition import builtin_registry
+    from sim.config.scene import load_scene
+    from sim.machines.qemu import QemuFactory
+    from sim.machines.qemu.errors import BackendUnavailable
+
+    firmware = Path(firmware).resolve()
+    document = yaml.safe_load((ROOT / "examples/can-faults/scene.yaml").read_text())
+    document["nodes"]["main"]["firmware"] = str(firmware)
+    prepared = firmware.parent / "can-faults.yaml"
+    with prepared.open("x") as output:
+        yaml.safe_dump(document, output, sort_keys=False)
+    observations = Observations(capture_can_faults=True)
+    machines, resources = {}, []
+
+    class CaptureFactory(QemuFactory):
+        def create(self, spec, context):
+            machine = super().create(spec, context)
+            machines[spec.name] = machine
+            return machine
+
+    def observe(event):
+        observations(event)
+        for name, machine in machines.items():
+            if machine.started and not any(row["name"] == name for row in resources):
+                info = machine.connection_info
+                pid = info["pid"]
+                resources.append({"name": name, "pid": pid,
+                    "starttime": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+                    "sockets": dict(info["sockets"])})
+
+    registry = builtin_registry(qemu=qemu)
+    registry["machine.qemu"] = CaptureFactory(qemu=qemu)
+    scene = load_scene(prepared, registry)
+    primary = None
+    try:
+        experiment = run_experiment(scene, registry, on_event=observe)
+    except BaseException as error:
+        if isinstance(error, BackendUnavailable):
+            error = Blocked(str(error))
+        primary = error
+        raise error
+    finally:
+        # run_experiment owns Simulation and independently closes its owners.
+        failures = []
+        for resource in resources:
+            stat = Path(f"/proc/{resource['pid']}/stat")
+            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[19] == resource["starttime"]:
+                failures.append("owned QEMU identity remains after cleanup")
+            if any(os.path.lexists(path) for path in resource["sockets"].values()):
+                failures.append("owned QEMU socket remains after cleanup")
+        partial = {**observations.report(), "resources": resources,
+                   "cleanup_completed": not failures, "cleanup_failures": failures}
+        if primary is not None:
+            primary.simulation_observations = partial
+            for failure in failures:
+                primary.add_note(failure)
+        elif failures:
+            error = AssertionError("; ".join(failures))
+            error.simulation_observations = partial
+            raise error
+    try:
+        if {row["name"] for row in resources} != {"main"}:
+            raise AssertionError("actual native QEMU identity was not observed")
+        verified = verify_can_faults(observations, experiment)
+    except BaseException as error:
+        error.simulation_observations = partial
+        raise
+    return {**partial, "state": "closed", "experiment": _plain(experiment), "can_faults": verified}
+
+
 def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=False,
-                  uart_skip_rx=False):
+                  uart_skip_rx=False, can_skip_rx=False):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
     source = ROOT / "examples" / EXAMPLE_ALIASES.get(case, case)
     default_build = (ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse"
+                     else source / "build" / (build_type + ("-skip-rx" if can_skip_rx else "")) if case == "can-faults"
                      else source / "build-rotor-loop" if case == "rotor-loop"
                      else source / "build-joint-loop" if case == "joint-loop" else source / "build")
     build = default_build if build_dir is None else Path(build_dir)
@@ -850,6 +1086,8 @@ def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=Fal
         variant.append("-DSIM_IMU_SKIP_GYRO_TEST=" + ("ON" if imu_skip_gyro else "OFF"))
     if source.name == "uart-link":
         variant.append("-DSIM_UART_SKIP_RX_TEST=" + ("ON" if uart_skip_rx else "OFF"))
+    if source.name == "can-faults":
+        variant.append("-DSIM_CAN_SKIP_RX_TEST=" + ("ON" if can_skip_rx else "OFF"))
     commands = (["cmake", "-S", str(source), "-B", str(build), f"-DCMAKE_BUILD_TYPE={build_type}", *variant],
                 ["cmake", "--build", str(build), "--parallel", "2"])
     logs = []
@@ -865,6 +1103,8 @@ def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=Fal
 
 
 def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
+    if case == "can-faults":
+        return run_can_faults(qemu=qemu, firmware=firmware)
     from sim.composition import builtin_registry
     from sim.config.scene import load_scene
     from sim.runtime import Simulation
@@ -988,7 +1228,9 @@ def _interrupted(signum, _frame):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "imu-readback", "uart-link", "all"), default="all")
+    parser.add_argument("--case", choices=(*NATIVE_CASES, "hal-gpio", "dual-board", "joint-loop", "imu-readback", "uart-link", "can-faults", "all"), default="all")
+    parser.add_argument("--can-skip-rx", action="store_true",
+                        help="test-only can-faults mutant omitting actual CAN RX reads")
     parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--hal-elf", type=Path,
                         default=ROOT / "build/teaching/Debug/gpio_key.elf",
@@ -997,6 +1239,8 @@ def main(argv=None):
         "QEMU_SYSTEM_ARM", ROOT / "build/qemu/qemu-system-arm")))
     parser.add_argument("--report", type=Path)
     args = parser.parse_args(argv)
+    if args.can_skip_rx and args.case != "can-faults":
+        parser.error("--can-skip-rx requires --case can-faults")
     report = args.report or ROOT / "build/test-results" / (
         "simulation-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f") +
         f"-{os.getpid()}") / "report.json"
@@ -1017,7 +1261,10 @@ def main(argv=None):
                 payload["cases"][case] = {"elf": str(elf),
                     "sha256": hashlib.sha256(elf.read_bytes()).hexdigest()}
             else:
-                payload["cases"][case] = build_example(case, build_type=args.build_type)
+                options = ({"can_skip_rx": args.can_skip_rx,
+                    "build_dir": report.resolve().parent / (report.stem + "-assets") /
+                        args.build_type} if case == "can-faults" else {})
+                payload["cases"][case] = build_example(case, build_type=args.build_type, **options)
             payload["cases"][case]["observations"] = run_case(
                 case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
             binary = Path(payload["cases"][case]["elf"])

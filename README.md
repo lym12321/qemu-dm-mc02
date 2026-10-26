@@ -12,6 +12,7 @@
 | [验证](#验证) | [故障排查](docs/USAGE.md#troubleshooting) |
 | [Virtual Lab：YAML 与交互命令](docs/USAGE.md#virtual-lab) | [GPIO/UART/CAN/ADC 示例](examples/labs/board-io.yaml) |
 | [HAL 教学：按键与 GPIO](docs/USAGE.md#hal-teaching) | [独立固件工程](examples/teaching/) |
+| [CAN 延迟与定向丢帧](docs/USAGE.md#can-故障实验) | [无需原生依赖的故障场景](examples/can-faults/host-only.yaml) |
 | [未迁移 Robot：固件、四轮模型与上位机](docs/USAGE.md#robot-manifest) | `uv run --extra mujoco tools/sim-unmigrated robot run robot.yaml` |
 
 > [!IMPORTANT]
