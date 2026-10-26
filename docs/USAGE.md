@@ -145,8 +145,8 @@ M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换�
 现有 Arena 的共享世界路径也由 Simulation 调度原生 CPU request/finish、CAN/plant
 和 referee；实际 participant 的资源所有权一次转交，借用连接仍由原调用方清理。
 reset、成员提前退出或清理错误使当前运行失败，不重步或发布成功。
-旧 CAN worker/`CanRuntime` 的跨 RESET 重建合同，以及独特的 Lab/Gazebo 应用能力
-尚未迁完，仍保留原入口；这不代表旧执行路径已全部删除。
+CAN worker 的跨 RESET 资源重建也已迁入 Simulation。独特的 Lab/Gazebo 应用能力
+仍保留原入口；这不代表旧执行路径已全部删除。
 
 ### 有限实验与断言
 
@@ -2775,7 +2775,7 @@ reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍�
 `CanParticipant((bus_a, bus_b), [shared])` 统一交付起点命令、推进这个唯一 plant，
 再交付目标反馈。总线集合须为非空 tuple，身份唯一；list、set 和 iterator 拒绝。
 `.buses` 保留准入顺序，`.bus` 仅用于单总线。不要为每条总线构造拥有相同 physics
-的 plant；`CanRuntime` 和固定 `FourWheelRuntime` 仍只接单条总线。
+的 plant；固定四轮 worker 场景仍只接单条 CAN 总线。
 
 这个示例把未标定四轮夹具的前、后轮分别接到独立总线，每条总线使用 ID 1、2：
 
@@ -3116,3 +3116,46 @@ key外部输入为pressed布尔值，线传递的是整数电平：低电平按�
 `bash tools/run-simulation-smoke.sh --case digital-link --qemu /path/to/qemu-system-arm`。
 调试可将该scene仅保留一块机器后用`sim run ... --gdb-port 1234`；多机器须分别配置独立
 QEMU factory端点，不共享单一GDB/QMP路径。
+
+
+### CAN worker sessions
+
+`tools/run-can-worker.py` and `tools/run-chassis-worker.py` now use the same
+`Simulation`/Topology factories as `sim run`. The rotor worker requires the
+default stationary IMU fixture; combining it with an independent legacy engine
+is rejected before connection. The chassis worker preflights the complete
+self-contained MJCF profile and closes that solver before opening transports.
+Includes/assets are rejected by this fixed worker profile; ordinary MuJoCo
+scenes retain their existing model support. Model changes after preflight fail.
+
+Each matching co-sim RESET_ACK closes the previous graph and creates a new
+Simulation with the acknowledged session ID and origin. CAN queues, devices and
+the native World are new resources. Borrowed transport sockets, incomplete RX
+records and queued TX suffixes survive unchanged. During RESET/ACK/DONE waits,
+CAN ingress only queues; it does not advance the World. STEP retries reuse the
+exact frame without another solver advance or IMU sample. A transport submission
+count belongs to its endpoint/session and does not prove firmware consumption.
+
+Known CAN deadlines can split a worker interval into several Simulation cuts.
+The worker wire STEP ID identifies the requested completed target; it is not an
+internal solver-step count. Native World seconds start at zero independently of
+the session's integer epoch. Completed World getters expose SI IMU, joint and
+body state without advancing physics.
+
+`--frames 0` remains continuous operation. Graph startup borrows the finite
+`--connect-timeout` budget; each target advance and its IMU observation borrow a
+2-second host budget. ACK/DONE waits keep their existing separate deadlines.
+Any execution/queue/I/O failure terminates the worker with independent cleanup;
+failed effects are not retried or rolled back. `PYTHON=/path/to/python` selects
+the interpreter for the chassis firmware runner as well as the DJI runner.
+
+The native RESET/suffix regression is included in:
+
+```sh
+QEMU_SYSTEM_ARM=/path/to/pinned/qemu-system-arm \
+  PATH=/path/to/native-env/bin:$PATH bash tools/run-qemu-worker-smoke.sh --chassis
+```
+
+It complements the actual guest SPI readback and existing DJI/Chassis firmware
+consumer gates. These gates do not establish a global CPU/World barrier,
+physical calibration or sustained real-time performance.
