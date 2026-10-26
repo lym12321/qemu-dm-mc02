@@ -1,27 +1,36 @@
-# Built by the Lab smoke; for other firmware, adapt its real ready/output events.
-schema: 1
-name: board-io
-board: dm-mc02
-firmware: ../../build/lab.elf
-ready: {endpoint: uart1, text: LAB_READY}
-duration: 400ms
-stimulus:
-  - {at: 40ms, endpoint: uart1, bytes: q}
-  - {at: 80ms, endpoint: key, pressed: true}
-  - {at: 120ms, endpoint: adc1.ch4, voltage_uv: 1650000}
-  - {at: 160ms, endpoint: adc1.ch4, raw: 12345}
-  - at: 200ms
-    endpoint: can1
-    frame: {id: 0x321, dlc: 8, data_hex: '4142434445464748'}
-  - {at: 240ms, endpoint: key, pressed: false}
-  - {at: 280ms, endpoint: gpio.B0, value: 1}
-assertions:
-  - {before: 100ms, uart_contains: {endpoint: uart1, text: 'UART=q'}}
-  - {before: 160ms, uart_contains: {endpoint: uart1, text: 'KEY=0'}}
-  - {before: 200ms, digital_equals: {endpoint: led, value: 1}}
-  - {before: 200ms, uart_contains: {endpoint: uart1, text: 'ADC=32768'}}
-  - {before: 240ms, uart_contains: {endpoint: uart1, text: 'ADC=12345'}}
-  - before: 300ms
-    can_seen: {endpoint: can1, id: 0x322, flags: 0, dlc: 8, data_hex: '4142434445464748'}
-  - {before: 350ms, digital_equals: {endpoint: gpio.B0, value: 1}}
-  - {before: 350ms, digital_equals: {endpoint: key, value: 1}}
+# Built by the Lab smoke; adapt the actual ready/output events for other firmware.
+schema: sim/v1
+runtime: {mode: stepped, quantum: 1ms, duration: 400ms}
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ../../build/lab.elf
+    adc: true
+  can0: {kind: bus.can}
+  host: {kind: device.can-host}
+links:
+  - [main.fdcan1, can0.can]
+  - [host.can, can0.can]
+experiment:
+  ready: {endpoint: main.uart1, text: LAB_READY}
+  inputs:
+    - {at: 40ms, endpoint: main.uart1, value: q}
+    - {at: 80ms, endpoint: main.key, value: true}
+    - {at: 120ms, endpoint: main.adc1.ch4, value: {voltage_uv: 1650000}}
+    - {at: 160ms, endpoint: main.adc1.ch4, value: {raw: 12345}}
+    - at: 200ms
+      endpoint: host.tx
+      value: {id: 0x321, dlc: 8, data_hex: '4142434445464748'}
+    - {at: 240ms, endpoint: main.key, value: false}
+    - {at: 280ms, endpoint: main.gpio.B0, value: 1}
+  assertions:
+    - {before: 100ms, uart_contains: {endpoint: main.uart1, text: 'UART=q'}}
+    - {before: 160ms, uart_contains: {endpoint: main.uart1, text: 'KEY=0'}}
+    - {before: 200ms, digital_equals: {endpoint: main.led, value: 1}}
+    - {before: 200ms, uart_contains: {endpoint: main.uart1, text: 'ADC=32768'}}
+    - {before: 240ms, uart_contains: {endpoint: main.uart1, text: 'ADC=12345'}}
+    - before: 300ms
+      can_seen: {endpoint: main.fdcan1, id: 0x322, flags: 0, dlc: 8, data_hex: '4142434445464748'}
+    - {before: 350ms, digital_equals: {endpoint: main.gpio.B0, value: 1}}
+    - {before: 350ms, digital_equals: {endpoint: main.key, value: 1}}

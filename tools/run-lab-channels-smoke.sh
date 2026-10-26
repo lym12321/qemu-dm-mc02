@@ -245,10 +245,10 @@ import yaml
 
 example, firmware, destination = sys.argv[1:]
 manifest = yaml.safe_load(Path(example).read_text())
-manifest["firmware"] = firmware
+manifest["nodes"]["main"]["firmware"] = firmware
 Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
 PY
-uv run --frozen python tools/sim-unmigrated lab run "$run_dir/lab.yaml" \
+uv run --frozen python tools/sim run "$run_dir/lab.yaml" \
     --qemu "$qemu_bin" --report "$run_dir/lab-report.json"
 python3 - "$run_dir/lab-report.json" <<'PY'
 from pathlib import Path
@@ -259,10 +259,12 @@ report = json.loads(Path(sys.argv[1]).read_text())
 assert report["status"] == "passed", report
 result = report["result"]
 assert result["status"] == ["pass"] * 8 and not result["failures"], result
-assert len(result["dispatched"]) == 7, result
-assert result["end_ns"] - result["origin_ns"] >= 400_000_000, result
-assert all(actual - result["origin_ns"] >= scheduled
-           for scheduled, actual, endpoint in result["dispatched"]), result
+assert result["delivered_inputs"] == 7, result
+assert result["end_ns"] - result["origin_ns"] == 400_000_000, result
+assert result["ready_receipt"]["kind"] == "uart", result
+assert result["ready_receipt"]["source_node"] == "main", result
+assert result["ready_receipt"]["source_port"] == "uart1", result
+print("AUTOMATIC_LAB_REPORT: " + json.dumps(report, sort_keys=True))
 print("Manifest consumer: eight assertions passed after owner cleanup")
 PY
 # A real UART marker that never occurs must exhaust the shared startup bound,
@@ -274,10 +276,10 @@ import yaml
 
 source, destination = sys.argv[1:]
 manifest = yaml.safe_load(Path(source).read_text())
-manifest["ready"]["text"] = "THIS_APPLICATION_EVENT_NEVER_OCCURS"
+manifest["experiment"]["ready"]["text"] = "THIS_APPLICATION_EVENT_NEVER_OCCURS"
 Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
 PY
-if uv run --frozen python tools/sim-unmigrated lab run "$run_dir/not-ready.yaml" \
+if uv run --frozen python tools/sim run "$run_dir/not-ready.yaml" \
     --qemu "$qemu_bin" --startup-timeout 0.3 --timeout 2 \
     --report "$run_dir/not-ready-report.json" > "$run_dir/not-ready.log" 2>&1; then
     printf '%s\n' 'missing application ready unexpectedly passed' >&2
@@ -291,6 +293,7 @@ import sys
 report = json.loads(Path(sys.argv[1]).read_text())
 assert report["status"] == "failed", report
 assert report["error_type"] in ("TimeoutError", "StartupTimeoutError"), report
+print("MISSING_READY_REPORT: " + json.dumps(report, sort_keys=True))
 print("Missing application ready: bounded failure confirmed")
 PY
 # The panel is another direct consumer of the same runtime, with native GDB
