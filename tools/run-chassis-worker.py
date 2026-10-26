@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dm_mc02_sim_worker as worker
-from sim.robots.four_wheel import FourWheelRuntime, create_four_wheel_plant
+from sim.robots.four_wheel import four_wheel_simulation_factory, four_wheel_imu
 
 
 def configure_parser(parser):
@@ -25,7 +25,7 @@ def main(argv=None):
         if (not args.fdcan or args.engine != 'null' or args.backend
                 or args.backend_registry):
             raise ValueError('--fdcan and the default engine are required')
-        plant = create_four_wheel_plant(
+        factory = four_wheel_simulation_factory(
             args.chassis_model, delay_ns=args.can_delay_ns,
             command_timeout_ns=args.m3508_timeout_ms * 1_000_000,
             torque_per_amp=args.torque_per_amp)
@@ -40,29 +40,8 @@ def main(argv=None):
         for note in getattr(exc, '__notes__', ()):
             print(f'chassis profile: {note}', file=sys.stderr)
         return 2
-    handed_off = False
-    primary = None
-
-    def factory(can, tx):
-        nonlocal handed_off
-        runtime = FourWheelRuntime(plant, can, tx)
-        handed_off = True
-        return runtime
-
     try:
-        try:
-            return worker.run(args, plant_factory=factory)
-        except BaseException as exc:
-            primary = exc
-            raise
-        finally:
-            if not handed_off:
-                try:
-                    plant.close()
-                except BaseException as exc:
-                    if primary is None:
-                        raise
-                    primary.add_note(f'chassis profile cleanup failed: {exc}')
+        return worker.run(args, simulation_factory=factory, imu_reader=four_wheel_imu)
     except (BufferError, ConnectionError, OSError, TimeoutError, TypeError,
             ValueError, RuntimeError, worker.SocketCANError) as exc:
         print(f'chassis worker: {exc}', file=sys.stderr)

@@ -6,11 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dm_mc02_sim_worker as worker
-from sim.devices.dji import M3508
-from sim.fabric import CanBus
-from sim.machines.qemu.endpoints import QemuCanEndpoint
-from sim.transports.socketcan_endpoint import SocketCanEndpoint
-from sim.fabric.runtime import CanRuntime
+from sim.apps.can_worker import rotor_simulation_factory
 
 
 def configure_parser(parser):
@@ -25,33 +21,26 @@ def configure_parser(parser):
                         help='uncalibrated rotor torque coefficient (default: .02 Nm/A)')
 
 
-def create_can_factory(args):
+def create_simulation_factory(args):
     """Validate the fixed profile before opening any host transport."""
-    if not args.fdcan:
-        raise ValueError('--fdcan is required')
+    if not args.fdcan or args.engine != 'null' or args.backend or args.backend_registry:
+        raise ValueError('--fdcan and the default engine are required')
     ids = args.m3508_id or [1]
     if len(set(ids)) != len(ids):
         raise ValueError('--m3508-id must be unique')
-    bus = CanBus(delay_ns=args.can_delay_ns)
-    devices = [M3508(bus, motor_id,
-                     command_timeout_ns=args.m3508_timeout_ms * 1_000_000,
-                     torque_per_amp=args.torque_per_amp) for motor_id in ids]
-
-    def factory(can, tx):
-        endpoint = QemuCanEndpoint(bus, can)
-        socket_endpoint = SocketCanEndpoint(bus, tx) if tx is not None else None
-        return CanRuntime(bus, endpoint, devices, socket_endpoint)
-    return factory
+    return rotor_simulation_factory(ids, delay_ns=args.can_delay_ns,
+        command_timeout_ns=args.m3508_timeout_ms * 1_000_000,
+        torque_per_amp=args.torque_per_amp)
 
 
 def main(argv=None):
     args = worker.parse_args(argv, configure_parser=configure_parser)
     try:
-        factory = create_can_factory(args)
+        factory = create_simulation_factory(args)
     except (ValueError, TypeError) as exc:
         print(f'CAN profile: {exc}', file=sys.stderr)
         return 2
-    return worker.run(args, can_factory=factory)
+    return worker.run(args, simulation_factory=factory)
 
 
 if __name__ == '__main__':

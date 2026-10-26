@@ -39,6 +39,7 @@ def test_help_includes_worker_and_can_options_outside_repository(tmp_path):
 @pytest.mark.parametrize('options,message', [
     (['--engine', 'mujoco', '--mujoco-model', '/unused/model.xml'], 'default engine'),
     (['--m3508-timeout-ms', '0'], 'positive unsigned64'),
+    (['--m3508-timeout-ms', '3600001'], 'at most 3600s'),
     (['--torque-per-amp', 'nan'], 'finite and nonnegative'),
     (['--can-delay-ns', '-1'], 'nonnegative'),
     (['--chassis-model', '/missing/absent-chassis.xml'], 'absent-chassis.xml'),
@@ -72,68 +73,57 @@ def chassis_launcher():
     return module
 
 
-def track_admitted_plant(monkeypatch, launcher, *, cleanup_error=None):
+def track_admitted_plant(monkeypatch, *, cleanup_error=None):
+    from sim.robots import four_wheel
     admitted, closes = [], []
-    create = launcher.create_four_wheel_plant
-
+    create = four_wheel.create_four_wheel_plant
     def observed_create(*args, **kwargs):
         plant = create(*args, **kwargs)
         admitted.append(plant)
         close = plant.close
-
         def observed_close():
             closes.append(plant)
             close()
             if cleanup_error is not None:
                 raise cleanup_error
-
         monkeypatch.setattr(plant, 'close', observed_close)
         return plant
-
-    monkeypatch.setattr(launcher, 'create_four_wheel_plant', observed_create)
+    monkeypatch.setattr(four_wheel, 'create_four_wheel_plant', observed_create)
     return admitted, closes
 
 
-@pytest.mark.parametrize('cleanup_fails', [False, True])
-def test_chassis_connection_failure_closes_prebuilt_profile_and_preserves_primary(
-        monkeypatch, capsys, cleanup_fails):
+def test_chassis_connection_failure_follows_completed_native_preflight(monkeypatch, capsys):
     pytest.importorskip('mujoco', reason='optional native chassis profile')
     launcher = chassis_launcher()
-    error = OSError('profile close boundary') if cleanup_fails else None
-    admitted, closes = track_admitted_plant(monkeypatch, launcher, cleanup_error=error)
-    primary = ConnectionError('connect boundary')
-
-    def failed_run(args, *, plant_factory):
-        assert callable(plant_factory) and len(admitted) == 1
-        assert not admitted[0].closed and admitted[0].physics.time_s == 0
-        raise primary
-
+    admitted, closes = track_admitted_plant(monkeypatch)
+    def failed_run(args, *, simulation_factory, imu_reader):
+        assert callable(simulation_factory) and callable(imu_reader)
+        assert len(admitted) == 1 and closes == admitted and admitted[0].closed
+        raise ConnectionError('connect boundary')
     monkeypatch.setattr(launcher.worker, 'run', failed_run)
     assert launcher.main(['--cosim', '/missing/cosim', '--fdcan', '/missing/can']) == 1
-    assert closes == admitted and admitted[0].closed
-    assert all(device.closed for device in admitted[0].devices)
-    stderr = capsys.readouterr().err
-    assert 'chassis worker: connect boundary' in stderr
-    if cleanup_fails:
-        assert 'chassis profile cleanup failed: profile close boundary' in stderr
-        assert primary.__notes__ == ['chassis profile cleanup failed: profile close boundary']
+    assert closes == admitted
+    assert 'chassis worker: connect boundary' in capsys.readouterr().err
 
 
-def test_chassis_runtime_handoff_moves_cleanup_to_worker_once(monkeypatch):
+def test_chassis_failed_preflight_cleanup_prevents_connection(monkeypatch, capsys):
     pytest.importorskip('mujoco', reason='optional native chassis profile')
     launcher = chassis_launcher()
-    admitted, closes = track_admitted_plant(monkeypatch, launcher)
-
-    class BorrowedCan:
-        def send(self, *args):
-            raise AssertionError('no transport output before runtime reset/step')
-
-    def run(args, *, plant_factory):
-        runtime = plant_factory(BorrowedCan(), None)
-        assert runtime.plant is admitted[0]
-        runtime.close()
-        return 0
-
-    monkeypatch.setattr(launcher.worker, 'run', run)
-    assert launcher.main(['--cosim', '/missing/cosim', '--fdcan', '/missing/can']) == 0
+    admitted, closes = track_admitted_plant(monkeypatch, cleanup_error=OSError('close boundary'))
+    monkeypatch.setattr(launcher.worker, 'run', lambda *a, **k: pytest.fail('connected'))
+    assert launcher.main(['--cosim', '/missing/cosim', '--fdcan', '/missing/can']) == 2
     assert closes == admitted and admitted[0].closed
+    assert 'chassis profile: close boundary' in capsys.readouterr().err
+
+
+def test_chassis_preflight_recipe_rejects_changed_model_before_acquisition(tmp_path):
+    pytest.importorskip('mujoco', reason='optional native chassis profile')
+    from sim.robots.four_wheel import four_wheel_simulation_factory
+    from sim.core import Session
+    from sim.transports.cosim import QemuTimestampMapper
+    model = tmp_path / 'model.xml'
+    model.write_bytes((LAUNCHER.parents[1] / 'models/four_wheel.xml').read_bytes())
+    acquire = four_wheel_simulation_factory(model)
+    model.write_text(model.read_text().replace('mass=".4"', 'mass=".5"'))
+    with pytest.raises(ValueError, match='changed after native preflight'):
+        acquire(Session(1), QemuTimestampMapper(0, 0), object(), None)

@@ -39,7 +39,8 @@ from sim.transports.cosim import (
     QemuTimestampMapper, FramedSocket, StepFramedSocket, V2SessionReset,
     wait_v2_response, send_v2_step, wait_v2_reset_ack,
 )
-from sim.core import StepResult
+from sim.core import Session, StepResult
+from sim.runtime import Simulation, SimulationState
 from sim.physics import MujocoPhysics, integrate_rotor
 from sim.devices.bmi088 import imu_to_bmi088_units
 
@@ -946,23 +947,22 @@ def engine_uses_external_time(engine) -> bool:
     return hasattr(engine, "imu_timestamp_ns")
 
 
-def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> int:
+def run(args: argparse.Namespace, *, simulation_factory=None, imu_reader=None,
+        on_session_started=None) -> int:
     _validate_worker_timing(args)
-    if plant_factory is not None:
-        if can_factory is not None:
-            raise ValueError("plant_factory and can_factory are mutually exclusive")
-        if (not callable(plant_factory) or not args.fdcan
-                or args.backend or args.backend_registry or args.engine != "null"):
-            raise ValueError("shared plant requires callable factory, --fdcan and default engine")
-    if can_factory is not None and (not callable(can_factory) or not args.fdcan):
-        raise ValueError("CAN runtime factory requires callable factory and --fdcan")
+    if simulation_factory is not None and (
+            not callable(simulation_factory) or not args.fdcan
+            or args.backend or args.backend_registry or args.engine != "null"):
+        raise ValueError("Simulation factory requires --fdcan and the default engine")
+    for hook in (imu_reader, on_session_started):
+        if hook is not None and (not callable(hook) or simulation_factory is None):
+            raise ValueError("Simulation hooks require a callable and a Simulation factory")
     cosim_sock = None
     can_sock = None
     socketcan_sock = None
     engine = None
-    can_runtime = None
-    can_runtime_close = None
-    plant_get_imu = None
+    simulation = None
+    simulation_close = None
     primary_error = None
     try:
         cosim_sock = connect_unix(args.cosim, args.connect_timeout)
@@ -974,22 +974,37 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
         socketcan_sock = open_socketcan(args.socketcan) if args.socketcan else None
         socketcan_tx = DatagramQueue(socketcan_sock) if socketcan_sock else None
         coordinator = None
-        if plant_factory is None:
+        if simulation_factory is None:
             engine = create_engine(args)
             motor_adapter = DmMotorBusAdapter.from_namespace(args)
             coordinator = StepCoordinator(engine, motor_adapter)
-        runtime_factory = plant_factory if plant_factory is not None else can_factory
-        if runtime_factory is not None:
-            can_runtime = runtime_factory(can, socketcan_tx)
-            # Resolve cleanup before any other plugin-owned descriptor.
-            can_runtime_close = getattr(can_runtime, "close", None)
-            if any(not callable(getattr(can_runtime, name, None)) for name in
-                   ("reset", "step", "ingest_qemu", "ingest_socketcan")) or not callable(can_runtime_close):
-                raise TypeError("CAN runtime requires reset/step/ingress/close methods")
-            if plant_factory is not None:
-                plant_get_imu = getattr(can_runtime, "get_imu", None)
-                if not callable(plant_get_imu):
-                    raise TypeError("shared plant runtime requires get_imu")
+
+        def start_session(session, mapper):
+            """Replace actual graph owners only after the native RESET_ACK."""
+            nonlocal simulation, simulation_close
+            if simulation is not None:
+                close = simulation_close
+                simulation = simulation_close = None
+                close()  # Cleanup failure terminates; never acquire a new graph.
+            deadline = time.monotonic() + args.connect_timeout
+            simulation = simulation_factory(session, mapper, can, socketcan_tx)
+            # Capture cleanup before inspecting any other returned descriptor.
+            simulation_close = getattr(simulation, "close", None)
+            if not isinstance(simulation, Simulation) or not callable(simulation_close):
+                raise TypeError("Simulation factory must return an unstarted Simulation")
+            if simulation.state != SimulationState.NEW:
+                raise ValueError("Simulation factory must return an unstarted Simulation")
+            descriptions = simulation.topology.validate(simulation.registry)
+            bridge = descriptions.get("transport")
+            if bridge is None:
+                raise ValueError("worker Simulation requires transport ingress")
+            for port in ("qemu_rx",) + (("socketcan_rx",) if socketcan_tx else ()):
+                if "external_input" not in bridge.port(port).capabilities:
+                    raise ValueError("worker Simulation requires external transport ingress")
+            simulation.start(deadline_monotonic=deadline)
+            if on_session_started is not None:
+                on_session_started(simulation)
+            simulation.check_deadline()
         cosim_sock.setblocking(False)
         # The initial telemetry timestamp is the best available common clock
         # origin for v1. v2 deliberately starts the plant clock at zero and
@@ -1038,9 +1053,9 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
         if args.protocol == "v1":
             qemu_timestamp_mapper = QemuTimestampMapper(
                 clock_base_ns, clock_base_ns)
-        if can_runtime is not None:
-            can_runtime.reset(1 if args.protocol == "v1" else session_id,
-                              clock_base_ns, qemu_timestamp_mapper)
+        if simulation_factory is not None:
+            start_session(Session(1 if args.protocol == "v1" else session_id,
+                                  clock_base_ns), qemu_timestamp_mapper)
         dt = 1.0 / args.rate
         integer_rate = (int(args.rate) if args.rate.is_integer() else 0)
         sequence = 0
@@ -1078,9 +1093,9 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
                 if engine_uses_external_time(engine) else None)
             qemu_timestamp_mapper = QemuTimestampMapper(
                 reset.t_sim_ns, reset.t_sim_ns)
-            if can_runtime is not None:
-                can_runtime.reset(reset.session_id, reset.t_sim_ns,
-                                  qemu_timestamp_mapper)
+            if simulation_factory is not None:
+                start_session(Session(reset.session_id, reset.t_sim_ns),
+                              qemu_timestamp_mapper)
 
         def complete_v2_reset(reset: V2SessionReset) -> None:
             reset = wait_v2_reset_ack(
@@ -1131,10 +1146,10 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
                 if args.verbose and can_frames:
                     print("received CAN frames", len(can_frames), flush=True)
                 for can_id, flags, dlc, timestamp_ns, data in can_frames:
-                    if can_runtime is not None:
-                        can_runtime.ingest_qemu(
+                    if simulation is not None:
+                        simulation.schedule_input("transport.qemu_rx",
                             CanFrame(can_id, flags, dlc, data, timestamp_ns),
-                            virtual_time_ns)
+                            at_ns=simulation.t_sim_ns)
                         continue
                     mapped_timestamp_ns = qemu_timestamp_mapper.map(
                         timestamp_ns, virtual_time_ns)
@@ -1152,16 +1167,16 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
             if socketcan_sock in ready:
                 try:
                     raw = socketcan_sock.recv(72)
-                    if can_runtime is not None:
-                        can_runtime.ingest_socketcan(raw, virtual_time_ns)
-                    else:
-                        frame = unpack_can_frame(raw, timestamp_ns=virtual_time_ns)
+                    frame = unpack_can_frame(raw, timestamp_ns=virtual_time_ns)
                 except ValueError as exc:
                     if args.verbose:
                         print(f"socketcan: ignored frame: {exc}",
                               file=sys.stderr, flush=True)
                 else:
-                    if can and can_runtime is None:
+                    if simulation is not None:
+                        simulation.schedule_input("transport.socketcan_rx", frame,
+                                                  at_ns=simulation.t_sim_ns)
+                    elif can:
                         can.send(
                             frame.can_id, frame.flags, frame.dlc,
                             qemu_timestamp_mapper.unmap(
@@ -1210,14 +1225,19 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
             step_span_ns = max(ideal_time_ns - virtual_time_ns,
                                adc_count + 1)
             virtual_time_ns += step_span_ns
-            if can_runtime is not None:
-                result = can_runtime.step(step_span_ns)
+            if simulation is not None:
+                result = simulation.run_until(virtual_time_ns, deadline_monotonic=(
+                    time.monotonic() + V2_STEP_RESPONSE_TIMEOUT_SEC))
                 if (not isinstance(result, StepResult) or result.status != "ok"
                         or type(result.reached_time_ns) is not int
                         or result.reached_time_ns != virtual_time_ns):
-                    raise RuntimeError(f"CAN runtime did not reach target: {result!r}")
-            if plant_get_imu is not None:
-                gyro, accel = imu_to_bmi088_units(plant_get_imu())
+                    raise RuntimeError(f"Simulation did not reach target: {result!r}")
+                if imu_reader is None:
+                    # Explicit stationary fixture, in existing BMI088 wire units.
+                    gyro, accel = (0., 0., 0.), (0., 0., 1.)
+                else:
+                    gyro, accel = imu_to_bmi088_units(imu_reader(simulation))
+                simulation.check_deadline()
             if args.protocol == "v1":
                 for input_index, (channel, raw) in enumerate(
                         args.adc_input_values):
@@ -1282,7 +1302,7 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
                         break
                     if done_response is False:
                         continue
-            if can and can_runtime is None and coordinator.active_indices:
+            if can and simulation is None and coordinator.active_indices:
                 send_dm_feedback(can, engine,
                                  sorted(coordinator.active_indices),
                                  virtual_time_ns, motor_adapter,
@@ -1305,20 +1325,20 @@ def run(args: argparse.Namespace, *, can_factory=None, plant_factory=None) -> in
             socketcan_tx.drain()
     except BaseException as exc:
         primary_error = exc
-        if can_runtime is not None and not callable(can_runtime_close):
-            exc.add_note("CAN runtime cleanup unavailable: no callable close obtained")
+        if simulation is not None and not callable(simulation_close):
+            exc.add_note("Simulation cleanup unavailable: no callable close obtained")
         raise
     finally:
         cleanup_errors = []
         # A failing backend must not prevent any transport from closing.
         # Catch interrupts here as well, then propagate after every attempt.
-        for name, resource in (("CAN runtime", can_runtime), ("backend", engine),
+        for name, resource in (("Simulation", simulation), ("backend", engine),
                                ("SocketCAN", socketcan_sock),
                                ("CAN", can_sock), ("co-sim", cosim_sock)):
             if resource is None:
                 continue
             try:
-                close = (can_runtime_close if name == "CAN runtime"
+                close = (simulation_close if name == "Simulation"
                          else getattr(resource, "close", None))
                 if callable(close):
                     close()

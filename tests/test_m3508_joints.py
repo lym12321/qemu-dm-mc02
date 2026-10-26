@@ -240,22 +240,34 @@ def test_multibus_feedback_failure_preserves_partial_commits_and_freezes(monkeyp
         plant.close()
 
 
-def test_fixed_four_wheel_runtime_rejects_multibus_before_imu_or_endpoint(monkeypatch):
+def test_fixed_four_wheel_simulation_declares_one_can_bus_before_native_or_transport_io(monkeypatch):
+    from sim.devices.dji.factory import M3508Factory
+    from sim.fabric.factory import CanBusFactory
+    from sim.physics.factory import MujocoFactory
     from sim.robots import four_wheel
-    buses, native = (CanBus(), CanBus()), native_stub()
-    devices = tuple(M3508Device(buses[i % 2], i + 1) for i in range(4))
-    plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))))
-    effects = []
-    monkeypatch.setattr(native, "get_imu", lambda _: effects.append("imu"), raising=False)
-    monkeypatch.setattr(four_wheel, "QemuCanEndpoint", lambda *_: effects.append("endpoint"))
-    try:
-        with pytest.raises(ValueError, match="one CAN bus"):
-            four_wheel.FourWheelRuntime(plant, object())
-        assert effects == [] and not plant.closed
-        assert all(not device.closed for device in devices)
-        assert all(bus.pending == 0 and bus.t_sim_ns == 0 for bus in buses)
-    finally:
-        plant.close()
+    from sim.runtime import SimulationState
+    from sim.transports.cosim import QemuTimestampMapper
+
+    def reject(*args, **kwargs):
+        pytest.fail("pure four-wheel recipe acquired native state or performed transport IO")
+
+    monkeypatch.setattr(MujocoPhysics, "from_xml_path", reject)
+    stream = SimpleNamespace(send=reject)
+    simulation = four_wheel.create_four_wheel_simulation(
+        Session(1), QemuTimestampMapper(0, 0), stream, model_path=ROOT / "models/four_wheel.xml")
+    assert simulation.state is SimulationState.NEW and not simulation.components
+    assert isinstance(simulation.registry["bus.can"], CanBusFactory)
+    assert isinstance(simulation.registry["physics.mujoco"], MujocoFactory)
+    assert isinstance(simulation.registry["device.dji-m3508"], M3508Factory)
+    assert [node.name for node in simulation.topology.nodes if node.kind == "bus.can"] == ["can"]
+    assert [(node.options["motor_id"], node.options["joint"])
+            for node in simulation.topology.nodes if node.kind == "device.dji-m3508"] == [
+                (1, "wheel_fl"), (2, "wheel_fr"), (3, "wheel_rl"), (4, "wheel_rr")]
+    assert [(str(link.source), str(link.target)) for link in simulation.topology.links
+            if link.source.port == "can" or link.source.node == "transport"] == [
+                ("transport.qemu", "can.can"), ("motor1.can", "can.can"),
+                ("motor2.can", "can.can"), ("motor3.can", "can.can"), ("motor4.can", "can.can")]
+    simulation.close()
 
 
 def test_native_gear_conversion_four_devices_one_advance_and_literal_feedback(monkeypatch):

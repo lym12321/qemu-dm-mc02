@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 """Actual trobot DJI driver consumer of the public CAN Fabric/M3508 boundary.
 
-This fixture owns a 1 ms plant clock. Monotonic QEMU CAN timestamps determine
-which host ticks may run; two command groups never cause two steps in one tick.
-Commands arriving within a tick settle at the next boundary (up to 1 ms
-quantization). Transport timestamps do not synchronize the QEMU CPU to the plant.
+One Simulation owns the devices and time, with a 1 ms maximum interval and cuts
+at known CAN delivery deadlines. Monotonic QEMU CAN timestamps bound catch-up;
+transport timestamps do not synchronize the QEMU CPU to the plant.
 """
 
 from __future__ import annotations
@@ -26,11 +25,10 @@ sys.path.insert(0, str(ROOT / "tools"))
 
 from dm_mc02_qmp import QmpSession
 from dm_mc02_sim_worker import CanStream, QemuTimestampMapper
-from sim.devices.dji.m3508 import M3508
+from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Session, Topology
+from sim.apps.can_worker import can_topology, create_can_simulation, motor_nodes
 from sim.devices.dji.protocol import encode_feedback
-from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.machines.qemu.endpoints import QemuCanEndpoint
-from sim.fabric.runtime import CanRuntime
+from sim.fabric import CanFrame
 
 STEP_NS = 1_000_000
 MAX_CATCHUP_STEPS = 1000
@@ -92,11 +90,42 @@ def append_bounded(records: list, item: dict) -> None:
     records.append(item)
 
 
-class VectorSource(VirtualCanDevice):
+class VectorSource:
     """Test-only literal feedback producer, borrowing the normal bus route."""
+
+    def __init__(self, context):
+        self.connection = context.attach("can", self)
 
     def receive(self, frame: CanFrame) -> None:
         pass
+
+    def input(self, port, frame):
+        self.connection.send(frame)
+
+    def close(self):
+        pass
+
+
+class VectorSourceFactory:
+    @staticmethod
+    def describe(spec):
+        if spec.options:
+            raise ValueError("literal vector source has no options")
+        return NodeDescription((PortSpec("can", "can", min_connections=1),
+            PortSpec("tx", "can-frame", "in", capabilities={"external_input"})),
+            frozenset({"input"}))
+
+    @staticmethod
+    def validate_input(spec, port, payload, *, connected_ports):
+        if port != "tx" or port in connected_ports:
+            raise ValueError("literal vectors require an unconnected tx input")
+        if not isinstance(payload, CanFrame):
+            raise TypeError("literal vector requires a CanFrame")
+        return payload
+
+    @staticmethod
+    def create(spec, context):
+        return VectorSource(context)
 
 
 class DjiFixture:
@@ -110,14 +139,19 @@ class DjiFixture:
         self.deliveries: list[dict] = []
         self.wire_seen: dict[str, dict[int, set[int]]] = defaultdict(
             lambda: defaultdict(set))
-        self.bus = CanBus(drop=self._drop, log=self._log)
-        self.endpoint = QemuCanEndpoint(self.bus, can)
-        self.motors = (M3508(self.bus, 1), M3508(self.bus, 5))
-        self.vector = VectorSource(self.bus, "literal-vector")
-        self.runtime = CanRuntime(self.bus, self.endpoint, self.motors)
+        topology = can_topology(motor_nodes((1, 5)))
+        topology = Topology((*topology.nodes, NodeSpec("literal-vector", "fixture.vector")),
+                            (*topology.links, LinkSpec("literal-vector.can", "can.can")))
         # Standalone harness starts the QEMU epoch at zero. Production workers
         # instead bind the actual co-sim RESET origin to this same endpoint API.
-        self.runtime.reset(1, 0, QemuTimestampMapper(0, 0))
+        self.runtime = create_can_simulation(Session(1, 0), QemuTimestampMapper(0, 0),
+            can, None, topology=topology, drop=self._drop, on_delivery=self._log,
+            extra_factories={"fixture.vector": VectorSourceFactory()})
+        self.deadline = time.monotonic() + 25
+        self.runtime.start(deadline_monotonic=min(self.deadline, time.monotonic() + 2))
+        self.endpoint = self.runtime.components["transport"].endpoint
+        self.motors = tuple(self.runtime.components[f"motor{ident}"] for ident in (1, 5))
+        self.vector = self.runtime.components["literal-vector"]
 
     def _drop(self, source, destination, frame: CanFrame) -> bool:
         if destination is not self.endpoint or frame.can_id not in (0x201, 0x205):
@@ -128,6 +162,11 @@ class DjiFixture:
             self.stage == "dji.drop" and frame.can_id == 0x201)
 
     def _log(self, event) -> None:
+        # The report proves firmware-facing feedback delivery. Real incoming
+        # command bytes are already retained once in trace; broadcasts to the
+        # two other virtual receivers add no independent boundary evidence.
+        if event.destination != "transport.qemu":
+            return
         append_bounded(self.deliveries, dict(
             phase=self.stage, source=event.source, destination=event.destination,
             can_id=event.frame.can_id, flags=event.frame.flags,
@@ -151,7 +190,7 @@ class DjiFixture:
                        for row in self.trace):
                 raise RuntimeError("missing actual timeout zero beyond 51ms drop interval")
             feedback = [row for row in self.deliveries
-                        if row["phase"] == self.stage and row["destination"] == "qemu"]
+                        if row["phase"] == self.stage and row["destination"] == "transport.qemu"]
             if (not any(row["can_id"] == 0x201 and row["dropped"] for row in feedback)
                     or not any(row["can_id"] == 0x205 and not row["dropped"]
                                for row in feedback)):
@@ -177,8 +216,8 @@ class DjiFixture:
                     timestamp_ns=self.runtime.t_sim_ns)
                 if frame.data != bytes.fromhex(literal):
                     raise RuntimeError("DJI feedback producer differs from literal vector")
-                self.vector.emit(frame)
-            self.bus.step(self.runtime.t_sim_ns)
+                self.runtime.schedule_input("literal-vector.tx", frame)
+            self.runtime.run_until(self.runtime.t_sim_ns, deadline_monotonic=self.deadline)
 
     def ingress(self, frame: CanFrame, *,
                 max_catchup_steps: int = MAX_CATCHUP_STEPS) -> None:
@@ -197,9 +236,9 @@ class DjiFixture:
         if catchup > max_catchup_steps:
             raise RuntimeError("QEMU CAN gap exceeds bounded fixture catch-up")
         for _ in range(catchup):
-            self.runtime.step(STEP_NS)
+            self.runtime.step(STEP_NS, deadline_monotonic=self.deadline)
             self.steps += 1
-        self.runtime.ingest_qemu(frame, self.runtime.t_sim_ns)
+        self.runtime.schedule_input("transport.qemu_rx", frame)
         self.previous_wire_ns = frame.timestamp_ns
         self.wire_seen[self.stage][frame.can_id].add(slots[0])
         append_bounded(self.trace, dict(
@@ -375,9 +414,11 @@ def run(qmp_path: str, uart_path: str, can_path: str, elf: str, qemu: str,
             deliveries=fixture.deliveries if fixture else [],
             steps=fixture.steps if fixture else 0,
             plant_time_ns=fixture.runtime.t_sim_ns if fixture else 0,
-            plant_step_ns=STEP_NS, command_quantization_ns=STEP_NS,
+            host_quantum_ns=STEP_NS, known_can_due_cuts=True,
+            intervals_completed=fixture.runtime.step_id if fixture else 0,
             phase_start_ns=fixture.phase_start_ns if fixture else {},
             max_catchup_steps=MAX_CATCHUP_STEPS, observation_bound=MAX_RECORDS,
+            delivery_scope="feedback to QEMU transport; incoming wire commands in trace",
             source_inputs=inputs,
             motor_consumer_declared_reference=MOTOR_CONSUMER_REVISION,
             motor_reference_hashes=MOTOR_REFERENCE_HASHES,

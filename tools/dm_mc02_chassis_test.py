@@ -29,7 +29,7 @@ from dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
 from dm_mc02_qmp import QmpSession
 from dm_mc02_test_harness import stop
 from dm_mc02_trobot_business import _identity
-from sim.robots.four_wheel import FourWheelRuntime, create_four_wheel_plant
+from sim.robots.four_wheel import four_wheel_simulation_factory, four_wheel_imu
 from sim.transports import connect_unix
 
 STEPS = 7500
@@ -97,8 +97,6 @@ def run_worker(cosim, can, trace_path, ready_path):
 
     signal.signal(signal.SIGTERM, interrupted)
     trace = Trace(trace_path)
-    plant = None
-    handed_off = False
     primary = None
 
     class ObservedCan(worker.CanStream):
@@ -136,57 +134,59 @@ def run_worker(cosim, can, trace_path, ready_path):
                     trace.record("control", **fields)
             return frames
 
-    class ObservedRuntime(FourWheelRuntime):
-        def reset(self, session_id, timestamp_ns, mapper):
-            super().reset(session_id, timestamp_ns, mapper)
-            trace.record("reset", session_id=session_id, timestamp_ns=timestamp_ns,
-                         qemu_origin_ns=mapper.qemu_origin_ns,
-                         worker_origin_ns=mapper.worker_origin_ns)
-            Path(ready_path).write_text("runtime reset completed\n")
+    latest_mapper = None
 
-        def get_imu(self):
-            sample = super().get_imu()
-            physics = self.plant.physics
-            pose = physics.get_body_pose("chassis")
-            joints = [physics.get_joint_state(name) for name in JOINTS]
-            trace.record("step", timestamp_ns=self.t_sim_ns, plant_time_s=physics.time_s,
-                         position_m=pose.position_m, quaternion_wxyz=pose.quaternion_wxyz,
-                         joint_position_rad=[joint.position_rad for joint in joints],
-                         joint_velocity_rad_s=[joint.velocity_rad_s for joint in joints],
-                         current_raw=[device.current_raw for device in self.plant.devices],
-                         gyro_rad_s=sample.gyro_rad_s, accel_m_s2=sample.accel_m_s2)
-            return sample
+    def started(simulation):
+        session = simulation.session
+        trace.record("reset", session_id=session.session_id, timestamp_ns=session.t_sim_ns,
+                     qemu_origin_ns=latest_mapper.qemu_origin_ns,
+                     worker_origin_ns=session.t_sim_ns)
+        Path(ready_path).write_text("Simulation session started\n")
+
+    def read_imu(simulation):
+        sample = four_wheel_imu(simulation)
+        world = simulation.components["world"]
+        pose = world.get_body_pose("chassis")
+        joints = [world.get_joint_state(name) for name in JOINTS]
+        trace.record("step", timestamp_ns=simulation.t_sim_ns, plant_time_s=world.time_s,
+                     position_m=pose.position_m, quaternion_wxyz=pose.quaternion_wxyz,
+                     joint_position_rad=[joint.position_rad for joint in joints],
+                     joint_velocity_rad_s=[joint.velocity_rad_s for joint in joints],
+                     current_raw=[simulation.components[f"motor{i}"].device.current_raw
+                                  for i in range(1, 5)],
+                     gyro_rad_s=sample.gyro_rad_s, accel_m_s2=sample.accel_m_s2)
+        return sample
 
     try:
-        plant = create_four_wheel_plant(ROOT / "models/four_wheel.xml")
+        acquire = four_wheel_simulation_factory(ROOT / "models/four_wheel.xml")
 
-        def factory(stream, socketcan):
-            nonlocal handed_off
-            runtime = ObservedRuntime(plant, stream, socketcan)
-            handed_off = True
-            return runtime
+        def factory(session, mapper, stream, datagrams):
+            nonlocal latest_mapper
+            latest_mapper = mapper
+            simulation = acquire(session, mapper, stream, datagrams)
+            # Record the exact admitted mapper supplied by the worker, without
+            # inferring native origin from solver time or a delivery timestamp.
+            trace.record("mapper", session_id=session.session_id,
+                         qemu_origin_ns=mapper.qemu_origin_ns,
+                         worker_origin_ns=mapper.worker_origin_ns)
+            return simulation
 
         args = worker.parse_args(["--cosim", cosim, "--fdcan", can, "--protocol", "v2",
                                   "--rate", "1000", "--frames", str(STEPS), "--realtime"])
         with patch.object(worker, "CanStream", ObservedCan), \
                 patch.object(worker, "StepFramedSocket", ObservedStep):
-            return worker.run(args, plant_factory=factory)
+            return worker.run(args, simulation_factory=factory, imu_reader=read_imu,
+                              on_session_started=started)
     except BaseException as exc:
         primary = exc
         raise
     finally:
-        for name, action in (("untransferred plant", lambda: plant.close()
-                             if plant is not None and not handed_off else None),
-                             ("trace", trace.close)):
-            try:
-                action()
-            except BaseException as exc:
-                if primary is None:
-                    primary = exc
-                else:
-                    primary.add_note(f"{name} cleanup failed: {exc}")
-        if primary is not None and sys.exc_info()[1] is None:
-            raise primary
+        try:
+            trace.close()
+        except BaseException as error:
+            if primary is None:
+                raise
+            primary.add_note(f"trace cleanup failed: {error}")
 
 
 def _yaw(row):

@@ -10,33 +10,10 @@ This host schedule does not establish a QEMU CPU or physical CAN time barrier.
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Protocol
 
-from sim.core import Coordinator, Session, SimParticipant, StepContext, StepResult
+from sim.core import Session, SimParticipant, StepContext, StepResult
 
 from .can import CanBus, check_can_time
-from .frame import CanFrame
-
-
-class TimestampMapper(Protocol):
-    def map(self, timestamp_ns: int, fallback_ns: int) -> int: ...
-
-    def unmap(self, timestamp_ns: int, fallback_ns: int) -> int: ...
-
-
-class TransportEndpoint(Protocol):
-    bus: CanBus
-
-    def bind_mapper(self, mapper: TimestampMapper) -> None: ...
-
-    def ingest(self, frame: CanFrame, current_time_ns: int) -> None: ...
-
-
-class DatagramEndpoint(Protocol):
-    bus: CanBus
-
-    def ingest(self, raw: bytes, current_time_ns: int) -> None: ...
-
 
 class CanParticipant:
     """Own device execution/cleanup; borrow one bus or an ordered bus tuple.
@@ -137,56 +114,3 @@ class CanParticipant:
                         f"CAN device {index} close failed: {type(exc).__name__}: {exc}")
         if primary is not None:
             raise primary
-
-
-class CanRuntime:
-    """Unmigrated CAN composition helper; new execution uses Simulation."""
-
-    def __init__(self, bus: CanBus, endpoint: TransportEndpoint,
-                 devices: Iterable[SimParticipant] = (),
-                 socket_endpoint: DatagramEndpoint | None = None):
-        if (getattr(endpoint, "bus", None) is not bus
-                or any(not callable(getattr(endpoint, name, None))
-                       for name in ("bind_mapper", "ingest"))):
-            raise ValueError("transport endpoint must belong to the runtime CAN bus")
-        if socket_endpoint is not None and (
-                getattr(socket_endpoint, "bus", None) is not bus
-                or not callable(getattr(socket_endpoint, "ingest", None))):
-            raise ValueError("SocketCAN endpoint must belong to the runtime CAN bus")
-        self.bus = bus
-        self.endpoint = endpoint
-        self.socket_endpoint = socket_endpoint
-        self.coordinator = Coordinator({"can": CanParticipant(bus, devices)})
-
-    @property
-    def t_sim_ns(self) -> int:
-        return self.coordinator.t_sim_ns
-
-    def reset(self, session_id: int, t_sim_ns: int,
-              mapper: TimestampMapper) -> None:
-        if self.coordinator.closed:
-            raise RuntimeError("CAN runtime is closed")
-        session = Session(session_id, t_sim_ns)
-        self.endpoint.bind_mapper(mapper)
-        self.coordinator.reset(session)
-
-    def step(self, dt_ns: int) -> StepResult:
-        return self.coordinator.step(dt_ns)["can"]
-
-    def _check_ingress(self) -> None:
-        if (self.coordinator.closed or self.coordinator.failed
-                or self.coordinator.session is None):
-            raise RuntimeError("CAN runtime requires a successful reset")
-
-    def ingest_qemu(self, frame: CanFrame, current_time_ns: int) -> None:
-        self._check_ingress()
-        self.endpoint.ingest(frame, current_time_ns)
-
-    def ingest_socketcan(self, raw: bytes, current_time_ns: int) -> None:
-        self._check_ingress()
-        if self.socket_endpoint is None:
-            raise RuntimeError("CAN runtime has no SocketCAN endpoint")
-        self.socket_endpoint.ingest(raw, current_time_ns)
-
-    def close(self) -> None:
-        self.coordinator.close()

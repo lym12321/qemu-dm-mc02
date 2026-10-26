@@ -5,7 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 export PYTHONPATH="$root_dir:$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
-chassis_python="$root_dir/.venv/bin/python"
+chassis_python=${PYTHON:-"$root_dir/.venv/bin/python"}
 [[ -x "$chassis_python" ]] || {
     printf '%s\n' 'Project Python missing: uv sync --locked --group dev --extra mujoco' >&2
     exit 1
