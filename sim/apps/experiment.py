@@ -7,10 +7,12 @@ Matching reuses the pure Lab evaluator, without importing a legacy runner.
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 from time import monotonic
 
-from sim.api import Endpoint, Event, NodeDescription, NodeSpec, TimeQuality, Topology
+from sim.api import (BackendUnavailable, Endpoint, Event, NodeDescription, NodeSpec,
+                     PortSpec, TimeQuality, Topology)
 from sim.api.events import check_timestamp
 from sim.boards import digital_level
 from sim.config.scene import ExperimentInput, ExperimentReady, Scene, load_scene
@@ -178,25 +180,29 @@ class _Consumer:
 
 
 class _CutObserver:
-    def __init__(self, consumer):
+    def __init__(self, consumer, on_cut=None):
         self.consumer = consumer
+        self.on_cut = on_cut
 
     def sample(self, cut):
         self.consumer.begin_cut(cut)
+        if self.on_cut is not None:
+            self.on_cut(cut)
 
     def close(self):
         pass
 
 
 class _CutObserverFactory:
-    def __init__(self, consumer):
+    def __init__(self, consumer, on_cut=None):
         self.consumer = consumer
+        self.on_cut = on_cut
 
     def describe(self, _spec):
         return NodeDescription(capabilities={"sample"})
 
     def create(self, _spec, _context):
-        return _CutObserver(self.consumer)
+        return _CutObserver(self.consumer, self.on_cut)
 
 
 @dataclass(frozen=True)
@@ -205,6 +211,7 @@ class _Admission:
     assertions: tuple
     snapshots: dict
     observations: dict
+    descriptions: Mapping
 
 
 def validate_input_batches(scene, registry, inputs, *, origin_ns):
@@ -219,31 +226,17 @@ def validate_input_batches(scene, registry, inputs, *, origin_ns):
             validate(spec, entries, origin_ns=origin_ns)
 
 
-def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
-                     descriptions=None):
-    """Pure shared config/Python admission; never acquire component resources."""
-    if not isinstance(scene, Scene):
-        raise TypeError("experiment requires a sim/v1 Scene")
-    if len(scene.topology.nodes) > 63:
-        raise ValueError("experiment scene requires at most 63 nodes")
-    if scene.mode != "stepped":
-        raise ValueError("finite experiment requires stepped scene mode")
-    check_timestamp(scene.duration_ns)
-    if scene.duration_ns == 0:
+def _admit_observations(duration_ns, descriptions, connected, assertions, ready):
+    """Admit only public observation capabilities, without factories or files."""
+    check_timestamp(duration_ns)
+    if duration_ns == 0:
         raise ValueError("experiment scene duration must be positive")
-    if (not isinstance(inputs, (tuple, list)) or len(inputs) > MAX_ITEMS
-            or any(type(item) is not ExperimentInput for item in inputs)
-            or not isinstance(assertions, (tuple, list)) or len(assertions) > MAX_ITEMS):
-        raise ValueError("experiment requires bounded typed inputs and assertion mappings")
+    if not isinstance(assertions, (tuple, list)) or len(assertions) > MAX_ITEMS:
+        raise ValueError("experiment requires at most 1024 assertion mappings")
     if ready is not None and type(ready) is not ExperimentReady:
         raise TypeError("experiment ready requires an ExperimentReady")
-    if descriptions is None:
-        descriptions = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns).validate()
-    specs = {node.name: node for node in scene.topology.nodes}
     snapshots = {}
     observations = {}
-    connected = {str(endpoint) for link in scene.topology.links
-                 for endpoint in (link.source, link.target)}
 
     def assertion_endpoint(kind, value):
         endpoint = Endpoint.parse(value)
@@ -276,8 +269,30 @@ def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
         assertion_endpoint("uart_contains", str(ready.endpoint))
     admitted = tuple(parse_assertion(_plain(value), index, endpoint_validator=assertion_endpoint)
                      for index, value in enumerate(assertions))
-    if any(item.before_ns > scene.duration_ns for item in admitted):
+    if any(item.before_ns > duration_ns for item in admitted):
         raise ValueError("assertion deadline exceeds scene duration")
+    return admitted, snapshots, observations
+
+
+def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
+                     descriptions=None):
+    """Pure shared config/Python admission; never acquire component resources."""
+    if not isinstance(scene, Scene):
+        raise TypeError("experiment requires a sim/v1 Scene")
+    if len(scene.topology.nodes) > 63:
+        raise ValueError("experiment scene requires at most 63 nodes")
+    if scene.mode != "stepped":
+        raise ValueError("finite experiment requires stepped scene mode")
+    if (not isinstance(inputs, (tuple, list)) or len(inputs) > MAX_ITEMS
+            or any(type(item) is not ExperimentInput for item in inputs)):
+        raise ValueError("experiment requires bounded typed inputs and assertion mappings")
+    if descriptions is None:
+        descriptions = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns).validate()
+    connected = {str(endpoint) for link in scene.topology.links
+                 for endpoint in (link.source, link.target)}
+    admitted, snapshots, observations = _admit_observations(
+        scene.duration_ns, descriptions, connected, assertions, ready)
+    specs = {node.name: node for node in scene.topology.nodes}
     queued = []
     for item in inputs:
         if item.at_ns > scene.duration_ns or item.endpoint.node not in descriptions:
@@ -293,11 +308,41 @@ def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
                                   if f"{spec.name}.{port.name}" in connected))
         queued.append(ExperimentInput(item.at_ns, item.endpoint, value))
     validate_input_batches(scene, registry, queued, origin_ns=0 if ready is None else None)
-    return _Admission(tuple(queued), admitted, snapshots, observations)
+    return _Admission(tuple(queued), admitted, snapshots, observations, descriptions)
+
+
+def _trace_api():
+    # Trace is optional; ordinary experiments never import its MCAP dependency.
+    try:
+        from sim.trace.experiment import ExperimentTrace, iter_experiment_records
+    except ModuleNotFoundError as error:
+        if error.name == "mcap" or (error.name or "").startswith("mcap."):
+            raise BackendUnavailable("experiment trace requires the trace extra") from error
+        raise
+    return ExperimentTrace, iter_experiment_records
+
+
+def _trace_config(scene, descriptions, assertions, ready):
+    return {
+        "duration_ns": scene.duration_ns,
+        "quantum_ns": scene.quantum_ns,
+        "ready": None if ready is None else {"endpoint": str(ready.endpoint), "text": ready.text},
+        "assertions": tuple(_plain(value) for value in assertions),
+        # Preserve all declared observation capabilities for replacement
+        # assertions, including snapshot-backed GPIOs not named in this run.
+        "descriptions": {name: {
+            "capabilities": tuple(sorted(description.capabilities)),
+            "ports": tuple({"name": port.name, "protocol": port.protocol,
+                            "direction": port.direction} for port in description.ports),
+        } for name, description in descriptions.items()},
+        "connected": tuple(sorted({str(endpoint) for link in scene.topology.links
+                                    for endpoint in (link.source, link.target)})),
+    }
 
 
 def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions=(), ready=None,
-                   startup_timeout_s=10, host_timeout_s=30, on_event=None) -> ExperimentResult:
+                   startup_timeout_s=10, host_timeout_s=30, on_event=None,
+                   trace=None) -> ExperimentResult:
     """Run relative inputs/assertions on one Simulation and clean before return.
 
     An optional actual UART ready marker establishes the experiment origin at
@@ -305,7 +350,13 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
     Session, Event or native timestamps. Matching ignores the whole ready cut.
     Machine UART/CAN use public observations; other connected producers use
     successful delivery events, keeping transport admission separate from reads.
+    Optional trace borrows a blocking binary output. Events and actual sample
+    cuts are recorded in callback order; completion/flush follows cleanup, even
+    for false assertions. Runtime or cleanup failures never publish completion.
+    Recording failures return no result and preserve accepted bytes, which may
+    include completion if a final flush fails. The caller alone closes output.
     """
+    trace_type = _trace_api()[0] if trace is not None else None
     registry = dict(registry)
     scene = load_scene(scene, registry) if isinstance(scene, (str, Path)) else scene
     if not isinstance(scene, Scene):
@@ -318,8 +369,10 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
     if on_event is not None and not callable(on_event):
         raise TypeError("experiment on_event must be callable")
     admitted = admit_experiment(scene, registry, inputs=inputs, assertions=assertions, ready=ready)
+    recorder = None
     simulation = None
     scheduled = False
+    cuts_total = 0
 
     def enqueue(origin):
         nonlocal scheduled
@@ -336,19 +389,28 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
                          admitted.observations, ready=ready, on_ready=enqueue)
 
     def observe(event):
+        if recorder is not None:
+            recorder.event(event)
         consumer(event)
         if on_event is not None:
             on_event(event)
+
+    def record_cut(cut):
+        nonlocal cuts_total
+        recorder.cut(cut)
+        cuts_total += 1
 
     # Reserve a fresh private name without restricting user component names.
     name = "_experiment_cut"
     while name in {node.name for node in scene.topology.nodes} or name in registry:
         name += "_"
-    registry[name] = _CutObserverFactory(consumer)
+    registry[name] = _CutObserverFactory(consumer, None if trace is None else record_cut)
     topology = Topology((*scene.topology.nodes, NodeSpec(name, name)), scene.topology.links)
     simulation = Simulation(topology, registry, quantum_ns=scene.quantum_ns,
                             startup_timeout_s=startup_timeout_s, host_timeout_s=host_timeout_s,
                             max_pending_inputs=max(256, len(admitted.inputs)), on_event=observe)
+    if trace is not None:
+        recorder = trace_type(trace, _trace_config(scene, admitted.descriptions, assertions, ready))
     begun = monotonic()
     total_deadline = begun + host_timeout_s
     startup_deadline = min(total_deadline, begun + startup_timeout_s)
@@ -382,6 +444,179 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
                 primary.add_note(f"simulation cleanup failed: {type(cleanup).__name__}: {cleanup}")
                 for note in getattr(cleanup, "__notes__", ()):
                     primary.add_note(note)
-    return ExperimentResult(consumer.evaluator.status, consumer.evaluator.failures,
-                            tuple(consumer.matches), completed, consumer.delivered_inputs, total,
-                            consumer.origin_ns, consumer.ready_receipt)
+    result = ExperimentResult(consumer.evaluator.status, consumer.evaluator.failures,
+                              tuple(consumer.matches), completed, consumer.delivered_inputs, total,
+                              consumer.origin_ns, consumer.ready_receipt)
+    if recorder is not None:
+        recorder.complete({"end_ns": completed, "origin_ns": consumer.origin_ns,
+                           "delivered_inputs": consumer.delivered_inputs,
+                           "events_total": total, "cuts_total": cuts_total})
+    return result
+
+
+def _exact_mapping(value, keys, label):
+    if not isinstance(value, Mapping) or set(value) != set(keys):
+        raise ValueError(f"invalid experiment trace {label}")
+    return value
+
+
+@dataclass(frozen=True)
+class _ReplayPlan:
+    duration_ns: int
+    quantum_ns: int
+    ready: ExperimentReady | None
+    assertions: tuple
+    snapshots: dict
+    observations: dict
+    descriptions: dict
+
+
+def _replay_plan(config, assertions):
+    config = _exact_mapping(config, ("duration_ns", "quantum_ns", "ready", "assertions",
+                                     "descriptions", "connected"), "configuration")
+    duration, quantum = config["duration_ns"], config["quantum_ns"]
+    for value in (duration, quantum):
+        check_timestamp(value)
+        if not value:
+            raise ValueError("experiment trace duration and quantum must be positive")
+    raw = config["descriptions"]
+    if not isinstance(raw, Mapping) or not 1 <= len(raw) <= 63:
+        raise ValueError("experiment trace requires 1..63 node descriptions")
+    descriptions = {}
+    for name, description in raw.items():
+        NodeSpec(name, "recorded")  # Reuse public identifier admission, without a factory.
+        description = _exact_mapping(description, ("capabilities", "ports"), "node description")
+        capabilities, ports = description["capabilities"], description["ports"]
+        if (type(capabilities) is not tuple or len(set(capabilities)) != len(capabilities)
+                or type(ports) is not tuple):
+            raise ValueError("experiment trace descriptions require capability and port tuples")
+        admitted_ports = []
+        for port in ports:
+            port = _exact_mapping(port, ("name", "protocol", "direction"), "port description")
+            admitted_ports.append(PortSpec(**port))
+        descriptions[name] = NodeDescription(tuple(admitted_ports), capabilities)
+    connected = config["connected"]
+    if (type(connected) is not tuple or len(connected) > 512
+            or len(set(connected)) != len(connected)):
+        raise ValueError("experiment trace requires bounded unique connected endpoints")
+    for value in connected:
+        endpoint = Endpoint.parse(value)
+        if endpoint.node not in descriptions:
+            raise ValueError("experiment trace connection names an unknown node")
+        descriptions[endpoint.node].port(endpoint.port)
+    ready = config["ready"]
+    if ready is not None:
+        ready = _exact_mapping(ready, ("endpoint", "text"), "ready declaration")
+        ready = ExperimentReady(ready["endpoint"], ready["text"])
+    original = _admit_observations(duration, descriptions, connected, config["assertions"], ready)
+    admitted, snapshots, observations = (original if assertions is None else
+        _admit_observations(duration, descriptions, connected, assertions, ready))
+    return _ReplayPlan(duration, quantum, ready, admitted, snapshots, observations, descriptions)
+
+
+class _DigestInput:
+    """Hash exactly the bytes consumed by the canonical bounded MCAP reader."""
+
+    def __init__(self, source):
+        self.source = source
+        self.digest = hashlib.sha256()
+
+    def read(self, size):
+        data = self.source.read(size)
+        if type(data) is bytes:
+            self.digest.update(data)
+        return data
+
+
+def _replay_pass(source, records, assertions, expected_config=None):
+    config = plan = consumer = summary = None
+    previous_cut = pending_cut = None
+    cuts_total = 0
+    for record in records(source):
+        if record.kind == "config":
+            if config is not None:
+                raise ValueError("duplicate experiment trace configuration")
+            config = record.data
+            if expected_config is not None and config != expected_config:
+                raise ValueError("experiment trace configuration changed between passes")
+            plan = _replay_plan(config, assertions)
+            consumer = _Consumer(plan.assertions, plan.duration_ns, plan.snapshots,
+                                 plan.observations, ready=plan.ready)
+            continue
+        if plan is None or summary is not None:
+            raise ValueError("invalid experiment trace lifecycle order")
+        if record.kind == "event":
+            event = record.data
+            if event.source_node not in plan.descriptions:
+                raise ValueError("experiment trace Event names an unknown node")
+            if event.source_port is not None:
+                plan.descriptions[event.source_node].port(event.source_port)
+            if previous_cut is None or event.delivery_time_ns > previous_cut:
+                if pending_cut is not None and pending_cut != event.delivery_time_ns:
+                    raise ValueError("experiment trace lacks an observation cut")
+                pending_cut = event.delivery_time_ns
+            consumer(event)
+        elif record.kind == "cut":
+            cut = record.data
+            if ((previous_cut is None and cut != 0) or
+                    (previous_cut is not None and not 0 <= cut - previous_cut <= plan.quantum_ns) or
+                    (pending_cut is not None and pending_cut != cut)):
+                raise ValueError("experiment trace observation cuts differ from its runtime")
+            consumer.begin_cut(cut)
+            previous_cut, pending_cut = cut, None
+            cuts_total += 1
+        elif record.kind == "completion":
+            summary = _exact_mapping(record.data,
+                ("end_ns", "origin_ns", "delivered_inputs", "events_total", "cuts_total"),
+                "completion")
+        else:
+            raise ValueError("unsupported experiment trace record")
+    # The iterator has now checked every CRC, footer, trailing magic and EOF.
+    if summary is None or consumer is None or consumer.evaluator is None:
+        raise ValueError("experiment trace lacks its completed ready lifecycle")
+    for value in summary.values():
+        check_timestamp(value)
+    end = summary["end_ns"]
+    if (pending_cut is not None or previous_cut != end or
+            consumer.origin_ns != summary["origin_ns"] or
+            end != consumer.origin_ns + plan.duration_ns or
+            consumer.delivered_inputs != summary["delivered_inputs"] or
+            consumer.sequence + 1 != summary["events_total"] or
+            cuts_total != summary["cuts_total"]):
+        raise ValueError("experiment trace completion differs from its captured lifecycle")
+    consumer.evaluator.finish(end)
+    result = ExperimentResult(consumer.evaluator.status, consumer.evaluator.failures,
+        tuple(consumer.matches), end, consumer.delivered_inputs, consumer.sequence + 1,
+        consumer.origin_ns, consumer.ready_receipt)
+    return config, result
+
+
+def replay_experiment(source, assertions=None) -> ExperimentResult:
+    """Reevaluate a complete finite transcript without factories or native IO.
+
+    Default assertions are the recorded originals. Replacement mappings use the
+    same grammar and all captured public capabilities. The borrowed blocking
+    read/seek/tell stream must start at zero and remain unchanged. Two complete
+    container/lifecycle passes and equal SHA256 digests precede any result.
+    Successful calls leave EOF; errors neither retry, rewind again nor close.
+    """
+    _, records = _trace_api()
+    if any(not callable(getattr(source, name, None)) for name in ("read", "seek", "tell")):
+        raise TypeError("experiment replay input requires read/seek/tell")
+    position = source.tell()
+    if type(position) is not int or position != 0:
+        raise ValueError("experiment replay input must start at byte zero")
+    if assertions is not None and (not isinstance(assertions, (tuple, list)) or
+                                   len(assertions) > MAX_ITEMS):
+        raise ValueError("experiment requires at most 1024 assertion mappings")
+    first = _DigestInput(source)
+    config, _ = _replay_pass(first, records, assertions)
+    source.seek(0)
+    position = source.tell()
+    if type(position) is not int or position != 0:
+        raise ValueError("experiment replay could not rewind to byte zero")
+    second = _DigestInput(source)
+    _, result = _replay_pass(second, records, assertions, expected_config=config)
+    if first.digest.digest() != second.digest.digest():
+        raise ValueError("experiment trace bytes changed between passes")
+    return result
