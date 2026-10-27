@@ -46,6 +46,11 @@ def _parser():
     run.add_argument('--gdb-port', type=_port, help='single machine native GDB port')
     run.add_argument('--qmp', type=Path, help='single machine additional native QMP socket')
     run.add_argument('--report', type=Path, help='create a new JSON report after cleanup')
+    run.add_argument('--trace', type=Path, help='record a finite stepped experiment to a new MCAP file')
+    replay = commands.add_parser('replay', help='evaluate a recorded experiment offline')
+    replay.add_argument('trace', type=Path)
+    replay.add_argument('--assertions', type=Path, help='bounded YAML replacement assertions')
+    replay.add_argument('--report', type=Path, help='create a new offline JSON report after cleanup')
     return parser
 
 
@@ -169,53 +174,124 @@ def _interrupted(_signum, _frame):
     raise KeyboardInterrupt('simulation interrupted')
 
 
+def _paths_overlap(left, right):
+    return left == right or left in right.parents or right in left.parents
+
+
+def _check_outputs(*paths, inputs=()):
+    """Reject existing or aliased outputs before acquiring native resources."""
+    resolved = set()
+    for path in paths:
+        if path is None:
+            continue
+        destination = path.resolve()
+        if any(_paths_overlap(destination, previous) for previous in resolved):
+            raise ValueError('trace and report output paths must differ and cannot contain one another')
+        if any(_paths_overlap(destination, source.resolve()) for source in inputs if source is not None):
+            raise ValueError('output paths must differ from input paths and cannot contain one another')
+        resolved.add(destination)
+        if path.exists() or path.is_symlink():
+            raise FileExistsError(f'output already exists: {path}')
+
+
+def _load_assertions(path):
+    from sim.config.yaml import ManifestError, fields, load_document
+
+    _, document = load_document(path)
+    fields(document, {'assertions'}, {'assertions'}, 'replay assertions')
+    assertions = document['assertions']
+    if type(assertions) is not list or len(assertions) > 1024:
+        raise ManifestError('assertions must be a list with at most 1024 entries')
+    # The application admits the shared grammar, recorded endpoints and times.
+    return assertions
+
+
+def _error_code(error):
+    from sim.api import BackendUnavailable
+
+    if isinstance(error, KeyboardInterrupt):
+        return 130
+    return 78 if isinstance(error, BackendUnavailable) else 1
+
+
 def main(argv=None):
     args = _parser().parse_args(argv)
     simulation = None
     error = None
     code = 0
     result = None
+    trace = source = None
+    provenance = None
+    report_allowed = True
     previous = signal.signal(signal.SIGTERM, _interrupted)
     try:
-        from sim.composition import builtin_registry
-        from sim.config.scene import load_scene
-        from sim.runtime import Simulation
+        if args.command == 'replay':
+            provenance = {'mode': 'offline-replay', 'trace': str(args.trace.resolve()),
+                          'assertions': None if args.assertions is None else str(args.assertions.resolve())}
+            report_allowed = False
+            _check_outputs(args.report, inputs=(args.trace, args.assertions))
+            report_allowed = True
+            assertions = None if args.assertions is None else _load_assertions(args.assertions)
+            from sim.apps.experiment import replay_experiment
 
-        registry = builtin_registry(**({'qemu': args.qemu, 'backend_root': args.backend_root,
-                                       'gdb_port': args.gdb_port, 'qmp_path': args.qmp}
-                                      if args.command == 'run' else {}))
-        scene = load_scene(args.scene, registry)
-        if args.command == 'validate':
-            print(f'valid: {args.scene} ({len(scene.topology.nodes)} nodes)')
-            return 0
-        if (args.gdb_port is not None or args.qmp is not None) and sum(
-                node.kind == 'machine.qemu' for node in scene.topology.nodes) != 1:
-            raise ValueError('--gdb-port/--qmp require exactly one QEMU machine')
-        timeout = args.timeout or (300.0 if scene.mode == 'interactive' else 30.0)
-        if scene.experiment is not None:
-            from sim.apps.experiment import run_experiment
-            experiment = run_experiment(scene, registry, host_timeout_s=timeout,
-                                        startup_timeout_s=args.startup_timeout, on_event=_emit)
+            if not args.trace.is_file():
+                raise ValueError('replay trace must be a regular file')
+            source = args.trace.open('rb')
+            experiment = replay_experiment(source, assertions=assertions)
             result = _json(experiment)
             code = 0 if experiment.passed else 1
             for failure in experiment.failures:
                 print(f'assertion failed: {failure}', file=sys.stderr)
         else:
-            simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
-                                    mode=scene.mode, host_timeout_s=timeout,
-                                    startup_timeout_s=args.startup_timeout, on_event=_emit)
-            simulation.start()
-            if scene.mode == 'interactive':
-                _interactive(simulation, scene)
+            if args.command == 'run' and args.trace is not None:
+                report_allowed = False
+                _check_outputs(args.trace, args.report)
+                report_allowed = True
+            from sim.composition import builtin_registry
+            from sim.config.scene import load_scene
+            from sim.runtime import Simulation
+
+            registry = builtin_registry(**({'qemu': args.qemu, 'backend_root': args.backend_root,
+                                           'gdb_port': args.gdb_port, 'qmp_path': args.qmp}
+                                          if args.command == 'run' else {}))
+            scene = load_scene(args.scene, registry)
+            if args.command == 'validate':
+                print(f'valid: {args.scene} ({len(scene.topology.nodes)} nodes)')
+                return 0
+            if (args.gdb_port is not None or args.qmp is not None) and sum(
+                    node.kind == 'machine.qemu' for node in scene.topology.nodes) != 1:
+                raise ValueError('--gdb-port/--qmp require exactly one QEMU machine')
+            if args.trace is not None:
+                if scene.mode != 'stepped' or len(scene.topology.nodes) > 63:
+                    raise ValueError('--trace requires a finite stepped scene with at most 63 nodes')
+                args.trace.parent.mkdir(parents=True, exist_ok=True)
+                trace = args.trace.open('xb')
+            timeout = args.timeout or (300.0 if scene.mode == 'interactive' else 30.0)
+            if scene.experiment is not None or trace is not None:
+                from sim.apps.experiment import run_experiment
+
+                options = {} if trace is None else {'trace': trace}
+                experiment = run_experiment(scene, registry, host_timeout_s=timeout,
+                                            startup_timeout_s=args.startup_timeout,
+                                            on_event=_emit, **options)
+                result = ({'time_ns': experiment.end_ns} if scene.experiment is None
+                          else _json(experiment))
+                code = 0 if experiment.passed else 1
+                for failure in experiment.failures:
+                    print(f'assertion failed: {failure}', file=sys.stderr)
             else:
-                simulation.run_until(scene.duration_ns)
-            result = {'time_ns': simulation.t_sim_ns}
+                simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
+                                        mode=scene.mode, host_timeout_s=timeout,
+                                        startup_timeout_s=args.startup_timeout, on_event=_emit)
+                simulation.start()
+                if scene.mode == 'interactive':
+                    _interactive(simulation, scene)
+                else:
+                    simulation.run_until(scene.duration_ns)
+                result = {'time_ns': simulation.t_sim_ns}
     except BaseException as caught:
         error = caught
-        code = 130 if isinstance(caught, KeyboardInterrupt) else 1
-        from sim.api import BackendUnavailable
-        if isinstance(caught, BackendUnavailable):
-            code = 78
+        code = _error_code(caught)
     finally:
         if simulation is not None:
             try:
@@ -223,14 +299,26 @@ def main(argv=None):
             except BaseException as cleanup:
                 if error is None:
                     error = cleanup
-                    code = 130 if isinstance(cleanup, KeyboardInterrupt) else 1
+                    code = _error_code(cleanup)
                 else:
                     error.add_note(f'Simulation cleanup: {type(cleanup).__name__}: {cleanup}')
+        for label, stream in (('trace', trace), ('replay source', source)):
+            if stream is None:
+                continue
+            try:
+                stream.close()
+            except BaseException as cleanup:
+                if error is None:
+                    error, code = cleanup, _error_code(cleanup)
+                elif cleanup is not error:
+                    error.add_note(f'{label} cleanup: {type(cleanup).__name__}: {cleanup}')
         signal.signal(signal.SIGTERM, previous)
     payload = ({'status': 'passed' if code == 0 else 'failed', 'result': result} if error is None else
                {'status': 'blocked' if code == 78 else 'failed', 'error': str(error),
                 'error_type': type(error).__name__, 'notes': getattr(error, '__notes__', [])})
-    if args.command == 'run' and args.report:
+    if provenance is not None:
+        payload['provenance'] = provenance
+    if args.command in ('run', 'replay') and args.report and report_allowed:
         try:
             args.report.parent.mkdir(parents=True, exist_ok=True)
             with args.report.open('x', encoding='utf-8') as output:
@@ -238,14 +326,16 @@ def main(argv=None):
         except BaseException as report_error:
             if error is None:
                 error = report_error
-                code = 130 if isinstance(report_error, KeyboardInterrupt) else 1
+                code = _error_code(report_error)
             else:
                 error.add_note(f'report: {type(report_error).__name__}: {report_error}')
     if error is not None:
-        print(f'error: {error}', file=sys.stderr)
+        prefix = 'offline replay error' if args.command == 'replay' else 'error'
+        print(f'{prefix}: {error}', file=sys.stderr)
         for note in getattr(error, '__notes__', ()):
             print(note, file=sys.stderr)
     else:
         stamp = result['time_ns'] if 'time_ns' in result else result['end_ns']
-        print(f"{payload['status']}: time_ns={stamp}")
+        prefix = 'offline replay ' if args.command == 'replay' else ''
+        print(f"{prefix}{payload['status']}: time_ns={stamp}")
     return code

@@ -171,7 +171,56 @@ UART 跨块匹配只保留必要后缀，网络交付仍不证明固件消费。
 未声明 ready 时，实验原点为 Simulation 的0；声明 `experiment.ready` 后，用实际 UART 观察
 的交付切点作为相对原点，输入及断言平移，Session/Event/native 时钟保持不变。包含 ready
 的整个切点属于启动观察，不参与断言。ready 与资源创建共用 startup host 期限，总期限
-不会重新计时。ADC1 输入已接入；VIN、原交互/Web、trace/capture 与故障脚本仍由旧入口承载。
+不会重新计时。ADC1 输入已接入；VIN、原交互/Web 和旧应用的专用故障脚本仍由旧入口承载。
+
+<a id="experiment-recording"></a>
+### 实验记录与离线断言复核
+
+安装可选的 `trace` extra，即可把有限 stepped 场景记录为独立 MCAP 文件：
+
+```bash
+python -m pip install '.[trace]'
+sim run examples/can-faults/host-only.yaml --trace observations.mcap --report live.json
+sim replay observations.mcap --report offline.json
+sim replay observations.mcap --assertions assertions.yaml --report revised.json
+```
+
+记录包含原断言、ready 条件、时长和完整可观察端点能力，无需原场景、ELF、QEMU 或物理引擎
+即可离线复核。替换文件仅包含 `assertions` 列表，沿用现有 `before`、`uart_contains`、
+`can_seen`、`digital_equals` 格式，最多1024条；截止时间相对原 ready 原点，不能超过录制时长。
+可为原来没有断言的已记录端点增加断言，不能为未支持的端点制造观测能力。
+
+```yaml
+assertions:
+  - before: 4ns
+    can_seen: {endpoint: host.can, id: 0x321, data_hex: 'aa'}
+```
+
+在线和离线共用一个断言消费者。记录保留每个 Event 的序号、来源、source/mapped/delivery
+时间及 quality，也保留没有事件的切点：空切点会使断言永久到期，不能在离线时省略。
+追加顺序不按源时间重新排序。ready 跨块匹配和排除整个 ready 切点的规则保持一致。
+离线复核只重新评估已记录的观测，不运行固件、输入动作或物理演化，不提供执行重放。
+
+Python 使用 `run_experiment(..., trace=output)` 和
+`replay_experiment(source, assertions=None)`，二者返回相同的 `ExperimentResult`。
+输出是借用的 blocking binary stream；离线输入需提供 `read/seek/tell`、从字节0开始，
+调用期间保持内容不变。函数不关闭借用流。CLI 排他创建记录和报告，不覆盖已有文件。
+未声明 `experiment` 的场景按空断言录制，普通运行报告仍保持 `time_ns` 形状。
+录制沿用实验 runner 的63个用户节点上限；首版仅支持一个 session 的有限 stepped 场景，
+交互、reset 和多 session 尚不支持。
+
+底层沿用 MCAP1.5.0 和现有有界存储，不增加调度器或时钟。配置、端点和断言分条保存，
+配置 typed JSON 总量上限为8MiB，按32KiB分段；其它单记录 payload 上限仍为64KiB。
+值最多嵌套32层，整数最多256bit；事件时间仍须满足现有 uint64 纳秒合同。
+基本数据、bytes 和当前内建 CAN/IMU/JointState 使用显式
+类型编码；未知记录类型、非有限数值或超限数据会明确失败，不使用动态导入或 pickle。
+离线两遍完整校验记录、计数、结束信息、CRC/footer/EOF，并比较两遍文件 SHA256 后才返回；
+这不认证文件的作者或硬件真实性。
+
+执行与组件清理完成后才写结束信息，即使断言失败也会生成可复核的完整记录。运行、清理或
+写入失败时不发布 CLI 成功，保留诊断文件及主错误。晚期 flush/close 错误可能发生在完整字节
+已经写出之后；已产生的 I/O 不作回滚。缺少 trace extra 返回 blocked/78，断言或记录错误
+返回 failed/1，中断返回130。基础安装、`sim --help` 和 `sim validate` 不加载 MCAP。
 
 
 <a id="rotor-loop"></a>

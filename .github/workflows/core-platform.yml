@@ -131,3 +131,62 @@ jobs:
         run: python -m pip install '.[referee]' 'pytest>=8,<9'
       - name: SharedWorld cuts, wire admission and cleanup without native backends
         run: python -m pytest -q tests/test_sim_shared_world.py
+
+  experiment-recording:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install trace extra without native backends
+        run: python -m pip install '.[trace]' 'pytest>=8,<9'
+      - name: MCAP, finite experiment and offline replay contracts
+        run: >-
+          python -m pytest -q
+          tests/test_sim_trace.py tests/test_sim_experiment.py
+          tests/test_experiment_trace.py tests/test_experiment_replay.py
+          tests/test_experiment_trace_cli.py
+      - name: Installed recording and standalone replay
+        working-directory: /tmp
+        env:
+          PYTHONPATH: ''
+          PYTHONHOME: ''
+        run: |
+          python -I - <<'PY'
+          import importlib.abc
+          import importlib.util
+          import json
+          from pathlib import Path
+          import sys
+          import tempfile
+
+          class NoNative(importlib.abc.MetaPathFinder):
+              def find_spec(self, fullname, path=None, target=None):
+                  if fullname.split('.')[0] in {'qemu', 'mujoco', 'numpy', 'tools'}:
+                      raise AssertionError('unexpected native import: ' + fullname)
+          sys.meta_path.insert(0, NoNative())
+          from sim.cli import main
+          import sim
+          assert '/site-packages/' in str(Path(sim.__file__).resolve())
+          with tempfile.TemporaryDirectory(prefix='sim.trace-ci.') as name:
+              directory = Path(name)
+              scene = directory / 'scene.yaml'
+              scene.write_text('schema: sim/v1\nruntime: {duration: 3ms}\nnodes:\n'
+                               '  host: {kind: device.can-host}\n'
+                               '  peer: {kind: device.can-host}\n'
+                               '  bus: {kind: bus.can}\nlinks:\n'
+                               '  - [host.can, bus.can]\n  - [peer.can, bus.can]\n'
+                               'experiment:\n  inputs:\n'
+                               '    - {at: 1ms, endpoint: host.tx, value: {id: 291, dlc: 1, data_hex: "42"}}\n'
+                               '  assertions:\n    - before: 3ms\n'
+                               '      can_seen: {endpoint: host.can, id: 291, data_hex: "42"}\n')
+              trace, live, offline = (directory / name for name in ('observations.mcap', 'live.json', 'offline.json'))
+              assert main(['run', str(scene), '--trace', str(trace), '--report', str(live)]) == 0
+              scene.unlink()
+              assert main(['replay', str(trace), '--report', str(offline)]) == 0
+              online = json.loads(live.read_text())
+              replayed = json.loads(offline.read_text())
+              assert online['status'] == replayed['status'] == 'passed'
+              assert online['result'] == replayed['result']
+          PY
