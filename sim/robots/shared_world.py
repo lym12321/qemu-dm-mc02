@@ -23,6 +23,7 @@ from sim.boards import (
     drain_paused_can, observe_initial_paused_can, wait_paused_can_input,
 )
 from sim.api import NodeDescription, NodeSpec, Session, StepResult, Topology
+from sim.api.events import check_timestamp
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.devices.dji import M3508JointPlant
 from sim.devices.dji.protocol import validate_motor_id
@@ -113,37 +114,69 @@ class _ParticipantFactory:
 
 
 class _BoardExecutionGroup:
-    """Own one requested board group; QMP and streams remain borrowed."""
+    """Prepare and commit each cut's exchange over borrowed board transports."""
 
     def __init__(self, runtime, context):
         self.runtime = runtime
         self.context = context
         self.pending = None
+        self.completed = False
+        self.responses = ()
         self.closed = False
 
-    def request_step(self, context):
+    def _prepare_cut(self, context):
         if self.closed or self.pending is not None:
-            raise RuntimeError('board execution group requires no pending request')
-        targets = tuple(mapper.unmap(context.t_sim_ns, mapper.qemu_origin_ns)
-                        for mapper in self.runtime._mappers)
+            raise RuntimeError('board exchange requires no pending cut')
+        targets = self.runtime._admit_cut(context.t_sim_ns, context.step_id)
+        if (context.session_id != self.context.session.session_id or
+                context.t_sim_ns - context.dt_ns != self.runtime.t_sim_ns or
+                context.step_id != self.runtime.step_id + 1):
+            raise ValueError('board exchange must continue the current Simulation cut')
         self.pending = (context, targets, None, None)
+        self.completed = False
+        return targets
+
+    def request_step(self, context):
+        targets = self._prepare_cut(context)
         starts, commands = self.runtime._request_cpus(targets, self.context.deadline_monotonic)
         self.pending = (context, targets, starts, commands)
 
     def finish_step(self, context):
-        if self.closed or self.pending is None or self.pending[0] is not context:
+        if (self.closed or self.pending is None or self.pending[0] is not context
+                or self.completed):
             raise RuntimeError('board execution completion requires its pending request')
         _, targets, starts, commands = self.pending
         deadline = self.context.deadline_monotonic
         self.runtime._finish_cpus(targets, starts, commands, deadline)
         self.runtime._service(deadline, 0)
         self.runtime._guard(deadline)
-        self.pending = None
+        self.completed = True
         return StepResult('ok', context.t_sim_ns)
+
+    def step(self, context):
+        # The non-execution mode prepares its actual wire transaction before
+        # the CAN/world participant; it never pretends to run a native CPU.
+        self._prepare_cut(context)
+        self.completed = True
+        return StepResult('ok', context.t_sim_ns)
+
+    def commit_inputs(self, cut_ns):
+        if self.closed:
+            raise RuntimeError('board exchange is closed')
+        if self.pending is None:
+            return  # Initial and repeated completed-cut settles have no STEP.
+        context, targets, _, _ = self.pending
+        if not self.completed or cut_ns != context.t_sim_ns:
+            raise RuntimeError('board exchange commit requires its completed cut')
+        self.responses = self.runtime._exchange_cut(
+            context, targets, self.context.deadline_monotonic)
+        self.pending = None
+        self.completed = False
 
     def close(self):
         self.closed = True
         self.pending = None
+        self.completed = False
 
 
 class _BoardGroupFactory:
@@ -151,7 +184,8 @@ class _BoardGroupFactory:
         self.runtime = runtime
 
     def describe(self, spec):
-        return NodeDescription(capabilities=frozenset({'machine'}))
+        capability = 'machine' if self.runtime._exact_execution else 'step'
+        return NodeDescription(capabilities=frozenset({capability, 'input_commit'}))
 
     def create(self, spec, context):
         return _BoardExecutionGroup(self.runtime, context)
@@ -190,7 +224,11 @@ class SharedWorldRuntime:
     def __init__(self, plant: M3508JointPlant,
                  bindings: tuple[BoardBinding, ...], *,
                  referees: tuple[RefereeBinding, ...] = (),
-                 check_running=None, on_response=None):
+                 check_running=None, on_response=None,
+                 quantum_ns=codec.UINT64_MAX):
+        check_timestamp(quantum_ns)
+        if quantum_ns == 0:
+            raise ValueError('shared world quantum_ns must be positive')
         if not isinstance(plant, M3508JointPlant) or plant.closed:
             raise TypeError("shared world requires an open M3508 joint plant")
         if (type(bindings) is not tuple or not bindings
@@ -312,6 +350,7 @@ class SharedWorldRuntime:
         self._can_baselines = ()
         self._can_input_states = ()
         self._motor_feedback_policies = {}
+        self._quantum_ns = quantum_ns
 
     @property
     def t_sim_ns(self):
@@ -402,6 +441,26 @@ class SharedWorldRuntime:
             raise RuntimeError("shared world CAN input drop count moved backwards")
         return rx
 
+    def _admit_cut(self, target, step_id):
+        """Admit one wire cut before any CPU or world effects at that cut."""
+        check_can_time(target)
+        if type(step_id) is not int or not 0 < step_id <= codec.UINT32_MAX:
+            raise ValueError("STEP sample ID must fit the unsigned 32-bit field")
+        for item in self.bindings:
+            check_can_time(target + item.endpoint.bus.delay_ns)
+        targets = tuple(mapper.unmap(target, mapper.qemu_origin_ns)
+                        for mapper in self._mappers)
+        for native_target in targets:
+            check_can_time(native_target)
+            if self._exact_execution and native_target > 0x7fffffffffffffff:
+                raise ValueError("native CPU target must fit signed64")
+        if self._exact_execution:
+            self._check_execution_wiring()
+            for index, (_, _, _, budget) in enumerate(self._can_wiring):
+                if self._input_goal(index) + 2 * budget > 0xfffffffffffffffe:
+                    raise ValueError("shared world CAN input lacks native counter headroom")
+        return targets
+
     def _request_cpus(self, targets, deadline):
         # Revalidate the previous cut before any new CPU is released. The first
         # cut has idle/no-target semantics, not a fabricated reached target.
@@ -487,7 +546,8 @@ class SharedWorldRuntime:
             raise V2SessionReset(frame.header.step_id, frame.header.t_sim_ns,
                                  frame.header.session_id)
 
-    def _service(self, deadline, timeout, *, active=None, acked=None):
+    def _service(self, deadline, timeout, *, active=None, acked=None,
+                 ingress_cut_ns=None):
         self._guard(deadline)
         # During start, only already-ACKed peers may be polled. Other RESET_ACKs
         # remain physically queued for their exclusive active wait. CAN RX is
@@ -524,15 +584,17 @@ class SharedWorldRuntime:
         # One canonical CAN read per stream; parsing/ingress never advances
         # time. The bus retains original ordering/future delivery and queues.
         if acked is None and not self._exact_execution:
+            ingress_cut = self.t_sim_ns if ingress_cut_ns is None else ingress_cut_ns
             for item in self.bindings:
                 for can_id, flags, dlc, timestamp, data in item.endpoint.stream.receive():
                     item.endpoint.ingest(CanFrame(can_id, flags, dlc, data, timestamp),
-                                         self.t_sim_ns)
+                                         ingress_cut)
                 self._guard(deadline)
 
-    def _wait_service(self, deadline, timeout, active):
+    def _wait_service(self, deadline, timeout, active, ingress_cut_ns):
         try:
-            self._service(deadline, timeout, active=active)
+            self._service(deadline, timeout, active=active,
+                          ingress_cut_ns=ingress_cut_ns)
         except TimeoutError as exc:
             # The canonical STEP helper retries its own ACK wait timeouts.
             # Callback/transport failures are terminal, even if transient.
@@ -594,10 +656,10 @@ class SharedWorldRuntime:
             for item, mapper in zip(self.bindings, mappers):
                 item.endpoint.bind_mapper(mapper)
             self._guard(deadline)
-            factories = ({'boards': _BoardGroupFactory(self)} if self._exact_execution else {})
+            factories = {'boards': _BoardGroupFactory(self)}
             factories.update(self._participant_factories)
             topology = Topology(tuple(NodeSpec(name, name) for name in factories))
-            self._simulation = Simulation(topology, factories, quantum_ns=codec.UINT64_MAX,
+            self._simulation = Simulation(topology, factories, quantum_ns=self._quantum_ns,
                                           initial_session=session)
             self._simulation.start(deadline_monotonic=deadline)
             for item in self.referees:
@@ -763,8 +825,44 @@ class SharedWorldRuntime:
             self._motor_feedback_policies[name] = _MotorFeedbackPolicy(
                 bus, original, drop, blocked)
 
+    def _exchange_cut(self, context, targets, deadline):
+        # All source getters and encoders finish before any board receives this
+        # batch. A failed later source retains world/CAN effects but publishes
+        # no partial board group. Simulation commits time only after this hook.
+        frames = []
+        for item, validator in zip(self.bindings, self._tx):
+            self._guard(deadline)
+            gyro, accel = imu_to_bmi088_units(self.plant.physics.get_imu(item.imu))
+            payload = codec.encode_imu_sample_v2(codec.ImuSampleV2(
+                gyro, accel, (0.0,) * 3, (0.0,) * 3,
+                context.t_sim_ns, context.step_id))
+            encoded = codec.build_step_frame(
+                codec.STEP, context.step_id, context.t_sim_ns, context.dt_ns,
+                session_id=validator.session_id, payload=payload)
+            frames.append((codec.decode_step_frame(encoded), encoded))
+            self._guard(deadline)
+        for validator, (frame, _) in zip(self._tx, frames):
+            validator.accept(frame)
+        responses = []
+        for index, (item, (_, encoded)) in enumerate(zip(self.bindings, frames)):
+            self._guard(deadline)
+            response = send_v2_step(
+                item.cosim, self._rx[index], encoded, context.step_id, context.t_sim_ns,
+                service_io=lambda timeout, active=index: self._wait_service(
+                    deadline, timeout, active, context.t_sim_ns))
+            self._guard(deadline)
+            responses.append(response)
+            self._observe(index, response, codec.decode_step_ack_payload(response.payload))
+            self._guard(deadline)
+        if self._exact_execution:
+            states = tuple(dict(self._wait_can_input(index, native_target, deadline))
+                           for index, native_target in enumerate(targets))
+            self._guard(deadline)
+            self._can_input_states = states
+        return tuple(responses)
+
     def step(self, dt_ns: int, *, deadline):
-        """Advance the sole world once; return actual per-board STEP_ACKs."""
+        """Advance through bounded exchanges; return the final cut's STEP_ACKs."""
         self._enter()
         try:
             deadline = _finite_seconds(deadline, "deadline")
@@ -772,60 +870,17 @@ class SharedWorldRuntime:
                 raise ValueError("dt_ns must be a positive signed64 integer")
             target = self.t_sim_ns + dt_ns
             check_can_time(target)
-            next_step = self.step_id + 1
-            if next_step > codec.UINT32_MAX:
-                raise ValueError("STEP sample ID must fit the unsigned 32-bit field")
-            for item in self.bindings:
-                check_can_time(target + item.endpoint.bus.delay_ns)
-            targets = tuple(mapper.unmap(target, mapper.qemu_origin_ns)
-                            for mapper in self._mappers)
-            for native_target in targets:
-                check_can_time(native_target)
-                if self._exact_execution and native_target > 0x7fffffffffffffff:
-                    raise ValueError("native CPU target must fit signed64")
-            if self._exact_execution:
-                self._check_execution_wiring()
-                for index, (_, _, _, budget) in enumerate(self._can_wiring):
-                    if self._input_goal(index) + 2 * budget > 0xfffffffffffffffe:
-                        raise ValueError("shared world CAN input lacks native counter headroom")
+            # Current graphs have no scheduled external inputs or dispatch
+            # owners, so their quantum split count is known before any IO.
+            cuts = (dt_ns + self._quantum_ns - 1) // self._quantum_ns
+            self._admit_cut(target, self.step_id + cuts)
             self._guard(deadline)
             self._service(deadline, 0)
             self._guard(deadline)
             self._simulation.step(dt_ns, deadline_monotonic=deadline)
             self._guard(deadline)
-            # Collect every completed IMU and encode every outgoing frame
-            # before sending any STEP; a later bad source cannot publish half
-            # the board group. CAN/native effects already performed are retained.
-            frames = []
-            for item, validator in zip(self.bindings, self._tx):
-                self._guard(deadline)
-                gyro, accel = imu_to_bmi088_units(self.plant.physics.get_imu(item.imu))
-                payload = codec.encode_imu_sample_v2(codec.ImuSampleV2(
-                    gyro, accel, (0.0,) * 3, (0.0,) * 3, target, next_step))
-                wire = codec.build_step_frame(codec.STEP, next_step, target, dt_ns,
-                                             session_id=validator.session_id, payload=payload)
-                frames.append((codec.decode_step_frame(wire), wire))
-                self._guard(deadline)
-            for validator, (frame, _) in zip(self._tx, frames):
-                validator.accept(frame)
-            responses = []
-            for index, (item, (_, wire)) in enumerate(zip(self.bindings, frames)):
-                self._guard(deadline)
-                response = send_v2_step(
-                    item.cosim, self._rx[index], wire, next_step, target,
-                    service_io=lambda timeout, active=index: self._wait_service(
-                        deadline, timeout, active))
-                self._guard(deadline)
-                responses.append(response)
-                self._observe(index, response, codec.decode_step_ack_payload(response.payload))
-                self._guard(deadline)
-            if self._exact_execution:
-                states = tuple(dict(self._wait_can_input(index, native_target, deadline))
-                               for index, native_target in enumerate(targets))
-                self._guard(deadline)
-                self._can_input_states = states
             self._failed = False
-            return tuple(responses)
+            return self._simulation.components['boards'].responses
         finally:
             self._busy = False
 

@@ -2874,9 +2874,13 @@ QEMU 须以 `-S -accel tcg,thread=single -icount shift=0,align=off,sleep=off`
 
 `start()` 只允许尝试一次：全部实际 RESET_ACK 到齐后，将各自 QEMU 时间原点
 映射到所给 Session 原点，再统一重置总线和世界一次。启动期间保留物理 CAN
-输入，不提前消费。每个 `step()` 先有界服务连接，再调用一次 Coordinator；
-plant 沿用既有命令超时分段。全部终点 IMU 编码成功后才发送各板 STEP，返回
-实际 ACK tuple；重试复用编码 bytes。`service()` 只收发和入队，不推进世界。
+输入，不提前消费。`step()` 通过唯一 Simulation 推进；可用构造参数 `quantum_ns`
+限制每个内部区间的长度，默认 `UINT64_MAX` 保持由调用方决定步长。plant 仍沿用
+既有命令超时分段。每个内部切点先完成 CPU/World、采样和目标交付，再收齐并编码
+全部 IMU，逐板发送 STEP、等待实际 ACK 和原生 CAN 输入处理回执，最后提交逻辑时间。
+`step()` 返回最后完成切点的 ACK tuple，`on_response` 可观察全部内部切点。
+原协议允许的重发复用相同编码 bytes，不重复推进或采样；初始化、重复 settle 和
+`service()` 不生成新的 STEP，`service()` 只收发和入队。
 
 提供 `BoardExecution` 时，启动还检查各原点处的初始空 CAN 基线。每步先检查全部
 目标和输入计数余量，再请求所有 CPU 执行到映射后的目标；实际 `reached/paused`
@@ -2907,13 +2911,16 @@ IRQ/器件事件全部闭合，输入处理也不代表固件消费；此组合�
 
 可传入 `check_running()` 检查调用方拥有的进程；
 `on_response(name, frame, decoded_payload)` 观察返回的 ACK 和闲置连接的回复，
-DONE 保留实际 status/consumed/missing。既有主动等待器会跳过部分 advisory
+DONE 保留实际 status/consumed/missing，提交只等待 ACK/传输回执，不等待未来 CPU
+执行才能产生的消费。切点提交期间，公开 `t_sim_ns`/`step_id` 仍表示上一完整切点；
+当前响应的时间和序号应取自实际帧头。既有主动等待器会跳过部分 advisory
 回复，因此此回调不是完整录制接口。每条连接的 RX 由主动等待器或闲置 poll
 独占。绝对 monotonic deadline 在收发及推进前后检查；阻塞 solver/callback
 仍须由外层进程限时。ACK 服务期间的回调或 transport `TimeoutError` 会以
 `RuntimeError` 传播并保留原 cause；只有 ACK 等待器自身的超时可以触发重试。
 任一运行失败或观测到原生 RESET 都冻结 owner，须重新
-创建完整 owner 和板卡进程；已推进世界和已发送数据保留。`close()` 仅关闭
+创建完整 owner 和板卡进程；失败切点不提交逻辑时间，已推进世界和已发送数据保留，
+不回滚或重放。`close()` 仅关闭
 拥有的 plant，不 flush 或关闭借用的连接和总线。
 
 `bash tools/run-qemu-shared-world-smoke.sh` 使用两个真实 QEMU 和同一四 hinge
