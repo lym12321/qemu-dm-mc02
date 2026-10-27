@@ -8,9 +8,10 @@ mode=normal
 two_chassis=0
 arena_runtime=0
 arena_cli=0
+multi_cut=0
 scene_args=()
 usage_error() {
-    printf 'usage: %s [--two-chassis|--arena-runtime|--arena-cli] [--peer-exit|--reset|--upper-exit|--interrupt]\n' "$0" >&2
+    printf 'usage: %s [--two-chassis|--arena-runtime|--arena-cli] [--multi-cut] [--peer-exit|--reset|--upper-exit|--interrupt]\n' "$0" >&2
     exit 2
 }
 for argument in "$@"; do
@@ -35,11 +36,16 @@ for argument in "$@"; do
             [[ $mode == normal ]] || usage_error
             mode=${argument#--}
             ;;
+        --multi-cut)
+            [[ $multi_cut == 0 ]] || usage_error
+            multi_cut=1
+            ;;
         *) usage_error ;;
     esac
 done
 [[ $mode != upper-exit || $arena_runtime == 1 ]] || usage_error
 [[ $mode != interrupt || $arena_cli == 1 ]] || usage_error
+[[ $multi_cut == 0 || ( $arena_runtime == 1 && $arena_cli == 0 && $mode == normal ) ]] || usage_error
 [[ -x "$qemu_bin" ]] || { printf 'SKIP: QEMU not found: %s\n' "$qemu_bin" >&2; exit 77; }
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'SKIP: arm-none-eabi-gcc required' >&2; exit 77; }
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'SKIP: python3 required' >&2; exit 77; }
@@ -63,6 +69,9 @@ if [[ $arena_runtime == 1 ]]; then
     scene_args=()
     if [[ $arena_cli == 1 ]]; then
         scene_args=(--cli)
+    fi
+    if [[ $multi_cut == 1 ]]; then
+        scene_args=(--multi-cut)
     fi
 fi
 python3 "$consumer" \

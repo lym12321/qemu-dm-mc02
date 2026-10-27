@@ -33,6 +33,97 @@ from test_arena_runtime import Environment, Peer
 from test_sim_shared_world import can_wire
 
 
+def multi_cut_receipt():
+    """Independent report literals for validator isolation; no native execution."""
+    events = []
+
+    def can_state(peer, target, completed, initial=False):
+        native = (1000, 2000)[peer] + target
+        return {"kind": "can-observation", "peer": peer, "submitted_frames": completed,
+            "state": {"execution": ({"state": "idle", "current-ns": native} if initial else
+                {"state": "reached", "current-ns": native, "target-ns": native}),
+                "status": {"running": False, "status": "prelaunch" if initial else "paused"},
+                "fdcan-rx-state": {"timestamp_ns": native, "controllers": {
+                    "dm-mc02.fdcan1": {"completed_frames": completed, "partial_bytes": 0, "rx_dropped": 0}}},
+                "fdcan-transports": {"dm-mc02.fdcan1": {"connected": True}}}}
+
+    events.extend(can_state(peer, 0, 0, True) for peer in (0, 1))
+    for step_id, (dt, target, goal) in enumerate(((400000, 400000, 0),
+            (400000, 800000, 0), (200000, 1000000, 4)), 1):
+        events.extend({"kind": "cpu-request", "peer": peer, "target_ns": epoch + target}
+                      for peer, epoch in enumerate((1000, 2000)))
+        events.append({"kind": "world-completed", "dt_ns": dt, "native_time_s": target / 1e9})
+        for peer in (0, 1):
+            header = dict(version=2, flags=peer + 1, step_id=step_id, t_sim_ns=target, dt_ns=dt)
+            events.append({"kind": "step-send", "peer": peer, "event": {
+                "header": dict(header, kind=2), "accepted": True,
+                "imu": {"sample_id": step_id, "sensor_time_ns": target}}})
+            events.append({"kind": "step-ack", "peer": peer, "event": {
+                "header": dict(header, kind=3), "decoded": {"status": 0}}})
+        events.extend(can_state(peer, target, goal) for peer in (0, 1))
+    return {"multi_cut": {"quantum_ns": 400000, "members": ["east", "west"], "events": events},
+        "native_calls": {"step_ns": [400000, 400000, 200000]},
+        "runtime_result": {"steps": 3, "end_ns": 1000000},
+        "responses": [{"name": name, "header": {"kind": 5}, "decoded": {"virtual_time_ns": epoch}}
+                      for name, epoch in (("east", 1000), ("west", 2000))]}
+
+
+def test_multi_cut_validator_requires_fresh_receipts_with_unchanged_early_goals():
+    report = multi_cut_receipt()
+    arena_module.check_multi_cut_observations(report)
+    assert report["multi_cut"]["verified"]
+    assert report["multi_cut"]["cuts"] == 3
+    assert report["multi_cut"]["unchanged_receipt_goals"] == 4
+    assert report["multi_cut"]["final_receipt_goals"] == {0: 4, 1: 4}
+
+
+@pytest.mark.parametrize("fault", ["missing-ack", "wrong-session", "wrong-dt", "missing-receipt",
+    "receipt-before-ack", "partial-receipt", "unreached-target", "duplicate-world", "wrong-cut-pattern"])
+def test_multi_cut_validator_rejects_incomplete_or_misattributed_report(fault):
+    report = multi_cut_receipt()
+    events = report["multi_cut"]["events"]
+    ack = next(row for row in events if row["kind"] == "step-ack")
+    receipt = next(row for row in events if row["kind"] == "can-observation"
+                   and row["state"]["execution"]["state"] == "reached")
+    if fault == "missing-ack":
+        events.remove(ack)
+    elif fault == "wrong-session":
+        ack["event"]["header"]["flags"] = 2
+    elif fault == "wrong-dt":
+        ack["event"]["header"]["dt_ns"] = 1000000
+    elif fault == "missing-receipt":
+        events.remove(receipt)
+    elif fault == "receipt-before-ack":
+        events.remove(receipt)
+        events.insert(events.index(ack), receipt)
+    elif fault == "partial-receipt":
+        receipt["state"]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["partial_bytes"] = 1
+    elif fault == "unreached-target":
+        receipt["state"]["execution"]["state"] = "running"
+    elif fault == "duplicate-world":
+        events.insert(5, deepcopy(next(row for row in events if row["kind"] == "world-completed")))
+    else:
+        report["native_calls"]["step_ns"] = [1000000]
+    with pytest.raises(ValueError, match="multi-cut"):
+        arena_module.check_multi_cut_observations(report)
+    assert not report["multi_cut"].get("verified", False)
+
+
+def test_firmware_response_control_uses_actual_pending_frame_cut():
+    observer = arena_module.FirmwareObservation({"responses": {"east": {
+        "count": 0, "first": None, "last": None, "step_ack_count": 0,
+        "first_step_ack": None, "last_step_ack": None}}}, SimpleNamespace())
+    observer.runtime = SimpleNamespace(t_sim_ns=800000)
+    cuts = []
+    observer.service_control = lambda: cuts.append(observer.observation_cut_ns())
+    frame = arena_module.codec.decode_step_frame(arena_module.codec.build_step_frame(
+        3, 3, 1000000, 200000, session_id=1,
+        payload=struct.pack("<IIII", 0, 0, 0, 0)))
+    observer.response("east", frame, arena_module.codec.decode_step_ack_payload(frame.payload))
+    assert cuts == [1000000]
+    assert observer.observation_cut_ns() == 800000
+
+
 SCENARIO_FIELDS = ("angle", "speed", "current", "temp", "ts", "output", "enabled",
                    "update_age", "feedback_age")
 SCENARIO_REQUIRED = {"control.rx", "reset.poweron", "bsp.init", "task.stack", "dji.scenario.stop", "dji.can",

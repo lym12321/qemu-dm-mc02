@@ -769,6 +769,12 @@ native 准入及各资源的有界清理不计入 active host 期限，阻塞 na
 uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena-runtime
 ```
 
+追加 `--multi-cut` 可验收同一入口的内部切点：每个外层 1 ms 请求按
+400/400/200 μs 推进唯一 World，每段实际 STEP/ACK 和原生 CAN 完整观测须早于
+下一段 CPU 请求。报告保留原始 wire 和逐切点记录。CAN 反馈仍按 1 ms 相位生成，
+部分切点没有新 CAN 帧；此门不要求或声称每个 IMU 样本均由固件消费。
+该选项只用于普通 `--arena-runtime` smoke，不与退出注入或 `--arena-cli` 组合。
+
 该默认关闭的夹具生成两份 Robot 配置、一份 Arena 配置和专用 bare-MMIO 固件，
 唯一执行入口是上述 `run_manifest()`。两个固件各自在完成 CAN/SPI 读取及最终
 sensortime 写回后输出实际 UART ready；随后共享世界运行 50 ms。报告保留具名
@@ -3020,8 +3026,9 @@ plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续
 
 Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
 
-该固定场景的 Debug 门已通过；最新 Release 复测在原 20 秒 host 期限内只完成
-1090 步，最终暂停 watchdog 观察缺失，仍按失败保留。期限稳定性尚未解决。
+该固定场景曾有 Release 复测在原 20 秒 host 期限内只完成 1090 步，最终暂停
+watchdog 观察缺失，历史失败保留。逐切点交换收敛后，Debug/Release 在原期限下
+各复测通过一次；单次通过不证明期限稳定性，也不构成实时性能证据。
 
 ```bash
 cd ../trobot

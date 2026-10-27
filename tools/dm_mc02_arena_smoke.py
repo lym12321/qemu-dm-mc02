@@ -37,6 +37,7 @@ from qemu.qmp import ExecInterruptedError
 
 COMMANDS = ("0040004000400040", "ffebff95ffebff95")
 LITERAL_ARGS = ("$HOME", "$(touch forbidden)", "a b", "")
+MULTI_CUT_QUANTUM_NS = 400_000
 
 
 def append_bounded(report, key, event, maximum=2048):
@@ -54,6 +55,97 @@ def close_observation_failure(owner, label, primary):
         if error is not primary:
             for note in tuple(getattr(error, "__notes__", ())):
                 primary.add_note(note)
+
+
+def check_multi_cut_observations(report):
+    """Check actual per-cut receipts; this does not produce native evidence."""
+    evidence = report["multi_cut"]
+    if evidence["quantum_ns"] != 400_000:
+        raise ValueError("multi-cut quantum differs from the fixed400us fixture")
+    steps = report["native_calls"]["step_ns"]
+    if not steps or len(steps) % 3 or steps != [400_000, 400_000, 200_000] * (len(steps) // 3):
+        raise ValueError("multi-cut World steps must be400/400/200us per outer1ms")
+    events = evidence["events"]
+    resets = {row["name"]: row["decoded"]["virtual_time_ns"] for row in report["responses"]
+              if row["header"]["kind"] == codec.RESET_ACK}
+    names = evidence["members"]
+    if len(names) != 2 or set(resets) != set(names):
+        raise ValueError("multi-cut requires both actual RESET_ACK origins")
+    baselines = {}
+    for event in events:
+        if event["kind"] == "can-observation" and event["state"]["execution"]["state"] == "idle":
+            baselines.setdefault(event["peer"], event["state"]["fdcan-rx-state"]
+                                 ["controllers"]["dm-mc02.fdcan1"]["completed_frames"])
+    if set(baselines) != {0, 1}:
+        raise ValueError("multi-cut lacks actual initial native CAN baselines")
+    starts = [index for index, row in enumerate(events)
+              if row["kind"] == "cpu-request" and row["peer"] == 0]
+    if len(starts) != len(steps):
+        raise ValueError("multi-cut CPU request count differs from World cuts")
+    target = 0
+    unchanged_goals = 0
+    previous_goals = dict(baselines)
+    for step_id, (start, end, dt_ns) in enumerate(zip(
+            starts, [*starts[1:], len(events)], steps, strict=True), 1):
+        target += dt_ns
+        cut = events[start:end]
+        requests = [(row["peer"], row["target_ns"]) for row in cut if row["kind"] == "cpu-request"]
+        if requests != [(peer, resets[name] + target) for peer, name in enumerate(names)]:
+            raise ValueError("multi-cut CPU targets do not match independent RESET epochs")
+        worlds = [(index, row) for index, row in enumerate(cut) if row["kind"] == "world-completed"]
+        if (len(worlds) != 1 or worlds[0][1]["dt_ns"] != dt_ns
+                or not math.isclose(worlds[0][1]["native_time_s"], target / 1e9, rel_tol=0, abs_tol=1e-12)):
+            raise ValueError("multi-cut requires exactly one completed World step per cut")
+        acknowledgements = []
+        for peer, name in enumerate(names):
+            sends = [(index, row["event"]) for index, row in enumerate(cut)
+                     if row["kind"] == "step-send" and row["peer"] == peer]
+            acks = [(index, row["event"]) for index, row in enumerate(cut)
+                    if row["kind"] == "step-ack" and row["peer"] == peer]
+            if len(sends) != 1 or len(acks) != 1:
+                raise ValueError("multi-cut requires exactly one STEP and ACK per board/cut")
+            send_index, sent = sends[0]
+            ack_index, ack = acks[0]
+            if sent["header"]["kind"] != codec.STEP or ack["header"]["kind"] != codec.STEP_ACK:
+                raise ValueError("multi-cut STEP/ACK message kinds disagree")
+            expected = (2, peer + 1, step_id, target, dt_ns)
+            for event in (sent, ack):
+                header = event["header"]
+                if tuple(header[key] for key in ("version", "flags", "step_id", "t_sim_ns", "dt_ns")) != expected:
+                    raise ValueError("multi-cut STEP/ACK wire identity differs from actual cut")
+            if (not sent["accepted"] or sent["imu"]["sample_id"] != step_id
+                    or sent["imu"]["sensor_time_ns"] != target or ack["decoded"]["status"] != 0
+                    or not worlds[0][0] < send_index < ack_index):
+                raise ValueError("multi-cut native exchange did not follow completed World state")
+            acknowledgements.append(ack_index)
+        # Each segment ends before the next CPU request. Require a fresh native
+        # observation after both ACKs even when no1ms CAN producer was due.
+        for peer, name in enumerate(names):
+            complete = []
+            for index, row in enumerate(cut):
+                if row["kind"] != "can-observation" or row["peer"] != peer or index <= max(acknowledgements):
+                    continue
+                state = row["state"]
+                native_target = resets[name] + target
+                execution, status = state["execution"], state["status"]
+                receipt = state["fdcan-rx-state"]
+                rx = receipt["controllers"]["dm-mc02.fdcan1"]
+                goal = baselines[peer] + row["submitted_frames"]
+                if (all(execution.get(key) == value for key, value in {
+                        "state": "reached", "current-ns": native_target, "target-ns": native_target}.items())
+                        and status["running"] is False and status["status"] == "paused"
+                        and receipt["timestamp_ns"] == native_target
+                        and rx["completed_frames"] == goal and rx["partial_bytes"] == 0
+                        and state["fdcan-transports"]["dm-mc02.fdcan1"]["connected"] is True):
+                    complete.append(goal)
+            if not complete or complete[-1] < previous_goals[peer]:
+                raise ValueError("multi-cut lacks completed native CAN receipt before next CPU target")
+            unchanged_goals += complete[-1] == previous_goals[peer]
+            previous_goals[peer] = complete[-1]
+    if report["runtime_result"]["steps"] != len(steps) or report["runtime_result"]["end_ns"] != target:
+        raise ValueError("multi-cut final result differs from completed native cuts")
+    evidence.update(verified=True, cuts=len(steps), unchanged_receipt_goals=unchanged_goals,
+                    final_receipt_goals=previous_goals)
 
 
 def write_manifests(directory, firmwares, *, referees=False, dji_scenario=False):
@@ -109,6 +201,10 @@ class Observation:
         self.feedback_sources = {}
         self.feedback_deliveries = {}
         self.run_result = self.run_error = None
+
+    def multi_event(self, kind, **values):
+        if "multi_cut" in self.report:
+            append_bounded(self.report["multi_cut"], "events", {"kind": kind, **values}, 32768)
 
     def run(self, manifest, **options):
         """Observe the actual CLI's single call; never execute another loop."""
@@ -167,7 +263,10 @@ class Observation:
 
         def observed_step(dt_ns):
             append_bounded(self.report["native_calls"], "step_ns", dt_ns, self.step_bound)
-            return step(dt_ns)
+            result = step(dt_ns)
+            if "multi_cut" in self.report:
+                self.multi_event("world-completed", dt_ns=dt_ns, native_time_s=native.time_s)
+            return result
 
         def observed_close():
             self.report["native_calls"]["close"] += 1
@@ -271,6 +370,8 @@ class Observation:
                 return value
 
             def observed_command(name, arguments=None):
+                if name == "x-run-to-virtual-time":
+                    self.multi_event("cpu-request", peer=index, target_ns=arguments["target-ns"])
                 try:
                     value = command(name, arguments)
                 except BaseException as error:
@@ -293,6 +394,11 @@ class Observation:
                 # these are not individual reply-arrival timestamps.
                 for (name, arguments), value in zip(requests, values, strict=True):
                     observe_value(name, arguments, value)
+                    if ("multi_cut" in self.report and name == "qom-get"
+                            and arguments.get("property") == "can-execution-state"):
+                        self.multi_event("can-observation", peer=index,
+                            state=json.loads(json.dumps(value)),
+                            submitted_frames=self.runtime.bindings[index].endpoint.submitted_frames)
                 groups["completed"] += 1
                 initial = execution["last_execution"]["state"] == "idle"
                 groups["initial_groups" if initial else "can_groups"] += 1
@@ -390,6 +496,7 @@ class Observation:
                 assert (*imu.gyro_dps, *imu.accel_g) == expected
                 assert (imu.sample_id, imu.sensor_time_ns) == (frame.header.step_id, frame.header.t_sim_ns)
                 event.update(imu=asdict(imu), source_name=name, source_si=asdict(source))
+                self.multi_event("step-send", peer=index, event=event)
             try:
                 result = send(wire)
             except BrokenPipeError as error:
@@ -431,6 +538,8 @@ class Observation:
         return names
 
     def shared(self, *args, **kwargs):
+        if "multi_cut" in self.report:
+            kwargs["quantum_ns"] = MULTI_CUT_QUANTUM_NS
         runtime = self.original_shared(*args, **kwargs)
         self.runtime = runtime
         close = runtime.close
@@ -493,8 +602,12 @@ class Observation:
         self.inject()
 
     def response(self, name, frame, decoded):
-        append_bounded(self.report, "responses", {"name": name, "header": asdict(frame.header),
-            "payload_hex": frame.payload.hex(), "decoded": None if decoded is None else asdict(decoded)})
+        event = {"name": name, "header": asdict(frame.header),
+                 "payload_hex": frame.payload.hex(), "decoded": None if decoded is None else asdict(decoded)}
+        append_bounded(self.report, "responses", event)
+        if frame.header.kind == codec.STEP_ACK:
+            self.multi_event("step-ack", peer=[member.name for member in self.manifest.robots].index(name),
+                             event=event)
         self.inject()
 
     def inject(self):
@@ -880,7 +993,19 @@ class FirmwareObservation(Observation):
         elif frame.header.kind == codec.STEP_DONE:
             summary["done_count"] += 1
             summary["last_done"] = row
-        self.service_control()
+        # ACK/DONE callbacks run before Simulation commits its public time.
+        # These control receipts belong to the actual received frame's cut.
+        previous = getattr(self, "_response_cut_ns", None)
+        self._response_cut_ns = (frame.header.t_sim_ns
+            if frame.header.kind in (codec.STEP_ACK, codec.STEP_DONE) else None)
+        try:
+            self.service_control()
+        finally:
+            self._response_cut_ns = previous
+
+    def observation_cut_ns(self):
+        pending = getattr(self, "_response_cut_ns", None)
+        return self.runtime.t_sim_ns if pending is None else pending
 
     def service_control(self):
         pass
@@ -1025,7 +1150,7 @@ class RefereeObservation(FirmwareObservation):
                 raise ValueError("Scenario referee requires both complete baselines before its event")
             if stream.tx_pending:
                 raise ValueError("Scenario referee control UART has prior pending output")
-            control = evidence["control"] = {"logical_ns": self.runtime.t_sim_ns,
+            control = evidence["control"] = {"logical_ns": self.observation_cut_ns(),
                 "wire_hex": "a5", "send_attempts": 1, "accepted": False,
                 "flush_attempts": 1, "completed": False,
                 "borrowed_stream_identity": id(stream)}
@@ -1036,7 +1161,7 @@ class RefereeObservation(FirmwareObservation):
             control["flush_attempts"] += 1
             stream.flush()
         if not stream.tx_pending and not control["completed"]:
-            control.update(completed=True, completed_logical_ns=self.runtime.t_sim_ns)
+            control.update(completed=True, completed_logical_ns=self.observation_cut_ns())
 
     def scenario_case(self, name, row, poll_sample_qemu_ns):
         prefix = "referee.arena."
@@ -1576,7 +1701,7 @@ class DjiScenarioObservation(FirmwareObservation):
             if control is None:
                 if stream.tx_pending:
                     raise ValueError("DJI Scenario borrowed control UART has prior pending output")
-                control = evidence["controls"][name] = {"logical_ns": self.runtime.t_sim_ns,
+                control = evidence["controls"][name] = {"logical_ns": self.observation_cut_ns(),
                     "wire_hex": "a5", "send_attempts": 1, "accepted": False,
                     "flush_attempts": 1, "completed": False, "borrowed_stream_identity": id(stream)}
                 stream.send(b"\xa5")
@@ -1585,7 +1710,7 @@ class DjiScenarioObservation(FirmwareObservation):
                 control["flush_attempts"] += 1
                 stream.flush()
             if not stream.tx_pending and not control["completed"]:
-                control.update(completed=True, completed_logical_ns=self.runtime.t_sim_ns)
+                control.update(completed=True, completed_logical_ns=self.observation_cut_ns())
 
     def scenario_case(self, name, row, poll_sample_qemu_ns):
         if not row["name"].startswith("dji.scenario.") or row["name"] == "dji.scenario.stop":
@@ -2398,6 +2523,8 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
 
 
 def main(args):
+    if args.multi_cut and (args.cli or args.mode != "normal"):
+        raise ValueError("--multi-cut requires the normal Arena runtime consumer")
     result_path = Path(args.result)
     if result_path.exists():
         raise FileExistsError("Arena fixture refuses to overwrite a result")
@@ -2424,6 +2551,11 @@ def main(args):
             ROOT / "models/four_wheel.xml", ROOT / "models/mujoco-LICENSE.txt",
             manifest.path, *(member.robot.path for member in manifest.robots))}}
     origins = source_origins()
+    if args.multi_cut:
+        report["multi_cut"] = {"quantum_ns": MULTI_CUT_QUANTUM_NS,
+                               "members": [member.name for member in manifest.robots], "events": []}
+        report["limitations"].append(
+            "400/400/200us World cuts retain1ms CAN feedback phase; unchanged receipt goals and missing IMU consumption are permitted.")
     observer = Observation(report, manifest, args.mode)
     observer.binary = binary
     if args.cli:
@@ -2481,7 +2613,10 @@ def main(args):
     try:
         calls = report["native_calls"]
         assert calls["reset"] == calls["close"] == 1 and calls["step_ns"]
-        assert all(dt == 1_000_000 for dt in calls["step_ns"])
+        if args.multi_cut:
+            check_multi_cut_observations(report)
+        else:
+            assert all(dt == 1_000_000 for dt in calls["step_ns"])
         assert len(observer.plant.devices) == 8 and report["world"]["distinct_buses"] == 2
         assert all(device.closed for device in observer.plant.devices)
         assert len(observer.owners) == 2 and len(observer.children) == 1
@@ -2590,11 +2725,15 @@ if __name__ == "__main__":
     parser.add_argument("--qemu", required=True)
     parser.add_argument("--firmware", nargs=2, required=True)
     parser.add_argument("--cli", action="store_true", help="exercise the real sim module CLI entry")
+    parser.add_argument("--multi-cut", action="store_true",
+                        help="verify400/400/200us cuts inside each normal Arena runtime1ms step")
     parser.add_argument("--mode", choices=("normal", "reset", "peer-exit", "upper-exit", "interrupt"), default="normal")
     parser.add_argument("--result", required=True)
     args = parser.parse_args()
     if args.mode == "interrupt" and not args.cli:
         parser.error("--mode interrupt requires --cli")
+    if args.multi_cut and (args.cli or args.mode != "normal"):
+        parser.error("--multi-cut requires normal mode without --cli")
     try:
         sys.exit(main(args))
     except ModuleNotFoundError as error:
