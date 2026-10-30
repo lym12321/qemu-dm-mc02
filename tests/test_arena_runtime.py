@@ -706,31 +706,31 @@ def test_arena_tool_observation_actual_socket_sources_follow_overtaking_and_equa
                  row["qemu_ns"], row["producer_current_raw"], row["send_live_current_raw"])
                 for row in east] == [
             (1_000_500, 1, 3_000_500, 3_000_500, 3_001_000, 0, 8192),
-            (3_000_500, 10, 3_000_500, 3_000_500, 3_001_000, 8192, 8192),
+            (3_000_500, 10, 3_000_500, 3_000_500, 3_001_000, 4096, 8192),
             (2_000_500, 5, 4_000_500, 4_000_500, 4_001_000, 0, 8192),
             (4_000_500, 14, 4_000_500, 4_000_500, 4_001_000, 8192, 8192),
         ]
-        groups = ((3_001_000, "0000"), (3_001_000, "2000"),
+        groups = ((3_001_000, "0000"), (3_001_000, "1000"),
                   (4_001_000, "0000"), (4_001_000, "2000"))
     else:
         assert [(row["world_ns"], row["due_ns"], row["delivered_ns"], row["qemu_ns"],
                  row["producer_current_raw"], row["send_live_current_raw"]) for row in east] == [
-            (1_000_500, 1_000_500, 1_000_500, 1_001_000, 4096, 4096),
+            (1_000_500, 1_000_500, 1_000_500, 1_001_000, 0, 4096),
             (2_000_500, 2_000_500, 2_000_500, 2_001_000, 4096, 4096),
             (3_000_500, 3_000_500, 3_000_500, 3_001_000, 4096, 4096),
             (4_000_500, 4_000_500, 4_000_500, 4_001_000, 4096, 4096),
         ]
-        groups = ((1_001_000, "1000"), (2_001_000, "1000"),
+        groups = ((1_001_000, "0000"), (2_001_000, "1000"),
                   (3_001_000, "1000"), (4_001_000, "1000"))
     west = [row for row in rows if row["peer"] == 1 and row["can_id"] == 0x201]
     assert [(row["world_ns"], row["due_ns"], row["delivered_ns"], row["qemu_ns"],
              row["producer_current_raw"]) for row in west] == [
-        (1_000_500, 1_000_500, 1_000_500, 1_002_000, -4096),
+        (1_000_500, 1_000_500, 1_000_500, 1_002_000, 0),
         (2_000_500, 2_000_500, 2_000_500, 2_002_000, -4096),
         (3_000_500, 3_000_500, 3_000_500, 3_002_000, -4096),
         (4_000_500, 4_000_500, 4_000_500, 4_002_000, -4096),
     ]
-    for index, group in enumerate((groups, ((1_002_000, "f000"), (2_002_000, "f000"),
+    for index, group in enumerate((groups, ((1_002_000, "0000"), (2_002_000, "f000"),
                                           (3_002_000, "f000"), (4_002_000, "f000")))):
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
             bytes.fromhex("0000 0000 " + (current if motor_id == 1 else "0000") + " 19 00").ljust(64, b"\0"))
@@ -1162,7 +1162,7 @@ def test_loaded_scenario_motor_feedback_uses_actual_socket_dispatch_without_rere
         result, = results
         assert len(calls) == 1 and calls[0] is not scenario
         payload = json.loads(report.read_text())
-        assert payload["status"] == "passed" and payload["result"]["steps"] == 5
+        assert payload["status"] == "passed" and payload["result"]["steps"] == 7
         assert environment.events[-1] == "feedback report write"
         output = capsys.readouterr()
         assert "passed" in output.out and output.err == ""
@@ -1174,12 +1174,15 @@ def test_loaded_scenario_motor_feedback_uses_actual_socket_dispatch_without_rere
     assert order == [(500, "delay", 2_000_000), (500, "feedback", False),
         (1_000_500, "delay", 0), (1_500_500, "feedback", True), (1_500_500, "feedback", False),
         (3_500_500, "feedback", True), (4_500_500, "feedback", False)]
-    assert (result.origin_ns, result.end_ns, result.steps) == (500, 4_500_500, 5)
-    assert environment.native.resets == 1 and environment.native.steps == [1_000_000, 500_000] + [1_000_000] * 3
+    assert (result.origin_ns, result.end_ns, result.steps) == (500, 4_500_500, 7)
+    assert environment.native.resets == 1
+    # Old2ms command and3ms feedback dues split the surrounding outer steps.
+    assert environment.native.steps == [1_000_000, 500_000, 500_000, 500_000, 500_000, 500_000, 1_000_000]
     zero = bytes.fromhex("0000 0000 0000 19 00")
-    feedback = (((2_501_000, "0000", range(2, 5)), (3_501_000, "0000", range(2, 5)),
-                 (3_501_000, "1000", range(2, 5)), (4_501_000, "1000", range(1, 5))),
-                tuple((stamp, "f000", range(1, 5)) for stamp in (1_002_000, 2_502_000, 3_502_000, 4_502_000)))
+    feedback = (((2_001_000, "0000", range(2, 5)), (3_001_000, "0000", range(2, 5)),
+                 (3_001_000, "1000", range(2, 5)), (4_501_000, "1000", range(1, 5))),
+                tuple((stamp, current, range(1, 5)) for stamp, current in (
+                    (1_002_000, "0000"), (2_002_000, "f000"), (3_002_000, "f000"), (4_502_000, "f000"))))
     for index, groups in enumerate(feedback):
         assert environment.received_can(index) == b"".join(struct.pack(
             "<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
@@ -1187,17 +1190,19 @@ def test_loaded_scenario_motor_feedback_uses_actual_socket_dispatch_without_rere
             for stamp, current, ids in groups for motor_id in ids)
     assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
             for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
-        (5, 2_500_500, 2_500_500, 2_500_500, True), (1, 1_000_500, 3_000_500, 3_500_500, True),
-        (9, 3_500_500, 3_500_500, 3_500_500, True), (13, 4_500_500, 4_500_500, 4_500_500, False)]
+        (5, 2_000_500, 2_000_500, 2_000_500, True), (1, 1_000_500, 3_000_500, 3_000_500, True),
+        (9, 3_000_500, 3_000_500, 3_000_500, True), (13, 4_500_500, 4_500_500, 4_500_500, False)]
     assert [(row.frame.data, row.timestamp_ns, row.due_ns, row.delivered_ns, row.dropped)
             for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
-        (bytes.fromhex("1000 0000 0000 0000"), 500, 2_000_500, 2_500_500, False)]
+        (bytes.fromhex("1000 0000 0000 0000"), 500, 2_000_500, 2_000_500, False)]
     assert [device.current_raw for device in environment.plant.devices] == [4096, 0, 0, 0, -4096, 0, 0, 0]
     ratio = 3591 / 187  # Fixed DJI specification, not a production conversion helper.
-    for offset, current in zip(range(0, 40, 8), (0, 0, 0, 4096, 4096)):
+    for offset, (current, west_current) in zip(range(0, 56, 8), (
+            (0, 0), (0, -4096), (0, -4096), (4096, -4096),
+            (4096, -4096), (4096, -4096), (4096, -4096))):
         group = environment.native.efforts[offset:offset + 8]
         assert group[0][1] == pytest.approx(current * 20 / 16384 * .02 * ratio)
-        assert group[4][1] == pytest.approx(-4096 * 20 / 16384 * .02 * ratio)
+        assert group[4][1] == pytest.approx(west_current * 20 / 16384 * .02 * ratio)
         assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
     assert len(old_calls) == len(deliveries[0]) == 68
     world, = observed.worlds
@@ -1320,13 +1325,12 @@ def test_loaded_scenario_can_delays_consumes_actual_arena_bus_without_rereading(
     world, = observed.worlds
     assert world.closed and world.referees == ()
     assert [(item.endpoint.bus.delay_ns, item.endpoint.bus.pending) for item in world.bindings] == [(0, 1), (0, 0)]
-    # Independent fixed C620 bytes: the new command is admitted after the policy
-    # change, while the old delayed command remains pending beyond this run.
+    # The new command is admitted at the final CPU cut, after that interval's
+    # feedback was produced. The old delayed command remains pending.
     zero = bytes.fromhex("0000 0000 0000 19 00")
-    current = bytes.fromhex("0000 0000 0800 19 00")
     for index, stamp in enumerate((1_001_000, 1_002_000)):
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
-            (current if index == 0 and motor_id == 1 else zero).ljust(64, b"\0"))
+            zero.ljust(64, b"\0"))
             for motor_id in range(1, 5))
         assert environment.received_can(index) == expected
 
@@ -1760,7 +1764,9 @@ def test_motor_feedback_pending_dispatch_and_recovery_preserve_wire_commands_and
             ((2_001_000, "0000", range(2, 5)), (3_001_000, "0000", range(2, 5)),
              (3_001_000, "1000", range(2, 5)), (4_001_000, "1000", range(1, 5)),
              (5_001_000, "1000", range(1, 5))),
-            tuple((stamp, "f000", range(1, 5)) for stamp in (1_002_000, 2_002_000, 3_002_000, 4_002_000, 5_002_000)))):
+            tuple((stamp, current, range(1, 5)) for stamp, current in (
+                (1_002_000, "0000"), (2_002_000, "f000"), (3_002_000, "f000"),
+                (4_002_000, "f000"), (5_002_000, "f000"))))):
         assert environment.received_can(index) == b"".join(struct.pack(
             "<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
             (bytes.fromhex("0000 0000 " + current + " 19 00") if motor_id == 1 else zero).ljust(64, b"\0"))
@@ -1777,7 +1783,7 @@ def test_motor_feedback_pending_dispatch_and_recovery_preserve_wire_commands_and
             for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
         (bytes.fromhex("1000 0000 0000 0000"), 0, 2_000_000, 2_000_000, False)]
     ratio = 3591 / 187  # Fixed DJI specification, independent of production conversion.
-    for offset, currents in zip(range(0, 40, 8), ((0, -4096), (0, -4096),
+    for offset, currents in zip(range(0, 40, 8), ((0, 0), (0, -4096),
                                                (4096, -4096), (4096, -4096), (4096, -4096))):
         group = environment.native.efforts[offset:offset + 8]
         assert group[0][1] == pytest.approx(currents[0] * 20 / 16384 * .02 * ratio)
@@ -1871,13 +1877,14 @@ def test_can_delay_off_grid_fifo_and_exact_duration_use_reset_origin(
     assert [(stamp - reset_origin, member, delay) for member, delay, stamp, *_ in observed.calls] == list(actions)
     assert [steps for _, _, _, steps, _, _ in observed.calls] == [
         (), (), (500_000,), (500_000,), (500_000, 1_000_000),
-        (500_000, 1_000_000, 1_000_000)]
+        (500_000, 1_000_000, 23, 18, 999_959)]
     assert all(not any(event.endswith(" cont") for event in row[4]) for row in observed.calls[:2])
     assert all(row[5] == (0, 0) for row in observed.calls[:2])
     assert observed.calls[2][5] == observed.calls[3][5] == (1, 1)
-    expected_steps = [500_000, 1_000_000, 1_000_000]
+    # Both already-queued1.5ms feedback batches keep their old23/41ns dues.
+    expected_steps = [500_000, 1_000_000, 23, 18, 999_959]
     if delayed_ready:
-        expected_steps += [1_000_000, 1_000_000, 500_000]
+        expected_steps += [23, 999_977, 1_000_000, 500_000]
     assert environment.native.steps == expected_steps and result.steps == len(expected_steps)
     assert (result.origin_ns, result.end_ns) == ((2_500_500, 5_000_500) if delayed_ready else (0, 2_500_000))
     assert environment.native.resets == 1
@@ -1970,8 +1977,9 @@ def test_can_delay_schedule_keeps_queued_native_interval_wire_policy_by_actual_a
     else:
         result = environment.run(duration=.004, can_delays=actions)
     environment.assert_clean()
-    assert environment.native.steps == [1_000_000, 500_000, 1_000_000, 1_000_000, 500_000]
-    assert (result.origin_ns, result.end_ns, result.steps) == (0, 4_000_000, 5)
+    assert environment.native.steps == [1_000_000, 500_000, 500_000, 500_000,
+                                        500_000, 500_000, 200_000, 300_000]
+    assert (result.origin_ns, result.end_ns, result.steps) == (0, 4_000_000, 8)
     assert boundaries == [(0, (0, 0)), (1_000_000, (6, 0)), (1_500_000, (6, 0))]
     assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [0, 0]
     old, future, newer = (bytes.fromhex(value) for value in (
@@ -1980,15 +1988,17 @@ def test_can_delay_schedule_keeps_queued_native_interval_wire_policy_by_actual_a
         (1_701_000, future, 0, 2_000_000), (1_201_000, newer, 1_500_000, 0)]
     assert [(row.frame.data, row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns, row.late)
             for row in deliveries[0] if row.destination == "m3508-1" and row.frame.can_id == 0x200] == [
-        (newer, 6, 1_200_000, 1_200_000, 1_500_000, True),
-        (old, 0, 0, 2_000_000, 2_500_000, True),
-        (future, 1, 1_700_000, 3_700_000, 4_000_000, True)]
+        (newer, 6, 1_200_000, 1_200_000, 2_000_000, True),
+        (old, 0, 0, 2_000_000, 2_000_000, False),
+        (future, 1, 1_700_000, 3_700_000, 3_700_000, False)]
     # Independent C620 layouts, fixed stationary rotor and separate QEMU epochs.
-    # New feedback overtakes the completed1ms batch, whose old2ms due remains.
+    # New feedback overtakes the completed1ms batch, whose old2ms delay remains.
+    # Commands discovered during an interval affect only subsequent World work;
+    # known queued2ms/3ms/3.7ms dues introduce exact cuts before the outer target.
     zero = bytes.fromhex("0000 0000 0000 19 00")
     feedbacks = (
-        ((2_501_000, "2000"), (3_501_000, "0000"), (3_501_000, "1000"), (4_001_000, "1000")),
-        ((1_002_000, "f000"), (2_502_000, "f000"), (3_502_000, "f000"), (4_002_000, "f000")),
+        ((2_001_000, "0000"), (3_001_000, "0000"), (3_001_000, "1000"), (4_001_000, "3000")),
+        ((1_002_000, "0000"), (2_002_000, "f000"), (3_002_000, "f000"), (4_002_000, "f000")),
     )
     for index, groups in enumerate(feedbacks):
         expected = b"".join(struct.pack("<IIB3xQ64s", 0x200 + motor_id, 0, 8, stamp,
@@ -1997,11 +2007,12 @@ def test_can_delay_schedule_keeps_queued_native_interval_wire_policy_by_actual_a
         assert environment.received_can(index) == expected
     assert [(row.sequence, row.timestamp_ns, row.due_ns, row.delivered_ns)
             for row in deliveries[0] if row.destination == "qemu" and row.frame.can_id == 0x201] == [
-        (7, 2_500_000, 2_500_000, 2_500_000), (2, 1_000_000, 3_000_000, 3_500_000),
-        (11, 3_500_000, 3_500_000, 3_500_000), (15, 4_000_000, 4_000_000, 4_000_000)]
+        (7, 2_000_000, 2_000_000, 2_000_000), (2, 1_000_000, 3_000_000, 3_000_000),
+        (11, 3_000_000, 3_000_000, 3_000_000), (15, 4_000_000, 4_000_000, 4_000_000)]
     ratio = 3591 / 187  # Pinned DJI M3508 specification, no production converter.
-    expected_currents = ((0, -4096), (0, -4096), (8192, -4096), (4096, -4096), (4096, -4096))
-    for offset, currents in zip(range(0, 40, 8), expected_currents):
+    expected_currents = ((0, 0), (0, -4096), (0, -4096), (4096, -4096),
+                         (4096, -4096), (4096, -4096), (4096, -4096), (12288, -4096))
+    for offset, currents in zip(range(0, 64, 8), expected_currents):
         group = environment.native.efforts[offset:offset + 8]
         assert group[0][1] == pytest.approx(currents[0] * 20 / 16384 * .02 * ratio)
         assert group[4][1] == pytest.approx(currents[1] * 20 / 16384 * .02 * ratio)
@@ -2036,7 +2047,7 @@ def test_can_delay_later_setter_failure_preserves_primary_policy_and_independent
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [
         ("east", 7, 0), ("west", 13, 1_500_000)]
     assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == [7, 0]
-    assert environment.native.steps == [1_000_000, 500_000]
+    assert environment.native.steps == [1_000_000, 7, 499_993]
     assert all(process.returncode == -signal.SIGTERM for process in environment.children)
     assert "CAN policy nested cleanup diagnosis" in "\n".join(primary.__notes__)
 
@@ -2075,7 +2086,7 @@ def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(
         [("east", 7, 0)] if violation == "pre_child_exit" else [("east", 7, 0), ("west", 13, 1_500_000)])
     assert [item.endpoint.bus.delay_ns for item in observed.worlds[0].bindings] == (
         [7, 0] if violation == "pre_child_exit" else [7, 13])
-    assert environment.native.steps == [1_000_000, 500_000]
+    assert environment.native.steps == [1_000_000, 7, 499_993]
     assert all(process.returncode == -signal.SIGTERM for process in environment.children)
 
 
@@ -2083,10 +2094,12 @@ def test_can_delay_post_setter_guard_prevents_equal_time_suffix_and_restep(
 def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target_action(
         environment, monkeypatch, via_scenario):
     observed = watch_can_delays(environment, monkeypatch)
-    primary, admissions, closing = ValueError("native interval500000 refused"), [], []
+    # Feedback produced at1ms has an already-known1ms+7ns due. Refuse
+    # that actual next interval before the later1.5ms policy boundary.
+    primary, admissions, closing = ValueError("native interval7 refused"), [], []
     def validate(intervals):
         admissions.append(intervals)
-        if intervals == (500_000,):
+        if intervals == (7,):
             raise primary
     environment.native.validate_steps = validate
     close = shared_world.SharedWorldRuntime.close
@@ -2103,7 +2116,7 @@ def test_can_delay_split_native_refusal_freezes_without_rounding_retry_or_target
             environment.run(can_delays=((0, "east", 7), (1_500_000, "east", 0)))
     assert caught.value is primary
     environment.assert_clean()
-    assert admissions == [(1_000_000,), (500_000,)]
+    assert admissions == [(1_000_000,), (7,)]
     assert environment.native.steps == [1_000_000] and len(environment.native.efforts) == 8
     assert closing == [(True, 1_000_000, 1)]
     assert [(name, delay, stamp) for name, delay, stamp, *_ in observed.calls] == [("east", 7, 0)]
@@ -2189,11 +2202,15 @@ def test_one_owner_canonical_aliases_literal_upper_commands_and_exact_final_tick
     assert environment.native.resets == 1
     assert environment.native.steps == [1_000_000, 1_000_000, 500_000]
     assert len(environment.native.efforts) == 24
-    for group in (environment.native.efforts[offset:offset + 8] for offset in (0, 8, 16)):
+    for offset in (0, 8, 16):
+        group = environment.native.efforts[offset:offset + 8]
         assert [name for name, _ in group] == [
             "alpha/wheel_fl", "alpha/wheel_fr", "alpha/wheel_rl", "alpha/wheel_rr",
             "bravo/wheel_fl", "bravo/wheel_fr", "bravo/wheel_rl", "bravo/wheel_rr"]
-        assert group[0][1] > 0 and group[4][1] < 0
+        if offset == 0:
+            assert group[0][1] == group[4][1] == 0
+        else:
+            assert group[0][1] > 0 and group[4][1] < 0
         assert all(group[index][1] == 0 for index in (1, 2, 3, 5, 6, 7))
     assert (result.name, result.origin_ns, result.end_ns, result.steps) == (
         "two-four-wheel", 0, 2_500_000, 3)
@@ -2512,7 +2529,7 @@ def test_ready_uart7_borrows_one_transport_and_scoped_literal_batches_from_one_c
     assert len(observed.worlds) == len(observed.simulations) == 1
     assert observed.services and not any(observed.services)
     assert [node.name for node in observed.simulations[0].topology.nodes] == [
-        'boards', 'can', 'referee_0', 'referee_1']
+        'boards', 'can_0', 'can_1', 'plant', 'referee_0', 'referee_1']
     assert environment.native.resets == 1 and environment.native.steps == [1_000_000]
     assert len(observed.resets) == 2 and observed.resets[0][1] is observed.resets[1][1]
     assert [(session.session_id, session.t_sim_ns) for _, session in observed.resets] == [(1, 0), (1, 0)]

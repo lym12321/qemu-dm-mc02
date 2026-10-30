@@ -20,7 +20,7 @@ from sim.fabric import CanBus, CanFrame, VirtualCanDevice
 from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.transports.socketcan_endpoint import SocketCanEndpoint
 from sim.fabric.frame import WIRE_FD, WIRE_BRS
-from sim.fabric.runtime import CanParticipant
+from sim.fabric.runtime import BorrowedCanDispatcher, CanParticipant
 
 SPEC = importlib.util.spec_from_file_location(
     "endpoint_worker", ROOT / "tools" / "dm_mc02_sim_worker.py")
@@ -277,6 +277,145 @@ def test_endpoint_admission_and_invalid_mapper_preserve_existing_binding(streams
     with pytest.raises(ValueError):
         endpoint.ingest(CanFrame(1), True)
     assert bus.pending == 0
+
+
+def test_dispatcher_admits_one_bus_and_exposes_its_known_deadlines():
+    bus = CanBus(delay_ns=5, dispatch_budget=2)
+    for invalid in (None, (bus,), [bus]):
+        with pytest.raises(TypeError, match="one CanBus"):
+            BorrowedCanDispatcher(invalid)
+    source = Device(bus, "source")
+    sink = Device(bus, "sink")
+    dispatcher = BorrowedCanDispatcher(bus)
+    with pytest.raises(TypeError, match="Session"):
+        dispatcher.reset(100)
+    dispatcher.reset(Session(7, 100))
+    source.emit(CanFrame(0x123, data=b"old", timestamp_ns=101))
+    bus.delay_ns = 9
+    source.emit(CanFrame(0x123, data=b"new", timestamp_ns=102))
+    assert dispatcher.bus is bus and dispatcher.dispatch_budget == 2
+    assert dispatcher.next_due_ns == dispatcher.next_due_ns == 106
+    assert bus.t_sim_ns == 100 and bus.pending == 2 and sink.commands == []
+    assert dispatcher.dispatch(105, 1) == 0
+    assert dispatcher.next_due_ns == 106
+    assert dispatcher.dispatch(106, 1) == 1
+    assert sink.commands == [CanFrame(0x123, data=b"old", timestamp_ns=106)]
+    assert dispatcher.next_due_ns == 111 and source.steps == sink.steps == []
+
+
+def test_dispatcher_forwards_tighter_budget_including_callback_work_and_zero():
+    bus = CanBus(dispatch_budget=2)
+    source = Device(bus)
+    received = []
+
+    def receive(frame):
+        received.append(frame)
+        if frame.data == b"first":
+            source.emit(CanFrame(0x123, data=b"callback", timestamp_ns=1))
+
+    bus.attach(SimpleNamespace(receive=receive))
+    dispatcher = BorrowedCanDispatcher(bus)
+    dispatcher.reset(Session(1))
+    source.emit(CanFrame(0x123, data=b"first"))
+    source.emit(CanFrame(0x123, data=b"second"))
+    assert dispatcher.dispatch(1, 1) == 1
+    assert [frame.data for frame in received] == [b"first"]
+    assert dispatcher.dispatch(2, 0) == 0
+    assert bus.t_sim_ns == 2 and bus.pending == 2 and dispatcher.next_due_ns == 0
+    assert dispatcher.dispatch(2, 99) == 2
+    assert [(frame.data, frame.timestamp_ns) for frame in received] == [
+        (b"first", 1), (b"second", 2), (b"callback", 2)]
+    assert dispatcher.next_due_ns is None and source.steps == []
+
+
+def test_dispatcher_retains_bus_failure_without_replay_until_logical_reset():
+    bus = CanBus()
+    source = Device(bus)
+    primary = KeyboardInterrupt("consumer failed after observing frame")
+    received = []
+    fail = [True]
+
+    def receive(frame):
+        received.append(frame.data)
+        if fail[0]:
+            raise primary
+
+    bus.attach(SimpleNamespace(receive=receive))
+    dispatcher = BorrowedCanDispatcher(bus)
+    source.emit(CanFrame(0x123, data=b"effect"))
+    source.emit(CanFrame(0x123, data=b"queued"))
+    for operation in (lambda: dispatcher.dispatch(10, 2),
+                      lambda: dispatcher.next_due_ns,
+                      lambda: dispatcher.dispatch(10, 2)):
+        with pytest.raises(KeyboardInterrupt) as caught:
+            operation()
+        assert caught.value is primary
+    assert received == [b"effect"] and bus.pending == 1 and bus.t_sim_ns == 10
+    fail[0] = False
+    dispatcher.reset(Session(2, 100))
+    assert dispatcher.next_due_ns is None and bus.t_sim_ns == 100
+    source.emit(CanFrame(0x123, data=b"fresh", timestamp_ns=100))
+    assert dispatcher.dispatch(100, 1) == 1
+    assert received == [b"effect", b"fresh"]
+
+
+@pytest.mark.parametrize("mutation", ["dispatch", "reset", "close"])
+def test_dispatcher_rejects_own_callback_mutation_and_bus_retains_failure(mutation):
+    bus = CanBus()
+    source = Device(bus)
+    dispatcher = BorrowedCanDispatcher(bus)
+    operations = {"dispatch": lambda: dispatcher.dispatch(0, 1),
+                  "reset": lambda: dispatcher.reset(Session(2)),
+                  "close": dispatcher.close}
+    bus.attach(SimpleNamespace(receive=lambda _: operations[mutation]()))
+    source.emit(CanFrame(0x123))
+    with pytest.raises(RuntimeError, match="delivery callback") as caught:
+        dispatcher.dispatch(0, 1)
+    with pytest.raises(RuntimeError) as retained:
+        dispatcher.next_due_ns
+    assert retained.value is caught.value and bus.pending == 0
+    dispatcher.reset(Session(3, 10))
+    assert dispatcher.dispatch(10, 1) == 0
+    dispatcher.close()
+
+
+def test_dispatcher_reset_and_close_preserve_borrowed_devices_and_stream_prefix(streams):
+    stream, peer = streams
+    bus = CanBus()
+    source = Device(bus, "source")
+    sink = Device(bus, "sink")
+    endpoint = QemuCanEndpoint(bus, stream)
+    endpoint.bind_mapper(worker.QemuTimestampMapper(1000, 0))
+    dispatcher = BorrowedCanDispatcher(bus)
+    source.emit(CanFrame(0x123, data=b"kept"))
+    assert bus.step(0) == 1
+    assert peer.recv(84) == wire(0x123, 0, 4, 1000, b"kept")
+    incoming = wire(0x301, 0, 2, 1001, b"rx")
+    peer.sendall(incoming[:19])
+    assert stream.receive() == []
+    source.emit(CanFrame(0x123, data=b"discard", timestamp_ns=100))
+    dispatcher.reset(Session(2, 5))
+    assert bus.pending == 0
+    assert sink.commands == [CanFrame(0x123, data=b"kept")]
+    source.emit(CanFrame(0x123, data=b"tx", timestamp_ns=6))
+    dispatcher.close()
+    dispatcher.close()
+    for operation in (lambda: dispatcher.dispatch(6, 1),
+                      lambda: dispatcher.reset(Session(3)),
+                      lambda: dispatcher.next_due_ns,
+                      lambda: dispatcher.dispatch_budget):
+        with pytest.raises(RuntimeError, match="closed"):
+            operation()
+    assert bus.pending == 1 and bus.t_sim_ns == 5
+    assert source.close_calls == sink.close_calls == 0
+    assert source.steps == sink.steps == []
+    assert bus.step(6) == 1
+    assert sink.commands == [CanFrame(0x123, data=b"kept"),
+                             CanFrame(0x123, data=b"tx", timestamp_ns=6)]
+    assert peer.recv(84) == wire(0x123, 0, 2, 1006, b"tx")
+    peer.sendall(incoming[19:])
+    assert stream.receive() == [(0x301, 0, 2, 1001, b"rx")]
+    assert stream.sock.fileno() >= 0 and peer.fileno() >= 0
 
 
 def test_participant_owns_unique_valid_devices(streams):

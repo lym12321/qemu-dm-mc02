@@ -664,7 +664,7 @@ def test_dji_scenario_actual_one_second_eight_device_socket_consumer_keeps_epoch
         delivery = report["command_deliveries"][name]["first"]
         assert (delivery["source_world_ns"], delivery["due_ns"], delivery["delivered_ns"],
                 delivery["mapped_qemu_ns"], delivery["data_hex"]) == (
-            0, 5_000_000 if index == 0 else 0, 5_000_000 if index == 0 else 0,
+            0, 5_000_000 if index == 0 else 0, 5_000_000 if index == 0 else 1_000_000,
             (1000, 2000)[index], "0040ffc000000000")
         assert report["command_deliveries"][name]["zero_count"] > 0
         for row in report["command_wire"][name]["transitions"]:
@@ -870,12 +870,12 @@ def test_dji_scenario_one_ms_fabric_commands_overtake_old_zero_after_fixed_delay
     assert [(row["source_world_ns"], row["delivered_ns"], row["data_hex"])
             for row in summary["transitions"]] == [
         (0, 5_000_000, zero), (100_000_000, 105_000_000, active), (120_000_000, 125_000_000, zero),
-        (251_000_000, 251_000_000, active), (247_000_000, 252_000_000, zero),
-        (252_000_000, 252_000_000, active), (248_000_000, 253_000_000, zero),
-        (253_000_000, 253_000_000, active)]
+        (251_000_000, 252_000_000, active), (247_000_000, 252_000_000, zero),
+        (252_000_000, 253_000_000, active), (248_000_000, 253_000_000, zero),
+        (253_000_000, 254_000_000, active)]
     assert (summary["last"]["source_world_ns"], summary["last"]["delivered_ns"],
             summary["last"]["data_hex"], summary["last"]["destination"]) == (
-                259_000_000, 259_000_000, active, "m3508-4")
+                259_000_000, 260_000_000, active, "m3508-4")
     assert report["command_deliveries"]["west"]["transition_count"] == 4
     assert all(cpu.completed == len(cpu.receipts) == 1040 and not cpu.partial
                for cpu in environment.cpus.values())

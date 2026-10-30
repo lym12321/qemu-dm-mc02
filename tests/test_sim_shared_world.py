@@ -195,7 +195,7 @@ def test_shared_world_transfers_real_participants_and_projects_one_clock(setup):
     assert isinstance(simulation, Simulation)
     assert simulation.session == Session(7, 500)
     assert all(factory.pending is None for factory in runtime._participant_factories.values())
-    assert tuple(simulation.components) == ('boards', 'can')
+    assert tuple(simulation.components) == ('boards', 'can_0', 'can_1', 'plant')
     runtime.step(10_000_000, deadline=time.monotonic() + 1)
     assert runtime.t_sim_ns == simulation.t_sim_ns == 10_000_500
     assert runtime.step_id == simulation.step_id == 1
@@ -490,10 +490,11 @@ def test_future_can_timestamp_cannot_control_earlier_interval(setup):
     start(runtime)
     peers[0].send(can_wire(boards.origins[0] + 1, "1000 0000 0000 0000"))
     runtime.step(10, deadline=time.monotonic() + 1)
-    assert native.efforts == [("j1", 0), ("j2", 0)]
-    runtime.step(10, deadline=time.monotonic() + 1)
+    assert native.steps == [1, 9]
     assert native.efforts == [("j1", 0), ("j2", 0), ("j1", .2), ("j2", 0)]
-    assert native.steps == [10, 10]
+    runtime.step(10, deadline=time.monotonic() + 1)
+    assert native.efforts == [("j1", 0), ("j2", 0)] + [("j1", .2), ("j2", 0)] * 2
+    assert native.steps == [1, 9, 10]
 
 
 def test_scoped_can_delay_keeps_pending_command_and_feedback_due_with_independent_epochs(setup):
@@ -1125,8 +1126,9 @@ def test_can_delay_scoped_admission_and_refusal_delegate_once_without_io(referee
     # only for the next interval; refusal did not freeze or discard admission.
     runtime.step(1_000_000, deadline=time.monotonic() + 1)
     runtime.step(1_000_000, deadline=time.monotonic() + 1)
-    assert native.efforts == [("j1", 0), ("j2", 0), ("j1", .2), ("j2", 0)]
-    assert not runtime.failed and runtime.step_id == 2
+    assert native.steps == [20, 999_980, 1_000_000]
+    assert native.efforts == [("j1", 0), ("j2", 0)] + [("j1", .2), ("j2", 0)] * 2
+    assert not runtime.failed and runtime.step_id == 3
 
 
 def test_can_delay_active_uart_callback_reentry_refuses_other_bus_before_delegation(
@@ -1702,8 +1704,13 @@ class NativeCpuQmp:
         self.on_rx = self.on_run = self.on_reached = None
 
     def _receive_input(self):
-        if not self.native.steps:
+        # Read limits describe physical fragments, including initial paused
+        # input. Empty native observations must not consume a fragment budget.
+        try:
+            pending = self.peer.recv(1, socket.MSG_PEEK)
+        except BlockingIOError:
             return
+        assert pending, "unexpected native CAN input EOF"
         limit = self.read_limits.pop(0) if self.read_limits else 4096
         if limit == 0:
             self.events.append(("receipt-blocked", self.index))
@@ -1916,7 +1923,7 @@ def test_each_internal_cut_exchanges_literal_imu_before_next_cpu(multi_cut_setup
     fixture = multi_cut_setup
     runtime, boards, native = fixture.runtime, fixture.boards, fixture.native
     start(runtime)
-    assert tuple(runtime._simulation.components) == ('boards', 'can')
+    assert tuple(runtime._simulation.components) == ('boards', 'can_0', 'can_1', 'plant')
     assert runtime._simulation.quantum_ns == 400_000
 
     def previous_exchange_is_complete(cpu):
@@ -2085,7 +2092,8 @@ def test_second_cut_receipt_failure_retains_the_first_complete_native_group(mult
 
 
 @pytest.mark.parametrize('multi_cut_setup', [False], indirect=True)
-def test_nonexact_ack_service_uses_current_ingress_cut_without_committing_time(multi_cut_setup):
+@pytest.mark.parametrize('stamp', [0, 1000])
+def test_nonexact_ack_can_stays_physical_until_next_pre_world_service(multi_cut_setup, stamp):
     fixture = multi_cut_setup
     runtime, boards, native = fixture.runtime, fixture.boards, fixture.native
     start(runtime)
@@ -2095,15 +2103,18 @@ def test_nonexact_ack_service_uses_current_ingress_cut_without_committing_time(m
     def emit_late(index, frame):
         if index == 0 and frame.header.kind == codec.STEP and frame.header.step_id == 1:
             assert runtime.t_sim_ns == 500 and native.steps == [400_000]
-            raw = can_wire(0, '1000 0000 0000 0000')
+            raw = can_wire(stamp, '1000 0000 0000 0000')
             assert fixture.peers[0].send(raw) == len(raw)
         return False
     boards.on_frame = emit_late
     runtime.step(1_000_000, deadline=time.monotonic() + 1)
     command = next(row for row in delivered if row.frame.can_id == 0x200)
     assert (command.timestamp_ns, command.due_ns, command.delivered_ns) == (
-        400_500, 400_600, 800_500)
-    # The newly observed command arrives after the second world interval.
+        (400_500, 400_600, 800_500) if stamp == 0 else (500, 600, 800_500))
+    assert command.late
+    assert native.steps == [400_000, 400_000, 200_000]
+    # Discovery follows cut selection: delivery occurs after that World interval,
+    # without reopening an already settled cut for either timestamp form.
     assert native.efforts == [('j1', 0), ('j2', 0), ('j1', 0), ('j2', 0),
                               ('j1', .2), ('j2', 0)]
 
@@ -2112,7 +2123,7 @@ def test_native_cpu_requests_and_completion_use_simulation_machine_phases(exact_
     runtime, _, native, _, cpus, _ = exact_setup
     start(runtime)
     simulation = runtime._simulation
-    assert tuple(simulation.components) == ('boards', 'can')
+    assert tuple(simulation.components) == ('boards', 'can_0', 'can_1', 'plant')
     phases = []
     request, finish = runtime._request_cpus, runtime._finish_cpus
     def requesting(*args):
@@ -2158,11 +2169,12 @@ def test_motor_feedback_exact_socket_receipts_keep_missing_selected_and_recover_
                                  (cpus[1], "f000", (1_002_000, 2_002_000))):
         assert cpu.receipts == [struct.pack(
             "<IIB3xQ64s", 0x201, 0, 8, stamp,
-            bytes.fromhex("0000 0000 " + current + " 19 00").ljust(64, b"\0"))
+            bytes.fromhex("0000 0000 " + ("0000" if stamp == 1_002_000 else current) + " 19 00").ljust(64, b"\0"))
             for stamp in stamps]
         assert not cpu.partial
     assert [state["completed_frames"] for state in runtime.can_input_states] == [1, 2]
-    assert native.steps == [1_000_000] * 2 and native.efforts == [("j1", .2), ("j2", -.2)] * 2
+    assert native.steps == [1_000_000] * 2
+    assert native.efforts == [("j1", 0), ("j2", 0), ("j1", .2), ("j2", -.2)]
     assert not runtime.failed and all(item.endpoint.bus.pending == 0 for item in bindings)
 
 
@@ -2547,3 +2559,272 @@ def test_exact_batch_final_result_is_fresh_and_change_freezes_completed_world(ba
     assert native.steps == [1_000_000] and len(cpus[0].receipts) == 1
     assert runtime.can_input_states == ({"completed_frames": 0, "partial_bytes": 0, "rx_dropped": 0},) * 2
     assert_exact_frozen(runtime, native, cpus)
+
+
+@pytest.fixture(params=(False, True), ids=('nonexact', 'exact'))
+def can_deadline_setup(request):
+    resources = request.getfixturevalue(
+        'exact_world_resources' if request.param else 'world_resources')
+    plant, boards, native, bindings, peers, events, stack = resources
+    def observe(name, frame, decoded):
+        events.append(('response', name, frame.header.kind, frame.header.step_id))
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards, on_response=observe)
+    stack.callback(runtime.close)
+    return SimpleNamespace(runtime=runtime, boards=boards, native=native,
+                           bindings=bindings, cpus=peers if request.param else (),
+                           peers=tuple(cpu.peer for cpu in peers) if request.param else peers,
+                           events=events)
+
+
+def admit_fixture_can(f):
+    """Decode fixture bytes into the real queue before CPU execution.
+
+    This isolates a pre-existing queue, not native QEMU producer timing. Native
+    gates obtain pending due from preceding CPU output plus a bus delay.
+    """
+    for binding in f.bindings:
+        for can_id, flags, dlc, stamp, data in binding.endpoint.stream.receive():
+            binding.endpoint.ingest(CanFrame(can_id, flags, dlc, data, stamp), f.runtime.t_sim_ns)
+
+
+def test_known_can_due_splits_world_and_exchanges_before_next_cpu(can_deadline_setup):
+    f = can_deadline_setup
+    start(f.runtime)
+    deliveries = []
+    f.bindings[0].endpoint.bus.log = deliveries.append
+    raw = can_wire(f.boards.origins[0] + 1_500_000, '1000 0000 0000 0000')
+    assert f.peers[0].send(raw) == 84
+    admit_fixture_can(f)
+    assert f.bindings[0].endpoint.bus.next_due_ns == 1_500_500
+    original_step = f.native.step
+    def world_step(dt):
+        # Source discovery is not dispatch: the first World interval must use
+        # the previous control even though its command is already queued.
+        if not f.native.steps:
+            assert f.runtime.plant.devices[0].current_raw == 0
+        original_step(dt)
+    f.native.step = world_step
+    def next_run():
+        if f.native.steps:
+            assert f.runtime.t_sim_ns == 1_500_500 and f.runtime.step_id == 1
+            assert all(len(cpu.receipts) == 1 for cpu in f.cpus)
+            assert all(frames[-1].header.step_id == 1 for frames in f.boards.frames)
+            assert {row[1] for row in f.events if row[:1] == ('response',)
+                    and row[2:] == (codec.STEP_ACK, 1)} == {'left', 'right'}
+    for cpu in f.cpus:
+        cpu.on_run = next_run
+    f.runtime.step(4_000_000, deadline=time.monotonic() + 1)
+    assert f.native.steps == [1_500_000, 2_500_000]
+    assert f.native.efforts == [('j1', 0), ('j2', 0), ('j1', .2), ('j2', 0)]
+    command = next(row for row in deliveries if row.frame.can_id == 0x200)
+    assert (command.timestamp_ns, command.due_ns, command.delivered_ns, command.late) == (
+        1_500_500, 1_500_500, 1_500_500, False)
+    for frames in f.boards.frames:
+        assert [(frame.header.step_id, frame.header.t_sim_ns, frame.header.dt_ns)
+                for frame in frames[1:]] == [(1, 1_500_500, 1_500_000), (2, 4_000_500, 2_500_000)]
+    if f.cpus:
+        assert [cpu.requests for cpu in f.cpus] == [
+            [1_501_000, 4_001_000], [1_502_000, 4_002_000]]
+        assert [state['completed_frames'] for state in f.runtime.can_input_states] == [2, 2]
+        # The first feedback reflects the old control. This is a transport
+        # receipt of actual socket bytes, never firmware consumption evidence.
+        assert f.cpus[0].receipts[0][20:28] == bytes.fromhex('0000 0000 0000 19 00')
+        assert f.cpus[0].receipts[1][20:28] == bytes.fromhex('0000 0000 1000 19 00')
+    assert f.runtime.step_id == 2 and f.runtime.t_sim_ns == 4_000_500
+
+
+def test_due_cut_keeps_independent_command_expiry_inside_one_world(can_deadline_setup):
+    f = can_deadline_setup
+    f.runtime.plant.devices[0].command_timeout_ns = 1_000_000
+    f.runtime.plant.devices[1].command_timeout_ns = 10_000_000
+    start(f.runtime)
+    for peer, stamp, command in zip(f.peers,
+            (f.boards.origins[0] + 1_500_000, f.boards.origins[1]),
+            ('1000 0000 0000 0000', 'f000 0000 0000 0000')):
+        assert peer.send(can_wire(stamp, command)) == 84
+    admit_fixture_can(f)
+    f.runtime.step(4_000_000, deadline=time.monotonic() + 1)
+    assert f.native.steps == [1_500_000, 1_000_000, 1_500_000]
+    assert f.native.efforts == [('j1', 0), ('j2', -.2), ('j1', .2), ('j2', -.2),
+                               ('j1', 0), ('j2', -.2)]
+    # Device expiry subdivides physics, not CPU/STEP transactions.
+    assert f.runtime.step_id == 2 and all(len(frames) == 3 for frames in f.boards.frames)
+    assert f.native.resets == 1
+    f.runtime.close()
+    f.runtime.close()
+    assert f.native.closed == 1
+
+
+def test_one_bus_settle_budget_cannot_be_spent_again_in_world_step(world_resources):
+    plant, boards, native, bindings, peers, _, stack = world_resources
+    bindings[0].endpoint.bus.dispatch_budget = 1
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards)
+    stack.callback(runtime.close)
+    start(runtime)
+    raw = can_wire(boards.origins[0] + 1_500_000, '1000 0000 0000 0000')
+    assert peers[0].send(raw * 2) == 168
+    with pytest.raises(RuntimeError, match='can_0 dispatch budget exhausted'):
+        runtime.step(4_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_500_000] and native.efforts == [('j1', 0), ('j2', 0)]
+    assert runtime.failed and runtime.t_sim_ns == 500 and runtime.step_id == 0
+    assert plant.devices[0].current_raw == 4096 and bindings[0].endpoint.bus.pending == 2
+    assert all(len(frames) == 1 for frames in boards.frames)
+    before = list(native.steps), bindings[0].endpoint.bus.pending
+    with pytest.raises(RuntimeError, match='fresh runtime'):
+        runtime.step(1, deadline=time.monotonic() + 1)
+    assert (native.steps, bindings[0].endpoint.bus.pending) == before
+
+
+def test_pending_due_is_immutable_and_drop_is_evaluated_at_its_cut(can_deadline_setup):
+    f = can_deadline_setup
+    start(f.runtime)
+    bus = f.bindings[0].endpoint.bus
+    deliveries = []
+    bus.log = deliveries.append
+    f.runtime.set_can_delay('left', 250_000)
+    assert f.peers[0].send(can_wire(f.boards.origins[0] + 1_000_000,
+                                  '1000 0000 0000 0000')) == 84
+    admit_fixture_can(f)
+    assert bus.next_due_ns == 1_250_500
+    f.runtime.set_can_delay('left', 0)
+    assert bus.next_due_ns == 1_250_500
+    bus.drop = lambda *_: True
+    f.runtime.step(2_000_000, deadline=time.monotonic() + 1)
+    command = next(row for row in deliveries if row.frame.can_id == 0x200)
+    assert (command.timestamp_ns, command.due_ns, command.delivered_ns, command.dropped) == (
+        1_000_500, 1_250_500, 1_250_500, True)
+    assert f.native.steps == [1_250_000, 750_000]
+    assert all(effort == 0 for _, effort in f.native.efforts)
+    bus.drop = None
+    f.runtime.step(1, deadline=time.monotonic() + 1)
+    assert f.runtime.plant.devices[0].current_raw == 0
+    assert sum(row.frame.can_id == 0x200 for row in deliveries) == 1
+
+
+def test_dynamic_due_cut_sample_exhaustion_freezes_before_second_world(can_deadline_setup, monkeypatch):
+    f = can_deadline_setup
+    start(f.runtime)
+    raw = can_wire(f.boards.origins[0] + 1_500_000, '1000 0000 0000 0000')
+    assert f.peers[0].send(raw) == 84
+    admit_fixture_can(f)
+    # The outer quantum lower bound admits one cut. The actual second cut must
+    # still validate wire sample headroom before any next CPU or World effect.
+    admit = f.runtime._admit_cut
+    def limited(target, step_id):
+        return admit(target, step_id if step_id <= 1 else 1 << 32)
+    monkeypatch.setattr(f.runtime, '_admit_cut', limited)
+    with pytest.raises(ValueError, match='sample ID'):
+        f.runtime.step(4_000_000, deadline=time.monotonic() + 1)
+    assert f.runtime.t_sim_ns == 1_500_500 and f.runtime.step_id == 1
+    assert f.runtime.failed and f.native.steps == [1_500_000]
+    assert all(len(cpu.requests) == 1 for cpu in f.cpus)
+    assert all(len(frames) == 2 for frames in f.boards.frames)
+
+
+def test_dispatch_graph_capacity_is_admitted_before_getters_or_reset(world_resources):
+    plant, boards, native, bindings, _, _, _ = world_resources
+    with pytest.raises(ValueError, match='1..64 nodes'):
+        SharedWorldRuntime(plant, (bindings[0],) * 63, check_running=boards)
+    assert native.reads == native.steps == [] and native.resets == native.closed == 0
+    assert not plant.closed and boards.frames == [[], []]
+
+
+def test_cross_bus_callback_settles_in_stable_order_with_one_budget_per_bus(world_resources):
+    plant, boards, native, bindings, peers, _, stack = world_resources
+    buses = tuple(item.endpoint.bus for item in bindings)
+    observed = []
+    left = SimpleNamespace(receive=lambda frame: observed.append(('left', frame.data)))
+    def right_receive(frame):
+        observed.append(('right', frame.data))
+        if frame.data == b'right':
+            buses[0].send(left, CanFrame(0x123, data=b'callback', timestamp_ns=500))
+    right = SimpleNamespace(receive=right_receive)
+    buses[0].attach(left, 'tap-left')
+    buses[1].attach(right, 'tap-right')
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards)
+    stack.callback(runtime.close)
+    start(runtime)
+    # Later owner queues work on the earlier owner after its first visit. The
+    # settle loop must drain it before the World interval, without a new step.
+    buses[0].send(bindings[0].endpoint, CanFrame(0x123, data=b'left', timestamp_ns=500))
+    buses[1].send(bindings[1].endpoint, CanFrame(0x123, data=b'right', timestamp_ns=500))
+    deliveries = []
+    buses[0].log = deliveries.append
+    runtime.step(1, deadline=time.monotonic() + 1)
+    assert observed == [('left', b'left'), ('right', b'right')]
+    assert [(row.frame.data, row.destination, row.sequence) for row in deliveries] == [
+        (b'left', 'm3508-1', 0), (b'left', 'tap-left', 0),
+        (b'callback', 'm3508-1', 1), (b'callback', 'qemu', 1)]
+    assert all(row.delivered_ns == 500 for row in deliveries)
+    assert native.steps == [1] and runtime.step_id == 1
+
+
+def test_second_due_cut_failure_retains_first_commit_and_borrowed_tails(can_deadline_setup):
+    f = can_deadline_setup
+    start(f.runtime)
+    assert f.peers[0].send(can_wire(f.boards.origins[0] + 1_500_000,
+                                  '1000 0000 0000 0000')) == 84
+    admit_fixture_can(f)
+    primary = OSError('second deadline ACK observer failed')
+    observe = f.runtime._on_response
+    def fail_second(name, frame, decoded):
+        observe(name, frame, decoded)
+        if name == 'right' and frame.header.kind == codec.STEP_ACK and frame.header.step_id == 2:
+            raise primary
+    f.runtime._on_response = fail_second
+    with pytest.raises(OSError) as caught:
+        f.runtime.step(4_000_000, deadline=time.monotonic() + 1)
+    assert caught.value is primary and f.runtime.failed
+    assert f.runtime.t_sim_ns == 1_500_500 and f.runtime.step_id == 1
+    assert f.native.steps == [1_500_000, 2_500_000]
+    assert all(frame.header.step_id == 1 for frame in
+               f.runtime._simulation.components['boards'].responses)
+    before = list(f.native.steps), [tuple(frames) for frames in f.boards.frames]
+    with pytest.raises(RuntimeError, match='fresh runtime'):
+        f.runtime.step(1, deadline=time.monotonic() + 1)
+    assert (f.native.steps, [tuple(frames) for frames in f.boards.frames]) == before
+    for item in f.bindings:
+        item.endpoint.stream.buffer.extend(b'CAN tail')
+        item.cosim.buffer.extend(b'STEP tail')
+    f.runtime.close()
+    assert f.native.closed == 1
+    assert all(bytes(item.endpoint.stream.buffer) == b'CAN tail'
+               and bytes(item.cosim.buffer) == b'STEP tail'
+               and item.endpoint.stream.sock.fileno() >= 0
+               and item.cosim.sock.fileno() >= 0 for item in f.bindings)
+
+
+@pytest.mark.parametrize('backtrack', [False, True])
+def test_initial_settle_receipt_precedes_first_cpu_without_rebasing(exact_world_resources, backtrack):
+    plant, boards, native, bindings, cpus, events, stack = exact_world_resources
+    source = SimpleNamespace(receive=lambda _: None)
+    bus = bindings[0].endpoint.bus
+    bus.attach(source, 'virtual-source')
+    runtime = SharedWorldRuntime(plant, bindings, check_running=boards)
+    stack.callback(runtime.close)
+    start(runtime)
+    bus.send(source, CanFrame(0x123, data=b'initial', timestamp_ns=500))
+    if backtrack:
+        observed = []
+        def invalid_drop():
+            if cpus[0].receipts:
+                observed.append(True)
+                cpus[0].rx_dropped = int(len(observed) <= 2)
+        cpus[0].on_rx = invalid_drop
+        with pytest.raises(RuntimeError, match='initial CAN baseline changed'):
+            runtime.step(1_000_000, deadline=time.monotonic() + 1)
+        assert runtime.failed and native.steps == [] and cpus[0].completed == 1
+        assert runtime.t_sim_ns == 500 and all(cpu.requests == [] for cpu in cpus)
+        return
+    def before_cpu():
+        assert native.steps == [] and runtime.t_sim_ns == 500
+        assert cpus[0].completed == 1 and len(cpus[0].receipts) == 1
+        assert cpus[0].receipts[0] == struct.pack('<IIB3xQ64s', 0x123, 0, 7, 1000,
+                                                  b'initial'.ljust(64, b'\0'))
+        assert runtime._can_baselines[0]['submitted_frames'] == 0
+        assert runtime._can_baselines[0]['completed_frames'] == 0
+    for cpu in cpus:
+        cpu.on_run = before_cpu
+    runtime.step(1_000_000, deadline=time.monotonic() + 1)
+    assert native.steps == [1_000_000] and runtime.step_id == 1
+    assert [state['completed_frames'] for state in runtime.can_input_states] == [2, 1]

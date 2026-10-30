@@ -1,7 +1,7 @@
 """Independent board exchanges around one owned joint world.
 
 The runtime borrows board endpoints and all nonblocking streams. One Simulation
-owns the existing CAN/plant participant and optional referee engines; referee
+owns borrowed CAN dispatchers, the plant and optional referee engines. Referee
 endpoints have a separate sequence lifecycle. This is a synchronous host
 composition. Explicit execution bindings additionally coordinate native CPU
 targets and paused CAN transport; they do not close equal-time timers or create
@@ -31,7 +31,7 @@ from sim.devices.referee import RefereeEngine, RefereeUartEndpoint, ScriptEvent
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import check_can_time
 from sim.machines.qemu.endpoints import QemuCanEndpoint
-from sim.fabric.runtime import CanParticipant
+from sim.fabric.runtime import BorrowedCanDispatcher
 from sim.runtime import Simulation
 from sim.transports.can_stream import CanStream
 from sim.transports.cosim import (
@@ -95,11 +95,12 @@ class _MotorFeedbackPolicy:
 class _ParticipantFactory:
     """Own an admitted participant until its one transfer to Simulation."""
 
-    def __init__(self, participant):
+    def __init__(self, participant, capabilities=frozenset({'step'})):
         self.pending = participant
+        self.capabilities = capabilities
 
     def describe(self, spec):
-        return NodeDescription(capabilities=frozenset({'step'}))
+        return NodeDescription(capabilities=self.capabilities)
 
     def create(self, spec, context):
         if self.pending is None:
@@ -155,8 +156,10 @@ class _BoardExecutionGroup:
 
     def step(self, context):
         # The non-execution mode prepares its actual wire transaction before
-        # the CAN/world participant; it never pretends to run a native CPU.
+        # plant; it never pretends to run a native CPU. CAN held during the
+        # previous ACK wait is discovered here and delivered after this World.
         self._prepare_cut(context)
+        self.runtime._service(self.context.deadline_monotonic, 0)
         self.completed = True
         return StepResult('ok', context.t_sim_ns)
 
@@ -237,6 +240,11 @@ class SharedWorldRuntime:
         if (type(referees) is not tuple
                 or any(type(item) is not RefereeBinding for item in referees)):
             raise TypeError("shared world requires a plain RefereeBinding tuple")
+        # Admit the expanded graph with the same pure topology limits before
+        # getters, ownership transfer or any native RESET transaction.
+        Topology(tuple(NodeSpec(name, name) for name in (
+            'boards', *(f'can_{i}' for i in range(len(bindings))), 'plant',
+            *(f'referee_{i}' for i in range(len(referees))))))
         for callback, name in ((check_running, "check_running"),
                                (on_response, "on_response")):
             if callback is not None and not callable(callback):
@@ -328,7 +336,10 @@ class SharedWorldRuntime:
                             bus.dispatch_budget != budget):
                         raise RuntimeError(
                             "shared world execution CAN wiring or dispatch budget changed")
-        factories = {'can': _ParticipantFactory(CanParticipant(buses, (plant,))),
+        factories = {**{f'can_{index}': _ParticipantFactory(
+                            BorrowedCanDispatcher(bus), frozenset({'dispatch'}))
+                        for index, bus in enumerate(buses)},
+                     'plant': _ParticipantFactory(plant),
                      **{f'referee_{index}': _ParticipantFactory(item.engine)
                         for index, item in enumerate(referees)}}
         self.bindings = bindings
@@ -433,10 +444,10 @@ class SharedWorldRuntime:
             raise ValueError("shared world CAN input goal exceeds native counter headroom")
         return goal
 
-    def _wait_can_input(self, index, target, deadline):
+    def _wait_can_input(self, index, target, deadline, *, initial=False):
         rx = wait_paused_can_input(
             **self._execution_io(index, deadline), target_ns=target,
-            completed_frames=self._input_goal(index))
+            completed_frames=self._input_goal(index), initial=initial)
         if rx["rx_dropped"] < self._can_input_states[index]["rx_dropped"]:
             raise RuntimeError("shared world CAN input drop count moved backwards")
         return rx
@@ -457,6 +468,8 @@ class SharedWorldRuntime:
         if self._exact_execution:
             self._check_execution_wiring()
             for index, (_, _, _, budget) in enumerate(self._can_wiring):
+                # Reserve both a possible previous-cut settle and the target
+                # settle. Each bus has one cumulative budget per settle.
                 if self._input_goal(index) + 2 * budget > 0xfffffffffffffffe:
                     raise ValueError("shared world CAN input lacks native counter headroom")
         return targets
@@ -466,20 +479,30 @@ class SharedWorldRuntime:
         # cut has idle/no-target semantics, not a fabricated reached target.
         starts = tuple(mapper.unmap(self.t_sim_ns, mapper.qemu_origin_ns)
                        for mapper in self._mappers)
+        initial_states = []
         for index, start in enumerate(starts):
             if self.step_id:
                 self._wait_can_input(index, start, deadline)
             else:
+                baseline = self._can_baselines[index]
+                goal = self._input_goal(index)
+                previous_rx = baseline
+                # The initial settle can submit virtual-device input. Observe
+                # its real idle/prelaunch receipt without rebasing the ledger.
+                if goal != baseline['completed_frames']:
+                    previous_rx = self._wait_can_input(index, start, deadline, initial=True)
                 observed = observe_initial_paused_can(
                     **self._execution_io(index, deadline), timestamp_ns=start)
-                baseline = self._can_baselines[index]
                 if (any(observed["tx"][field] != baseline[field]
                         for field in ("tx_dropped", "tx_short_writes")) or
-                        any(observed["rx"][field] != baseline[field]
-                            for field in ("completed_frames", "rx_dropped")) or
-                        self.bindings[index].endpoint.submitted_frames !=
-                        baseline["submitted_frames"]):
+                        observed['rx']['completed_frames'] != goal or
+                        observed['rx']['rx_dropped'] < previous_rx['rx_dropped'] or
+                        (goal == baseline['completed_frames'] and
+                         observed['rx']['rx_dropped'] != baseline['rx_dropped'])):
                     raise RuntimeError("shared world initial CAN baseline changed")
+                initial_states.append(dict(observed['rx']))
+        if not self.step_id:
+            self._can_input_states = tuple(initial_states)
         commands = tuple(self._execution_io(index, deadline)["qmp"].command
                          for index in range(len(self.bindings)))
         # Admission replies do not prove completion. Submit every target before
@@ -518,9 +541,9 @@ class SharedWorldRuntime:
                     pending.remove(index)
             if pending:
                 self._service(deadline, 0.001)
-        # Every output producer is now quiescent. All canonical drains precede
-        # the same sole world step; interior timestamps keep the existing bus
-        # sampled-target policy and cannot retroactively affect this interval.
+        # Every output producer is now quiescent. Canonical drains only enqueue:
+        # dispatch follows the sole world step. Newly discovered output cannot
+        # retroactively affect either the CPU or World interval just completed.
         for index, target in enumerate(targets):
             endpoint = self.bindings[index].endpoint
 
@@ -547,7 +570,7 @@ class SharedWorldRuntime:
                                  frame.header.session_id)
 
     def _service(self, deadline, timeout, *, active=None, acked=None,
-                 ingress_cut_ns=None):
+                 hold_can=False):
         self._guard(deadline)
         # During start, only already-ACKed peers may be polled. Other RESET_ACKs
         # remain physically queued for their exclusive active wait. CAN RX is
@@ -559,7 +582,7 @@ class SharedWorldRuntime:
             self._guard(deadline)
         readable = [item.cosim.sock for item in self.bindings]
         writable = [item.cosim.sock for item in self.bindings if item.cosim.tx_pending]
-        if acked is None and not self._exact_execution:
+        if acked is None and not self._exact_execution and not hold_can:
             readable.extend(item.endpoint.stream.sock for item in self.bindings)
             writable.extend(item.endpoint.stream.sock for item in self.bindings
                             if item.endpoint.stream.tx_pending)
@@ -581,20 +604,20 @@ class SharedWorldRuntime:
                 if item.endpoint.transport.sock in ready_write:
                     item.endpoint.flush()
                 self._guard(deadline)
-        # One canonical CAN read per stream; parsing/ingress never advances
-        # time. The bus retains original ordering/future delivery and queues.
-        if acked is None and not self._exact_execution:
-            ingress_cut = self.t_sim_ns if ingress_cut_ns is None else ingress_cut_ns
+        # ACK waits occur after target settlement. Retain CAN in the borrowed
+        # transport until the next pre-World service, so old timestamps cannot
+        # reopen a committed cut. No host queue or fabricated +1ns is needed.
+        if acked is None and not self._exact_execution and not hold_can:
             for item in self.bindings:
                 for can_id, flags, dlc, timestamp, data in item.endpoint.stream.receive():
                     item.endpoint.ingest(CanFrame(can_id, flags, dlc, data, timestamp),
-                                         ingress_cut)
+                                         self.t_sim_ns)
                 self._guard(deadline)
 
-    def _wait_service(self, deadline, timeout, active, ingress_cut_ns):
+    def _wait_service(self, deadline, timeout, active):
         try:
             self._service(deadline, timeout, active=active,
-                          ingress_cut_ns=ingress_cut_ns)
+                          hold_can=True)
         except TimeoutError as exc:
             # The canonical STEP helper retries its own ACK wait timeouts.
             # Callback/transport failures are terminal, even if transient.
@@ -849,7 +872,7 @@ class SharedWorldRuntime:
             response = send_v2_step(
                 item.cosim, self._rx[index], encoded, context.step_id, context.t_sim_ns,
                 service_io=lambda timeout, active=index: self._wait_service(
-                    deadline, timeout, active, context.t_sim_ns))
+                    deadline, timeout, active))
             self._guard(deadline)
             responses.append(response)
             self._observe(index, response, codec.decode_step_ack_payload(response.payload))
@@ -870,8 +893,8 @@ class SharedWorldRuntime:
                 raise ValueError("dt_ns must be a positive signed64 integer")
             target = self.t_sim_ns + dt_ns
             check_can_time(target)
-            # Current graphs have no scheduled external inputs or dispatch
-            # owners, so their quantum split count is known before any IO.
+            # Quantum gives only the minimum cut count. Known CAN deadlines can
+            # add cuts; _prepare_cut admits every actual cut before CPU/World IO.
             cuts = (dt_ns + self._quantum_ns - 1) // self._quantum_ns
             self._admit_cut(target, self.step_id + cuts)
             self._guard(deadline)
