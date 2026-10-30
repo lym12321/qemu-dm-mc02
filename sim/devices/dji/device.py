@@ -8,7 +8,7 @@ measurement. Rotor-to-output gearbox conversion belongs to that consumer.
 from dataclasses import dataclass
 import math
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 from sim.fabric import CanFrame, VirtualCanDevice
 
 from .protocol import decode_current_command, encode_feedback, validate_motor_id

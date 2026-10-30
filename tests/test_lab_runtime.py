@@ -66,7 +66,8 @@ def test_second_connection_failure_closes_first_and_qmp(tmp_path, monkeypatch):
         return sock
 
     monkeypatch.setattr(runtime, "running_qemu", owner)
-    monkeypatch.setattr(runtime, "QmpSession", lambda *args, **kwargs: qmp)
+    monkeypatch.setattr(runtime, "qmp_session_class",
+                        lambda: lambda *args, **kwargs: qmp)
     monkeypatch.setattr(runtime, "connect_unix", connect)
     # First wrapper is deliberately minimal: this test stops before channel
     # admission and isolates acquisition, rather than duplicating codecs.
@@ -116,7 +117,8 @@ def test_peer_cleanup_attempts_all_and_preserves_interrupt(tmp_path, monkeypatch
                           close=lambda: fail_close("qmp"))
     sock = SimpleNamespace(close=lambda: fail_close("uart1"))
     monkeypatch.setattr(runtime, "running_qemu", owner)
-    monkeypatch.setattr(runtime, "QmpSession", lambda *args, **kwargs: qmp)
+    monkeypatch.setattr(runtime, "qmp_session_class",
+                        lambda: lambda *args, **kwargs: qmp)
     monkeypatch.setattr(runtime, "connect_unix", lambda *args: sock)
     expected = KeyboardInterrupt if interrupt else OSError
     with pytest.raises(expected) as failure:

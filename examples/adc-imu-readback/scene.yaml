@@ -16,7 +16,7 @@ links:
   - [world.imu.body, wire.signal]
   - [wire.signal, main.imu]
 experiment:
-  ready: {endpoint: main.uart1, text: ADC_IMU_READY}
+  ready: [{name: main, endpoint: main.uart1, text: ADC_IMU_READY}]
   inputs:
     - {at: 20ms, endpoint: main.adc1.ch4, value: {raw: 12345}}
     - {at: 40ms, endpoint: main.adc1.ch4, value: {voltage_uv: 1650000}}

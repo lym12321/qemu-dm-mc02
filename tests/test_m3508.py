@@ -10,7 +10,7 @@ from dataclasses import FrozenInstanceError, replace
 
 import pytest
 
-from sim.core import Session, StepContext
+from sim.api import Session, StepContext
 from sim.devices.dji import M3508, M3508Device, decode_current_command, encode_feedback
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.frame import WIRE_EXTENDED, WIRE_FD, WIRE_RTR

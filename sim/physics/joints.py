@@ -6,7 +6,7 @@ Physics and drivers remain borrowed; their resource owners close them.
 
 import math
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 
 from .base import JointPhysics, JointState
 from .binding import JointDriveBinding, JointDrivePlan

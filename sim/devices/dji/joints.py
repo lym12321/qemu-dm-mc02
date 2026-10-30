@@ -9,7 +9,7 @@ The owned plant closes its devices and physics independently; buses are borrowed
 from collections.abc import Mapping
 import math
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 from sim.physics.base import JointPhysics, JointState
 from sim.physics.binding import JointDriveBinding, JointDrivePlan
 from sim.physics.joints import JointExecution

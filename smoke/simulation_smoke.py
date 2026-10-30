@@ -854,7 +854,7 @@ def verify_can_faults(observations, experiment):
     events = observations.fault_events
     origin = experiment.origin_ns
     if (not experiment.passed or experiment.delivered_inputs != 47 or origin <= 0
-            or experiment.ready_receipt is None):
+            or not experiment.ready_receipts):
         raise AssertionError("CAN fault experiment lacks its complete actual-ready inputs/assertions")
     uart = bytes(observations.uart)
     cursor = 0

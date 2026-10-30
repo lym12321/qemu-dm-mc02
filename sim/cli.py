@@ -47,6 +47,8 @@ def _parser():
     run.add_argument('--qmp', type=Path, help='single machine additional native QMP socket')
     run.add_argument('--report', type=Path, help='create a new JSON report after cleanup')
     run.add_argument('--trace', type=Path, help='record a finite stepped experiment to a new MCAP file')
+    run.add_argument('--allow-host-processes', action='store_true',
+                     help='explicitly trust literal host commands in this scene')
     replay = commands.add_parser('replay', help='evaluate a recorded experiment offline')
     replay.add_argument('trace', type=Path)
     replay.add_argument('--assertions', type=Path, help='bounded YAML replacement assertions')
@@ -252,12 +254,16 @@ def main(argv=None):
             from sim.runtime import Simulation
 
             registry = builtin_registry(**({'qemu': args.qemu, 'backend_root': args.backend_root,
-                                           'gdb_port': args.gdb_port, 'qmp_path': args.qmp}
+                                           'gdb_port': args.gdb_port, 'qmp_path': args.qmp,
+                                           'allow_host_processes': args.allow_host_processes}
                                           if args.command == 'run' else {}))
             scene = load_scene(args.scene, registry)
             if args.command == 'validate':
                 print(f'valid: {args.scene} ({len(scene.topology.nodes)} nodes)')
                 return 0
+            if not args.allow_host_processes and any(
+                    node.kind == 'app.host-processes' for node in scene.topology.nodes):
+                raise ValueError('scene host commands require --allow-host-processes')
             if (args.gdb_port is not None or args.qmp is not None) and sum(
                     node.kind == 'machine.qemu' for node in scene.topology.nodes) != 1:
                 raise ValueError('--gdb-port/--qmp require exactly one QEMU machine')

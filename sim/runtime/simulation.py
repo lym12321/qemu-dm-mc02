@@ -149,7 +149,8 @@ class Simulation:
     ``describe`` is pure. ``create`` constructs connection owners, then binding
     owners, then other nodes, preserving manifest order within each group.
     After all wiring, optional reset(Session) and start() hooks
-    run. Machine capability requires request_step/finish_step; step capability
+    run. Machines prepare all targets before any request_step/finish_step;
+    step capability
     requires step. Both return exact-target StepResult values. Every instance
     requires close(). No implicit retries or cross-component rollback occur.
 
@@ -213,6 +214,8 @@ class Simulation:
         self._components: dict[str, Any] = {}
         self._contexts: dict[str, ComponentContext] = {}
         self._owned: list[tuple[str, Any]] = []
+        self._health_checks: list[tuple[str, Callable[[], None]]] = []
+        self._checking_health = False
         self._inputs: list[tuple[int, int, _Input]] = []
         self._input_sequence = 0
         self._events: deque[Event] = deque(maxlen=event_history)
@@ -271,6 +274,18 @@ class Simulation:
             raise self.failure
         if monotonic() >= self._deadline:
             raise TimeoutError(f"simulation host deadline exceeded during {self._phase}")
+        if self._closing:
+            return
+        if self._checking_health:
+            raise self._freeze_failure(RuntimeError("simulation health checks cannot reenter the runtime"))
+        self._checking_health = True
+        try:
+            for _, check in self._health_checks:
+                check()
+                if self.state == SimulationState.FAILED and self.failure is not None:
+                    raise self.failure
+        finally:
+            self._checking_health = False
 
     def _freeze_failure(self, error: BaseException) -> BaseException:
         if self.state == SimulationState.FAILED and self.failure is not None:
@@ -328,7 +343,9 @@ class Simulation:
             methods = ["close"]
             caps = self._descriptions[node.name].capabilities
             if "machine" in caps:
-                methods += ["request_step", "finish_step"]
+                methods += ["prepare_step", "request_step", "finish_step"]
+            if "health" in caps:
+                methods += ["check_health"]
             if "step" in caps:
                 methods += ["step"]
             if "input" in caps:
@@ -343,6 +360,8 @@ class Simulation:
                 methods += ["sample"]
             if any(not callable(getattr(component, method, None)) for method in methods):
                 raise TypeError(f"component {node.name} lacks capability methods: {', '.join(methods)}")
+            if "health" in caps:
+                self._health_checks.append((node.name, component.check_health))
             if "dispatch" in caps:
                 self._dispatch_limit(node.name, component)
                 self._next_due(node.name, component)
@@ -544,6 +563,12 @@ class Simulation:
         results = {}
         self._dispatch_time_ns = target
         self._not_before_ns = target
+        self._phase = "machine preflight"
+        for name, component in self._owned:
+            if "machine" in self._descriptions[name].capabilities:
+                self._check_deadline()
+                component.prepare_step(ctx)
+                self._check_deadline()
         self._phase = "machine request"
         for name, component in self._owned:
             if "machine" in self._descriptions[name].capabilities:
@@ -661,6 +686,7 @@ class Simulation:
         for context in self._contexts.values():
             context._active = False
         self._owned.clear()
+        self._health_checks.clear()
         self._components.clear()
         self._contexts.clear()
         self._closing = False
@@ -701,12 +727,18 @@ class Simulation:
         if (self._stepping or self._closing or self._committing_cut is not None
                 or self._phase in ("creating", "initializing", "initial sample", "initial delivery")):
             raise RuntimeError("close cannot interrupt active construction, execution or cleanup")
+        primary = None
+        if self.state in (SimulationState.PAUSED, SimulationState.RUNNING):
+            try:
+                self._check_deadline()
+            except BaseException as error:
+                primary = self._freeze_failure(error)
         self._phase = "cleanup"
         self.state = SimulationState.CLOSED
-        primary = self._close_owned()
+        primary = self._close_owned(primary)
         self._inputs.clear()
         if primary is not None:
-            if self.failure is not None:
+            if self.failure is not None and primary is not self.failure:
                 self.failure.add_note(f"simulation cleanup failed: {type(primary).__name__}: {primary}")
                 for note in getattr(primary, "__notes__", ()):
                     self.failure.add_note(note)

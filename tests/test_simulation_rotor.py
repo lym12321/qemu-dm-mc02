@@ -19,6 +19,9 @@ class CommandSource:
         self.connection = context.attach("can", self)
         self.feedback = []
 
+    def prepare_step(self, context):
+        pass
+
     def request_step(self, context):
         pass
 

@@ -54,9 +54,7 @@ def _values(message, limits):
                  for field, maximum in zip(fields(message), limits, strict=True))
 
 
-def encode_message(message: GameStatus | RobotStatus | PowerHeat | Buff,
-                   sequence: int = 0) -> bytes:
-    """Validate and encode one supported payload using the shared envelope."""
+def _payload(message):
     if type(message) is GameStatus:
         kind, phase, remaining, timestamp = _values(message, (5, 5, 0xffff, 0xffffffffffffffff))
         if kind == 0:
@@ -73,4 +71,16 @@ def encode_message(message: GameStatus | RobotStatus | PowerHeat | Buff,
         command, payload = 0x0204, struct.pack("<BHBBHB", *values)
     else:
         raise TypeError("a supported referee message is required")
+    return command, payload
+
+
+def validate_message(message: GameStatus | RobotStatus | PowerHeat | Buff) -> None:
+    """Admit supported wire fields without importing a checksum implementation."""
+    _payload(message)
+
+
+def encode_message(message: GameStatus | RobotStatus | PowerHeat | Buff,
+                   sequence: int = 0) -> bytes:
+    """Validate and encode one supported payload using the shared envelope."""
+    command, payload = _payload(message)
     return encode_frame(command, payload, sequence)

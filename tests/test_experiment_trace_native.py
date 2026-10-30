@@ -76,7 +76,7 @@ def test_real_can_fault_recording_replays_after_elf_is_inaccessible(
     result = recorded['result']
     assert result['status'] == ['pass'] * 5 + (['fail'] if skip_rx else ['pass'])
     assert result['delivered_inputs'] == 47 and result['origin_ns'] > 0
-    assert result['ready_receipt']['kind'] == 'uart'
+    assert result['ready_receipts']['main']['kind'] == 'uart'
     if skip_rx:
         # Apply the unchanged independent verifier to the original five actual
         # assertions. Its nonce check must still reject apparent UART success.

@@ -15,7 +15,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 mujoco = pytest.importorskip("mujoco", reason="optional native MuJoCo runtime")
-from sim.core import Coordinator, Session
+from sim.api import Session
+from simulation_support import simulation_for
 from sim.physics import PhysicsParticipant
 from sim.physics.mujoco import MujocoPhysics
 from sim.physics.base import BodyPose, ImuSample, JointState
@@ -149,20 +150,20 @@ def test_reset_uses_native_qpos0_and_clears_previous_effort():
     assert physics.get_joint_state("shaft") == state
 
 
-def test_coordinator_owns_native_physics_with_an_independent_logical_epoch():
+def test_simulation_owns_native_physics_with_an_independent_logical_epoch():
     physics = rotor()
     participant = PhysicsParticipant(physics)
-    coordinator = Coordinator({"world": participant})
     # Large, exactly preserved logical time within the public uint64 contract.
     origin_ns = (1 << 63) + 17
     dt_ns, dt_s = 1_000_001, .001000001
+    coordinator = simulation_for({"world": participant}, session=Session(7, origin_ns))
     try:
-        coordinator.reset(Session(7, origin_ns))
+        coordinator.start()
         borrowed = participant.physics
         assert borrowed is physics and borrowed.time_s == 0
         initial = borrowed.get_joint_state("shaft")
         borrowed.set_joint_effort("shaft", .4)
-        result = coordinator.step(dt_ns)["world"]
+        result = coordinator.step(dt_ns).diagnostics["components"]["world"]
         assert result.reached_time_ns == coordinator.t_sim_ns == origin_ns + dt_ns
         assert result.diagnostics["native_time_s"] == borrowed.time_s == dt_s
         state = borrowed.get_joint_state("shaft")
@@ -175,10 +176,15 @@ def test_coordinator_owns_native_physics_with_an_independent_logical_epoch():
         assert borrowed.get_imu("imu") == sample
         assert borrowed.time_s == dt_s
 
-        coordinator.reset(Session(8, origin_ns + 99))
+        coordinator.close()
+        physics = rotor()
+        participant = PhysicsParticipant(physics)
+        borrowed = physics
+        coordinator = simulation_for({"world": participant}, session=Session(8, origin_ns + 99))
+        coordinator.start()
         assert coordinator.t_sim_ns == origin_ns + 99 and borrowed.time_s == 0
         assert borrowed.get_joint_state("shaft") == initial
-        result = coordinator.step(dt_ns)["world"]
+        result = coordinator.step(dt_ns).diagnostics["components"]["world"]
         assert result.diagnostics["native_time_s"] == dt_s
         assert borrowed.get_joint_state("shaft") == initial  # Reset cleared effort.
         assert borrowed.get_imu("imu").gyro_rad_s == (0, 0, 0)

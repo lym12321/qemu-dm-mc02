@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import math
 from typing import Protocol
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 
 from .base import JointState
 

@@ -2,7 +2,7 @@
 
 import math
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 
 
 class PhysicsParticipant:
@@ -10,7 +10,7 @@ class PhysicsParticipant:
 
     Construction transfers ownership only on success. The caller must not step
     or reset the physics directly, or give it to another execution owner.
-    Calls require one synchronous caller, as with the host Coordinator.
+    Calls require one synchronous Simulation owner.
     Native time and sensor stamps keep their own epoch and precision; the host
     target is an integer session time, not a sensor delivery or CPU barrier.
     """

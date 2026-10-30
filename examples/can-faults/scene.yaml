@@ -21,7 +21,7 @@ links:
   - [diagnostic.can, can0.can]
   - [observer.can, can0.can]
 experiment:
-  ready: {endpoint: main.uart1, text: "SIM_READY can-faults\n"}
+  ready: [{name: main, endpoint: main.uart1, text: "SIM_READY can-faults\n"}]
   inputs:
     - {at: 0ms, endpoint: can0.fault, value: normal}
     - {at: 5ms, endpoint: heartbeat.tx, value: {id: 0x321, dlc: 8, data_hex: 'eea55c132d3306b6'}}

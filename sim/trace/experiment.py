@@ -26,7 +26,7 @@ from sim.physics.base import JointState
 from .storage import MAX_PAYLOAD_BYTES, TraceEvent, TraceWriter, iter_events
 
 
-FORMAT = "sim/experiment/1"
+FORMAT = "sim/experiment/2"
 MAX_CONFIG_BYTES = 8 * 1024 * 1024
 CONFIG_SEGMENT_BYTES = 32 * 1024
 MAX_VALUE_DEPTH = 32

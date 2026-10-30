@@ -29,7 +29,7 @@ from dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
 from dm_mc02_qmp import QmpSession
 from dm_mc02_test_harness import stop
 from dm_mc02_trobot_business import _identity
-from sim.robots.four_wheel import four_wheel_simulation_factory, four_wheel_imu
+from sim.apps.four_wheel import four_wheel_simulation_factory, four_wheel_imu
 from sim.transports import connect_unix
 
 STEPS = 7500

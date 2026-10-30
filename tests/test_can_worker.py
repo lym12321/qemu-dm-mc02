@@ -74,7 +74,7 @@ def chassis_launcher():
 
 
 def track_admitted_plant(monkeypatch, *, cleanup_error=None):
-    from sim.robots import four_wheel
+    from sim.apps import four_wheel
     admitted, closes = [], []
     create = four_wheel.create_four_wheel_plant
     def observed_create(*args, **kwargs):
@@ -118,8 +118,8 @@ def test_chassis_failed_preflight_cleanup_prevents_connection(monkeypatch, capsy
 
 def test_chassis_preflight_recipe_rejects_changed_model_before_acquisition(tmp_path):
     pytest.importorskip('mujoco', reason='optional native chassis profile')
-    from sim.robots.four_wheel import four_wheel_simulation_factory
-    from sim.core import Session
+    from sim.apps.four_wheel import four_wheel_simulation_factory
+    from sim.api import Session
     from sim.transports.cosim import QemuTimestampMapper
     model = tmp_path / 'model.xml'
     model.write_bytes((LAUNCHER.parents[1] / 'models/four_wheel.xml').read_bytes())

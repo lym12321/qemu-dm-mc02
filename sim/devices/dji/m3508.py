@@ -9,7 +9,7 @@ the instantaneous commanded current, not an electrical measurement. There is
 no gearbox conversion; the real firmware decoder applies its own ratio.
 """
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 from sim.fabric import CanBus
 from sim.physics import Rotor
 

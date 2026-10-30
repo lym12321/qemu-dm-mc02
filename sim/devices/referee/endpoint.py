@@ -4,8 +4,6 @@ This endpoint has no socket, UART, receive parser, clock or engine ownership.
 Reset preserves physical queued bytes, including a partially sent frame.
 """
 
-from sim.transports import FixedRecordStream, LengthPrefixedStream, StreamTransport
-
 from .engine import RefereeState
 from .messages import Buff, GameStatus, PowerHeat, RobotStatus, encode_message
 from .protocol import _uint
@@ -19,12 +17,13 @@ class RefereeUartEndpoint:
     means transport admission, not firmware receipt; the caller owns draining.
     """
 
-    def __init__(self, transport: StreamTransport, *, sequence: int = 0):
-        if (not isinstance(transport, StreamTransport)
-                or isinstance(transport, (FixedRecordStream, LengthPrefixedStream))):
-            raise TypeError("referee UART requires an unframed StreamTransport")
+    def __init__(self, transport, *, sequence: int = 0):
+        send = getattr(transport, "send", None)
+        if not callable(send):
+            raise TypeError("referee UART requires a borrowed send(bytes) endpoint")
         self._next_sequence = _uint(sequence, 255, "sequence")
         self._transport = transport
+        self._send = send
         self._failed = False
         self._closed = False
 
@@ -58,7 +57,7 @@ class RefereeUartEndpoint:
             frames.append(encode_message(message, (self._next_sequence + offset) % 256))
         wire = b"".join(frames)
         try:
-            self._transport.send(wire)
+            self._send(wire)
             self._next_sequence = (self._next_sequence + 4) % 256
         except BufferError:
             # Existing transport rejects capacity before enqueueing new bytes.
@@ -67,14 +66,6 @@ class RefereeUartEndpoint:
             self._failed = True
             raise
         return wire
-
-    def flush(self) -> bool:
-        self._ready()
-        try:
-            return self._transport.flush()
-        except BaseException:
-            self._failed = True
-            raise
 
     def reset(self, sequence: int = 0) -> None:
         if self._closed:

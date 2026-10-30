@@ -1,6 +1,6 @@
 """Small, backend independent contracts for composable simulations."""
 
-from sim.core.participant import Session, StepContext, StepResult
+from .time import Session, StepContext, StepResult
 
 from .topology import Endpoint, LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
 from .events import Event, TimeQuality

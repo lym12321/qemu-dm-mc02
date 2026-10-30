@@ -13,7 +13,7 @@ def evidence():
     observations = smoke.Observations(capture_can_faults=True)
     origin = 2_000_000
     result = SimpleNamespace(passed=True, delivered_inputs=47, origin_ns=origin,
-                             ready_receipt=object())
+                             ready_receipts={"firmware": object()})
     for ms, previous, profile, delay in ((0, "normal", "normal", 0),
             (20, "normal", "missing-heartbeat", 0), (50, "missing-heartbeat", "normal", 0),
             (60, "normal", "delayed", 7_000_000), (80, "delayed", "normal", 0)):

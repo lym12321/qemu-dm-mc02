@@ -20,11 +20,12 @@ from sim.physics import BodyPose, GazeboPhysics, ImuSample, JointState, PhysicsP
 from sim.physics.mujoco import BodyPose as LegacyBodyPose
 from sim.physics.mujoco import ImuSample as LegacyImuSample
 from sim.physics.mujoco import JointState as LegacyJointState
-from sim.core import Coordinator, Session
+from sim.api import Session
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tests"))
+from simulation_support import simulation_for
 from sim.devices.dji import M3508Device, M3508JointPlant
 from sim.devices.bmi088 import imu_to_bmi088_units
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.fabric.runtime import CanParticipant
 
 MODELS = Path(__file__).resolve().parents[4] / "models"
 ARENA_PATH = MODELS / "gazebo_rmua19.sdf"
@@ -444,7 +445,7 @@ class CanHost(VirtualCanDevice):
 
 
 def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
-              observe_imus=False, independent_buses=False, composed_buses=False):
+              observe_imus=False, independent_buses=False, composed_buses=False, session=None):
     xml = rotor_sdf()
     if observe_imus:
         xml = xml.replace('</inertial></link>',
@@ -470,9 +471,8 @@ def motor_rig(tmp_path, *, timeouts=(100_000_000,) * 4, observe_bodies=False,
     try:
         plant = M3508JointPlant(physics, {device: f"j{i}" for i, device
                                          in enumerate(devices, 1)}, gear_ratio=2)
-        participant = (plant if independent_buses and not composed_buses else
-                       CanParticipant(buses if independent_buses else buses[0], [plant]))
-        coordinator = Coordinator({"world" if independent_buses else "can": participant})
+        coordinator = simulation_for({"world": plant}, session=session,
+            buses=buses if not independent_buses or composed_buses else ())
         return (physics, buses if independent_buses else buses[0],
                 hosts if independent_buses else hosts[0], devices, plant, coordinator)
     except BaseException:
@@ -497,14 +497,14 @@ def observe_motor_advances(monkeypatch, physics):
 
 
 def test_actual_can_four_joint_gear_and_completed_feedback(native, tmp_path, monkeypatch):
-    physics, bus, host, devices, plant, coordinator = motor_rig(tmp_path)
+    physics, bus, host, devices, plant, coordinator = motor_rig(tmp_path, session=Session(1, 7))
     calls = observe_motor_advances(monkeypatch, physics)
     try:
         # Native epoch remains zero even with a non-grid logical session origin.
-        coordinator.reset(Session(1, 7))
+        coordinator.start()
         host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 2000 e000"),
                            timestamp_ns=7))
-        result = coordinator.step(10_000_000)["can"]
+        result = coordinator.step(10_000_000).diagnostics["components"]["world"]
         assert calls == [("effort", "j1", .2), ("effort", "j2", -.2),
                          ("effort", "j3", .4), ("effort", "j4", -.4),
                          ("step", 10_000_000)]
@@ -528,7 +528,11 @@ def test_actual_can_four_joint_gear_and_completed_feedback(native, tmp_path, mon
         assert result.status == "ok" and result.reached_time_ns == 10_000_007
         assert physics.time_ns == 10_000_000
         assert plant.t_sim_ns == bus.t_sim_ns == coordinator.t_sim_ns == 10_000_007
-        coordinator.reset(Session(2, 17))
+        coordinator.close()
+        assert plant.closed and all(device.closed for device in devices)
+        physics, bus, host, devices, plant, coordinator = motor_rig(
+            tmp_path, session=Session(2, 17))
+        coordinator.start()
         assert physics.time_ns == 0 and plant.t_sim_ns == 17
         assert all(device.get_rotor_state() == (0, 0) for device in devices)
         coordinator.step(1_000_000)
@@ -546,7 +550,7 @@ def test_actual_shared_expiry_intervals_and_coasting(native, tmp_path, monkeypat
         timeouts=(3_000_000, 7_000_000, 10_000_000, 3_000_000))
     calls = observe_motor_advances(monkeypatch, physics)
     try:
-        coordinator.reset(Session(1))
+        coordinator.start()
         host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 2000 e000")))
         coordinator.step(10_000_000)
         assert calls == [
@@ -572,14 +576,14 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
                                                      composed):
     physics, buses, hosts, devices, plant, coordinator = motor_rig(tmp_path,
         independent_buses=True, composed_buses=composed,
-        timeouts=(3_000_000, 3_000_000, 7_000_000, 7_000_000))
+        timeouts=(3_000_000, 3_000_000, 7_000_000, 7_000_000), session=Session(1, 7))
     calls = observe_motor_advances(monkeypatch, physics)
     deliveries = []
     for index, bus in enumerate(buses):
         step = bus.step
-        def observe_delivery(t_sim_ns, *, index=index, step=step):
-            count = step(t_sim_ns)
-            if t_sim_ns == 7:
+        def observe_delivery(t_sim_ns, *, max_dispatch=None, index=index, step=step):
+            count = step(t_sim_ns, max_dispatch=max_dispatch)
+            if t_sim_ns == 7 and count:
                 deliveries.append((index, count,
                                    tuple(device.current_raw for device in devices)))
             return count
@@ -591,9 +595,9 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
         reset()
     monkeypatch.setattr(physics, "reset", reset_native)
     try:
-        coordinator.reset(Session(1, 7))
+        coordinator.start()
         # Manual delivery retains the lower shared-plant consumer. The composed
-        # path delegates both borrowed bus clocks to the sole CanParticipant.
+        # path delegates both borrowed bus clocks to the sole Simulation.
         if not composed:
             for bus in buses:
                 bus.reset(7)
@@ -610,7 +614,7 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
             assert all(bus.t_sim_ns == 7 and bus.pending == 1 for bus in buses)
         assert [device.motor_id for device in devices] == [1, 2, 1, 2]
         assert resets == [0] and physics.time_ns == 0
-        result = coordinator.step(10_000_000)["world"]
+        result = coordinator.step(10_000_000).diagnostics["components"]["world"]
         assert deliveries == [(0, 1, (4096, -4096, 0, 0)),
                               (1, 1, (4096, -4096, -4096, 4096))]
         assert calls == [
@@ -633,8 +637,7 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
                 (2 * state.position_rad, 2 * velocity), abs=1e-10)
         assert physics.time_ns == 10_000_000 and resets == [0]
         assert result.status == "ok" and result.reached_time_ns == 10_000_007
-        assert result.diagnostics == ({"delivered_start": 2, "delivered_target": 4,
-                                       "pending": 0} if composed else {"physics_segments": 3})
+        assert result.diagnostics == {"physics_segments": 3}
         assert plant.t_sim_ns == coordinator.t_sim_ns == 10_000_007
         assert all(device.current_raw == 0 and device.t_sim_ns == 10_000_007
                    for device in devices)
@@ -667,10 +670,10 @@ def test_actual_multibus_repeated_ids_share_one_world(native, tmp_path, monkeypa
 def test_motor_step_preflight_rejects_before_any_control_or_native_advance(
         native, tmp_path, monkeypatch, dt_ns, timeout):
     physics, bus, host, devices, plant, coordinator = motor_rig(
-        tmp_path, timeouts=(timeout,) * 4)
+        tmp_path, timeouts=(timeout,) * 4, session=Session(1, 7))
     calls = observe_motor_advances(monkeypatch, physics)
     try:
-        coordinator.reset(Session(1, 7))
+        coordinator.start()
         # An already-held valid command must survive failed plant preflight.
         physics.set_joint_effort("j1", .4)
         calls.clear()
@@ -679,17 +682,22 @@ def test_motor_step_preflight_rejects_before_any_control_or_native_advance(
         with pytest.raises(ValueError, match="whole SDF ticks"):
             coordinator.step(dt_ns)
         assert calls == [] and physics.time_ns == 0 and bus.pending == 0
-        assert plant.failed and coordinator.failed
+        assert plant.failed and coordinator.state == "failed"
         assert plant.t_sim_ns == coordinator.t_sim_ns == bus.t_sim_ns == 7
         assert all(device.t_sim_ns == 7 and device.get_rotor_state() == (0, 0)
                    for device in devices)
         assert host.frames == []
-        with pytest.raises(RuntimeError, match="successful reset"):
+        with pytest.raises(RuntimeError, match="paused"):
             coordinator.step(1_000_000)
         # Independent backend remains usable: no failed transaction wrote torque.
         physics.step(1_000_000)
         assert physics.get_joint_state("j1").velocity_rad_s == pytest.approx(.02, abs=1e-10)
-        coordinator.reset(Session(2, 17))  # cancels all prepared plans and commands
+        with pytest.raises(RuntimeError, match="paused"):
+            coordinator.reset()  # Failed executions cannot replay partial effects.
+        coordinator.close()
+        physics, bus, host, devices, plant, coordinator = motor_rig(
+            tmp_path, session=Session(2, 17))
+        coordinator.start()
         calls.clear()
         coordinator.step(1_000_000)
         assert physics.time_ns == 1_000_000 and not plant.failed
@@ -818,7 +826,7 @@ def test_python_body_binding_types_reject_before_native_acquisition(native, monk
 def test_shared_motor_consumer_reads_completed_body_pose(native, tmp_path):
     physics, _, host, _, _, coordinator = motor_rig(tmp_path, observe_bodies=True)
     try:
-        coordinator.reset(Session(1))
+        coordinator.start()
         host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000")))
         coordinator.step(100_000_000)
         # 5A*.02*gear2/Izz.02=10rad/s² -> theta +/- .05rad in100ms.
@@ -830,7 +838,10 @@ def test_shared_motor_consumer_reads_completed_body_pose(native, tmp_path):
             assert (x, y) == pytest.approx((0, 0), abs=1e-12)
             assert physics.get_body_pose(name) == pose
         assert physics.time_ns == coordinator.t_sim_ns == 100_000_000
-        coordinator.reset(Session(2, 7))
+        coordinator.close()
+        physics, _, host, _, _, coordinator = motor_rig(
+            tmp_path, observe_bodies=True, session=Session(2, 7))
+        coordinator.start()
         assert physics.time_ns == 0
         assert physics.get_body_pose("b1") == BodyPose((0, 0, 0), (1, 0, 0, 0))
     finally:
@@ -969,7 +980,7 @@ def test_python_imu_only_observation_and_binding_admission(native, tmp_path, mon
 def test_shared_motor_consumer_reads_generated_imu_and_existing_bmi_units(native, tmp_path):
     physics, _, host, _, _, coordinator = motor_rig(tmp_path, observe_imus=True)
     try:
-        coordinator.reset(Session(1))
+        coordinator.start()
         host.emit(CanFrame(0x200, data=bytes.fromhex("1000 f000 0000 0000")))
         coordinator.step(100_000_000)
         # 5A*.02*gear2/Izz.02=10rad/s² -> omega +/-1 at100ms. Sensor at joint
@@ -983,7 +994,10 @@ def test_shared_motor_consumer_reads_generated_imu_and_existing_bmi_units(native
             assert accel == pytest.approx((0, 0, 0), abs=1e-12)
             assert physics.get_imu(name) == sample
         assert physics.time_ns == coordinator.t_sim_ns == 100_000_000
-        coordinator.reset(Session(2, 7))
+        coordinator.close()
+        physics, _, host, _, _, coordinator = motor_rig(
+            tmp_path, observe_imus=True, session=Session(2, 7))
+        coordinator.start()
         assert physics.time_ns == 0
         assert physics.get_imu("i1") == ImuSample((0, 0, 0), (0, 0, 0))
     finally:
@@ -997,13 +1011,13 @@ def test_physics_participant_completed_native_world_and_off_grid_rejection(nativ
                            bodies={"body": ("rotor", "body")},
                            imus={"imu": ("rotor", "body", "imu")})
     participant = PhysicsParticipant(physics)
-    coordinator = Coordinator({"world": participant})
-    origin = (1 << 80) + 7
+    origin = (1 << 63) + 7
+    coordinator = simulation_for({"world": participant}, session=Session(1, origin))
     try:
-        coordinator.reset(Session(1, origin))
+        coordinator.start()
         assert physics.time_ns == 0 and coordinator.t_sim_ns == origin
         physics.set_joint_effort("shaft", .4)
-        result = coordinator.step(10_000_000)["world"]
+        result = coordinator.step(10_000_000).diagnostics["components"]["world"]
         assert result.reached_time_ns == origin + 10_000_000
         assert result.diagnostics == {"native_time_s": .01}
         assert physics.time_ns == 10_000_000
@@ -1016,10 +1030,17 @@ def test_physics_participant_completed_native_world_and_off_grid_rejection(nativ
         assert physics.time_ns == 10_000_000  # Observation never advances.
         with pytest.raises(ValueError):
             coordinator.step(1)  # Pure backend admission rejects a partial tick.
-        assert coordinator.failed and participant.failed
+        assert coordinator.state == "failed" and participant.failed
         assert coordinator.t_sim_ns == origin + 10_000_000
         assert physics.time_ns == 10_000_000 and physics.get_joint_state("shaft") == state
-        coordinator.reset(Session(2, 17))
+        with pytest.raises(RuntimeError, match="paused"):
+            coordinator.reset()
+        coordinator.close()
+        physics = GazeboPhysics(path, joints={"shaft": ("rotor", "shaft")},
+                               bodies={"body": ("rotor", "body")},
+                               imus={"imu": ("rotor", "body", "imu")})
+        coordinator = simulation_for({"world": PhysicsParticipant(physics)}, session=Session(2, 17))
+        coordinator.start()
         assert physics.time_ns == 0 and coordinator.t_sim_ns == 17
         coordinator.step(1_000_000)
         assert physics.get_joint_state("shaft").velocity_rad_s == 0

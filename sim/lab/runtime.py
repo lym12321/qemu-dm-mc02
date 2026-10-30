@@ -18,10 +18,11 @@ from sim.boards.launch import (UARTS, CANS, PROJECT_ROOT, positive_seconds,
                                regular_file as _regular_file, resolve_qemu as _qemu_path,
                                qmp_socket_path as _external_qmp, qemu_command)
 from sim.transports import StreamTransport, connect_unix
-from tools.dm_mc02_firmware_rtf import deadline_qmp_call
-from tools.dm_mc02_qmp import QmpSession
-from tools.dm_mc02_sim_worker import CanStream, FramedSocket, TELEMETRY
-from tools.dm_mc02_test_harness import running_qemu
+from sim.machines.qemu.deadline import deadline_qmp_call
+from sim.machines.qemu.qmp import qmp_session_class
+from sim.transports.can_stream import CanStream
+from sim.transports.cosim import FramedSocket, TELEMETRY
+from sim.machines.qemu.process import running_qemu
 
 from .manifest import Stimulus
 
@@ -128,7 +129,7 @@ def open_lab(firmware, *, qemu=None, uarts=(), cans=(), adc=False,
                     raise TimeoutError("Lab connection startup deadline expired")
                 return min(2.0, value)
 
-            qmp = QmpSession(str(owner.sockets["qmp"]), timeout=remaining(),
+            qmp = qmp_session_class()(str(owner.sockets["qmp"]), timeout=remaining(),
                              connect_timeout=remaining(), close_timeout=2.0)
             resources.append(("QMP", qmp))
             streams = {}

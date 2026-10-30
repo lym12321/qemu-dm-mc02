@@ -94,6 +94,9 @@ def test_connected_replacement_preserves_delivery_versus_machine_observation(mac
         def receive_uart(self, data):
             pass
 
+        def prepare_step(self, context):
+            pass
+
         def request_step(self, context):
             pass
 
@@ -126,7 +129,7 @@ def test_connected_replacement_preserves_delivery_versus_machine_observation(mac
 def test_ready_fragments_and_whole_ready_cut_exclusion_survive_replay():
     configured, registry, _ = scene(quantum=10, duration=20,
         options={"uart_observations": ((10, b"R"), (20, b"EADY startup"))})
-    data, online = capture(configured, registry, ready=ExperimentReady("board.uart", "READY"),
+    data, online = capture(configured, registry, ready=(ExperimentReady("main", "board.uart", "READY"),),
         inputs=(ExperimentInput(0, "board.uart", b"same-cut"),
                 ExperimentInput(3, "board.uart", b"active")),
         assertions=(uart_assert("board.uart", "startup", "10ns"),
@@ -134,7 +137,7 @@ def test_ready_fragments_and_whole_ready_cut_exclusion_survive_replay():
                     uart_assert("board.uart", "active", "10ns")))
     assert replay_experiment(BytesIO(data)) == online
     assert (online.origin_ns, online.end_ns, online.status) == (20, 40, ("fail", "fail", "pass"))
-    assert online.ready_receipt.source_time_ns == 720
+    assert online.ready_receipts["main"].source_time_ns == 720
 
 
 @pytest.mark.parametrize("quantum,expected", [(10, "pass"), (5, "fail")])
@@ -194,7 +197,7 @@ def test_same_cut_event_after_repeated_empty_markers_still_precedes_cut_expiry()
     writer.cut(5)
     writer.cut(10)
     writer.complete({"end_ns": 10, "origin_ns": 0, "delivered_inputs": 0,
-                     "events_total": 1, "cuts_total": 5})
+                     "events_total": 1, "cuts_total": 5, "ready_receipts": {}, "boards": {}})
     result = replay_experiment(BytesIO(output.getvalue()))
     assert result.status == ("pass",)
     assert result.matches[0].event_sequence == 0
@@ -251,6 +254,23 @@ def test_recorded_configuration_is_admitted_without_runtime(field, value):
 
     def change(records):
         records[0] = replace(records[0], data={**records[0].data, field: value})
+        return records
+
+    with pytest.raises((TypeError, ValueError)):
+        replay_experiment(BytesIO(rewrite(data, change)))
+
+
+@pytest.mark.parametrize("changes", [
+    {"origin": "marker:undeclared"}, {"origin": "unsupported"},
+    {"at_ns": 31}, {"endpoint": "missing.uart"}, {"endpoint": "board.snapshot"},
+])
+def test_recorded_inputs_require_declared_timeline_horizon_and_input_capability(changes):
+    data, _ = capture(inputs=(ExperimentInput(3, "board.uart", b"opaque payload"),))
+
+    def change(records):
+        config = records[0].data
+        records[0] = replace(records[0], data={**config,
+            "inputs": ({**config["inputs"][0], **changes},)})
         return records
 
     with pytest.raises((TypeError, ValueError)):
@@ -490,3 +510,96 @@ for action in (lambda: replay_experiment(BytesIO()), lambda: run_experiment(None
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=environment,
                             capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
+
+
+def multi_machine_capture():
+    """Explicit mock machine observations; these are not native QEMU evidence."""
+    from sim.api import StepResult
+    from test_sim_experiment import snapshot
+
+    class Machine(Peripheral):
+        def prepare_step(self, context):
+            pass
+
+        def request_step(self, context):
+            pass
+
+        def finish_step(self, context):
+            return StepResult("ok", context.t_sim_ns)
+
+        def sample(self, cut):
+            native = self.spec.options["epoch"] + cut
+            self.context.emit("snapshot", "snapshot", snapshot(native, self.level),
+                              source_time_ns=native, mapped_time_ns=cut)
+            for stamp, data in self.spec.options.get("uart_observations", ()):
+                if stamp == cut:
+                    self.context.emit("uart", "uart", data, source_time_ns=native,
+                                      mapped_time_ns=cut, quality="upper_bound")
+
+    class Factory(PeripheralFactory):
+        def describe(self, spec):
+            description = super().describe(spec)
+            return NodeDescription(description.ports, description.capabilities | {"machine"})
+
+        def create(self, spec, context):
+            instance = Machine(spec, context, self)
+            self.created.append(instance)
+            return instance
+
+    configured = Scene(Topology((
+        NodeSpec("west", "mock", {"epoch": 700, "uart_observations": ((5, b"WEST startup"),)}),
+        NodeSpec("east", "mock", {"epoch": 900, "uart_observations": ((10, b"EAST"),)}),
+    )), quantum_ns=5, duration_ns=20)
+    factory = Factory()
+    return capture(configured, {"mock": factory},
+        ready=(ExperimentReady("west", "west.uart", "WEST"),
+               ExperimentReady("east", "east.uart", "EAST")),
+        inputs=(ExperimentInput(1, "west.level", 1, "marker:west"),),
+        assertions=({"origin": "session", **uart_assert("west.uart", "startup", "10ns")},
+                    uart_assert("west.uart", "startup", "10ns")))
+
+
+def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive_two_pass_replay():
+    data, online = multi_machine_capture()
+    assert replay_experiment(BytesIO(data)) == online
+    assert (online.origin_ns, online.end_ns, online.status) == (10, 30, ("pass", "fail"))
+    assert list(online.ready_receipts) == ["west", "east"]
+    assert [item.source_time_ns for item in online.ready_receipts.values()] == [705, 910]
+    assert [online.boards[name]["native_origin_ns"] for name in ("west", "east")] == [700, 900]
+    assert online.boards["west"] == {"native_origin_ns": 700, "first_source_ns": 700,
+        "last_source_ns": 730, "first_mapped_ns": 0, "last_mapped_ns": 30,
+        "observation_batches": 8}
+    assert online.boards["east"]["observation_batches"] == 8
+    # Only two UART batches, but every native snapshot and empty cut remains.
+    records = list(iter_experiment_records(BytesIO(data)))
+    assert sum(record.kind == "event" and record.data.kind == "uart" for record in records) == 2
+    assert [record.data for record in records if record.kind == "cut"] == [0, 5, 6, 10, 15, 20, 25, 30]
+    replacement = replay_experiment(BytesIO(data), (
+        {"origin": "session", **uart_assert("east.uart", "EAST", "15ns")},
+        uart_assert("east.uart", "EAST", "15ns")))
+    assert replacement.status == ("pass", "fail")
+
+
+@pytest.mark.parametrize("field", ["ready_receipts", "boards"])
+def test_completion_cannot_forge_ready_receipt_or_native_epoch_metadata(field):
+    data, _ = multi_machine_capture()
+    def change(records):
+        records[-1] = replace(records[-1], data={**records[-1].data, field: {}})
+        return records
+    with pytest.raises(ValueError, match="captured lifecycle"):
+        replay_experiment(BytesIO(rewrite(data, change)))
+
+
+def test_native_epoch_change_is_rejected_even_with_matching_completion_and_valid_container():
+    data, _ = multi_machine_capture()
+    def change(records):
+        for index, record in enumerate(records):
+            if record.kind == "event" and record.data.kind == "snapshot" and record.data.mapped_time_ns == 30:
+                event = record.data
+                payload = {**event.payload, "timestamp_ns": event.source_time_ns + 1}
+                records[index] = replace(record, data=replace(event,
+                    source_time_ns=event.source_time_ns + 1, payload=payload))
+                break
+        return records
+    with pytest.raises(ValueError, match="epoch changed"):
+        replay_experiment(BytesIO(rewrite(data, change)))

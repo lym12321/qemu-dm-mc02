@@ -17,7 +17,9 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
 import _dm_gazebo_native as native
-from sim.core import Coordinator, Session
+from sim.api import Session
+sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "tests"))
+from simulation_support import simulation_for
 from sim.physics import CameraFrame, GazeboPhysics, LidarScan, PhysicsParticipant
 from test_world import imu_sdf
 
@@ -294,17 +296,15 @@ def test_consumer_imported_texture(tmp_path, monkeypatch, request):
 
 def test_consumer_physics_participant_without_joints(monkeypatch):
     monkeypatch.setenv("GZ_PARTITION", "dm-world-participant-" + uuid.uuid4().hex)
-    physics = GazeboPhysics(SCENE, cameras=CAMERAS, lidars=LIDARS)
-    coordinator = Coordinator({"world": PhysicsParticipant(physics)})
-    try:
-        coordinator.reset(Session(1, 17))
-        check_samples(*collect(physics, advance=coordinator.step))
-        assert coordinator.t_sim_ns == physics.time_ns + 17
-        coordinator.reset(Session(2, 29))
-        assert coordinator.t_sim_ns == 29 and physics.time_ns == 0
-        for sample in (physics.get_camera("front"), physics.get_lidar("scan")):
-            assert sample is None or sample.timestamp_ns == 0
-        check_samples(*collect(physics, advance=coordinator.step))
-        assert coordinator.t_sim_ns == physics.time_ns + 29
-    finally:
-        coordinator.close()
+    for session in (Session(1, 17), Session(2, 29)):
+        physics = GazeboPhysics(SCENE, cameras=CAMERAS, lidars=LIDARS)
+        simulation = simulation_for({"world": PhysicsParticipant(physics)}, session=session)
+        try:
+            simulation.start()
+            assert simulation.t_sim_ns == session.t_sim_ns and physics.time_ns == 0
+            for sample in (physics.get_camera("front"), physics.get_lidar("scan")):
+                assert sample is None or sample.timestamp_ns == 0
+            check_samples(*collect(physics, advance=simulation.step))
+            assert simulation.t_sim_ns == physics.time_ns + session.t_sim_ns
+        finally:
+            simulation.close()

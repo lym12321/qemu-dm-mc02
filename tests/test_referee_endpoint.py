@@ -8,12 +8,14 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.core import Coordinator, Session
+from types import SimpleNamespace
+from sim.api import NodeDescription, NodeSpec, Session, Topology
+from sim.runtime import Simulation
 from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot, decode_frame,
 )
-from sim.transports import FixedRecordStream, LengthPrefixedStream, StreamTransport
+from sim.transports import StreamTransport
 
 
 STATE = RefereeState(GameStatus(1, 0, 0, 0x0102030405060708),
@@ -111,7 +113,7 @@ def test_socketpair_receives_four_literal_frames_and_wraps_sequence(pair):
     endpoint = RefereeUartEndpoint(stream, sequence=254)
     assert endpoint.send_state(STATE) == WIRE
     assert endpoint.next_sequence == 2
-    assert endpoint.flush() is True
+    assert stream.flush() is True
     assert not stream.tx_pending
     wire = received(peer)
     assert wire == WIRE
@@ -177,14 +179,18 @@ def test_sequence_admission_before_io_in_constructor_and_reset(pair, sequence):
     assert received(peer) == b""
 
 
-def test_only_existing_unframed_transport_is_admitted(pair):
-    sock, _ = pair
-    for transport in (object(), sock,
-                      FixedRecordStream(sock, record_size=82),
-                      LengthPrefixedStream(sock, min_length=0, max_length=128)):
+def test_borrowed_sender_needs_only_complete_batch_admission():
+    batches = []
+    sender = SimpleNamespace(send=batches.append)
+    endpoint = RefereeUartEndpoint(sender, sequence=254)
+    assert endpoint.send_state(STATE) == WIRE
+    assert batches == [WIRE] and endpoint.next_sequence == 2
+    assert not hasattr(endpoint, "flush")
+    endpoint.close()
+    assert batches == [WIRE]
+    for invalid in (object(), SimpleNamespace(send=None)):
         with pytest.raises(TypeError):
-            RefereeUartEndpoint(transport)
-    assert sock.sends == sock.reads == sock.closes == 0
+            RefereeUartEndpoint(invalid)
 
 
 def test_capacity_one_admits_whole_batch_and_refusal_does_not_commit_new_batch(pair):
@@ -202,7 +208,7 @@ def test_capacity_one_admits_whole_batch_and_refusal_does_not_commit_new_batch(p
     assert [bytes(view) for view in stream.tx_queue] == [WIRE[5:]]
     assert received(peer) == WIRE[:5]  # Capacity check may progress only old bytes.
     sock.budget = None
-    assert endpoint.flush() is True
+    assert stream.flush() is True
     assert received(peer) == WIRE[5:]
     new = endpoint.send_state(STATE)
     assert endpoint.next_sequence == 6
@@ -225,53 +231,40 @@ def test_logical_reset_preserves_exact_partial_suffix_and_already_queued_batch(p
     assert endpoint.next_sequence == 254
     assert sock.sends == sends
     assert [bytes(view) for view in stream.tx_queue] == before
-    assert endpoint.flush() is False
+    assert stream.flush() is False
     sock.budget = None
-    assert endpoint.flush() is True
+    assert stream.flush() is True
     assert received(peer) == WIRE[5:] + second
     assert endpoint.next_sequence == 254
     assert endpoint.send_state(STATE) == WIRE
     assert received(peer) == WIRE
 
 
-@pytest.mark.parametrize("operation", ["send", "flush"])
 @pytest.mark.parametrize("error", [OSError("controlled send failure"), KeyboardInterrupt()])
-def test_io_failure_preserves_primary_and_freezes_without_replay_until_reset(pair, operation, error):
+def test_send_failure_preserves_primary_and_freezes_without_replay_until_reset(pair, error):
     sock, peer = pair
     stream = StreamTransport(sock, max_pending=1)
     endpoint = RefereeUartEndpoint(stream, sequence=254)
-    if operation == "flush":
-        sock.budget = 5
-        endpoint.send_state(STATE)
-        assert received(peer) == WIRE[:5]
-        expected_suffix, expected_sequence = WIRE[5:], 2
-    else:
-        expected_suffix, expected_sequence = WIRE, 254
     sock.error = error
     with pytest.raises(type(error)) as raised:
-        endpoint.send_state(STATE) if operation == "send" else endpoint.flush()
+        endpoint.send_state(STATE)
     assert raised.value is error
-    assert endpoint.next_sequence == expected_sequence
-    assert [bytes(view) for view in stream.tx_queue] == [expected_suffix]
+    assert endpoint.next_sequence == 254
+    assert [bytes(view) for view in stream.tx_queue] == [WIRE]
     sends = sock.sends
-    for action in (lambda: endpoint.send_state(STATE), endpoint.flush):
-        with pytest.raises(RuntimeError):
-            action()
+    with pytest.raises(RuntimeError):
+        endpoint.send_state(STATE)
     with pytest.raises((TypeError, ValueError)):
         endpoint.reset(False)
-    with pytest.raises(RuntimeError):
-        endpoint.flush()
     assert sock.sends == sends
-    assert [bytes(view) for view in stream.tx_queue] == [expected_suffix]
     endpoint.reset(sequence=37)
     assert sock.sends == sends
     sock.error, sock.budget = None, None
-    assert endpoint.flush() is True
-    assert received(peer) == expected_suffix  # No re-encoding/duplicate prefix.
+    assert stream.flush() is True
+    assert received(peer) == WIRE  # Caller drains physical bytes, without replay.
     assert endpoint.next_sequence == 37
-    new = endpoint.send_state(STATE)
+    endpoint.send_state(STATE)
     assert [frame.sequence for frame in frames(received(peer))] == [37, 38, 39, 40]
-    assert len(new) == 82
     assert endpoint.next_sequence == 41
 
 
@@ -287,7 +280,7 @@ def test_close_does_not_flush_or_close_borrowed_stream_and_getter_remains_readab
     assert endpoint.next_sequence == 2
     assert sock.sends == sends
     assert sock.closes == 0
-    for action in (lambda: endpoint.send_state(STATE), endpoint.flush, endpoint.reset):
+    for action in (lambda: endpoint.send_state(STATE), endpoint.reset):
         with pytest.raises(RuntimeError):
             action()
     assert [bytes(view) for view in stream.tx_queue] == [WIRE]
@@ -304,8 +297,11 @@ def test_completed_engine_snapshot_directly_consumed_over_existing_transport(pai
                            cooling_42mm_per_s=2,
                            events=(ScriptEvent(500_000_000, Hit(30)),
                                    ScriptEvent(500_000_000, Shot(5, 7))))
-    coordinator = Coordinator({"referee": engine})
-    coordinator.reset(Session(7, 100))
+    factory = SimpleNamespace(describe=lambda spec: NodeDescription(capabilities={"step"}),
+                              create=lambda spec, context: engine)
+    coordinator = Simulation(Topology((NodeSpec("referee", "fixture"),)), {"fixture": factory},
+                             initial_session=Session(7, 100))
+    coordinator.start()
     coordinator.step(1_000_000_000)
     state = engine.get_state()
     endpoint = RefereeUartEndpoint(StreamTransport(sock), sequence=10)

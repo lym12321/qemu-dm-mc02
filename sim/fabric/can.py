@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 import heapq
 from typing import Callable, Protocol
 
-from sim.core.clock import check_time
+from sim.api.time import check_time
 
 from .frame import CanFrame
 

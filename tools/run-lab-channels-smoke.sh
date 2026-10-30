@@ -261,9 +261,9 @@ result = report["result"]
 assert result["status"] == ["pass"] * 8 and not result["failures"], result
 assert result["delivered_inputs"] == 7, result
 assert result["end_ns"] - result["origin_ns"] == 400_000_000, result
-assert result["ready_receipt"]["kind"] == "uart", result
-assert result["ready_receipt"]["source_node"] == "main", result
-assert result["ready_receipt"]["source_port"] == "uart1", result
+assert result["ready_receipts"]["main"]["kind"] == "uart", result
+assert result["ready_receipts"]["main"]["source_node"] == "main", result
+assert result["ready_receipts"]["main"]["source_port"] == "uart1", result
 print("AUTOMATIC_LAB_REPORT: " + json.dumps(report, sort_keys=True))
 print("Manifest consumer: eight assertions passed after owner cleanup")
 PY
@@ -276,7 +276,7 @@ import yaml
 
 source, destination = sys.argv[1:]
 manifest = yaml.safe_load(Path(source).read_text())
-manifest["experiment"]["ready"]["text"] = "THIS_APPLICATION_EVENT_NEVER_OCCURS"
+manifest["experiment"]["ready"][0]["text"] = "THIS_APPLICATION_EVENT_NEVER_OCCURS"
 Path(destination).write_text(yaml.safe_dump(manifest, sort_keys=False))
 PY
 if uv run --frozen python tools/sim run "$run_dir/not-ready.yaml" \

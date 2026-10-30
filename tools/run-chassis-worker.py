@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import dm_mc02_sim_worker as worker
-from sim.robots.four_wheel import four_wheel_simulation_factory, four_wheel_imu
+from sim.apps.four_wheel import four_wheel_simulation_factory, four_wheel_imu
 
 
 def configure_parser(parser):

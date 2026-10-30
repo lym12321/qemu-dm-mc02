@@ -13,7 +13,7 @@ links:
   - [main.fdcan1, can0.can]
   - [host.can, can0.can]
 experiment:
-  ready: {endpoint: main.uart1, text: LAB_READY}
+  ready: [{name: main, endpoint: main.uart1, text: LAB_READY}]
   inputs:
     - {at: 40ms, endpoint: main.uart1, value: q}
     - {at: 80ms, endpoint: main.key, value: true}

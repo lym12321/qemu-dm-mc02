@@ -219,7 +219,7 @@ def simulation_cli(elf, qemu, manifest_path, directory, record, *, expect_failur
     payload = record["report"]
     summary = payload.get("result")
     if (not isinstance(summary, dict) or summary.get("end_ns") != 800_000_000
-            or summary.get("origin_ns") != 0 or summary.get("ready_receipt") is not None
+            or summary.get("origin_ns") != 0 or summary.get("ready_receipts") != {}
             or summary.get("delivered_inputs") != 2):
         raise AssertionError(f"Simulation CLI did not complete the GPIO lesson: {record!r}")
     if expect_failure:

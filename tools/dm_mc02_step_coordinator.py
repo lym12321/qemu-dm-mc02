@@ -8,7 +8,7 @@ import sys
 
 # Direct tools execution and importlib consumers resolve the same package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.core.clock import check_time
+from sim.api.time import check_time
 
 try:
     from dm_mc02_motor_adapter import DmMotorBusAdapter, MotorBackend, MotorCommand

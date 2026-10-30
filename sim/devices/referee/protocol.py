@@ -10,11 +10,20 @@ not implement a stream parser, command schemas, sequence policy or rules.
 from dataclasses import dataclass
 import struct
 
-from crccheck.crc import Crc8MaximDow, Crc16Mcrf4Xx
-
 
 MAX_FRAME_BYTES = 128
 MAX_PAYLOAD_BYTES = MAX_FRAME_BYTES - 9
+
+
+def _checksums():
+    try:
+        from crccheck.crc import Crc8MaximDow, Crc16Mcrf4Xx
+    except ModuleNotFoundError as error:
+        if error.name not in ("crccheck", "crccheck.crc"):
+            raise
+        from sim.api import BackendUnavailable
+        raise BackendUnavailable("referee protocol requires the referee extra (crccheck==1.3.1)") from error
+    return Crc8MaximDow, Crc16Mcrf4Xx
 
 
 @dataclass(frozen=True)
@@ -38,6 +47,7 @@ def encode_frame(command_id: int, payload: bytes, sequence: int = 0) -> bytes:
         raise TypeError("referee payload must be bytes")
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise ValueError(f"referee payload exceeds {MAX_PAYLOAD_BYTES} bytes")
+    Crc8MaximDow, Crc16Mcrf4Xx = _checksums()
     header = struct.pack("<BHB", 0xa5, len(payload), sequence)
     header += bytes((Crc8MaximDow.calc(header, initvalue=0xff),))
     body = header + struct.pack("<H", command_id) + payload
@@ -55,6 +65,7 @@ def decode_frame(raw: bytes) -> Frame:
     payload_length = struct.unpack_from("<H", raw, 1)[0]
     if payload_length + 9 != len(raw):
         raise ValueError("referee payload length does not match the complete frame")
+    Crc8MaximDow, Crc16Mcrf4Xx = _checksums()
     if Crc8MaximDow.calc(raw[:4], initvalue=0xff) != raw[4]:
         raise ValueError("referee header CRC8 mismatch")
     if Crc16Mcrf4Xx.calc(raw[:-2]) != struct.unpack_from("<H", raw, len(raw) - 2)[0]:

@@ -38,6 +38,40 @@ V2_STEP_DONE_MAX_RETRIES = 3
 V2_QUEUE_FULL_RETRY_SEC = 0.001
 
 
+def protocol_frame(kind: int, sequence: int, virtual_time_ns: int,
+                   payload: bytes = b"") -> bytes:
+    if len(payload) > MAX_PAYLOAD:
+        raise ValueError("payload is too large")
+    body = struct.pack("<IHHIQQ", MAGIC, VERSION, kind, len(payload),
+                       sequence, virtual_time_ns) + payload
+    return struct.pack("<I", len(body)) + body
+
+
+def adc_input_frame(sequence: int, virtual_time_ns: int,
+                    channel: int, raw: int) -> bytes:
+    """Build a version-1 ADC input frame for a 0..31 ADC channel."""
+    if not 0 <= channel <= 31:
+        raise ValueError("ADC channel must be in range 0..31")
+    if not 0 <= raw <= 0xffff:
+        raise ValueError("ADC raw value must be in range 0..65535")
+    return protocol_frame(ADC_INPUT, sequence, virtual_time_ns,
+                          struct.pack("<HHI", channel, raw, 0))
+
+
+def adc_voltage_frame(sequence: int, virtual_time_ns: int,
+                      channel: int, voltage_uv: int, flags: int = 0) -> bytes:
+    """Build a version-1 ADC analog voltage frame (0..3.3 V)."""
+    if not 0 <= channel <= 31:
+        raise ValueError("ADC channel must be in range 0..31")
+    if flags & ~ADC_VOLTAGE_FLAGS_MASK:
+        raise ValueError("unsupported ADC voltage flags")
+    if not 0 <= voltage_uv <= ADC_VOLTAGE_MAX_UV:
+        raise ValueError("ADC voltage must be in range 0..3.3 V")
+    return protocol_frame(ADC_VOLTAGE, sequence, virtual_time_ns,
+                          struct.pack("<HHII", channel, flags,
+                                      voltage_uv, 0))
+
+
 class QemuTimestampMapper:
     """Translate between QEMU virtual time and the worker's step epoch."""
 

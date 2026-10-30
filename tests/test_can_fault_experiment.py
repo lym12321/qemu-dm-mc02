@@ -210,6 +210,9 @@ def test_machine_completion_already_queued_output_keeps_due_but_uses_new_drop(tm
         def __init__(self, context):
             self.connection = context.attach("can", self)
 
+        def prepare_step(self, context):
+            pass
+
         def request_step(self, context):
             pass
 

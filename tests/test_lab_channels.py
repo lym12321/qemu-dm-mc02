@@ -13,7 +13,8 @@ from sim.boards.channels import ChannelEvent, LabChannels
 from sim.fabric import CanBus, CanFrame
 from sim.fabric.frame import WIRE_FD, WIRE_BRS
 from sim.transports import StreamTransport
-from tools.dm_mc02_sim_worker import CanStream, FramedSocket, StepFramedSocket
+from sim.transports.can_stream import CanStream
+from sim.transports.cosim import FramedSocket, StepFramedSocket
 
 
 @contextmanager
@@ -120,7 +121,7 @@ def test_referee_tx_owner_retains_suffix_while_lab_observes_same_uart():
             assert budget.sends == budget.reads == 1
             assert stream.tx_queue[0] is suffix and bytes(suffix) == WIRE[19:]
             budget.budget = None
-            assert endpoint.flush() and received(peer) == WIRE
+            assert endpoint.transport.flush() and received(peer) == WIRE
         finally:
             endpoint.close()
         assert original.sock.fileno() >= 0 and budget.closes == 0

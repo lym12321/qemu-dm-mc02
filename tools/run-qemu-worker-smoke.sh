@@ -313,7 +313,7 @@ arguments = ["worker", "--cosim", cosim_path, "--protocol", "v2", "--frames", "1
 patches = []
 if fdcan_path:
     from sim.fabric import CanFrame
-    from sim.robots.four_wheel import four_wheel_simulation_factory, four_wheel_imu
+    from sim.apps.four_wheel import four_wheel_simulation_factory, four_wheel_imu
 
     arguments += ["--fdcan", fdcan_path]
     model = Path(worker.__file__).resolve().parents[1] / "models/four_wheel.xml"

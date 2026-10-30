@@ -59,6 +59,9 @@ class Machine(Component):
     def input(self, port, payload):
         self.input_values.append((port, payload))
 
+    def prepare_step(self, ctx):
+        pass
+
     def request_step(self, ctx):
         self.trace.append(("request", self.name))
         self.request_views.append(tuple(self.frames))

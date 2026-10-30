@@ -129,11 +129,13 @@ def release(owners):
 
 
 def prepare_mujoco_source(mode):
-    from sim.core import Coordinator, Session
+    from types import SimpleNamespace
+    from sim.api import NodeSpec, NodeDescription, Topology
+    from sim.runtime import Simulation
     from sim.devices.bmi088 import imu_to_bmi088_units
     from sim.devices.dji import M3508Device, M3508JointPlant
     from sim.fabric import CanBus, CanFrame
-    from sim.fabric.runtime import CanParticipant
+    from sim.fabric.runtime import BorrowedCanDispatcher
     from sim.physics import MujocoPhysics
     from dm_mc02_step_protocol import ImuSampleV2, encode_imu_sample_v2
 
@@ -156,8 +158,16 @@ def prepare_mujoco_source(mode):
         for motor_id in (1, 2, 3, 4):
             devices.append(M3508Device(bus, motor_id))
         owner = M3508JointPlant(physics, dict(zip(devices, joints)))
-        owner = Coordinator({"can": CanParticipant(bus, (owner,))})
-        owner.reset(Session(1))
+        plant = owner
+        owner = Simulation(Topology((NodeSpec("bus", "bus"), NodeSpec("plant", "plant"))), {
+            "bus": SimpleNamespace(
+                describe=lambda spec: NodeDescription(capabilities={"dispatch"}),
+                create=lambda spec, context: BorrowedCanDispatcher(bus)),
+            "plant": SimpleNamespace(
+                describe=lambda spec: NodeDescription(capabilities={"step"}),
+                create=lambda spec, context: plant),
+        })
+        owner.start()
 
         def advance(command):
             bus.send(host, CanFrame(0x200, dlc=8, data=command,

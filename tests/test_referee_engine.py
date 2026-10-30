@@ -9,7 +9,9 @@ import sys
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.core import Coordinator, Session, StepContext, StepResult
+from types import SimpleNamespace
+from sim.api import NodeDescription, NodeSpec, Session, StepContext, StepResult, Topology
+from sim.runtime import Simulation
 from sim.devices.referee import (
     Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState,
     RobotStatus, ScriptEvent, Shot, decode_frame, encode_message,
@@ -252,18 +254,21 @@ def test_fractional_heat_overflow_cannot_hide_in_wire_floor():
 
 
 @pytest.mark.parametrize("live", [False, True], ids=["script", "queued"])
-def test_existing_coordinator_and_message_envelope_consume_completed_state(live):
+def test_simulation_and_message_envelope_consume_completed_state(live):
     from sim.devices.referee import RefereeUartEndpoint
     from sim.transports import StreamTransport
 
     events = (ScriptEvent(NS // 2, Hit(30)), ScriptEvent(NS // 2, Shot(5, 7)))
     value = engine(events=() if live else events,
                    cooling_42mm_per_s=2)
-    coordinator = Coordinator({"referee": value})
-    coordinator.reset(Session(7))
+    factory = SimpleNamespace(describe=lambda spec: NodeDescription(capabilities={"step"}),
+                              create=lambda spec, context: value)
+    coordinator = Simulation(Topology((NodeSpec("referee", "fixture"),)), {"fixture": factory},
+                             initial_session=Session(7))
+    coordinator.start()
     if live:
         value.queue_events(events, session_id=7)
-    assert coordinator.step(NS) == {"referee": StepResult("ok", NS)}
+    assert coordinator.step(NS).diagnostics["components"] == {"referee": StepResult("ok", NS)}
     state = value.get_state()
     # Official wire layouts, with independently expected HP70 and heat12/25.
     expected = ("0100000807060504030201", "03024600c80003006400500007",

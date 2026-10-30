@@ -14,10 +14,10 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sim.core import Coordinator, Session, StepContext
+from sim.api import Session, StepContext
+from simulation_support import simulation_for
 from sim.devices.dji import M3508, M3508Device, M3508JointDriver, M3508JointPlant
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
-from sim.fabric.runtime import CanParticipant
 from sim.physics import JointState, MujocoPhysics
 from sim.physics.binding import JointDriveBinding
 from sim.physics.joints import JointExecution
@@ -244,7 +244,7 @@ def test_fixed_four_wheel_simulation_declares_one_can_bus_before_native_or_trans
     from sim.devices.dji.factory import M3508Factory
     from sim.fabric.factory import CanBusFactory
     from sim.physics.factory import MujocoFactory
-    from sim.robots import four_wheel
+    from sim.apps import four_wheel
     from sim.runtime import SimulationState
     from sim.transports.cosim import QemuTimestampMapper
 
@@ -304,10 +304,11 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
                     for bus in buses for motor_id in (1, 2))
     plant = M3508JointPlant(native, dict(zip(devices, ("j1", "j2", "j3", "j4"))),
                             gear_ratio=2)
-    coordinator = Coordinator({"world": CanParticipant(buses, (plant,)) if composed else plant})
+    coordinator = simulation_for({"world": plant}, buses=buses if composed else (),
+                                 session=Session(1, 7))
     calls = track_physics(monkeypatch, native)
     try:
-        coordinator.reset(Session(1, 7))
+        coordinator.start()
         for bus, host, literal in zip(buses, hosts,
                                       ("1000 2000 0000 0000", "f000 e000 0000 0000")):
             if composed:
@@ -315,7 +316,7 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
             else:
                 bus.reset(7)
                 command(bus, host, literal, timestamp_ns=7)
-        result = coordinator.step(10_000_000)["world"]
+        result = coordinator.step(10_000_000).diagnostics["components"]["world"]
         assert calls == {"reset": 1, "step": [10_000_000], "effort": [
             ("j1", .2), ("j2", .4), ("j3", -.2), ("j4", -.4)]}
         # Literal Izz=.02, gear2 and +/-5/10A: Euler v=alpha*dt,
@@ -325,8 +326,7 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
             assert native.get_joint_state(name) == JointState(position, velocity)
         assert native.time_s == .01 and result.reached_time_ns == 10_000_007
         if composed:
-            assert result.diagnostics == {
-                "delivered_start": 2, "delivered_target": 4, "pending": 0}
+            assert result.diagnostics == {"physics_segments": 1}
             assert all(bus.t_sim_ns == 10_000_007 and bus.pending == 0 for bus in buses)
         else:
             assert result.diagnostics == {"physics_segments": 1}
@@ -339,10 +339,6 @@ def test_native_multibus_repeated_ids_isolated_commands_and_feedback(monkeypatch
             assert [(f.can_id, f.timestamp_ns, f.data) for f in host.frames] == [
                 (0x201 + i, 10_000_007, bytes.fromhex(payload))
                 for i, payload in enumerate(payloads)]
-        coordinator.reset(Session(2, 50_000_000))
-        assert calls["reset"] == 2 and native.time_s == 0
-        assert all(device.get_rotor_state() == (0, 0) for device in devices)
-        assert all(bus.t_sim_ns == (50_000_000 if composed else 10_000_007) for bus in buses)
     finally:
         coordinator.close()
 
@@ -406,11 +402,11 @@ def test_all_target_samples_are_admitted_before_any_device_completion(monkeypatc
     assert not plant.failed and all(device.t_sim_ns == 1_000_000 for device in devices)
 
 
-def test_actual_fabric_emission_failure_freezes_plant_and_coordinator_until_reset(monkeypatch):
+def test_actual_fabric_emission_failure_freezes_simulation_without_replay(monkeypatch):
     bus, host, devices, native, plant = setup(bus=CanBus(max_pending=1))
     calls = track_physics(monkeypatch, native)
-    coordinator = Coordinator({"joint-plant": plant})
-    coordinator.reset(Session(1))
+    coordinator = simulation_for({"joint-plant": plant})
+    coordinator.start()
     command(bus, host, "1000 0000 0000 0000")
     host.emit(CanFrame(0x123, data=b"occupied", timestamp_ns=100_000_000))
     with pytest.raises(BufferError, match="capacity"):
@@ -419,16 +415,16 @@ def test_actual_fabric_emission_failure_freezes_plant_and_coordinator_until_rese
     assert all(device.t_sim_ns == 0 for device in devices[1:])
     assert native.time_s == pytest.approx(.001) and bus.pending == 1
     assert plant.t_sim_ns == coordinator.t_sim_ns == 0
-    assert plant.failed and coordinator.failed
-    with pytest.raises(RuntimeError, match="successful reset"):
+    assert plant.failed and coordinator.state == "failed"
+    with pytest.raises(RuntimeError, match="paused"):
         coordinator.step(1_000_000)
     assert calls["step"] == [1_000_000]
-    coordinator.reset(Session(2))
-    assert bus.pending == 1  # The queue belongs to the caller, even after failure.
-    assert all(device.get_rotor_state() == (0, 0) for device in devices)
-    coordinator.step(500_000)  # No feedback is due before its reset phase's first1ms.
-    assert not coordinator.failed and not plant.failed
-    assert calls["step"] == [1_000_000, 500_000]
+    with pytest.raises(RuntimeError, match="paused"):
+        coordinator.reset()
+    assert bus.pending == 1  # Failure never clears the caller's queued frame.
+    coordinator.close()
+    assert plant.closed and all(device.closed for device in devices)
+    assert bus.pending == 1 and calls["step"] == [1_000_000]
 
 
 def test_invalid_bindings_have_no_reset_control_or_advance_effects(monkeypatch):

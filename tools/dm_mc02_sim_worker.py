@@ -38,8 +38,9 @@ from sim.transports.cosim import (
     V2_QUEUE_FULL_RETRY_SEC,
     QemuTimestampMapper, FramedSocket, StepFramedSocket, V2SessionReset,
     wait_v2_response, send_v2_step, wait_v2_reset_ack,
+    protocol_frame, adc_input_frame, adc_voltage_frame,
 )
-from sim.core import Session, StepResult
+from sim.api import Session, StepResult
 from sim.runtime import Simulation, SimulationState
 from sim.physics import MujocoPhysics, integrate_rotor
 from sim.devices.bmi088 import imu_to_bmi088_units
@@ -204,46 +205,10 @@ class ExternalTimestampMapper:
         return candidate
 
 
-def protocol_frame(kind: int, sequence: int, virtual_time_ns: int,
-                   payload: bytes = b"") -> bytes:
-    if len(payload) > MAX_PAYLOAD:
-        raise ValueError("payload is too large")
-    body = struct.pack("<IHHIQQ", MAGIC, VERSION, kind, len(payload),
-                       sequence, virtual_time_ns) + payload
-    return struct.pack("<I", len(body)) + body
-
-
 def imu_frame(sequence: int, virtual_time_ns: int,
               gyro: Iterable[float], accel: Iterable[float]) -> bytes:
     return protocol_frame(IMU_SAMPLE, sequence, virtual_time_ns,
                           struct.pack("<6f", *gyro, *accel))
-
-
-def adc_input_frame(sequence: int, virtual_time_ns: int,
-                    channel: int, raw: int) -> bytes:
-    """Build a version-1 ADC input frame for a 0..31 ADC channel."""
-    if not 0 <= channel <= 31:
-        raise ValueError("ADC channel must be in range 0..31")
-    if not 0 <= raw <= 0xffff:
-        raise ValueError("ADC raw value must be in range 0..65535")
-    return protocol_frame(ADC_INPUT, sequence, virtual_time_ns,
-                          struct.pack("<HHI", channel, raw, 0))
-
-
-def adc_voltage_frame(sequence: int, virtual_time_ns: int,
-                      channel: int, voltage_uv: int, flags: int = 0) -> bytes:
-    """Build a version-1 ADC analog voltage frame (0..3.3 V)."""
-    if not 0 <= channel <= 31:
-        raise ValueError("ADC channel must be in range 0..31")
-    if flags & ~ADC_VOLTAGE_FLAGS_MASK:
-        raise ValueError("unsupported ADC voltage flags")
-    if not 0 <= voltage_uv <= ADC_VOLTAGE_MAX_UV:
-        raise ValueError("ADC voltage must be in range 0..3.3 V")
-    return protocol_frame(ADC_VOLTAGE, sequence, virtual_time_ns,
-                          struct.pack("<HHII", channel, flags,
-                                      voltage_uv, 0))
-
-
 
 
 def send_socketcan(sock: socket.socket, frame: CanFrame) -> None:

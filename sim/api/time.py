@@ -1,9 +1,15 @@
-"""Protocol-neutral session and synchronous participant contract."""
+"""Canonical integer virtual-time and completed-step data contracts."""
 
 from dataclasses import dataclass, field
-from typing import Protocol
 
-from .clock import check_time
+
+def check_time(t_sim_ns: int, previous_ns: int | None, *, strict=True) -> None:
+    if type(t_sim_ns) is not int or t_sim_ns < 0:
+        raise ValueError("simulation time must be a nonnegative integer")
+    if previous_ns is not None and (t_sim_ns <= previous_ns if strict
+                                    else t_sim_ns < previous_ns):
+        raise ValueError("simulation time must increase strictly" if strict
+                         else "simulation time must not decrease")
 
 
 @dataclass(frozen=True)
@@ -39,9 +45,3 @@ class StepResult:
     status: str
     reached_time_ns: int
     diagnostics: dict[str, object] = field(default_factory=dict)
-
-
-class SimParticipant(Protocol):
-    def reset(self, session: Session) -> None: ...
-    def step(self, ctx: StepContext) -> StepResult: ...
-    def close(self) -> None: ...

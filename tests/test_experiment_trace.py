@@ -94,7 +94,7 @@ def rewrite(data, edit):
 
 def test_roundtrip_preserves_all_event_fields_and_only_admitted_public_records():
     output = Output()
-    config = {"duration_ns": 100, "ready": {"endpoint": "mcu.uart1", "text": b"R\x00"},
+    config = {"duration_ns": 100, "ready": ({"name": "main", "endpoint": "mcu.uart1", "text": b"R\x00"},),
               "assertions": ({"before": "1ns", "digital_equals": {"endpoint": "mcu.key", "value": 0}},)}
     writer = ExperimentTrace(output, config)
     writer.cut(0)
@@ -129,7 +129,7 @@ def test_roundtrip_preserves_all_event_fields_and_only_admitted_public_records()
     native = list(StreamReader(BytesIO(output.data), validate_crcs=True).records)
     channel, = [item for item in native if isinstance(item, Channel)]
     assert (channel.topic, channel.metadata) == ("experiment", {
-        "source": "simulation", "event_type": "sim/experiment/1", "clock": "simulation"})
+        "source": "simulation", "event_type": "sim/experiment/2", "clock": "simulation"})
     messages = [item for item in native if isinstance(item, Message)]
     raw = json.loads(messages[2].data)
     assert raw["data"]["payload"]["value"]["frame"] == {"type": "CanFrame", "value": {
@@ -179,14 +179,14 @@ def test_reader_accepts_independent_literal_schema_records():
     # Fixed JSON/base64 literals are an independent producer of the schema,
     # without calling ExperimentTrace or any of its value encoders.
     payloads = (
-        (0, b'{"format":"sim/experiment/1","kind":"config","ordinal":0,"data":'
+        (0, b'{"format":"sim/experiment/2","kind":"config","ordinal":0,"data":'
             b'{"index":0,"count":1,"size":29,"data":"eyJ0eXBlIjoibWFwcGluZyIsInZhbHVlIjp7fX0="}}'),
-        (2, b'{"format":"sim/experiment/1","kind":"cut","ordinal":1,"data":2}'),
-        (2, b'{"format":"sim/experiment/1","kind":"completion","ordinal":2,"data":'
+        (2, b'{"format":"sim/experiment/2","kind":"cut","ordinal":1,"data":2}'),
+        (2, b'{"format":"sim/experiment/2","kind":"completion","ordinal":2,"data":'
             b'{"events":0,"cuts":1,"records":3,"session_id":null,"last_time_ns":2,'
             b'"summary":{"type":"mapping","value":{}}}}'))
     for stamp, payload in payloads:
-        writer.append(TraceEvent(stamp, "simulation", "experiment", "sim/experiment/1",
+        writer.append(TraceEvent(stamp, "simulation", "experiment", "sim/experiment/2",
                                  payload, "simulation"))
     writer.finish()
     assert [(item.kind, item.data) for item in iter_experiment_records(Input(output.getvalue()))] == [
@@ -315,7 +315,7 @@ def test_reader_rejects_semantic_corruption_even_with_valid_mcap_crc(change):
         elif change == "completion-duplicate":
             documents.append(documents[-1].copy())
         else:
-            documents.append({"format": "sim/experiment/1", "kind": "cut", "ordinal": 5, "data": 11})
+            documents.append({"format": "sim/experiment/2", "kind": "cut", "ordinal": 5, "data": 11})
     malformed = rewrite(encoded_trace(), edit)
     # The transport envelope remains independently valid, unlike truncation.
     list(StreamReader(BytesIO(malformed), validate_crcs=True).records)

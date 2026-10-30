@@ -273,7 +273,7 @@ class WorkerRunTests(unittest.TestCase):
     def _simulation_profile(self, *, results=None, sample=None, echo=False):
         """Mock a device only; run the actual Simulation, bridge, queues and IO."""
         from sim.api import NodeSpec, NodeDescription, PortSpec, LinkSpec, Topology
-        from sim.core import StepResult
+        from sim.api import StepResult
         from sim.physics import ImuSample
         from sim.runtime import Simulation
         from sim.fabric import CanFrame
@@ -430,7 +430,7 @@ class WorkerRunTests(unittest.TestCase):
         self._assert_closed(close_calls=0)
 
     def test_simulation_wrong_target_never_samples_or_sends_step(self):
-        from sim.core import StepResult
+        from sim.api import StepResult
         graphs, devices, calls, factory, reader = self._simulation_profile(
             results=(StepResult("ok", 999_999),))
         self.peers[0].sendall(self._reset_ack())

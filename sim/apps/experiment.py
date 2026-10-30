@@ -6,7 +6,7 @@ Matching reuses the pure Lab evaluator, without importing a legacy runner.
 """
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 from pathlib import Path
 from time import monotonic
@@ -15,7 +15,7 @@ from sim.api import (BackendUnavailable, Endpoint, Event, NodeDescription, NodeS
                      PortSpec, TimeQuality, Topology)
 from sim.api.events import check_timestamp
 from sim.boards import digital_level
-from sim.config.scene import ExperimentInput, ExperimentReady, Scene, load_scene
+from sim.config.scene import ExperimentInput, ExperimentReady, Scene, load_scene, validate_ready
 from sim.fabric import CanFrame
 from sim.gpio import validate_gpio_pin
 from sim.lab.experiment import AssertionEvaluator, AssertionObservation
@@ -48,7 +48,8 @@ class ExperimentResult:
     delivered_inputs: int
     events_total: int
     origin_ns: int = 0
-    ready_receipt: ObservationReceipt | None = None
+    ready_receipts: dict[str, ObservationReceipt] = field(default_factory=dict)
+    boards: dict[str, dict] = field(default_factory=dict)
 
     @property
     def passed(self):
@@ -65,28 +66,66 @@ def _plain(value):
 
 class _Consumer:
     def __init__(self, assertions, duration_ns, snapshot_endpoints, observations, *,
-                 ready=None, on_ready=None):
+                 ready=(), assertion_origins=None, on_unlock=None, machine_nodes=()):
         self.assertions, self.duration_ns = assertions, duration_ns
-        self.ready, self.on_ready = ready, on_ready
-        self.origin_ns = None if ready is not None else 0
-        self.evaluator = None if ready is not None else AssertionEvaluator(assertions, duration_ns, 0)
-        self.ready_receipt = None
-        self._ready_tail = b""
-        self.snapshot_endpoints = snapshot_endpoints
-        self.observations = observations
+        self.ready = validate_ready(ready)
+        self.on_unlock = on_unlock
+        self.origin_ns = None if self.ready else 0
+        self.ready_receipts = {}
+        self._ready_tails = {item.name: b"" for item in self.ready}
+        self.snapshot_endpoints, self.observations = snapshot_endpoints, observations
+        self.machine_nodes, self.boards = frozenset(machine_nodes), {}
+        self.assertion_origins = tuple(assertion_origins or ("ready",) * len(assertions))
+        self._evaluators = {}
+        self._start_evaluator("session", 0)
+        if not self.ready:
+            self._start_evaluator("ready", 0)
         self.cut = None
         self.sequence = -1
         self.matches = []
         self.delivered_inputs = 0
 
+    def _start_evaluator(self, origin, at):
+        indices = tuple(index for index, value in enumerate(self.assertion_origins) if value == origin)
+        self._evaluators[origin] = (indices, AssertionEvaluator(
+            tuple(self.assertions[index] for index in indices), self.duration_ns, at))
+
+    @property
+    def status(self):
+        result = ["pending"] * len(self.assertions)
+        for indices, evaluator in self._evaluators.values():
+            for index, status in zip(indices, evaluator.status):
+                result[index] = status
+        return tuple(result)
+
+    @property
+    def failures(self):
+        return tuple(f"assertion[{index + 1}] {item.kind} {item.endpoint} "
+                     f"did not match before {item.before_ns} ns"
+                     for index, (item, status) in enumerate(zip(self.assertions, self.status))
+                     if status == "fail")
+
+    def finish(self, end):
+        if self.origin_ns is None:
+            raise ValueError("experiment lacks its completed ready lifecycle")
+        for _, evaluator in self._evaluators.values():
+            evaluator.finish(end)
+
     def begin_cut(self, cut):
         check_timestamp(cut)
         if self.cut is not None and cut < self.cut:
             raise ValueError("experiment observation cuts moved backwards")
-        if (self.evaluator is not None and self.cut is not None and cut > self.cut
-                and self.cut >= self.origin_ns):
-            self.evaluator.advance(self.cut)
+        if self.cut is not None and cut > self.cut:
+            for _, evaluator in self._evaluators.values():
+                if self.cut >= evaluator.origin_ns:
+                    evaluator.advance(self.cut)
         self.cut = cut
+
+    @staticmethod
+    def _receipt(event, index=None):
+        return ObservationReceipt(index, event.session_id, event.sequence,
+            event.source_node, event.source_port, event.kind, event.source_time_ns,
+            event.mapped_time_ns, event.delivery_time_ns, event.quality)
 
     def __call__(self, event):
         if not isinstance(event, Event) or event.session_id != 1 or event.sequence != self.sequence + 1:
@@ -95,15 +134,46 @@ class _Consumer:
         self.sequence = event.sequence
         if event.kind == "input.delivered":
             self.delivered_inputs += 1
+        self._board_observation(event)
         endpoint = (f"{event.source_node}.{event.source_port}"
                     if event.source_port is not None else None)
-        if self.evaluator is None:
-            self._observe_ready(event, endpoint)
+        self._observe_ready(event, endpoint)
+        digital, observed = self._values(event, endpoint)
+        if not digital and not observed:
             return
-        # The whole matching cut belongs to startup, including other producers
-        # and events after the marker in that same observation batch.
-        if self.ready is not None and event.delivery_time_ns <= self.origin_ns:
+        matches = []
+        for origin, (indices, evaluator) in self._evaluators.items():
+            if origin == "ready" and self.ready and event.delivery_time_ns <= self.origin_ns:
+                continue
+            before = evaluator.status
+            evaluator.observe_values(digital, observed, event.delivery_time_ns, expire=False)
+            for index, old, new in zip(indices, before, evaluator.status):
+                if old == "pending" and new == "pass":
+                    matches.append(self._receipt(event, index))
+        self.matches.extend(sorted(matches, key=lambda receipt: receipt.assertion_index))
+
+    def _board_observation(self, event):
+        if event.kind != "snapshot" or event.source_node not in self.machine_nodes:
             return
+        native = event.source_time_ns
+        if (type(native) is not int or not isinstance(event.payload, Mapping)
+                or event.payload.get("timestamp_ns") != native
+                or event.mapped_time_ns != event.delivery_time_ns or native < event.mapped_time_ns):
+            raise ValueError("machine snapshot must preserve its native epoch and completed cut")
+        epoch = native - event.mapped_time_ns
+        old = self.boards.get(event.source_node)
+        if old is not None and (old["native_origin_ns"] != epoch or native < old["last_source_ns"]):
+            raise ValueError("machine snapshot native epoch changed or moved backwards")
+        self.boards[event.source_node] = {
+            "native_origin_ns": epoch,
+            "first_source_ns": native if old is None else old["first_source_ns"],
+            "last_source_ns": native,
+            "first_mapped_ns": event.mapped_time_ns if old is None else old["first_mapped_ns"],
+            "last_mapped_ns": event.mapped_time_ns,
+            "observation_batches": 1 if old is None else old["observation_batches"] + 1,
+        }
+
+    def _values(self, event, endpoint):
         digital, observed = {}, ()
         if event.kind == "snapshot" and event.source_node in self.snapshot_endpoints:
             if event.mapped_time_ns != event.delivery_time_ns:
@@ -116,16 +186,16 @@ class _Consumer:
             if event.kind == "net.uart.delivery":
                 endpoint, data = event.payload["source"], event.payload["data"]
             if self.observations.get(endpoint) != event.kind:
-                return
+                return {}, ()
             if (endpoint is None or type(data) is not bytes
                     or event.quality == TimeQuality.LOWER_BOUND):
                 raise ValueError("UART assertion requires bytes with an observation upper bound")
             observed = (AssertionObservation(endpoint, event.mapped_time_ns, data),)
         elif event.kind in ("can-tx", "can.delivery"):
             if self.observations.get(endpoint) != event.kind:
-                return
+                return {}, ()
             if event.kind == "can.delivery" and event.payload["dropped"]:
-                return
+                return {}, ()
             if event.quality == TimeQuality.LOWER_BOUND:
                 raise ValueError("CAN assertion requires an observation upper bound")
             frame = event.payload if event.kind == "can-tx" else event.payload.get("frame")
@@ -134,49 +204,43 @@ class _Consumer:
             observed = (AssertionObservation(endpoint, event.mapped_time_ns, frame),)
         elif event.kind in ("digital", "net.digital.sample") and endpoint is not None:
             if self.observations.get(endpoint) != "digital":
-                return
+                return {}, ()
             if event.mapped_time_ns != event.delivery_time_ns:
                 raise ValueError("digital sample requires its completed observation cut")
             level = event.payload if event.kind == "digital" else event.payload["level"]
             if level is not None:
                 digital[endpoint] = level
-        if not digital and not observed:
-            return
-        before = self.evaluator.status
-        self.evaluator.observe_values(digital, observed, event.delivery_time_ns, expire=False)
-        for index, (old, new) in enumerate(zip(before, self.evaluator.status)):
-            if old == "pending" and new == "pass":
-                self.matches.append(ObservationReceipt(index, event.session_id, event.sequence,
-                    event.source_node, event.source_port, event.kind, event.source_time_ns,
-                    event.mapped_time_ns, event.delivery_time_ns, event.quality))
+        return digital, observed
 
     def _observe_ready(self, event, endpoint):
-        if event.kind not in ("uart", "net.uart.delivery"):
+        if self.origin_ns is not None or event.kind not in ("uart", "net.uart.delivery"):
             return
         data = event.payload
         if event.kind == "net.uart.delivery":
             endpoint, data = event.payload["source"], event.payload["data"]
-        wanted = str(self.ready.endpoint)
-        if endpoint != wanted or self.observations.get(endpoint) != event.kind:
-            return
-        if (type(data) is not bytes or event.quality == TimeQuality.LOWER_BOUND
-                or event.mapped_time_ns > event.delivery_time_ns):
-            raise ValueError("UART ready requires bytes with an observation upper bound")
-        combined = self._ready_tail + data
-        if self.ready.text not in combined:
-            keep = len(self.ready.text) - 1
-            self._ready_tail = combined[-keep:] if keep else b""
-            return
-        origin = event.delivery_time_ns
-        check_timestamp(origin + self.duration_ns)
-        self.evaluator = AssertionEvaluator(self.assertions, self.duration_ns, origin)
-        self.origin_ns = origin
-        self._ready_tail = b""
-        self.ready_receipt = ObservationReceipt(None, event.session_id, event.sequence,
-            event.source_node, event.source_port, event.kind, event.source_time_ns,
-            event.mapped_time_ns, event.delivery_time_ns, event.quality)
-        if self.on_ready is not None:
-            self.on_ready(origin)
+        matched = []
+        for item in self.ready:
+            if (item.name in self.ready_receipts or endpoint != str(item.endpoint)
+                    or self.observations.get(endpoint) != event.kind):
+                continue
+            if (type(data) is not bytes or event.quality == TimeQuality.LOWER_BOUND
+                    or event.mapped_time_ns > event.delivery_time_ns):
+                raise ValueError("UART ready requires bytes with an observation upper bound")
+            combined = self._ready_tails[item.name] + data
+            if item.text not in combined:
+                keep = len(item.text) - 1
+                self._ready_tails[item.name] = combined[-keep:] if keep else b""
+                continue
+            self._ready_tails[item.name] = b""
+            self.ready_receipts[item.name] = self._receipt(event)
+            matched.append(item.name)
+        if len(self.ready_receipts) == len(self.ready):
+            origin = event.delivery_time_ns
+            check_timestamp(origin + self.duration_ns)
+            self.origin_ns = origin
+            self._start_evaluator("ready", origin)
+        if matched and self.on_unlock is not None:
+            self.on_unlock()
 
 
 class _CutObserver:
@@ -212,6 +276,7 @@ class _Admission:
     snapshots: dict
     observations: dict
     descriptions: Mapping
+    assertion_origins: tuple
 
 
 def validate_input_batches(scene, registry, inputs, *, origin_ns):
@@ -233,8 +298,7 @@ def _admit_observations(duration_ns, descriptions, connected, assertions, ready)
         raise ValueError("experiment scene duration must be positive")
     if not isinstance(assertions, (tuple, list)) or len(assertions) > MAX_ITEMS:
         raise ValueError("experiment requires at most 1024 assertion mappings")
-    if ready is not None and type(ready) is not ExperimentReady:
-        raise TypeError("experiment ready requires an ExperimentReady")
+    ready = validate_ready(ready)
     snapshots = {}
     observations = {}
 
@@ -265,16 +329,25 @@ def _admit_observations(duration_ns, descriptions, connected, assertions, ready)
             and "machine" not in description.capabilities else direct)
         return str(endpoint)
 
-    if ready is not None:
-        assertion_endpoint("uart_contains", str(ready.endpoint))
-    admitted = tuple(parse_assertion(_plain(value), index, endpoint_validator=assertion_endpoint)
-                     for index, value in enumerate(assertions))
+    for item in ready:
+        assertion_endpoint("uart_contains", str(item.endpoint))
+    admitted, origins = [], []
+    for index, value in enumerate(assertions):
+        value = _plain(value)
+        if not isinstance(value, dict):
+            raise TypeError("experiment assertions require mappings")
+        origin = value.pop("origin", "ready")
+        if origin not in ("session", "ready"):
+            raise ValueError("assertion origin must be session or ready")
+        origins.append(origin)
+        admitted.append(parse_assertion(value, index, endpoint_validator=assertion_endpoint))
+    admitted = tuple(admitted)
     if any(item.before_ns > duration_ns for item in admitted):
         raise ValueError("assertion deadline exceeds scene duration")
-    return admitted, snapshots, observations
+    return admitted, snapshots, observations, tuple(origins)
 
 
-def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
+def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=(),
                      descriptions=None):
     """Pure shared config/Python admission; never acquire component resources."""
     if not isinstance(scene, Scene):
@@ -290,11 +363,15 @@ def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
         descriptions = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns).validate()
     connected = {str(endpoint) for link in scene.topology.links
                  for endpoint in (link.source, link.target)}
-    admitted, snapshots, observations = _admit_observations(
+    ready = validate_ready(ready)
+    admitted, snapshots, observations, origins = _admit_observations(
         scene.duration_ns, descriptions, connected, assertions, ready)
     specs = {node.name: node for node in scene.topology.nodes}
     queued = []
+    marker_origins = {"marker:" + item.name for item in ready}
     for item in inputs:
+        if item.origin.startswith("marker:") and item.origin not in marker_origins:
+            raise ValueError("experiment input names an unknown ready marker")
         if item.at_ns > scene.duration_ns or item.endpoint.node not in descriptions:
             raise ValueError("experiment input exceeds duration or names an unknown node")
         description = descriptions[item.endpoint.node]
@@ -306,9 +383,14 @@ def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=None,
         value = registry[spec.kind].validate_input(spec, item.endpoint.port, item.payload,
             connected_ports=tuple(port.name for port in description.ports
                                   if f"{spec.name}.{port.name}" in connected))
-        queued.append(ExperimentInput(item.at_ns, item.endpoint, value))
-    validate_input_batches(scene, registry, queued, origin_ns=0 if ready is None else None)
-    return _Admission(tuple(queued), admitted, snapshots, observations, descriptions)
+        queued.append(ExperimentInput(item.at_ns, item.endpoint, value, item.origin))
+    if not ready:
+        validate_input_batches(scene, registry, queued, origin_ns=0)
+    else:
+        for origin in dict.fromkeys(item.origin for item in queued):
+            validate_input_batches(scene, registry, tuple(item for item in queued if item.origin == origin),
+                                  origin_ns=0 if origin == "session" else None)
+    return _Admission(tuple(queued), admitted, snapshots, observations, descriptions, origins)
 
 
 def _trace_api():
@@ -326,35 +408,55 @@ def _trace_config(scene, descriptions, assertions, ready):
     return {
         "duration_ns": scene.duration_ns,
         "quantum_ns": scene.quantum_ns,
-        "ready": None if ready is None else {"endpoint": str(ready.endpoint), "text": ready.text},
+        "ready": tuple({"name": item.name, "endpoint": str(item.endpoint), "text": item.text}
+                       for item in ready),
         "assertions": tuple(_plain(value) for value in assertions),
         # Preserve all declared observation capabilities for replacement
         # assertions, including snapshot-backed GPIOs not named in this run.
         "descriptions": {name: {
             "capabilities": tuple(sorted(description.capabilities)),
             "ports": tuple({"name": port.name, "protocol": port.protocol,
-                            "direction": port.direction} for port in description.ports),
+                            "direction": port.direction,
+                            "capabilities": tuple(sorted(port.capabilities))}
+                           for port in description.ports),
         } for name, description in descriptions.items()},
         "connected": tuple(sorted({str(endpoint) for link in scene.topology.links
                                     for endpoint in (link.source, link.target)})),
     }
 
 
-def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions=(), ready=None,
-                   startup_timeout_s=10, host_timeout_s=30, on_event=None,
-                   trace=None) -> ExperimentResult:
-    """Run relative inputs/assertions on one Simulation and clean before return.
+def _receipt_value(receipt):
+    return {"assertion_index": receipt.assertion_index, "session_id": receipt.session_id,
+            "event_sequence": receipt.event_sequence, "source_node": receipt.source_node,
+            "source_port": receipt.source_port, "kind": receipt.kind,
+            "source_time_ns": receipt.source_time_ns, "mapped_time_ns": receipt.mapped_time_ns,
+            "delivery_time_ns": receipt.delivery_time_ns, "quality": str(receipt.quality)}
 
-    An optional actual UART ready marker establishes the experiment origin at
-    its delivery cut. Without ready the origin is zero. Neither path rewrites
-    Session, Event or native timestamps. Matching ignores the whole ready cut.
-    Machine UART/CAN use public observations; other connected producers use
-    successful delivery events, keeping transport admission separate from reads.
-    Optional trace borrows a blocking binary output. Events and actual sample
-    cuts are recorded in callback order; completion/flush follows cleanup, even
-    for false assertions. Runtime or cleanup failures never publish completion.
-    Recording failures return no result and preserve accepted bytes, which may
-    include completion if a final flush fails. The caller alone closes output.
+
+def _ready_values(consumer):
+    return {item.name: _receipt_value(consumer.ready_receipts[item.name]) for item in consumer.ready}
+
+
+def _result(consumer, end, total):
+    return ExperimentResult(consumer.status, consumer.failures, tuple(consumer.matches), end,
+        consumer.delivered_inputs, total, consumer.origin_ns,
+        {item.name: consumer.ready_receipts[item.name] for item in consumer.ready},
+        dict(consumer.boards))
+
+
+def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions=(), ready=(),
+                   startup_timeout_s=10, host_timeout_s=30, on_event=None,
+                   on_cut=None, trace=None) -> ExperimentResult:
+    """Run one finite Simulation; readiness never changes native/session epochs.
+
+    Named UART markers unlock their own input groups immediately. All markers
+    establish the active origin at the final matching cut. Session assertions
+    include startup; ready assertions exclude the entire matching cut. Inputs
+    use the sole runtime queue, with session inputs admitted before newly
+    unlocked groups and declaration order within each group. Trace completion
+    follows all component cleanup, including for false assertions.
+    on_cut(cut_ns, simulation) borrows the existing source-sample cut before target delivery; it
+    must not reenter execution or claim that target input commit has succeeded.
     """
     trace_type = _trace_api()[0] if trace is not None else None
     registry = dict(registry)
@@ -362,31 +464,56 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
     if not isinstance(scene, Scene):
         raise TypeError("experiment requires a sim/v1 Scene")
     if scene.experiment is not None:
-        if inputs or assertions or ready is not None:
+        if inputs or assertions or ready:
             raise ValueError("scene experiment cannot be overridden by Python experiment values")
         inputs, assertions, ready = (scene.experiment.inputs, scene.experiment.assertions,
                                      scene.experiment.ready)
-    if on_event is not None and not callable(on_event):
-        raise TypeError("experiment on_event must be callable")
+    ready = validate_ready(ready)
+    for callback, label in ((on_event, "on_event"), (on_cut, "on_cut")):
+        if callback is not None and not callable(callback):
+            raise TypeError(f"experiment {label} must be callable")
     admitted = admit_experiment(scene, registry, inputs=inputs, assertions=assertions, ready=ready)
-    recorder = None
-    simulation = None
-    scheduled = False
+    recorder = simulation = None
+    scheduled = set()
     cuts_total = 0
+    startup_complete = False
 
-    def enqueue(origin):
-        nonlocal scheduled
-        validate_input_batches(scene, registry, admitted.inputs, origin_ns=origin)
-        # start hooks/initial sampling run while Simulation is NEW. They can
-        # establish readiness, but enqueue only after all construction completes.
+    def input_origin(item):
+        if item.origin == "session":
+            return 0
+        if item.origin == "ready":
+            return consumer.origin_ns
+        receipt = consumer.ready_receipts.get(item.origin[7:])
+        return None if receipt is None else receipt.delivery_time_ns
+
+    def enqueue():
+        nonlocal startup_complete
+        # Initial source sampling may match markers while construction is NEW.
+        # The first public operation settles all deferred inputs before CPU IO.
         if simulation.state == SimulationState.NEW:
             return
-        for item in admitted.inputs:
-            simulation.schedule_input(item.endpoint, item.payload, at_ns=origin + item.at_ns)
-        scheduled = True
+        known = tuple((index, item, input_origin(item)) for index, item in enumerate(admitted.inputs)
+                      if input_origin(item) is not None)
+        absolute = tuple(ExperimentInput(origin + item.at_ns, item.endpoint, item.payload, "session")
+                         for _, item, origin in known)
+        validate_input_batches(scene, registry, absolute, origin_ns=0)
+        order = sorted(known, key=lambda row: (row[1].origin != "session", row[0]))
+        for index, item, origin in order:
+            if index not in scheduled:
+                simulation.schedule_input(item.endpoint, item.payload, at_ns=origin + item.at_ns)
+                scheduled.add(index)
+        if consumer.origin_ns is not None and not startup_complete:
+            startup_complete = True
+            # Readiness can arise at an input/deadline cut inside the current
+            # startup request. Return at that cut before choosing the active
+            # end, which can precede the startup request's original target.
+            if simulation.state == SimulationState.RUNNING:
+                simulation.pause()
 
     consumer = _Consumer(admitted.assertions, scene.duration_ns, admitted.snapshots,
-                         admitted.observations, ready=ready, on_ready=enqueue)
+        admitted.observations, ready=ready, assertion_origins=admitted.assertion_origins,
+        on_unlock=enqueue, machine_nodes=tuple(name for name, description in admitted.descriptions.items()
+                                             if "machine" in description.capabilities))
 
     def observe(event):
         if recorder is not None:
@@ -395,30 +522,35 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
         if on_event is not None:
             on_event(event)
 
-    def record_cut(cut):
+    def sample_cut(cut):
         nonlocal cuts_total
-        recorder.cut(cut)
+        if recorder is not None:
+            recorder.cut(cut)
         cuts_total += 1
+        if on_cut is not None:
+            on_cut(cut, simulation)
 
-    # Reserve a fresh private name without restricting user component names.
     name = "_experiment_cut"
     while name in {node.name for node in scene.topology.nodes} or name in registry:
         name += "_"
-    registry[name] = _CutObserverFactory(consumer, None if trace is None else record_cut)
+    registry[name] = _CutObserverFactory(consumer, sample_cut)
     topology = Topology((*scene.topology.nodes, NodeSpec(name, name)), scene.topology.links)
     simulation = Simulation(topology, registry, quantum_ns=scene.quantum_ns,
                             startup_timeout_s=startup_timeout_s, host_timeout_s=host_timeout_s,
                             max_pending_inputs=max(256, len(admitted.inputs)), on_event=observe)
     if trace is not None:
-        recorder = trace_type(trace, _trace_config(scene, admitted.descriptions, assertions, ready))
+        config = _trace_config(scene, admitted.descriptions, assertions, ready)
+        config["inputs"] = tuple({"at_ns": item.at_ns, "endpoint": str(item.endpoint),
+                                  "payload": item.payload, "origin": item.origin}
+                                 for item in admitted.inputs)
+        recorder = trace_type(trace, config)
     begun = monotonic()
     total_deadline = begun + host_timeout_s
     startup_deadline = min(total_deadline, begun + startup_timeout_s)
     primary = None
     try:
         simulation.start(deadline_monotonic=startup_deadline)
-        if consumer.origin_ns is not None and not scheduled:
-            enqueue(consumer.origin_ns)
+        enqueue()
         while consumer.origin_ns is None:
             target = simulation.t_sim_ns + scene.quantum_ns
             check_timestamp(target)
@@ -428,9 +560,8 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
         result = simulation.run_until(end, deadline_monotonic=total_deadline)
         if result.status != "ok" or result.reached_time_ns != end:
             raise RuntimeError("experiment did not complete its requested duration")
-        consumer.evaluator.finish(end)
-        completed = simulation.t_sim_ns
-        total = simulation.events_total
+        consumer.finish(end)
+        completed, total = simulation.t_sim_ns, simulation.events_total
     except BaseException as error:
         primary = error
         raise
@@ -444,13 +575,12 @@ def run_experiment(scene: Scene | str | Path, registry, *, inputs=(), assertions
                 primary.add_note(f"simulation cleanup failed: {type(cleanup).__name__}: {cleanup}")
                 for note in getattr(cleanup, "__notes__", ()):
                     primary.add_note(note)
-    result = ExperimentResult(consumer.evaluator.status, consumer.evaluator.failures,
-                              tuple(consumer.matches), completed, consumer.delivered_inputs, total,
-                              consumer.origin_ns, consumer.ready_receipt)
+    result = _result(consumer, completed, total)
     if recorder is not None:
         recorder.complete({"end_ns": completed, "origin_ns": consumer.origin_ns,
                            "delivered_inputs": consumer.delivered_inputs,
-                           "events_total": total, "cuts_total": cuts_total})
+                           "events_total": total, "cuts_total": cuts_total,
+                           "ready_receipts": _ready_values(consumer), "boards": dict(consumer.boards)})
     return result
 
 
@@ -464,16 +594,17 @@ def _exact_mapping(value, keys, label):
 class _ReplayPlan:
     duration_ns: int
     quantum_ns: int
-    ready: ExperimentReady | None
+    ready: tuple[ExperimentReady, ...]
     assertions: tuple
     snapshots: dict
     observations: dict
     descriptions: dict
+    assertion_origins: tuple
 
 
 def _replay_plan(config, assertions):
     config = _exact_mapping(config, ("duration_ns", "quantum_ns", "ready", "assertions",
-                                     "descriptions", "connected"), "configuration")
+                                     "descriptions", "connected", "inputs"), "configuration")
     duration, quantum = config["duration_ns"], config["quantum_ns"]
     for value in (duration, quantum):
         check_timestamp(value)
@@ -492,7 +623,11 @@ def _replay_plan(config, assertions):
             raise ValueError("experiment trace descriptions require capability and port tuples")
         admitted_ports = []
         for port in ports:
-            port = _exact_mapping(port, ("name", "protocol", "direction"), "port description")
+            port = _exact_mapping(port, ("name", "protocol", "direction", "capabilities"),
+                                  "port description")
+            if (type(port["capabilities"]) is not tuple or
+                    len(set(port["capabilities"])) != len(port["capabilities"])):
+                raise ValueError("experiment trace port capabilities require unique tuples")
             admitted_ports.append(PortSpec(**port))
         descriptions[name] = NodeDescription(tuple(admitted_ports), capabilities)
     connected = config["connected"]
@@ -505,13 +640,29 @@ def _replay_plan(config, assertions):
             raise ValueError("experiment trace connection names an unknown node")
         descriptions[endpoint.node].port(endpoint.port)
     ready = config["ready"]
-    if ready is not None:
-        ready = _exact_mapping(ready, ("endpoint", "text"), "ready declaration")
-        ready = ExperimentReady(ready["endpoint"], ready["text"])
+    if type(ready) is not tuple:
+        raise ValueError("experiment trace ready markers require a tuple")
+    ready = validate_ready(tuple(ExperimentReady(**_exact_mapping(
+        value, ("name", "endpoint", "text"), "ready declaration")) for value in ready))
+    inputs = config["inputs"]
+    if type(inputs) is not tuple or len(inputs) > MAX_ITEMS:
+        raise ValueError("experiment trace requires bounded input declarations")
+    names = {"marker:" + item.name for item in ready}
+    for value in inputs:
+        value = _exact_mapping(value, ("at_ns", "endpoint", "payload", "origin"), "input declaration")
+        item = ExperimentInput(**value)
+        if (item.at_ns > duration or item.endpoint.node not in descriptions
+                or item.origin.startswith("marker:") and item.origin not in names):
+            raise ValueError("invalid recorded input origin, endpoint or horizon")
+        description = descriptions[item.endpoint.node]
+        port = description.port(item.endpoint.port)
+        if ("input" not in description.capabilities or port.direction == "out"
+                or "external_input" not in port.capabilities):
+            raise ValueError("recorded endpoint cannot accept experiment inputs")
     original = _admit_observations(duration, descriptions, connected, config["assertions"], ready)
-    admitted, snapshots, observations = (original if assertions is None else
+    admitted, snapshots, observations, origins = (original if assertions is None else
         _admit_observations(duration, descriptions, connected, assertions, ready))
-    return _ReplayPlan(duration, quantum, ready, admitted, snapshots, observations, descriptions)
+    return _ReplayPlan(duration, quantum, ready, admitted, snapshots, observations, descriptions, origins)
 
 
 class _DigestInput:
@@ -541,7 +692,9 @@ def _replay_pass(source, records, assertions, expected_config=None):
                 raise ValueError("experiment trace configuration changed between passes")
             plan = _replay_plan(config, assertions)
             consumer = _Consumer(plan.assertions, plan.duration_ns, plan.snapshots,
-                                 plan.observations, ready=plan.ready)
+                                 plan.observations, ready=plan.ready, assertion_origins=plan.assertion_origins,
+                                 machine_nodes=tuple(name for name, description in plan.descriptions.items()
+                                                     if "machine" in description.capabilities))
             continue
         if plan is None or summary is not None:
             raise ValueError("invalid experiment trace lifecycle order")
@@ -567,27 +720,28 @@ def _replay_pass(source, records, assertions, expected_config=None):
             cuts_total += 1
         elif record.kind == "completion":
             summary = _exact_mapping(record.data,
-                ("end_ns", "origin_ns", "delivered_inputs", "events_total", "cuts_total"),
+                ("end_ns", "origin_ns", "delivered_inputs", "events_total", "cuts_total",
+                 "ready_receipts", "boards"),
                 "completion")
         else:
             raise ValueError("unsupported experiment trace record")
     # The iterator has now checked every CRC, footer, trailing magic and EOF.
-    if summary is None or consumer is None or consumer.evaluator is None:
+    if summary is None or consumer is None or consumer.origin_ns is None:
         raise ValueError("experiment trace lacks its completed ready lifecycle")
-    for value in summary.values():
-        check_timestamp(value)
+    for key in ("end_ns", "origin_ns", "delivered_inputs", "events_total", "cuts_total"):
+        check_timestamp(summary[key])
     end = summary["end_ns"]
     if (pending_cut is not None or previous_cut != end or
             consumer.origin_ns != summary["origin_ns"] or
             end != consumer.origin_ns + plan.duration_ns or
             consumer.delivered_inputs != summary["delivered_inputs"] or
             consumer.sequence + 1 != summary["events_total"] or
-            cuts_total != summary["cuts_total"]):
+            cuts_total != summary["cuts_total"] or
+            _ready_values(consumer) != summary["ready_receipts"] or
+            consumer.boards != summary["boards"]):
         raise ValueError("experiment trace completion differs from its captured lifecycle")
-    consumer.evaluator.finish(end)
-    result = ExperimentResult(consumer.evaluator.status, consumer.evaluator.failures,
-        tuple(consumer.matches), end, consumer.delivered_inputs, consumer.sequence + 1,
-        consumer.origin_ns, consumer.ready_receipt)
+    consumer.finish(end)
+    result = _result(consumer, end, consumer.sequence + 1)
     return config, result
 
 

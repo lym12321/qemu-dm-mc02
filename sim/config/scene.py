@@ -17,21 +17,29 @@ class ExperimentInput:
     at_ns: int
     endpoint: Endpoint | str
     payload: object
+    origin: str = "ready"
 
     def __post_init__(self):
         check_timestamp(self.at_ns)
         object.__setattr__(self, "endpoint", Endpoint.parse(self.endpoint))
         object.__setattr__(self, "payload", immutable(self.payload))
+        if (type(self.origin) is not str or self.origin not in ("session", "ready")
+                and not self.origin.startswith("marker:")):
+            raise ValueError("experiment input origin must be session, ready or marker:<name>")
+        if self.origin.startswith("marker:"):
+            identifier(self.origin[7:], "input marker name")
 
 
 @dataclass(frozen=True)
 class ExperimentReady:
     """An actual UART observation requested before relative experiment time."""
 
+    name: str
     endpoint: Endpoint | str
     text: bytes | str
 
     def __post_init__(self):
+        identifier(self.name, "ready marker name")
         object.__setattr__(self, "endpoint", Endpoint.parse(self.endpoint))
         value = self.text
         if type(value) is str:
@@ -44,18 +52,27 @@ class ExperimentReady:
 
 @dataclass(frozen=True)
 class ExperimentSpec:
-    ready: ExperimentReady | None = None
+    ready: tuple[ExperimentReady, ...] = ()
     inputs: tuple[ExperimentInput, ...] = ()
     assertions: tuple[object, ...] = ()
 
     def __post_init__(self):
-        if self.ready is not None and type(self.ready) is not ExperimentReady:
-            raise TypeError("experiment.ready requires an ExperimentReady")
+        object.__setattr__(self, "ready", validate_ready(self.ready))
         for name in ("inputs", "assertions"):
             values = getattr(self, name)
             if not isinstance(values, (tuple, list)) or len(values) > 1024:
                 raise ValueError(f"experiment.{name} requires at most 1024 entries")
             object.__setattr__(self, name, tuple(immutable(value) for value in values))
+
+
+def validate_ready(values):
+    if (not isinstance(values, (tuple, list)) or len(values) > 64
+            or any(type(item) is not ExperimentReady for item in values)):
+        raise TypeError("experiment.ready requires at most 64 named ready markers")
+    result = tuple(values)
+    if len({item.name for item in result}) != len(result):
+        raise ValueError("experiment ready marker names must be unique")
+    return result
 
 
 @dataclass(frozen=True)
@@ -116,11 +133,16 @@ def load_scene(path: str | Path, registry: Mapping) -> Scene:
         return scene
     experiment = fields(document["experiment"], {"ready", "inputs", "assertions"},
                         set(), "experiment")
-    ready = None
-    if "ready" in experiment:
-        item = fields(experiment["ready"], {"endpoint", "text"},
-                      {"endpoint", "text"}, "experiment.ready")
-        ready = ExperimentReady(item["endpoint"], text_bytes(item["text"], "experiment.ready.text"))
+    raw_ready = experiment.get("ready", [])
+    if type(raw_ready) is not list or len(raw_ready) > 64:
+        raise ManifestError("experiment.ready requires a list of at most 64 named markers")
+    ready = []
+    for index, value in enumerate(raw_ready):
+        label = f"experiment.ready[{index}]"
+        item = fields(value, {"name", "endpoint", "text"}, {"name", "endpoint", "text"}, label)
+        ready.append(ExperimentReady(item["name"], item["endpoint"],
+                                     text_bytes(item["text"], label + ".text")))
+    ready = validate_ready(ready)
     inputs = experiment.get("inputs", [])
     assertions = experiment.get("assertions", [])
     for label, values in (("inputs", inputs), ("assertions", assertions)):
@@ -129,9 +151,10 @@ def load_scene(path: str | Path, registry: Mapping) -> Scene:
     queued = []
     for index, value in enumerate(inputs):
         label = f"experiment.inputs[{index}]"
-        item = fields(value, {"at", "endpoint", "value"}, {"at", "endpoint", "value"}, label)
+        item = fields(value, {"at", "endpoint", "value", "origin"},
+                      {"at", "endpoint", "value"}, label)
         queued.append(ExperimentInput(parse_time(item["at"], label + ".at"),
-                                      item["endpoint"], item["value"]))
+                                      item["endpoint"], item["value"], item.get("origin", "ready")))
     # The optional application owns the shared assertion/factory admission.
     # Import only for an explicit experiment; scene-only validation stays light.
     from sim.apps.experiment import admit_experiment

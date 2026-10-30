@@ -14,9 +14,9 @@ inputs. There is no automatic overheat punishment, revival or physics judgment.
 
 from dataclasses import dataclass, replace
 
-from sim.core import Session, StepContext, StepResult
+from sim.api import Session, StepContext, StepResult
 
-from .messages import Buff, GameStatus, PowerHeat, RobotStatus, encode_message
+from .messages import Buff, GameStatus, PowerHeat, RobotStatus, validate_message
 from .protocol import _uint
 
 
@@ -60,7 +60,7 @@ def _admit_message(value, expected_type):
     if type(value) is not expected_type:
         raise TypeError(f"expected {expected_type.__name__}")
     # Borrow the wire owner's admission instead of maintaining a second schema.
-    encode_message(value)
+    validate_message(value)
     if expected_type is RobotStatus and value.current_hp > value.maximum_hp:
         raise ValueError("current_hp must not exceed maximum_hp")
     if (expected_type is GameStatus and value.game_progress in (2, 3, 4)

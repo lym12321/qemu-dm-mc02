@@ -43,6 +43,21 @@ def test_load_resolves_paths_without_starting_native(tmp_path, monkeypatch):
     assert len(scene.topology.links) == 2
 
 
+def test_cli_host_commands_require_opt_in_before_any_resource_acquisition(tmp_path, monkeypatch, capsys):
+    from sim.cli import main
+    from sim.machines.qemu import QemuFactory
+
+    path, document = write_scene(tmp_path)
+    document["nodes"]["upper"] = {"kind": "app.host-processes", "commands": {
+        "observer": {"command": [sys.executable, "-c", "raise SystemExit(0)"]}}}
+    path.write_text(yaml.safe_dump(document))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_a, **_k: pytest.fail("host launch before opt-in"))
+    monkeypatch.setattr(QemuFactory, "create", lambda *_a, **_k: pytest.fail("native acquisition before opt-in"))
+    assert main(["validate", str(path)]) == 0
+    assert main(["run", str(path)]) == 1
+    assert "--allow-host-processes" in capsys.readouterr().err
+
+
 @pytest.mark.parametrize("change", [
     lambda d: d.update(schema=1),
     lambda d: d.update(unknown=True),
@@ -116,7 +131,7 @@ def test_core_static_import_direction():
 def test_help_and_validate_refuse_optional_imports_in_fresh_process(tmp_path):
     path, document = write_scene(tmp_path)
     document["experiment"] = {
-        "ready": {"endpoint": "main.uart1", "text": "READY"},
+        "ready": [{"name": "main", "endpoint": "main.uart1", "text": "READY"}],
         "inputs": [{"at": "1ms", "endpoint": "main.uart1", "value": "hello\0é"}],
         "assertions": [{"before": "10ms", "uart_contains": {"endpoint": "main.uart1", "text": "OK"}}],
     }
@@ -146,11 +161,15 @@ raise SystemExit(main(sys.argv[2:]))
 def test_scene_experiment_pure_admission_canonicalizes_inputs_and_freezes_order(tmp_path, monkeypatch):
     path, document = write_scene(tmp_path)
     document["experiment"] = {
-        "ready": {"endpoint": "main.uart1", "text": "就绪\0"},
-        "inputs": [{"at": "2ms", "endpoint": "main.uart1", "value": "one\0é"},
-                   {"at": "2ms", "endpoint": "main.key", "value": True},
+        "ready": [{"name": "main", "endpoint": "main.uart1", "text": "就绪\0"},
+                  {"name": "control", "endpoint": "main.uart1", "text": "CONTROL"}],
+        "inputs": [{"at": "2ms", "endpoint": "main.uart1", "value": "one\0é",
+                    "origin": "session"},
+                   {"at": "2ms", "endpoint": "main.key", "value": True,
+                    "origin": "marker:control"},
                    {"at": "0ns", "endpoint": "main.gpio.B0", "value": 1}],
-        "assertions": [{"before": "10ms", "digital_equals": {"endpoint": "main.led", "value": 1}}],
+        "assertions": [{"before": "10ms", "origin": "session",
+                        "digital_equals": {"endpoint": "main.led", "value": 1}}],
     }
     path.write_text(yaml.safe_dump(document))
     registry = builtin_registry()
@@ -158,8 +177,11 @@ def test_scene_experiment_pure_admission_canonicalizes_inputs_and_freezes_order(
         monkeypatch.setattr(factory, "create", lambda *_: pytest.fail("static scene acquired resources"))
     configured = load_scene(path, registry)
     experiment = configured.experiment
-    assert str(experiment.ready.endpoint) == "main.uart1"
-    assert experiment.ready.text == "就绪\0".encode()
+    assert str(experiment.ready[0].endpoint) == "main.uart1"
+    assert experiment.ready[0].text == "就绪\0".encode()
+    assert [item.name for item in experiment.ready] == ["main", "control"]
+    assert [item.origin for item in experiment.inputs] == ["session", "marker:control", "ready"]
+    assert experiment.assertions[0]["origin"] == "session"
     assert [(item.at_ns, str(item.endpoint), item.payload) for item in experiment.inputs] == [
         (2_000_000, "main.uart1", b"one\0\xc3\xa9"),
         (2_000_000, "main.key", True), (0, "main.gpio.B0", 1)]
@@ -169,16 +191,23 @@ def test_scene_experiment_pure_admission_canonicalizes_inputs_and_freezes_order(
 
 @pytest.mark.parametrize("experiment", [
     {"unknown": True},
-    {"ready": {"endpoint": "main.uart1", "text": ""}},
-    {"ready": {"endpoint": "main.key", "text": "READY"}},
-    {"ready": {"endpoint": "absent.uart1", "text": "READY"}},
+    {"ready": {"name": "main", "endpoint": "main.uart1", "text": "READY"}},
+    {"ready": [{"name": "main", "endpoint": "main.uart1", "text": "READY"}] * 2},
+    {"ready": [{"name": "main", "endpoint": "main.uart1", "text": ""}]},
+    {"ready": [{"name": "main", "endpoint": "main.key", "text": "READY"}]},
+    {"ready": [{"name": "main", "endpoint": "absent.uart1", "text": "READY"}]},
     {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": 1}]},
+    {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": True, "origin": "invalid"}]},
+    {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": True,
+                 "origin": "marker:undeclared"}]},
     {"inputs": [{"at": "151ms", "endpoint": "main.key", "value": True}]},
     {"inputs": [{"at": "1ms", "endpoint": "main.key", "value": True, "extra": 1}]},
     {"inputs": [{"at": "1ms", "endpoint": "main.key"}]},
     {"inputs": [{"at": "0ns", "endpoint": "main.key", "value": True} for _ in range(1025)]},
     {"assertions": [{"before": "151ms", "uart_contains": {"endpoint": "main.uart1", "text": "OK"}}]},
     {"assertions": [{"before": "1ms", "uart_contains": {"endpoint": "main.key", "text": "OK"}}]},
+    {"assertions": [{"before": "1ms", "origin": "marker:main",
+                     "uart_contains": {"endpoint": "main.uart1", "text": "OK"}}]},
 ])
 def test_bad_scene_experiment_rejects_before_any_component_creation(tmp_path, monkeypatch, experiment):
     path, document = write_scene(tmp_path)
@@ -202,7 +231,7 @@ def test_scene_adc_batches_validate_before_io_and_distinguish_ready_origin(tmp_p
     path.write_text(yaml.safe_dump(document))
     with pytest.raises(ValueError, match="origin"):
         load_scene(path, registry)
-    document["experiment"]["ready"] = {"endpoint": "main.uart1", "text": "READY"}
+    document["experiment"]["ready"] = [{"name": "main", "endpoint": "main.uart1", "text": "READY"}]
     path.write_text(yaml.safe_dump(document))
     configured = load_scene(path, registry)
     assert configured.experiment.inputs[0].payload == {"raw": 12345}
@@ -267,7 +296,7 @@ def _cli_experiment(tmp_path, monkeypatch, *, payload="OK", close_error=None):
     path = tmp_path / "cli-experiment.yaml"
     path.write_text(yaml.safe_dump({"schema": "sim/v1", "runtime": {
         "quantum": "10ns", "duration": "20ns"}, "nodes": {"port": {"kind": "producer"}},
-        "experiment": {"ready": {"endpoint": "port.uart", "text": "READY"},
+        "experiment": {"ready": [{"name": "main", "endpoint": "port.uart", "text": "READY"}],
             "inputs": [{"at": "3ns", "endpoint": "port.uart", "value": payload}],
             "assertions": [{"before": "10ns", "uart_contains": {
                 "endpoint": "port.uart", "text": "OK"}}]}}))
@@ -286,7 +315,7 @@ def test_cli_experiment_reports_real_ready_relative_assertions_after_cleanup(
     assert delivered == [(23, payload.encode())]
     assert result["result"]["origin_ns"] == 20 and result["result"]["end_ns"] == 40
     assert result["result"]["delivered_inputs"] == 1
-    ready = result["result"]["ready_receipt"]
+    ready = result["result"]["ready_receipts"]["main"]
     assert (ready["source_time_ns"], ready["mapped_time_ns"], ready["delivery_time_ns"]) == (720, 20, 20)
     assert result["result"]["status"] == (["pass"] if expected_code == 0 else ["fail"])
     assert f"{status}: time_ns=40" in capsys.readouterr().out
@@ -334,7 +363,7 @@ def test_teaching_scene_admits_qualified_key_inputs_without_native_acquisition(t
     scene = load_scene(path, registry)
     assert scene.duration_ns == 800_000_000 and scene.quantum_ns == 1_000_000
     assert scene.topology.nodes[0].options["uarts"] == ()
-    assert scene.experiment.ready is None
+    assert scene.experiment.ready == ()
     assert [(item.at_ns, str(item.endpoint), item.payload) for item in scene.experiment.inputs] == [
         (100_000_000, "main.key", True), (600_000_000, "main.key", False)]
     assert scene.experiment.assertions == ({"before": "500ms", "digital_equals": {

@@ -170,6 +170,9 @@ def test_can_assertion_observes_actual_fabric_delivery_and_ignores_future_queue(
 
 def test_machine_can_assertion_retains_native_epoch_after_network_send_event():
     class Machine(Peripheral):
+        def prepare_step(self, ctx):
+            pass
+
         def request_step(self, ctx):
             pass
 
@@ -268,7 +271,7 @@ def test_can_lower_bound_cannot_prove_strict_before_assertion():
     with pytest.raises(ValueError, match="upper bound"):
         consumer(Event(1, 0, "board", "can", "can-tx", CanFrame(0x123, timestamp_ns=901),
                        901, 1, 10, "lower_bound"))
-    assert consumer.evaluator.status == ("pending",) and consumer.matches == []
+    assert consumer.status == ("pending",) and consumer.matches == []
 
 
 def test_strict_uart_deadline_final_empty_cut_and_bounded_history_do_not_hide_failures():
@@ -341,7 +344,7 @@ def test_ready_fragments_set_relative_origin_and_exclude_the_whole_matching_cut(
     configured, registry, factory = scene(quantum=10, duration=20,
         options={"uart_observations": ((10, b"R"), (20, b"EADY startup"))})
     events = []
-    result = run_experiment(configured, registry, ready=ExperimentReady("board.uart", "READY"),
+    result = run_experiment(configured, registry, ready=(ExperimentReady("main", "board.uart", "READY"),),
         inputs=(ExperimentInput(0, "board.uart", b"same-cut"),
                 ExperimentInput(3, "board.uart", b"active")),
         assertions=(uart_assert("board.uart", "startup", "10ns"),
@@ -350,7 +353,7 @@ def test_ready_fragments_set_relative_origin_and_exclude_the_whole_matching_cut(
     assert result.origin_ns == 20 and result.end_ns == 40
     assert result.status == ("fail", "fail", "pass") and result.delivered_inputs == 2
     assert factory.created[0].calls == [(20, "uart", b"same-cut"), (23, "uart", b"active")]
-    receipt = result.ready_receipt
+    receipt = result.ready_receipts["main"]
     original = next(event for event in events if event.sequence == receipt.event_sequence)
     assert original.payload == b"EADY startup" and original.session_id == 1
     assert (receipt.source_time_ns, receipt.mapped_time_ns, receipt.delivery_time_ns,
@@ -364,10 +367,10 @@ def test_ready_fragments_set_relative_origin_and_exclude_the_whole_matching_cut(
 def test_ready_at_zero_defers_enqueue_until_start_completes():
     configured, registry, factory = scene(duration=10,
         options={"uart_observations": ((0, b"READY"),)})
-    result = run_experiment(configured, registry, ready=ExperimentReady("board.uart", b"READY"),
+    result = run_experiment(configured, registry, ready=(ExperimentReady("main", "board.uart", b"READY"),),
         inputs=(ExperimentInput(0, "board.level", 1),),
         assertions=({"before": "10ns", "digital_equals": {"endpoint": "board.gpio.B0", "value": 1}},))
-    assert result.origin_ns == 0 and result.ready_receipt.mapped_time_ns == 0
+    assert result.origin_ns == 0 and result.ready_receipts["main"].mapped_time_ns == 0
     assert factory.created[0].calls == [(0, "level", 1)]
     # The initial matching cut is excluded; a later completed sample is needed.
     assert result.status == ("fail",) and result.delivered_inputs == 1
@@ -395,7 +398,7 @@ def test_ready_zero_offset_input_reaches_input_commit_before_target_commit():
     configured = Scene(Topology((NodeSpec("board", "fixture", {
         "uart_observations": ((10, b"READY"),)}),)), quantum_ns=10, duration_ns=10)
     result = run_experiment(configured, {"fixture": factory},
-        ready=ExperimentReady("board.uart", "READY"), inputs=(ExperimentInput(0, "board.level", 1),))
+        ready=(ExperimentReady("main", "board.uart", "READY"),), inputs=(ExperimentInput(0, "board.level", 1),))
     assert result.passed and result.origin_ns == 10 and result.end_ns == 20
     assert factory.created[0].calls == [(10, "level", 1)]
     assert (10, 1) in factory.created[0].commits
@@ -406,16 +409,16 @@ def test_ready_wrong_endpoint_never_joins_fragments_and_tail_stays_bounded():
     from sim.apps.experiment import _Consumer
 
     consumer = _Consumer((), 10, {}, {"board.uart": "uart", "peer.uart": "uart"},
-                         ready=ExperimentReady("board.uart", "READY"))
+                         ready=(ExperimentReady("main", "board.uart", "READY"),))
     def observe(index, node, data):
         consumer(Event(1, index, node, "uart", "uart", data, 700 + index,
                        index, index, "upper_bound"))
     observe(0, "board", b"x" * 4096 + b"RE")
-    assert len(consumer._ready_tail) == 4
+    assert len(consumer._ready_tails["main"]) == 4
     observe(1, "peer", b"ADY")
     assert consumer.origin_ns is None
     observe(2, "board", b"ADY")
-    assert consumer.origin_ns == 2 and consumer._ready_tail == b""
+    assert consumer.origin_ns == 2 and consumer._ready_tails["main"] == b""
 
 
 def test_ready_rejects_lower_bound_and_acceptance_notifications():
@@ -423,12 +426,12 @@ def test_ready_rejects_lower_bound_and_acceptance_notifications():
     from sim.apps.experiment import _Consumer
 
     consumer = _Consumer((), 10, {}, {"board.uart": "uart"},
-                         ready=ExperimentReady("board.uart", "READY"))
+                         ready=(ExperimentReady("main", "board.uart", "READY"),))
     consumer(Event(1, 0, "board", "uart", "input.delivered", b"READY", 0, 0, 0, "exact"))
     assert consumer.origin_ns is None
     with pytest.raises(ValueError, match="upper bound"):
         consumer(Event(1, 1, "board", "uart", "uart", b"READY", 700, 0, 0, "lower_bound"))
-    assert consumer.origin_ns is None and consumer.ready_receipt is None
+    assert consumer.origin_ns is None and consumer.ready_receipts == {}
 
 
 def test_ready_and_acquisition_share_startup_deadline_and_keep_total_deadline(monkeypatch):
@@ -457,7 +460,7 @@ def test_ready_and_acquisition_share_startup_deadline_and_keep_total_deadline(mo
     factory = ClockFactory()
     configured = Scene(Topology((NodeSpec("board", "fixture", {
         "uart_observations": ((10, b"READY"),)}),)), quantum_ns=10, duration_ns=10)
-    result = run_experiment(configured, {"fixture": factory}, ready=ExperimentReady("board.uart", "READY"),
+    result = run_experiment(configured, {"fixture": factory}, ready=(ExperimentReady("main", "board.uart", "READY"),),
                             startup_timeout_s=.012, host_timeout_s=.02)
     assert result.origin_ns == 10 and deadlines == [100.012, 100.012, 100.02]
     assert factory.closed == factory.created
@@ -466,7 +469,7 @@ def test_ready_and_acquisition_share_startup_deadline_and_keep_total_deadline(mo
     factory = ClockFactory()
     absent = Scene(Topology((NodeSpec("board", "fixture"),)), quantum_ns=10, duration_ns=10)
     with pytest.raises(TimeoutError, match="deadline"):
-        run_experiment(absent, {"fixture": factory}, ready=ExperimentReady("board.uart", "NEVER"),
+        run_experiment(absent, {"fixture": factory}, ready=(ExperimentReady("main", "board.uart", "NEVER"),),
                        startup_timeout_s=.01, host_timeout_s=1)
     assert factory.closed == factory.created
 
@@ -480,7 +483,7 @@ def test_declared_experiment_runs_canonical_values_and_rejects_python_override()
         run_experiment(declared, registry, inputs=(ExperimentInput(1, "board.level", 1),))
     assert factory.created == []
     result = run_experiment(declared, registry)
-    assert result.passed and result.origin_ns == 0 and result.ready_receipt is None
+    assert result.passed and result.origin_ns == 0 and result.ready_receipts == {}
     assert factory.created[0].calls == [(3, "uart", b"OK")]
 
 
@@ -498,11 +501,12 @@ def test_optional_factory_batch_admission_is_pure_and_rechecks_actual_origin():
     configured, _, _ = scene(options={"uart_observations": ((10, b"READY"),)})
     factory = BatchFactory()
     inputs = (ExperimentInput(2, "board.level", 1), ExperimentInput(0, "board.uart", b"OK"))
-    result = run_experiment(configured, {"fixture": factory}, ready=ExperimentReady("board.uart", "READY"),
+    result = run_experiment(configured, {"fixture": factory}, ready=(ExperimentReady("main", "board.uart", "READY"),),
                             inputs=inputs)
     assert result.origin_ns == 10
-    assert [origin for origin, _ in factory.batches] == [None, 10]
+    assert [origin for origin, _ in factory.batches] == [None, 0]
     assert factory.batches[0][1] == ((2, "level", 1), (0, "uart", b"OK"))
+    assert factory.batches[1][1] == ((12, "level", 1), (10, "uart", b"OK"))
     factory = BatchFactory()
     with pytest.raises(ValueError, match="duplicate cut"):
         run_experiment(configured, {"fixture": factory}, inputs=(inputs[0], inputs[0]))
@@ -533,3 +537,96 @@ def test_yaml_host_can_input_uses_real_shared_bus_and_matches_delivery(tmp_path)
     received = next(event for event in events if event.kind == "can-host.received")
     assert received.source_node == "peer"
     assert received.payload["frame"] == CanFrame(0x321, dlc=2, data=b"\0\xff", timestamp_ns=5)
+
+
+def test_named_markers_unlock_individually_and_all_ready_keeps_session_assertions():
+    factory = PeripheralFactory()
+    configured = Scene(Topology((
+        NodeSpec("west", "fixture", {"uart_observations": ((10, b"WEST startup"),)}),
+        NodeSpec("east", "fixture", {"uart_observations": ((20, b"EAST"),)}),
+    )), quantum_ns=10, duration_ns=20)
+    markers = (ExperimentReady("west_ready", "west.uart", "WEST"),
+               ExperimentReady("east_ready", "east.uart", "EAST"))
+    result = run_experiment(configured, {"fixture": factory}, ready=markers,
+        inputs=(ExperimentInput(0, "west.uart", b"marker", "marker:west_ready"),
+                ExperimentInput(10, "west.uart", b"session", "session"),
+                ExperimentInput(0, "east.uart", b"all-ready"),
+                ExperimentInput(1, "east.uart", b"active")),
+        assertions=({"origin": "session", **uart_assert("west.uart", "startup", "15ns")},
+                    uart_assert("west.uart", "startup", "15ns"),
+                    uart_assert("east.uart", "all-ready", "15ns"),
+                    uart_assert("east.uart", "active", "15ns")))
+    assert (result.origin_ns, result.end_ns, result.status) == (20, 40, ("pass", "fail", "fail", "pass"))
+    assert list(result.ready_receipts) == ["west_ready", "east_ready"]
+    assert [item.delivery_time_ns for item in result.ready_receipts.values()] == [10, 20]
+    assert factory.created[0].calls == [(10, "uart", b"session"), (10, "uart", b"marker")]
+    assert factory.created[1].calls == [(20, "uart", b"all-ready"), (21, "uart", b"active")]
+
+
+def test_marker_input_can_make_peer_ready_before_any_additional_cpu_interval():
+    configured, registry, factory = scene(("west", "east"), quantum=10, duration=5,
+                                        options={"uart_observations": ((3, b"WEST"),)})
+    result = run_experiment(configured, registry,
+        ready=(ExperimentReady("west", "west.uart", "WEST"),
+               ExperimentReady("east", "east.uart", "EAST")),
+        inputs=(ExperimentInput(3, "west.level", 1, "session"),
+                ExperimentInput(0, "east.uart", b"EAST", "marker:west")))
+    assert result.origin_ns == 3 and result.end_ns == 8
+    assert result.ready_receipts["west"].delivery_time_ns == result.ready_receipts["east"].delivery_time_ns == 3
+    assert factory.created[1].calls == [(3, "uart", b"EAST")]
+
+
+def test_session_input_at_zero_unlocks_ready_without_overshooting_short_active_duration():
+    configured, registry, factory = scene(quantum=10, duration=3)
+    result = run_experiment(configured, registry,
+        ready=(ExperimentReady("boot", "board.uart", "READY"),),
+        inputs=(ExperimentInput(0, "board.uart", b"READY", "session"),
+                ExperimentInput(1, "board.uart", b"active")),
+        assertions=({"origin": "session", **uart_assert("board.uart", "READY", "3ns")},))
+    assert (result.origin_ns, result.end_ns, result.status) == (0, 3, ("pass",))
+    assert factory.created[0].calls == [(0, "uart", b"READY"), (1, "uart", b"active")]
+
+
+def test_same_event_unlocks_named_groups_in_input_declaration_order():
+    configured, registry, factory = scene(quantum=10, duration=5,
+        options={"uart_observations": ((0, b"AB"),)})
+    result = run_experiment(configured, registry,
+        ready=(ExperimentReady("a", "board.uart", "A"), ExperimentReady("b", "board.uart", "B")),
+        inputs=(ExperimentInput(0, "board.uart", b"b", "marker:b"),
+                ExperimentInput(0, "board.uart", b"a", "marker:a")))
+    assert result.passed and factory.created[0].calls == [(0, "uart", b"b"), (0, "uart", b"a")]
+
+
+@pytest.mark.parametrize("ready,inputs,assertions", [
+    (None, (), ()),
+    (ExperimentReady("a", "board.uart", "A"), (), ()),
+    ((ExperimentReady("a", "board.uart", "A"),) * 2, (), ()),
+    (tuple(ExperimentReady(f"m{index}", "board.uart", "A") for index in range(65)), (), ()),
+    ((), (ExperimentInput(0, "board.uart", b"x", "marker:absent"),), ()),
+    ((), (), ({"origin": "marker:a", **uart_assert("board.uart")},)),
+])
+def test_new_readiness_and_timeline_admission_has_no_resource_effects(ready, inputs, assertions):
+    configured, registry, factory = scene()
+    with pytest.raises((TypeError, ValueError)):
+        run_experiment(configured, registry, ready=ready, inputs=inputs, assertions=assertions)
+    assert factory.created == factory.closed == []
+
+
+def test_source_cut_callback_uses_runtime_input_queue_before_commit_and_errors_cleanup():
+    configured, registry, factory = scene(quantum=5, duration=10)
+    cuts = []
+    def inject(cut, simulation):
+        cuts.append(cut)
+        if cut == 5:
+            simulation.schedule_input("board.uart", b"ACK", at_ns=cut)
+    result = run_experiment(configured, registry, on_cut=inject,
+                            assertions=(uart_assert("board.uart", "ACK", "10ns"),))
+    assert result.status == ("pass",) and cuts == [0, 5, 10]
+    assert factory.created[0].calls == [(5, "uart", b"ACK")]
+    failure = RuntimeError("source cut observer failed")
+    def bad(cut, simulation):
+        if cut == 5:
+            raise failure
+    with pytest.raises(RuntimeError) as caught:
+        run_experiment(configured, registry, on_cut=bad)
+    assert caught.value is failure and factory.closed == factory.created

@@ -96,6 +96,7 @@ class QemuMachine:
         self._origin_ns = None
         self._last_time_ns = ctx.session.t_sim_ns
         self._pending = None
+        self._prepared = None
         self._closed = False
         # A profile owns partial construction until it returns an adapter.
         # Once returned, this backend admits and closes that object on failure.
@@ -266,18 +267,26 @@ class QemuMachine:
                                               if self._factory.qmp_path else None),
                         'native_origin_ns': self._origin_ns})
 
-    def request_step(self, step):
+    def prepare_step(self, step):
         self.check()
-        if self._owner is None or self._pending is not None:
+        if self._owner is None or self._pending is not None or self._prepared is not None:
             raise RuntimeError('QEMU machine is not ready for a target request')
         if (step.session_id != self._ctx.session.session_id or
                 step.t_sim_ns - step.dt_ns != self._last_time_ns):
             raise ValueError('QEMU step does not continue the current session')
         self.validate_cut()
+        self.to_native(step.t_sim_ns)
+        self._prepared = step
+
+    def request_step(self, step):
+        self.check()
+        if step is not self._prepared or self._pending is not None:
+            raise ValueError('QEMU request requires the original prepared step')
         target = self.to_native(step.t_sim_ns)
         self._adapter.service(self._last_time_ns)
         self.command('x-run-to-virtual-time', {'target-ns': target})
         self._pending = step
+        self._prepared = None
 
     def finish_step(self, step):
         self.check()

@@ -7,9 +7,8 @@ delivery time. UART timestamps are caller-supplied polling samples, not byte
 times or proven upper bounds. A consumer needing a deadline bound must query
 QEMU virtual time after the read and retain that observation bound separately.
 
-The ``tools.dm_mc02_sim_worker`` import is a temporary migration boundary to
-the canonical v1 ADC codec, timestamp mapper and stream wrappers. This adapter
-does not instantiate a worker, physics backend or its runtime state machine.
+The canonical transport modules own the v1 ADC codec, timestamp mapping and
+stream framing. This adapter does not instantiate a worker or physics backend.
 All transports and sockets remain owned by the caller.
 """
 
@@ -22,8 +21,9 @@ from sim.fabric import CanBus, CanFrame
 from sim.fabric.can import CanDelivery, check_can_time
 from sim.machines.qemu.endpoints import QemuCanEndpoint
 from sim.transports import FixedRecordStream, LengthPrefixedStream, StreamTransport
-from tools.dm_mc02_sim_worker import (
-    ADC_VOLTAGE_MAX_UV, CAN_WIRE_SIZE, HEADER, MAX_PAYLOAD, RESET,
+from sim.transports.can_codec import WIRE_SIZE as CAN_WIRE_SIZE
+from sim.transports.cosim import (
+    ADC_VOLTAGE_MAX_UV, HEADER, MAX_PAYLOAD, RESET,
     QemuTimestampMapper, adc_input_frame, adc_voltage_frame, protocol_frame,
 )
 

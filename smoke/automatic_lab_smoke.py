@@ -134,7 +134,7 @@ def verify_combined(events, result):
 def verify_board(events, result):
     uart, _bounds = uart_observations(events)
     if (not result.passed or len(result.status) != 8 or result.delivered_inputs != 7
-            or result.origin_ns <= 0 or result.ready_receipt is None):
+            or result.origin_ns <= 0 or not result.ready_receipts):
         raise AssertionError("complete seven-input/eight-assertion board experiment is required")
     for line in (b"LAB_READY\n", b"UART=q\n", b"KEY=0\n", b"ADC=32768\n", b"ADC=12345\n"):
         if line not in uart:
