@@ -1,40 +1,57 @@
 # DM-MC02 QEMU 使用手册
 
-本手册说明如何获取、构建、运行和验证项目，以及排查常见环境问题。命令均从仓库根目录执行；可使用下面的 HAL 教学工程，或提供自己的固件 ELF。
+项目以真实 MCU ELF 为输入，用一个 `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
+当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
+Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。完整原生运行以
+Linux x86_64 为交付环境；其它宿主的原生构建尚未验证。
 
-<a id="simulation"></a>
-## Simulation：通用场景入口
+命令默认从仓库根目录执行。按需要阅读：
 
-新入口是可安装的 `sim` 命令和 `sim.runtime.Simulation`。Python 3.11+ 的基础安装只依赖
-锁定的 PyYAML；`pip install -e .`、`sim --help`、`sim validate` 不加载原生 QMP 或物理引擎。
-MuJoCo、Trace、Referee 分别使用 `mujoco`、`trace`、`referee` extra。
-Linux 是当前原生运行平台。
+- [安装](#installation)与[原生构建](#build)
+- [sim/v1 场景与唯一运行时](#simulation)
+- [互连与精度](#connections)
+- [有限实验、时间线与离线复核](#experiments)
+- [四轮与多板应用预设](#application-presets)
+- [HAL 教学](#hal-teaching)与[保留的交互 Lab](#virtual-lab)
+- [原生调试与接口](#native-debug)、[外部 worker](#external-simulation-worker)
+- [验证与性能](#testing-and-performance)、[故障排查](#troubleshooting)
 
-`QemuFactory(profile=...)` 显式注入板级描述、输入/连接准入和外设 adapter。
-QEMU Backend 独占进程、QMP、socket、虚拟时间请求/完成与清理；adapter 借用这些资源，
-提供 launch 参数、外设连接、完成态观测和输入转换，不能推进 CPU。
-默认 `DmMc02Profile` 包含板级串口槽位、引脚极性、CAN QOM 与 BMI088 STEP 约定。
-测试中的 Fake Profile 复用同一后端合同，但不代表第二颗 MCU 已获支持。
+<a id="installation"></a>
+
+## 安装
 
 ```bash
+git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+cd qemu-dm-mc02
 python3 -m venv .venv
 . .venv/bin/activate
 python -m pip install -e .
-cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
-cmake --build examples/minimal-board/build
-sim validate examples/minimal-board/scene.yaml
-sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
+sim --help
+sim validate examples/can-faults/host-only.yaml
+sim run examples/can-faults/host-only.yaml --report build/host-only.json
 ```
 
-先按[构建](#build)得到当前子模块的项目 QEMU。默认使用 `build/qemu/qemu-system-arm`，
-也可设置 `QEMU_SYSTEM_ARM` 或传 `--qemu`。原生后端要求 `x-run-to-virtual-time`、
-`x-query-virtual-execution` 和当前 CAN execution QOM 接口；旧二进制会明确报错。
-原生执行使用安装的固定 QEMU Python wheel；基础包不会安装它。
-给出 `--qemu /path/to/qemu-system-arm` 后可在 checkout 外运行，无需 `--backend-root`。
-后者仅用于查找默认二进制，不再从源码目录加载 QMP client。
-配置校验只检查资源和拓扑，不能证明 ELF 能运行或后端二进制能力完备。
+这个三端点 CAN 实验没有固件或物理求解器，验证延迟、定向丢帧及恢复；不能作为原生后端证据。
+基础安装只依赖锁定的 PyYAML。可选依赖分别安装：
 
-从当前固定子模块构建完整上游 Python 包及其许可证：
+```bash
+python -m pip install '.[mujoco]'       # 原生 MuJoCo 世界
+python -m pip install '.[trace]'        # MCAP 记录与离线复核
+python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
+```
+
+开发测试使用 `uv sync --locked --group dev`；需要哪种可选后端，再添加对应 `--extra`。
+`sim --help`、`sim validate` 不加载 QMP client、物理求解器、MCAP 或裁判 CRC 库。
+
+### 原生后端与可安装 QMP client
+
+原生固件运行先[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
+默认二进制为 `build/qemu/qemu-system-arm`，也可使用 `QEMU_SYSTEM_ARM` 或 `sim run --qemu BIN`。
+普通系统 QEMU 没有本项目板卡和执行能力，不能替代。后端要求固定的 QMP client、
+`x-run-to-virtual-time`、`x-query-virtual-execution` 及 CAN execution QOM 能力；不满足会明确报错。
+静态校验不会启动它们，也不证明 ELF 或二进制可运行。
+
+从当前固定子模块构建完整的上游 Python distribution 与许可证：
 
 ```bash
 uv venv build/qmp-package-env --python 3.11
@@ -44,30 +61,119 @@ python tools/dm_mc02_qemu_bundle.py verify build/qemu-bundle
 uv pip install --python .venv/bin/python build/qemu-bundle/python/qemu-*.whl
 ```
 
-构建器要求 `uv`，输出目录必须不存在。client 来自子模块提交
-`263bfd8adf272be63177dafc6b5f1dd41e0a1389` 的完整 `qemu` Python distribution，
-包括现有有界 grouped-command 扩展；运行时检查版本和源码指纹，不复制私有 QMP 实现，
-也不接受任意同名 PyPI 包。升级原生 fork 时须同时更新固定来源并重跑协议与原生门。
-二进制仍须含本项目 DM-MC02 模型及所需能力，普通系统 QEMU 不能替代。
+输出目录必须不存在。运行时使用安装包的版本和源码指纹，不从 checkout 偷加载 QMP，
+不复制私有 client，也不接受任意同名 PyPI 包。显式给出兼容二进制后可在 checkout 外运行；
+`--backend-root` 只帮助寻找默认二进制。fork 升级须同步 client 来源并重跑原生合同。
 
-可选 `--qemu BIN --binary-provenance FILE` 把二进制装入 bundle；provenance JSON 要求
-`schema: dm-mc02/qemu-binary/1`、固定 `source_commit` 及实际 `sha256`。
-它记录调用者提供的构建来源并校验选定字节，不代替原生构建验收。
-bundle 清单保存命令、哈希和许可证；Linux 动态运行库需由部署环境提供。
+可用 `--qemu BIN --binary-provenance FILE` 把二进制装入 bundle；provenance 要求
+`schema: dm-mc02/qemu-binary/1`、固定 `source_commit` 和实际 `sha256`。
+bundle 保存调用者提供的来源、字节哈希、命令和许可证；动态运行库由部署环境提供，
+来源清单不代替原生验收。
 
-`examples/minimal-board` 是真实 Cortex-M7 裸机固件：SysTick、USART1 和 A15→B0。
-`examples/can-motor` 使用相同构建命令，将目录名替换即可；固件通过真实 FDCAN1
-发送一条 C620 电流命令，并读取 M3508 的 ACTIVE、超时后零电流反馈。
-这里的转子位置和速度固定为显式配置值，不计算力学。
-验收脚本还会注入按键，检查有序 UART/GPIO、CAN 来源、切点延迟、超时及资源清理：
+<a id="simulation"></a>
+
+## sim/v1 场景与唯一运行时
+
+先构建真实裸机 ELF，再运行同一场景：
 
 ```bash
-bash tools/run-simulation-smoke.sh --case all
-bash tools/run-simulation-smoke.sh --case dual-board
-python -m pytest -q tests/test_topology.py tests/test_simulation.py tests/test_qemu_machine.py tests/test_scene_cli.py
+cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build examples/minimal-board/build
+sim validate examples/minimal-board/scene.yaml
+sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
 ```
 
+`examples/minimal-board` 的 Cortex-M7 固件实际使用 SysTick、USART1 和 A15→B0。
+`examples/can-motor` 用同样构建方式，实际收发 FDCAN1/C620 数据。
+场景只有一套 `schema: sim/v1`：
 
+```yaml
+schema: sim/v1
+runtime: {mode: stepped, quantum: 1ms, duration: 200ms}
+nodes:
+  main:
+    kind: machine.qemu
+    model: dm-mc02
+    firmware: ./build/firmware.elf
+    uarts: [uart1]
+  can0: {kind: bus.can}
+  motor0:
+    kind: device.dji-m3508
+    motor_id: 1
+    plant: fixed-rotor
+    position_rad: 0
+    velocity_rad_s: 0
+links:
+  - [main.fdcan1, can0.can]
+  - [motor0.can, can0.can]
+```
+
+文件路径相对 YAML 目录。省略网络与设备可运行单板；核心不依赖机器人、比赛或教学应用。
+准入拒绝未知字段、重复 key、anchor/alias、不支持的 kind/model/端口、方向/能力不匹配和重复连接。
+文件最多 1 MiB、64 个节点、256 条连接；时间使用整数 `ns/us/ms/s`，配置时长最多 3600s。
+实验因增加一个无资源观察节点，最多接收 63 个用户节点。`validate` 不创建进程、socket 或求解器。
+
+Python API 与 CLI 共用 Factory admission 和执行路径：
+
+```python
+from sim.composition import builtin_registry
+from sim.config.scene import load_scene
+from sim.runtime import Simulation
+
+registry = builtin_registry()
+scene = load_scene("examples/minimal-board/scene.yaml", registry)
+with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
+                on_event=lambda event: print(event.kind, event.mapped_time_ns)) as simulation:
+    simulation.schedule_input("main.key", True, at_ns=40_000_000)
+    simulation.schedule_input("main.key", False, at_ns=90_000_000)
+    simulation.run_until(scene.duration_ns)
+```
+
+显式 Registry 注册 Factory；不自动发现或导入配置里的 Python 路径。
+`describe(spec)` 返回纯 `NodeDescription`/`PortSpec`，`create(spec, context)` 才取得资源。
+`context.attach(port, endpoint)` 借用连接 Owner 的协议句柄；设备不拥有总线、机器或其它节点。
+连接、binding owner、其它组件按组构建，组内保留声明顺序，循环资源依赖提前拒绝。
+`QemuFactory(profile=...)` 注入板级端口、输入规则和外设 adapter；Backend 独占进程、QMP、
+socket 和 CPU request/finish，Profile 不能推进 CPU。Fake Profile 只证明接口合同，不代表第二颗 MCU。
+
+### 时间、状态与失败合同
+
+一次非零区间从完成切点 `t` 开始：
+
+1. `settle(t)` 按入队顺序应用同刻输入，按 Owner 声明顺序派发到期工作；新到期工作继续受有限预算约束。
+   稳定后对 `input_commit` 组件提交当前输入批次。
+2. 下一切点为目标、`t + quantum`、已排定输入和 Owner 已知截止时间的最小值。
+   settle 后仍不晚于 `t` 的 deadline 是错误，不能回退或零步自旋。
+3. 先预检全部 Machine 的目标，再请求全部 Machine，完成全部 CPU，随后推进非 Machine 组件。
+4. 采样完成的源状态，交付目标切点输入与网络事件，提交输入批次，最后提交 Simulation 时间和 step ID。
+
+初始化只采样一次。plant 使用区间开始已生效的控制；本区间产生的 CAN/IMU/GPIO 最早在
+区间末交付，只能影响下一段 CPU/物理执行。已知输入可精确切分区间；GPIO 快照无法恢复
+采样点之间未记录的短脉冲。输入 transport 接受、原生 FIFO 处理和固件应用消费是不同证据。
+
+Event 保留 session、稳定序号、node/port、`source_time_ns`、`mapped_time_ns`、
+`delivery_time_ns` 和 `exact/sampled/lower_bound/upper_bound`。CAN 保留实际 wire 来源，
+UART 使用读取后的完成态上界；`can-input-processed` 仅表示原生 transport 处理已返回。
+默认历史只保留最近 256 个事件并公开丢弃数；完整记录使用回调或 trace。
+
+静态输入拒绝可修正；执行队列超限、I/O、组件或期限错误使当前 Simulation FAILED 并冻结，
+保留部分效果，不重步、重放或伪回滚。默认外部输入容量 256、全局派发预算 4096，Owner 各有有限预算。
+健康暂停态 `reset()` 重建 owned 组件并递增 session，host 总期限不重新计时；失败态应关闭并新建。
+`close()` 独立清理资源并保留主错误与辅助诊断；只有清理完成才发布成功。
+
+嵌入已有会话可传 `initial_session=Session(id, origin_ns)`。借用有限绝对 host deadline 时，
+`start` 和后续每次 `step/run_until/reset` 都须显式传 `deadline_monotonic`。
+同步第三方调用无法由 Python 抢占，组件必须遵守借用期限。
+
+`runtime.mode: interactive` 使用同一切点，支持 `run`、`pause`、`step 1ms`、`state`、
+`inject main.key true`、`inject main.uart1 "text"`、`reset`、`quit`。
+每轮至多一条命令与一个 step，输入按 4096 字节有界读取；`run` 只提供 host pacing。
+默认启动预算 10s、stepped 总预算 30s、interactive 总预算 300s；用 `--startup-timeout/--timeout` 调整。
+单机器可使用 `--gdb-port`、`--qmp`，手动 GDB resume/step 会破坏 Runtime 的切点前提。
+
+<a id="connections"></a>
+
+## 互连与精度
 
 ### UART 字节流与遥控器 RX
 
@@ -142,88 +248,6 @@ M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换�
 缺少原生依赖返回 `blocked`（退出码78），模型、绑定或运行错误
 返回 `failed`（退出码1）。示例参数未标定，不声明实时性能或 CPU/世界全局锁步。
 
-现有 Arena 的共享世界路径也由 Simulation 调度原生 CPU request/finish、CAN/plant
-和 referee；实际 participant 的资源所有权一次转交，借用连接仍由原调用方清理。
-reset、成员提前退出或清理错误使当前运行失败，不重步或发布成功。
-CAN worker 的跨 RESET 资源重建也已迁入 Simulation。有限自动 Lab 实验已迁入 Simulation；原生交互/Web/GDB 自由运行和独特的 Gazebo 应用能力
-仍保留原入口；这不代表旧执行路径已全部删除。
-
-### 有限实验与断言
-
-`sim.apps.experiment.run_experiment(scene, registry, inputs=..., assertions=...)`
-在同一个 Simulation 上运行单板、外设或多节点实验。`scene` 接受 `Scene` 或现有
-sim/v1 文件；输入使用 `ExperimentInput(at_ns, "node.port", payload)`，按原顺序交付同时间输入。
-断言复用现有 `before` + `uart_contains` / `digital_equals` / `can_seen` 格式，
-endpoint 使用完整节点端口名；不新增配置格式或执行器。
-
-```bash
-cmake -S examples/minimal-board -B build/experiment-firmware -DCMAKE_BUILD_TYPE=Debug
-cmake --build build/experiment-firmware
-python examples/experiment/main.py --qemu build/qemu/qemu-system-arm \
-  --firmware build/experiment-firmware/firmware.elf
-```
-
-示例用真实固件响应和 GPIO 观测验证按键输入。结果仅在资源清理完成后返回，
-包含各断言状态、失败说明以及匹配事件的 source/mapped/delivery 时间和质量。
-UART/CAN 入队通知不能满足断言；严格截止断言拒绝仅有时间下界的观察证据。
-UART 跨块匹配只保留必要后缀，网络交付仍不证明固件消费。
-每个实验最多63个用户节点、1024条输入和1024条断言；只支持有限 stepped 场景，
-未声明 ready 时，实验原点为 Simulation 的0；声明 `experiment.ready` 后，用实际 UART 观察
-的交付切点作为相对原点，输入及断言平移，Session/Event/native 时钟保持不变。包含 ready
-的整个切点属于启动观察，不参与断言。ready 与资源创建共用 startup host 期限，总期限
-不会重新计时。ADC1 输入已接入；VIN、原交互/Web 和旧应用的专用故障脚本仍由旧入口承载。
-
-<a id="experiment-recording"></a>
-### 实验记录与离线断言复核
-
-安装可选的 `trace` extra，即可把有限 stepped 场景记录为独立 MCAP 文件：
-
-```bash
-python -m pip install '.[trace]'
-sim run examples/can-faults/host-only.yaml --trace observations.mcap --report live.json
-sim replay observations.mcap --report offline.json
-sim replay observations.mcap --assertions assertions.yaml --report revised.json
-```
-
-记录包含原断言、ready 条件、时长和完整可观察端点能力，无需原场景、ELF、QEMU 或物理引擎
-即可离线复核。替换文件仅包含 `assertions` 列表，沿用现有 `before`、`uart_contains`、
-`can_seen`、`digital_equals` 格式，最多1024条；截止时间相对原 ready 原点，不能超过录制时长。
-可为原来没有断言的已记录端点增加断言，不能为未支持的端点制造观测能力。
-
-```yaml
-assertions:
-  - before: 4ns
-    can_seen: {endpoint: host.can, id: 0x321, data_hex: 'aa'}
-```
-
-在线和离线共用一个断言消费者。记录保留每个 Event 的序号、来源、source/mapped/delivery
-时间及 quality，也保留没有事件的切点：空切点会使断言永久到期，不能在离线时省略。
-追加顺序不按源时间重新排序。ready 跨块匹配和排除整个 ready 切点的规则保持一致。
-离线复核只重新评估已记录的观测，不运行固件、输入动作或物理演化，不提供执行重放。
-
-Python 使用 `run_experiment(..., trace=output)` 和
-`replay_experiment(source, assertions=None)`，二者返回相同的 `ExperimentResult`。
-输出是借用的 blocking binary stream；离线输入需提供 `read/seek/tell`、从字节0开始，
-调用期间保持内容不变。函数不关闭借用流。CLI 排他创建记录和报告，不覆盖已有文件。
-未声明 `experiment` 的场景按空断言录制，普通运行报告仍保持 `time_ns` 形状。
-录制沿用实验 runner 的63个用户节点上限；首版仅支持一个 session 的有限 stepped 场景，
-交互、reset 和多 session 尚不支持。
-
-底层沿用 MCAP1.5.0 和现有有界存储，不增加调度器或时钟。配置、端点和断言分条保存，
-配置 typed JSON 总量上限为8MiB，按32KiB分段；其它单记录 payload 上限仍为64KiB。
-值最多嵌套32层，整数最多256bit；事件时间仍须满足现有 uint64 纳秒合同。
-基本数据、bytes 和当前内建 CAN/IMU/JointState 使用显式
-类型编码；未知记录类型、非有限数值或超限数据会明确失败，不使用动态导入或 pickle。
-离线两遍完整校验记录、计数、结束信息、CRC/footer/EOF，并比较两遍文件 SHA256 后才返回；
-这不认证文件的作者或硬件真实性。
-
-执行与组件清理完成后才写结束信息，即使断言失败也会生成可复核的完整记录。运行、清理或
-写入失败时不发布 CLI 成功，保留诊断文件及主错误。晚期 flush/close 错误可能发生在完整字节
-已经写出之后；已产生的 I/O 不作回滚。缺少 trace extra 返回 blocked/78，断言或记录错误
-返回 failed/1，中断返回130。基础安装、`sim --help` 和 `sim validate` 不加载 MCAP。
-
-
-<a id="rotor-loop"></a>
 ### 单电机转子反馈闭环
 
 `device.dji-m3508` 的 `plant` 可显式选择 `fixed-rotor` 或 `rigid-rotor`；
@@ -253,186 +277,258 @@ UART 时间是观察上界；guest 消费证据还依赖实际读取分支和随
 当前模型采用半隐式 Euler 近似，反馈按完成的 step 合并；电流是命令值，未模拟电气动态或齿轮损耗。
 `--case all` 包含此门，结果只在资源清理和输入哈希核对后发布，不代表实物精度或全局 CPU/plant 锁步。
 
-场景只有 `schema: sim/v1` 一套格式。单板可省略总线、电机并使用 `links: []`：
+### CAN 故障实验
+
+`bus.can` 可以预声明故障策略，通过同一 Simulation 输入队列定时切换。下面的策略只阻断
+`host.can` 到 `main.fdcan1` 的 ID `0x321`，其他接收端和 CAN ID 继续交付：
 
 ```yaml
-schema: sim/v1
-runtime:
-  mode: stepped
-  quantum: 1ms
-  duration: 200ms
 nodes:
-  main:
-    kind: machine.qemu
-    model: dm-mc02
-    firmware: ./build/firmware.elf
-    uarts: [uart1]
   can0:
     kind: bus.can
-  motor0:
-    kind: device.dji-m3508
-    motor_id: 1
-    plant: fixed-rotor
-    position_rad: 0
-    velocity_rad_s: 0
-links:
-  - [main.fdcan1, can0.can]
-  - [motor0.can, can0.can]
+    fault_profiles:
+      delayed:
+        delay_ns: 7000000
+      receive_loss:
+        drop:
+          - {source: host.can, destination: main.fdcan1, can_id: 801}
+# 其余节点与 CAN links 按普通场景配置。
+experiment:
+  inputs:
+    - {at: 20ms, endpoint: can0.fault, value: receive_loss}
+    - {at: 50ms, endpoint: can0.fault, value: normal}
+    - {at: 60ms, endpoint: can0.fault, value: delayed}
+    - {at: 80ms, endpoint: can0.fault, value: normal}
 ```
 
-路径相对 YAML 所在目录解析；不会执行主机 shell 或自动加载主机程序。未知字段、重复 key、
-anchor/alias、未知 kind/model/port、协议/方向/能力不匹配及连接重复在创建资源前拒绝。
-同一总线的 M3508 ID 必须唯一。文件最多 1 MiB、节点最多 64、连接最多 256；
-时间为整数 `ns/us/ms/s`，场景时长最多 3600s。固件文件必须已存在。
-`bus.can` 可配置 `delay_ns`、`loopback`、`max_pending`、`dispatch_budget`；
-固定转子可配置 `command_timeout: 100ms`、`feedback_period: 1ms`、`temperature_c: 25`。
+每条总线最多声明 16 个策略，所有策略合计最多 64 条丢弃规则。策略名遵循节点名的 ASCII
+identifier 规则，`normal` 是保留的恢复名称。策略可省略 `delay_ns` 或 `drop`，分别使用
+总线初始延迟和空规则；每次切换都完整替换声明式策略。健康 Simulation reset 后也恢复初始状态。
+Python 中同样使用 `simulation.schedule_input("can0.fault", "receive_loss", at_ns=...)`。
 
-Python 使用同一个准入和执行路径；也可直接构建 `Topology`/`NodeSpec`/`LinkSpec`，
-使用显式 registry 注册自己的 factory：
+规则只接受 `source`、`destination` 和 `can_id`，至少指定一项；同一规则内取“且”，多条规则取“或”。
+端点必须实际连接在该总线上，未知或跨总线端点在静态校验时拒绝。`can_id` 精确比较数值 ID，
+不区分相同数值的标准帧和扩展帧，也不改写 flags、DLC 或数据。`fault` 是外部控制端口，不能接内部连线。
+原有 Python drop callback 继续逐目标执行一次，与声明式规则取“或”；`normal` 不撤销该 callback。
+
+时间语义沿用总线合同：延迟只影响切换之后入队的帧，已经排队的 due time 不变；后发帧可能先到。
+丢弃在 dispatch 时判断，所以切换也会影响尚未交付的旧 pending。相同时刻外部输入按声明/入队顺序执行，
+然后 dispatch；若 host 帧要使用新延迟，应先排策略输入再排发送输入。该切点之前 CPU 区间产生、
+已经入队的帧仍使用旧延迟，但可受新丢弃策略影响。恢复不补发已丢弃帧，不追溯影响已完成的 CPU。
+
+`can.fault.applied` 记录实际应用的策略与切点；`can.delivery` 保留逐目标 `dropped` 和原始帧、due、
+source/mapped/delivery 时间。`input.delivered` 或发送成功只证明输入处理，不能证明固件消费。
+当前 `can_seen` 不表达指定目标的一段静默期；故障验收检查逐目标交付记录和实际接收端响应。
+容量、callback 或 I/O 失败会冻结当前 Simulation，不重放已有副作用。
+
+无需原生依赖的三端点实例：
+
+```bash
+sim validate examples/can-faults/host-only.yaml
+sim run examples/can-faults/host-only.yaml --report build/can-fault-host.json
+```
+
+真实固件门使用 ARM GCC、CMake 和项目 QEMU，分别验证 Debug/Release 的实际 CAN 序号应答、
+心跳超时、恢复及不匹配 ID 的持续通信，不需要 MuJoCo：
+
+```bash
+bash tools/run-simulation-smoke.sh --case can-faults --build-type Debug --qemu /path/to/qemu-system-arm
+bash tools/run-simulation-smoke.sh --case can-faults --build-type Release --qemu /path/to/qemu-system-arm
+```
+
+这是主机通信交付层的确定性故障，未模拟电气仲裁、ACK 错误、错误计数器或 bus-off，也不证明物理校准、
+持续实时性能或 CPU/World 全局屏障。故障输入、裁判脚本和断言均通过同一个场景组合。
+
+<a id="experiments"></a>
+
+## 有限实验与观察
+
+`sim.apps.experiment.run_experiment` 使用同一个 Simulation 的输入队列、公开 Event 和纯断言 evaluator。
+单板、外设、多机器均可使用 `experiment`，输入与断言各最多 1024 项：
+
+```yaml
+experiment:
+  ready:
+    - {name: west, endpoint: west.uart1, text: "WEST_READY"}
+    - {name: east, endpoint: east.uart1, text: "EAST_READY"}
+  inputs:
+    - {at: 20ms, endpoint: west.key, value: true, origin: session}
+    - {at: 0ns, endpoint: referee.enable, value: true, origin: "marker:west"}
+    - {at: 50ms, endpoint: east.key, value: true}
+  assertions:
+    - before: 200ms
+      origin: session
+      uart_contains: {endpoint: west.uart1, text: "WEST_READY"}
+    - before: 100ms
+      digital_equals: {endpoint: east.gpio.B0, value: 1}
+```
+
+上例是接在已声明 west/east/referee 节点上的实验片段。ready 为最多 64 个具名 UART 标记，名称唯一；
+不声明时原点为 session 0。每个 `marker:<name>` 输入从自己的实际匹配交付切点起算，
+不等待其它板。全部标记达成的最后切点建立 ready 活动原点，`duration` 从此开始。
+输入 `origin` 为 `session`、`ready`（默认）或已声明的 `marker:<name>`；
+同刻 session 输入先入队，随后解锁的输入按原声明顺序进入同一队列，没有第二个时钟。
+
+断言 `origin` 只接受 `session` 或 `ready`（默认）。session 包含启动与匹配 ready 的整个切点；
+ready 断言排除整个最后匹配切点，只消费之后的观察。`before` 是严格截止时间，不能超过
+scene duration；不能借 ready 等待将 session 断言的截止时间延后。
+支持 `uart_contains`、`digital_equals`、`can_seen`，endpoint 始终使用完整节点端口名。
+UART 跨块匹配只保留必要后缀；仅下界质量不能证明严格截止。发送通知不能替代收到的帧或实际快照。
+
+`at=duration` 仅进行最后交付，没有额外响应窗口。ready 等待与资源创建共用 startup host 期限，
+总预算不重新计时。结果在清理后返回，包含断言状态、逐标记 `ready_receipts`、匹配 Event 的
+完整时间质量，以及各 Machine 的 native epoch、首末 source/mapped 时间和 snapshot 批次数。
+这些字段描述真实捕获，不把 CPU 暂停、传输交付或输入接受合并为固件消费保证。
+
+Python 可传 `ExperimentInput(at_ns, endpoint, payload, origin="ready")` 和
+`ready=(ExperimentReady(name, endpoint, text), ...)`；文件与 Python 值共用纯准入。
+`on_cut(cut_ns, simulation)` 借用源采样之后、目标交付之前的现有观察点，可向同一队列
+排定当前切点输入；不能重入 step/run/reset/close，也不能声称当前交付已完成。
+初始采样在 NEW 状态，不能从该回调注入。回调错误终止当前执行并清理。
+
+```bash
+python examples/experiment/main.py --qemu build/qemu/qemu-system-arm \
+  --firmware examples/minimal-board/build/firmware.elf
+```
+
+<a id="experiment-recording"></a>
+
+### 实验记录与离线断言复核
+
+```bash
+sim run examples/can-faults/host-only.yaml --trace observations.mcap --report live.json
+sim replay observations.mcap --report offline.json
+sim replay observations.mcap --assertions assertions.yaml --report revised.json
+```
+
+需要 `trace` extra。`sim/experiment/2` 记录原输入声明、命名 ready、断言时间线、时长、公开能力、
+每个 Event 原始 source/mapped/delivery/quality、空切点和 snapshot 批次；清理完成后写结束记录。
+无需 ELF、原场景、Factory、QEMU 或求解器即可复核。替换文件只有一个 `assertions` 列表，
+沿用相同 endpoint、origin、before 和断言语法，不能为未记录能力制造观察。
+
+在线与离线共用消费者，不按源时间重排。离线重新构建 ready receipts、每板 epoch 与 batch 汇总，
+并与结束记录核对；两遍完整校验 MCAP CRC/footer/EOF、计数和字节 SHA256 后才返回。
+离线只重新评估捕获观察，**不会重跑固件、输入或物理演化**，也不认证文件作者或硬件真实性。
+
+Python 使用借用的 binary stream：`run_experiment(..., trace=output)` 与
+`replay_experiment(source, assertions=None)` 返回同一 `ExperimentResult`。
+输入需 `read/seek/tell`、从字节 0 开始且调用期间不变；函数不关闭借用流。
+CLI 排他创建 trace/report，不覆盖已有文件。失败断言也可得到完整记录；执行、清理、
+写入或晚期 flush/close 错误均不发布成功，已发生 I/O 不回滚。
+
+MCAP 固定 1.5.0；typed 配置上限 8 MiB，按 32 KiB 分段，其它单记录上限 64 KiB；
+嵌套最多 32 层、整数最多 256bit，时间遵循 uint64 ns。bytes、CAN/IMU/JointState 显式编码，
+不使用 pickle 或动态导入。首版只支持单 session 的有限 stepped 实验，不支持 reset/interactive 录制。
+
+<a id="application-presets"></a>
+
+## 四轮与多板应用预设
+
+Robot/Arena/Scenario 的有限运行已经表达为普通 sim/v1 图；不再提供独立 schema1、专用 CLI 或运行时。
+`sim.apps.presets` 只构造数据，不取得资源或推进时间：
 
 ```python
-from sim.composition import builtin_registry
-from sim.config.scene import load_scene
-from sim.runtime import Simulation
+from pathlib import Path
+import yaml
+from sim.apps.presets import four_wheel_document, add_can_faults
 
-registry = builtin_registry()
-scene = load_scene("examples/minimal-board/scene.yaml", registry)
-with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
-                on_event=lambda event: print(event.kind, event.mapped_time_ns)) as simulation:
-    simulation.schedule_input("main.key", True, at_ns=40_000_000)
-    simulation.schedule_input("main.key", False, at_ns=90_000_000)
-    simulation.run_until(scene.duration_ns)
+scene = four_wheel_document(
+    {"west": Path("west.elf"), "east": Path("east.elf")},
+    Path("models/two_four_wheel.xml"),
+    ready={"west": "WEST_READY", "east": "EAST_READY"}, duration="1s",
+    assertions=[{"origin": "session", "before": "300ms",
+                 "uart_contains": {"endpoint": "west.uart1", "text": "WEST_READY"}}],
+)
+add_can_faults(scene, "west", delays=((0, 5_000_000), (250_000_000, 0)),
+               feedback=((300_000_000, 1, False), (400_000_000, 1, True)))
+Path("scene.yaml").write_text(yaml.safe_dump(scene, sort_keys=False))
 ```
 
-嵌入现有原生会话时，可显式传入 `initial_session=Session(id, origin_ns)`；
-首轮使用该会话，reset 重建资源、递增 ID，并回到配置的 origin（默认0）。
-`start(deadline_monotonic=...)` 可借用调用方的有限绝对 host 期限；此后每次
-`step`、`run_until`、`reset` 都必须显式提供自己的 `deadline_monotonic`。
-该模式替换默认启动/运行预算，过期即冻结；未选择该模式时仍使用原有总预算。
-期限不会推进仿真时间，失败也不会重试已经执行的步骤。
+将 ELF 和 ready 文本替换为实际固件值，再运行 `sim validate scene.yaml`、`sim run scene.yaml`。
+单板使用一个 firmware 与 `models/four_wheel.xml`。双板按调用者顺序映射 `alpha/`、`bravo/`，
+共享一个 MuJoCo Native Solver；各自四个 M3508、CAN 和 IMU link 独立，ID1..4 为 FL/FR/RL/RR。
+`add_can_faults` 生成 session 原点的 CAN 策略输入；反馈缺失只阻断指定电机到所属 MCU 的路由，
+不能模拟断电，恢复不补发丢弃帧。等时 delay 先于 feedback，输入顺序明确保留。
+添加其它驱动器使用 Adapter/Factory 和 joint plan，不修改 Simulation 或 MuJoCo 的厂商分支。
 
-factory 的 `describe(spec)` 纯校验并返回 `NodeDescription`/`PortSpec`，
-`create(spec, context)` 返回唯一 owned 实例；构造失败时 factory 负责未返回的部分资源。
-可选纯 `validate_topology(topology, descriptions, registry)` 在创建前校验组件间约束。
-所有实例提供 `close()`；按实际能力提供 `request_step/finish_step`（machine）、
-`step`（同步设备/plant）、`input`，以及可选 `reset(session)`、`start()`。
-机器的 request 全部发出后才逐一等待 finish。CAN endpoint 通过
-`context.attach(port, endpoint)` 借用连接所有者返回的协议句柄；CAN以`receive(frame)`接收、句柄发送；
-设备不拥有总线或 QEMU。新增 endpoint 无需修改调度器。
+多板原生验收使用统一的场景消费者；shell 负责编译真实 ELF、保留结果与清理，不拥有世界时钟：
 
-`runtime.mode: interactive` 与 stepped 使用相同切点。终端支持
-`run`、`pause`、`step 1ms`、`state`、`inject main.key true`、
-`inject main.uart1 "text"`、`reset`、`quit`。每轮至多一条命令和一个公共 step，
-读取最多 4096 字节，过长行丢到换行并报错。`run` 仅在 host 上按 quantum pacing，
-不保证实时；默认总 host 预算 stepped 30s、interactive 300s，启动 10s，
-可用 `--timeout`、`--startup-timeout` 修改。`--gdb-port 1234` 和
-`--qmp /tmp/sim-user-qmp.sock` 暴露单机器的原生接口，仍受同一 host 期限。
-手动 GDB 运行/暂停会影响切点前提；应通过 Runtime 的 run/step 推进，不能另开 CPU 时间 owner。
-
-一次非零区间从已完成的切点 `t` 开始，顺序固定：
-
-1. `settle(t)`：按入队顺序应用同时间外部输入，再按连接 Owner 的声明顺序派发到期工作；
-   回调新建的当前到期事件在同一有限预算内继续处理。交付稳定后调用声明 `input_commit`
-   的组件 `commit_inputs(t)`，统一提交已收齐的协议输入批次。
-2. 下一切点取目标、`t + quantum`、已排定输入与 Owner 已知传输截止时间的最小值；
-   settle 后仍报告不晚于 `t` 的截止时间属于错误，不能生成零步长或回退。
-3. 请求全部 Machine，然后逐个完成到该精确目标；随后推进非 Machine 执行组件。
-4. 采样全部已完成源状态，派发目标切点的输入/连接事件；交付稳定后提交输入批次，
-   最后提交 Simulation 时间和 step ID。提交回调只能排未来输入，试图重开当前/过去切点
-   将冻结仿真；后续普通 API 仍可在已完成切点投递未封闭的 UART/按键输入。
-
-Owner 分组先构造连接、再构造 binding owner、最后构造其他节点；每组内保留场景声明顺序。
-初始化完成后只采样一次。plant 使用区间开始时已生效的控制量；本区间生成的 CAN/IMU/GPIO
-最早在区间末切点交付，CAN 还需加链路延迟，因此只能影响下一段 CPU 或物理执行。
-已知的窄外部脉冲会分割区间；仅查询 GPIO 快照无法重建两个采样点间的未知脉冲，缩小 quantum
-也不能补出缺失的原生边沿来源。当前数字连接不提供同切点组合逻辑闭包。
-所有观测含 session、稳定 sequence、来源 node/port、原始 source time、映射时间、交付时间和
-`exact/sampled/lower_bound/upper_bound` 质量。CAN 保留 guest wire 时间；UART 取 read 后
-原生暂停快照作为观察上界。`can-input-processed` 只证明 native transport 处理，
-FIFO 接收和 guest 读取需各自证据。CLI 输出 UART 为 hex，`snapshot` 可由 Python 回调观察。
-默认只保留最近 256 个事件，丢弃数公开；回调可消费完整流并自行有界记录。
-
-非法类型、时间或未获准的外部输入在入队前拒绝；执行队列耗尽与运行错误进入 FAILED，
-保留部分效果，关闭后新建 Simulation，不隐式回滚/重试。全局派发预算默认 4096，
-外部待处理输入默认最多 256；Owner 还各自执行有限派发预算，回调不能无限自激。
-健康且暂停时 `reset()` 销毁并重建全部 owned 组件，session 递增，原 host 总预算不重启。
-`close()` 独立尝试所有资源；CLI 在清理成功后才报告 passed，报告路径拒绝覆盖。
-缺失可选后端返回 78，执行失败 1，中断 130。
-同步第三方调用本身无法由 Python 抢占，factory/组件必须遵守借用的期限。
-
-当前执行 CAN、采样数字 GPIO、完成态 SI IMU，以及 M3508 到共享 MuJoCo World 的关节绑定。
-UART 可作机器外部输入、观测或跨节点字节流连线；ADC1 可作显式外部输入，
-SPI/I2C/ADC 网络连接尚未接入统一运行时，
-不支持的连接在创建资源前拒绝。第二种真实 MCU 和跨板事件级锁步尚未实现；
-DM-MC02 是首个真实 profile，不能靠 YAML 声明额外板卡。
-`api/runtime/config/fabric` 不导入任何具体板卡、DJI 或物理后端。
-
-自动单板 Lab 使用 `sim run`。原生交互/Web、Robot/Arena/Scenario 的独特应用及
-Gazebo/Trace 路径仍有未迁移部分，相关入口使用 `tools/sim-unmigrated`。
-迁移时须保留各自底层和直接消费者回归，通过 factory/公开事件接入同一 Runtime，不能新增 scheduler。
-
-## 原生板级接口与既有应用
-
-板级状态可通过原生 QMP 读取，无需检查固件内存：
-
-```json
-{"execute":"qom-get","arguments":{"path":"/machine","property":"board-state"}}
+```bash
+PYTHON=.venv/bin/python bash tools/run-qemu-shared-world-smoke.sh
+PYTHON=.venv/bin/python bash tools/run-qemu-shared-world-smoke.sh --cli
+PYTHON=.venv/bin/python bash tools/run-qemu-shared-world-smoke.sh --can-deadlines
 ```
 
-返回 schema 1 对象：`timestamp_ns` 是 QEMU 虚拟时间，`gpio` 包含 A–H 的
-`moder`、`sampled`（与 IDR 相同）、`odr` 和 `output_mask`；`key` 给出 profile 引脚、
-active-low 按下状态和采样值，`led` 给出引脚、RGB、亮度和来源，`vin_mv` 给出配置电压。
-该属性只读，读取不会推进时间或消费外设状态。输入仍使用 `qom-set` 的 `user-key`
-布尔值或 `gpio-input` 字符串，例如 `A15=0`。
+`--peer-exit`、`--reset`、`--upper-exit`、`--interrupt` 分别检查失败冻结和独立清理。
+缺依赖的这个可选 shell gate 返回 77 并输出 BLOCKED；不能按退出 0 的通过结果统计。
+真实裁判与 DJI consumer 使用后文专用固件门，普通共享世界门不能替代其消费证据。
 
-LED 的 `ws2812-dma` 来源是既有 DMA 波形观察近似；`gpio-latch` 来源将 LED 引脚 ODR
-映射成白/黑，适合初期调试。它不表示实际引脚电气驱动，应结合 GPIO mode 和 output mask
-检查。AF/analog、电气波形和全局 CPU/plant 锁步仍未由这个接口验证。
+### 显式可信的上位机程序
 
-Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是现有
-`tools.dm_mc02_qmp.QmpSession`。`snapshot()` 校验原生对象；`digital("gpio.B0")`、
-`digital("key")` 读取采样值，`digital("led")` 判断 RGB 是否非零。`set_gpio("B0", 1)`、
-`set_key(True)`、`set_vin(24000)` 注入公开输入，`pause()`/`resume()`/`reset()` 使用
-原生 QMP。调用方负责 QMP 的期限和关闭；这些 API 不判断应用是否已启动。
+需要外部程序时，在同一场景中声明：
 
-`QmpSession.command_many(((name, arguments), ...))` 可在同一连接上查询 1–8 个
-互相独立的命令，按输入顺序返回结果元组；参数为 `dict` 或 `None`，整组须先通过
-JSON 序列化检查，并配置有限的正超时；组等待和取消清理分别使用该超时。
-它不是原子快照；错误按输入顺序选择首个异常，
-其余异常附入 notes。超时或中断会取消并等待本组请求清理，但已发送的命令仍可能执行。
-失败后应停止当前操作并关闭连接，不得重试整组或跨 I/O、CPU、world 边界复用结果。
+```yaml
+nodes:
+  upper:
+    kind: app.host-processes
+    commands:
+      observer: {command: [./observer, literal-argument]}
+```
 
-外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
-socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
+`sim validate` 只准入命令；运行必须显式 `sim run scene.yaml --allow-host-processes`。
+Python 同样需 `builtin_registry(allow_host_processes=True)`。配置可执行本机程序，
+此选择只用于可信场景；不可信 ELF/manifest 的隔离属于外部沙箱系统。
+argv 使用 `shell=False`，不展开 shell；工作目录是场景目录，程序在准入时解析为绝对路径。
+最多 8 个子进程、每个 128 个参数、每参数 4096 UTF-8 bytes、总计 16 KiB（含终止符）。
+Simulation 检查子进程和 host deadline；任何提前退出，包括退出码 0，均失败。
+stdout/stderr 有界采样尾部各最多 12000 bytes，持续输出可能背压。
+清理独立 TERM/KILL/reap 各组并关闭管道，失败不能发布成功。
+程序的绝对启动路径保留符号链接，确保虚拟环境的 Python 仍使用其自身依赖。
 
-`sim.boards.channels.LabChannels` 可借用既有 UART、CAN 和 co-sim 连接：UART 使用无帧
-`StreamTransport`，CAN 使用固定 84 字节 `CanStream` 与 CAN Fabric，ADC1 使用 v1
-`FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns)`
-每个连接只读一次有界数据；CAN 观察保留原始 QEMU 时间，UART 时间只是调用者的轮询样本。
-需要截止时间判断时，应在读取后再查询 QMP 虚拟时间作为观察上界。
-已有独立 UART TX owner 时可调用 `service(timestamp_ns, flush_uart=False)`，
-继续读取并报告 UART 字节，同时保留其发送队列和后缀；TX owner 负责发送与 flush。
-该参数必须为布尔值，默认仍服务 UART 发送；CAN 和 ADC 服务保持各自原语义。
+`bash tools/run-robot-smoke.sh` 验证实际 UART ready、上位机原生 QMP 和清理。
+该 busy-MMIO 裸机夹具在指令计数时钟下运行完整 2 秒，功能门使用 120 秒 Host 预算；
+迁移时原自由运行路径的 10 秒预算已超时，尚未恢复该性能水平。
+此结果与 DJI 固件保持不变的 20 秒验收门分别记录，不代表实时执行能力。
 
-ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(time)`，输入时间严格递增。
-收到 QEMU RESET 后必须重新显式 reset。逻辑 reset 保留物理流尾部，不提供 CAN/v1 历史输入隔离。
-可运行 `tools/run-lab-channels-smoke.sh` 验证真实固件 UART/CAN/ADC 与按键驱动 LED；
-该裸机测试夹具是数字模型消费者，不代表实板校准或完整 HAL 初始化。
+### 裁判 fixture
 
-自动实验使用下面的 `sim/v1` 场景；原 schema1 自动 Lab loader 和 `lab run` 已删除。
-配置复用锁定的 PyYAML 6.0.3：拒绝未知/重复字段、类型错误、anchor/alias及资源超限。
-文件最多1MiB，输入/断言各最多1024条，文本最多4096 UTF-8字节，配置时长最多3600秒。
-`at=duration` 只做最终交付，没有额外响应窗口。
+`device.referee` 使用 `net.uart` 接入机器 UART7；引擎只处理显式脚本，与物理碰撞无关。
+状态从 session reset 开始演化，`period` 默认 100ms（准入 1ms..60s），只有 `enable: true`
+输入后才发布完成态快照。配合 `origin: marker:<board>`，每板在自己的实际 ready 后启用，
+无需等待另一板。四组 payload 以一个 82-byte 批次排队，使用一个序号 Owner；
+`referee.batch.admitted` 仅证明字节队列准入，实际固件消费必须另取 UART/HAL/BSP 证据。
 
-Python 调用者可用 `sim.lab.parse_assertion(value, index)` 单独解析一个同格式的断言，
-返回冻结的 `Assertion`；`index` 为诊断使用的零基位置。解析不读取文件或导入板卡运行层。
-调用者负责列表配额、总时长以及实际可观测端点的准入；该函数不运行或裁决断言。
+节点 `initial` 要求 `game/robot/power_heat/buff` 四组全部字段，`durations` 显式给出
+`countdown_s/battle_s`；可选 `events` 使用 `{offset_ns, hit|shot|game|robot|power_heat|buff}`。
+事件以 reset 相对时间非递减排列，同刻保持顺序；最多 1024 项。typed 编码与状态引擎位于
+`sim.devices.referee`，固定 RoboMaster 2026 V1.1.0 的 0001/0201/0202/0204，使用同一 CRC 封装。
+当前 0206 固件结构不匹配而保持未支持，不填充字节掩盖差异；不支持官方各命令独立发送周期、
+自动命中裁决、增益叠加、过热扣血或功率惩罚。toy 世界与规则均不作实物标定声明。
 
-`LabExperiment` 只消费实际数字快照、UART 字节与 CAN 帧；`before` 为严格截止时间。
-UART 判断用读取后 QMP 上界，CAN 用原始 wire 时间，数字用快照时间；观测较晚可能保守失败，
-失败后不会被迟到数据改成通过。串口匹配只保留最小尾部，不缓存完整运行记录。
+引擎热量算法窄移植自固定 [rm_control](https://github.com/rm-controls/rm_control/blob/c5205eb193a8cda6147efe760eafedd0a3ed0104/rm_common/include/rm_common/decision/heat_limit.h)
+（BSD-3-Clause），阶段转换参考固定 [XDU referee mock](https://github.com/XDU-IRobot/rm_referee_ros2/blob/45da10a5317d47cc4b5d5968ec553946c43ebe0d/rm_referee_mock/rm_referee_mock/match_control_timing.py)
+（Apache-2.0）；来源和许可证随模块保留，配置时长不代表官方赛事常量。
+
+<a id="referee-protocol"></a>
+
+#### 纯裁判编码
+
+```python
+from sim.devices.referee import encode_frame, decode_frame, encode_message, GameStatus
+
+wire = encode_message(GameStatus(1, 4, 300, 0), sequence=7)
+assert decode_frame(wire).command_id == 0x0001
+wire = encode_frame(command_id=0x0201, payload=b"opaque", sequence=0)
+```
+
+完整帧最多 128 bytes，payload 最多 119；固定反射 CRC8(init FF)/CRC16(init FFFF,xor0)
+来自锁定的 MIT `crccheck 1.3.1`。opaque codec 不判断 command 支持、HP、ID、规则或时钟，
+不拥有 UART/sequence。typed 编码拒绝 bool、越界和未知字段；PowerHeat 保留 8 bytes 输出 0。
+Buff 按官方 8-byte packed struct 在 offset7 编码 remaining_energy；文档表格 offset6
+与结构/长度冲突，未静默借用其它版本。官方版本入口为 [RoboMaster 文档](https://bbs.robomaster.com/wiki/20204847/811363)。
 
 <a id="hal-teaching"></a>
+
 ## HAL 教学：按键控制 GPIO
 
 第一课使用独立的 C 工程，通过 ST HAL 读取 DM-MC02 的 A15 按键，并控制 B0 GPIO：
@@ -511,8 +607,8 @@ GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字�
 当前只交付第一课；UART、ADC、CAN 实验将沿用同一工程逐课增加。
 
 <a id="virtual-lab"></a>
-<a id="virtual-lab"></a>
-## Virtual Lab
+
+## 保留的交互 Lab
 
 有限自动实验使用同一 Simulation：
 
@@ -533,7 +629,8 @@ runtime: {duration: 250ms, quantum: 1ms}
 nodes:
   main: {kind: machine.qemu, firmware: build/student.elf, uarts: [uart1, uart2]}
 experiment:
-  ready: {endpoint: main.uart1, text: READY}
+  ready:
+    - {name: main, endpoint: main.uart1, text: READY}
   inputs:
     - {at: 100ms, endpoint: main.uart1, value: hello}
   assertions:
@@ -559,7 +656,7 @@ ADC2、ADC网络互连及精确GPIO边沿未支持。
 
 `--timeout` 默认30秒、`--startup-timeout` 默认10秒，均包含资源创建；ready不重启总预算。
 报告只在清理结束后创建，拒绝覆盖；状态为passed/failed/blocked，断言失败退出1、缺后端78。
-报告保留相对原点、ready receipt及匹配事件source/mapped/delivery/quality，不把ACK等同于应用消费。
+报告保留相对原点、具名ready receipts及匹配事件source/mapped/delivery/quality，不把ACK等同于应用消费。
 不提供CPU/plant全局锁步或实板校准保证。
 
 原生自由运行、手动GDB与交互仍使用已有连接owner：
@@ -599,890 +696,11 @@ quit
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
 
-<a id="robot-manifest"></a>
-## Robot manifest（尚未迁移）
 
-`sim robot run` 将一块 DM-MC02、FDCAN1、一条 CAN 总线、四个 M3508 与既有 MuJoCo
-四轮模型组合运行，可同时启动上位机程序。先在构建 QEMU 的环境中安装 MuJoCo extra：
 
-```bash
-uv sync --frozen --extra mujoco
-uv run --extra mujoco tools/sim-unmigrated robot run robot.yaml --duration 5 --report build/robot-result.json
-# 自动编译既有裸机测试固件，验证实际进程组合与失败清理：
-nix develop -c uv run --frozen --extra mujoco bash tools/run-robot-smoke.sh
-```
+<a id="environment"></a>
 
-例如将下面的 `robot.yaml` 放在仓库根目录，将固件路径改成自己的 ELF：
-
-```yaml
-schema: 1
-robot: {name: four-wheel}
-boards:
-  main: {type: qemu, board: dm-mc02, firmware: build/firmware.elf}
-buses:
-  drive: {type: can}
-links:
-  - {from: main.fdcan1, to: drive}
-devices:
-  fl: {type: dji-m3508, bus: drive, id: 1, joint: wheel_fl}
-  fr: {type: dji-m3508, bus: drive, id: 2, joint: wheel_fr}
-  rl: {type: dji-m3508, bus: drive, id: 3, joint: wheel_rl}
-  rr: {type: dji-m3508, bus: drive, id: 4, joint: wheel_rr}
-physics: {backend: mujoco, model: models/four_wheel.xml}
-```
-
-固件和模型路径相对 YAML 所在目录。schema 1 固定支持上述单板、单总线、单物理后端及
-ID 1–4 的 joint 对应关系；标签可改，接线和身份必须一致。未知字段、重复 key、错误类型、
-YAML anchor/alias 及资源超限都拒绝。模型的 joint/actuator/IMU binding 由 worker 在
-连接 co-sim、发送 RESET 前校验。模型尺寸、质量、摩擦和电机参数是未标定的 toy profile。
-
-固件若输出实际应用就绪标记，可增加以下字段：
-
-```yaml
-ready: {endpoint: main.uart1, text: "READY\n"}
-upper_computers:
-  observer: {command: [./observer, literal-argument]}
-```
-
-`ready` 支持 `uart1/2/3/5/7/10`，必须与实际固件相符；匹配后用该批字节读取后的 QMP
-虚拟时间上界作为 duration 起点。省略时报告 `not_waited`，起点是恢复前的 QEMU 快照，
-不验证应用 ready 或 plant 已推进。`--duration` 默认 5 个 QEMU 虚拟秒，范围为 1 ns–3600 s。
-
-上位机 `command` 是原样 argv，不展开 shell；程序在配置准入时解析为绝对可执行路径，
-工作目录固定为 YAML 所在目录，其余参数原样保留。最多 8 个上位机，每个最多 128 个参数、
-单参数 4096 UTF-8 字节、总计 16 KiB（含终止符及解析后的程序路径）。相对 PATH 项也按该
-工作目录查找。上位机可使用自身已有的标准接口；配置不自动提供 CAN、UART 或视觉订阅。
-
-worker 独占 co-sim 与 FDCAN1，运行既有 v2、1 kHz、realtime 四轮 profile；父进程只观察
-原生 QMP 和 ready UART。`--qemu` 覆盖二进制；`--startup-timeout` 默认 10 秒、
-`--timeout` 默认 30 秒，两者从启动 QEMU 前开始计入。startup 包含连接、子进程启动及
-实际 ready 等待；active host 期限包含 startup，但不包含各资源独立的有界清理。进程退出
-（包括上位机提前返回 0）、超时、中断及清理失败均非零，成功报告仅在清理结束后发布。
-报告保留每个子进程 stdout/stderr 的采样尾部，各最多 12000 字节；持续输出可能遇到 pipe 背压。
-
-`--qmp /tmp/robot-qmp.sock` 提供独立的原生 QMP monitor，路径须不存在、父目录须存在、
-总长度最多 100 字节；正常退出由 QEMU 清理该 socket，强制 KILL 后可能留下路径，重试前
-应核对并删除旧 socket。`--gdb-port 1234` 使用原生 GDB；Robot 自动恢复运行，没有
-`--paused` 模式。GDB 暂停仍受 worker ACK 与 host 期限约束。
-
-本入口验证进程组合与声明的运行边界。CPU、worker 和 plant epoch 各自独立，UART ready、
-ACK/DONE 和 realtime pacing 不建立全局时间屏障。实际四轮固件控制见下文 ChassisTest；
-持续四轮实时性能、实板标定、多板、DR16、裁判系统和赛场组合仍未由该入口支持。
-
-<a id="arena-配置准入"></a>
-## Arena 配置准入（尚未迁移）
-
-`sim.arena.manifest.load_manifest()` 可读取固定双底盘的 schema 1 配置，复用两个
-完整的 Robot 配置。将下面的 `arena.yaml` 放在仓库根目录：
-
-```yaml
-schema: 1
-arena: {name: two-four-wheel}
-world: {backend: mujoco, model: models/two_four_wheel.xml}
-robots:
-  west:
-    manifest: robots/bravo.yaml
-    prefix: bravo/
-    physics: shared-world
-  east:
-    manifest: robots/alpha.yaml
-    prefix: alpha/
-    physics: shared-world
-```
-
-两个子文件使用上文的 Robot schema，各自的 `physics.model` 必须解析到本仓库的
-`models/four_wheel.xml`；例如在 `robots/alpha.yaml` 中写 `../models/four_wheel.xml`。
-固件路径和上位机工作目录仍由子文件目录决定，argv 参数原样保留。ready 保留各自
-实际 UART 标记，省略时仍为 `None`。局部板、总线和电机标签可以相同；上位机合计最多 8 个，
-重复引用同一 Robot 文件也分别计数。
-
-```python
-from sim.arena.manifest import load_manifest
-
-arena = load_manifest("arena.yaml")
-for member in arena.robots:  # 固定按 alpha/、bravo/ 返回，保留 east/west 标签
-    print(member.name, member.prefix, member.robot.board.firmware)
-```
-
-当前只接受上述两个前缀、显式 `shared-world`、canonical 双底盘世界与原始四轮模型。
-指向 canonical 文件的符号链接可用，复制文件或自定义模型会被拒绝；路径一致仅选择
-固定 profile，模型 binding 仍由 native consumer 校验。准入返回不可变记录，只读取配置，
-不启动 QEMU、上位机或物理后端。已验证准入数据驱动同一个 MuJoCo 世界、两条独立
-CAN 总线和八个 M3508 的直接 consumer。
-
-可选 `referees` 先提供裁判配置准入，每个成员最多一份，键使用已有的成员名称：
-
-```yaml
-referees:
-  east:
-    uart: main.uart7
-    initial:
-      game: {game_type: 1, game_progress: 2, stage_remain_time: 1, sync_timestamp: 0}
-      robot: {robot_id: 3, robot_level: 2, current_hp: 100, maximum_hp: 200,
-              cooling_per_s: 3, heat_limit: 100, chassis_power_limit: 80, power_outputs: 5}
-      power_heat: {buffer_energy_j: 40, heat_17mm: 10, heat_42mm: 20}
-      buff: {recovery_percent: 5, cooling_per_s: 9, defence_percent: 7,
-             vulnerability_percent: 11, attack_percent: 13, remaining_energy: 254}
-    durations: {countdown_s: 3, battle_s: 300}
-    cooling_42mm_per_s: 2
-    events:
-      - {offset_ns: 500000000, hit: {damage_hp: 30}}
-```
-
-`uart` 必须精确对应该成员子配置的板名称和 `uart7`。初始四组和时长必须完整，
-数值沿用裁判公共类型的校验；`sync_timestamp` 明确填写，不从世界时间推导。
-`events` 默认空，每项包含 `offset_ns` 及 `hit`、`shot`、`game`、`robot`、
-`power_heat`、`buff` 中恰好一种完整数据；至多 1024 项，偏移非递减，同时间保持原顺序。
-`cooling_42mm_per_s` 默认零。返回的 `arena.referees` 是按成员顺序排列的不可变记录。
-准入不创建裁判引擎或 UART endpoint；运行时的 ready 条件与发布方式见下文。
-省略 `referees` 继续使用原运行路径。
-
-命令行运行同一配置：
-
-```bash
-uv run --frozen --extra mujoco python -m sim.apps.unmigrated_cli arena run arena.yaml \
-  --duration 1 --report build/test-results/arena.json
-```
-
-`tools/sim-unmigrated arena run` 使用相同入口。`--qemu`、`--startup-timeout` 和 `--timeout`
-分别选择 QEMU 和设置主机期限；默认值及参数可用 `arena run --help` 查看。
-UART 文本带成员名称，例如 `UART east.uart1 poll_sample_ns=... b'...'`，字节以
-转义形式显示。`poll_sample_ns` 属于该 QEMU 的采样时间；结果中的 `origin_ns`、
-`end_ns` 是共享世界时间。JSON 包含各板独立的 ready 状态和时间，省略 ready
-仍为 `not_waited`。运行、清理或报告写入失败返回非零；中断返回 130，并保留错误诊断。
-
-可通过 Python 运行这两个配置成员，共享一个世界 owner：
-
-```python
-from sim.arena.manifest import load_manifest
-from sim.arena.runtime import run_manifest
-
-result = run_manifest(load_manifest("arena.yaml"), duration=1.0)
-print(result.origin_ns, result.end_ns, result.boards)
-```
-
-使用上文的 MuJoCo extra 和已构建的 QEMU。`qemu` 可显式覆盖二进制。
-`startup_timeout` 默认 10 秒、`timeout` 默认 30 秒，从启动第一进程前计入；
-后续 QEMU、连接、上位机和 ready 等待使用同一期限。模型 binding 在进程启动前准入。
-运行层直接使用两组原生 QMP/co-sim/CAN/UART 连接和唯一 shared-world runtime，
-上位机保持各子配置的原样 argv、工作目录和独立进程组。
-Arena 默认以单线程 TCG、固定 `icount shift=0` 和 `-S` 启动两块板，并将 CPU
-执行交给 shared-world runtime。每步所有 CPU 到达映射目标且 CAN 输出排空后，
-世界才推进一次；反馈的原生输入处理回执完成后才允许下一步。运行期间须由此入口
-独占 CPU 控制、原始 CAN 连接及配置。
-
-`duration` 是所有声明的 UART ready 标记匹配之后的共享世界时间，范围 1 ns–3600 s；
-省略所有标记时从世界时间 0 开始。ready 等待期间继续提供世界输入，匹配后不再次 reset。
-每次世界推进 1 ms，最后一段使用精确余量。结果分别保留每块 QEMU 的 RESET 原点、
-ready 读取后时间上界和最后观察时间，不能将这些时间与共享世界 epoch 混用。
-运行器在完成一次 CPU/世界步进和输入轮询后直接进入下一轮，不按世界步长额外等待主机时间。
-每轮仍分别读取上位机各管道及 UART 的有界批次；外部进程输入落入哪个虚拟时间步取决于
-实际到达时刻，未提供主机调度公平性或输入延迟保证。
-`emit` 可接收带成员标签的 `ArenaEvent`，`on_response` 可观察实际 co-sim 响应；
-响应观察不构成完整 wire trace，也不保证每步样本消费。
-
-Python 入口还接受 `on_observation` 回调，每次成员轮询在原有 `emit` 和 ready
-处理后交付一个 `ArenaObservation(name, snapshot, events)`，没有事件时也交付。
-`snapshot` 是该次读取后取得的实际板卡快照，`events` 是同次串口读取返回的原列表；
-不额外查询 QMP。UART 事件的 `timestamp_ns` 保留读取前轮询样本，严格截止时间判断
-应使用 `snapshot["timestamp_ns"]` 作为读取后上界，时间属于该成员自身的 QEMU epoch。
-调用者须只读使用借用的字典和列表，不得在回调中重入 runtime；外层记录冻结并不冻结
-内部对象。回调异常会终止本次运行并沿用现有清理规则，不重放批次。
-
-这些批次包含原有已打开 UART 的字节和数字板卡快照。CAN 仍由 SharedWorld 独占，
-不通过此接口交付；接口也不增加 UART 端口、全局时间屏障、完整 trace 或 Scenario 断言。
-
-配置裁判时，对应子 Robot 必须声明实际应用 `ready` 标记；该标记应由固件在
-UART7 接收初始化后输出。每个成员匹配自己的标记后，发布裁判的最新完成状态，
-随后默认每 100 ms 共享逻辑时间发布一批四命令快照。Python 调用可用
-`referee_period_ns` 指定 1 ms–60 s 的整数周期；既有 world tick 将发布时刻向后
-量化至多 1 ms。这是快照发送策略，未实现官方各命令的独立周期。
-
-脚本仍从共同 RESET 原点计算，首次发布可能已包含 startup 期间的事件；ready
-不会重置世界或裁判。UART 观察只读，发送和后缀 flush 由 SharedWorld 独占。
-队列容量不足会终止本次 Arena 运行，保留原物理后缀；不会重步或丢弃旧快照。
-结果的 `referees` 是不可变的 `ArenaRefereeResult` 记录，包含成员、UART、
-`period_ns`、快照准入次数 `publications`、首末共享时间
-`first_logical_ns`/`last_logical_ns` 和下一个发送序号 `next_sequence`。
-这些记录不证明固件实际消费或 CPU 时间屏障。
-
-提前退出（包括退出码 0）、期限、RESET/EOF、QMP、transport、solver、输出或清理错误
-均使本次运行失败。成功只在独立清理世界、上位机、连接和两组 QEMU 后返回。
-native 准入及各资源的有界清理不计入 active host 期限，阻塞 native 调用仍需外层 timeout。
-该固定 profile 尚不提供独立 QMP/GDB 参数或 wall-clock pacing。CPU 目标完成
-不代表同刻 IRQ/器件事件全部闭合，CAN 输入处理也不代表固件消费。
-
-实际进程与数据交付的验证入口为：
-
-```bash
-uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena-runtime
-```
-
-追加 `--multi-cut` 可验收同一入口的内部切点：每个外层 1 ms 请求按
-400/400/200 μs 推进唯一 World，每段实际 STEP/ACK 和原生 CAN 完整观测须早于
-下一段 CPU 请求。报告保留原始 wire 和逐切点记录。CAN 反馈仍按 1 ms 相位生成，
-部分切点没有新 CAN 帧；此门不要求或声称每个 IMU 样本均由固件消费。
-该选项只用于普通 `--arena-runtime` smoke，不与退出注入或 `--arena-cli` 组合。
-
-该默认关闭的夹具生成两份 Robot 配置、一份 Arena 配置和专用 bare-MMIO 固件，
-唯一执行入口是上述 `run_manifest()`。两个固件各自在完成 CAN/SPI 读取及最终
-sensortime 写回后输出实际 UART ready；随后共享世界运行 50 ms。报告保留具名
-SI 样本、实际 float32 STEP、八路 CAN 反馈、DONE masks、原始 UART、独立 QEMU
-时间和进程清理结果，并验证上位机的原样 argv 与工作目录。raw 数据包含实际
-滤波历史；独立首样本量化验证仍由 `--two-chassis` 门完成。
-
-追加 `--reset`、`--peer-exit` 或 `--upper-exit` 可分别验证单板复位、单板退出和
-上位机退出。负例返回非零，保留 failed JSON、停止步进和资源回收证据；QMP
-断连可能先于进程退出检测，清理错误也保留在报告中。缺少 MuJoCo 或 ARM
-工具链时明确返回 SKIP 77。该夹具尚不证明 HAL/BSP 闭环或实物标定。
-
-命令行入口与 JSON 报告的原生验证使用同一夹具：
-
-```bash
-uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --arena-cli
-```
-
-它在既有 smoke 进程中执行标准 `sim` 模块入口，保留测试观察以核验单次 runtime
-调用、实际参数、输出与完整报告。该门属于带观察的模块运行。`--reset`、
-`--peer-exit` 和 `--upper-exit` 继续保留实际失败报告；`--interrupt` 发送 SIGTERM，
-要求返回 130，并验证世界、QEMU 与上位机已清理，关闭后的 owner 拒绝再次步进。
-
-## Referee protocol
-
-已有共享世界 owner 可以组合具名裁判引擎和 UART endpoint：
-
-```python
-from sim.robots.shared_world import RefereeBinding, SharedWorldRuntime
-from sim.devices.referee import ScriptEvent, Hit
-
-world = SharedWorldRuntime(plant, boards, referees=(
-    RefereeBinding("east", east_engine, east_uart_endpoint),
-    RefereeBinding("west", west_engine, west_uart_endpoint),
-))
-world.start(session, wire_sessions, deadline=deadline)
-world.queue_referee_events("east", (ScriptEvent(0, Hit(5)),),
-                           session_id=session.session_id)
-world.step(1_000_000, deadline=deadline)  # 由原有步进处理到期事件
-# 调用者先观察相应固件的实际 UART7 ready 事件，再发布：
-wire = world.publish_referee("east", deadline=deadline)
-world.service(deadline=deadline)  # 发送已排队的 suffix，不推进世界
-```
-
-`plant`、板绑定、引擎和 endpoint 由调用者预先创建；构造成功后，world 拥有 plant、
-引擎及 endpoint 的执行和清理，socket 与 byte transport 仍由调用者清理。
-所有引擎使用同一个 Session 和 StepContext，`world.step()` 推进它们；发布只消费
-已完成状态。启动及步进不会自动发布。启动保留 endpoint 当前序号及既有排队字节，
-不能用逻辑 reset 清除旧 UART 数据。
-
-`queue_referee_events(name, events, session_id=...)` 只向具名引擎交付动态事件，
-使用 host Session ID 和相对 reset 的偏移，沿用引擎的整批准入、顺序及 1024 项
-pending 限制。该调用不推进时间或发布 UART；名称、输入、session、顺序或容量
-拒绝均保留原状态，可以随后正常准入及 step。启动前、关闭后、执行失败后或
-活动回调中的调用会被拒绝。调用者负责事件来源和去重。
-
-配置消费者可调用 `sim.arena.manifest.parse_referee_events(value, label=...)`，
-将与 Arena `events` 相同的列表转换为不可变 `ScriptEvent` 元组。每项必须包含
-`offset_ns` 和一个 `hit`、`shot`、`game`、`robot`、`power_heat` 或 `buff` 值；
-最多 1024 项，偏移非递减，等时顺序保留。该函数只解析和校验，不读取文件或
-创建运行资源；成员及 session 由调用者校验。已有类型值可直接通过
-`sim.devices.referee.validate_referee_events(events)` 校验，类型、范围和顺序规则
-与引擎一致。
-
-`sim.config.yaml.parse_time(value, label, zero=True)` 供配置消费者复用 Lab 的时间语法：
-整数 `ns/us/ms/s` 字符串，最多 13 位十进制数字，结果不超过 3600 秒。
-`zero=False` 拒绝零值；不接受浮点、负数或其它单位，不推进任何时钟。
-
-Scenario 的首版文件准入接口为 `sim.scenario.load_manifest(path)`：
-
-```yaml
-schema: 1
-arena: arena.yaml
-duration: 1s
-referee_events:
-  east:
-    - at: 100ms
-      hit: {damage_hp: 10}
-  west:
-    - at: 100ms
-      shot: {heat_17mm: 5, heat_42mm: 7}
-```
-
-`arena` 相对 Scenario 文件解析，目标必须是该 Arena 中已配置 referee 的成员。
-`referee_events` 可省略；事件复用上面的六种 typed 值，合计最多 1024 项。
-每个成员的 `at` 必须非递减且不超过 `duration`，等时顺序保留。完整文件校验后
-返回不可变记录，可将各 `record.events` 交给共享世界的 `queue_referee_events`。
-
-Scenario 也可声明 CAN 延迟动作，无需配置 referee：
-
-```yaml
-schema: 1
-arena: arena.yaml
-duration: 1s
-events:
-  - at: 500us
-    action: can_delay
-    target: east.chassis_can
-    value: 5ms
-  - at: 1s
-    action: can_delay
-    target: east.chassis_can
-    value: 0ns
-```
-
-每项必须且只能包含 `at/action/target/value`；本例使用 `can_delay`。
-`target` 精确匹配 Arena 成员名与其 Robot 配置中的总线名，格式为 `成员.总线`；
-不接受未限定的总线名、板卡 FDCAN endpoint 或其它成员的总线名称。
-`at/value` 沿用整数 `ns/us/ms/s` 字符串，范围 0..3600 秒；
-`at` 不超过 `duration`，整个列表非递减，同刻跨成员和重复动作保留输入顺序。
-CAN 动作独立限制为 1024 项，不占用 referee 的 1024 项额度。
-完整动作形状和值在读取引用的 Arena 前校验，实际成员与总线关联在配置加载后校验。
-加载结果的 `can_delays` 是不可变 `ScenarioCanDelay(offset_ns, member, delay_ns)` 元组。
-执行入口将这些记录按原顺序转换为下面 Arena Python 入口的动作元组，
-由同一 Arena 调度器完成准入和执行；空列表保持原有调用方式。
-
-`at` 从 shared host Session reset 起算；`duration` 沿用 Arena 在全部请求的 ready
-之后计算的活动时长，两者的起点不同。启动期间的事件可以先改变裁判状态；
-`at: 0ns` 的裁判动态事件在下一次成功 step 才生效。加载接口只读取配置。
-通过 `sim.scenario.runtime.run_manifest(scenario)` 执行时，时长来自该配置，
-裁判事件与 CAN 动作交给同一 Arena 执行器；返回现有 `ArenaResult`，资源清理完成后才返回。
-命令行使用同一执行入口，时长由 Scenario 配置决定：
-
-```bash
-uv run --frozen --extra mujoco python -m sim.apps.unmigrated_cli scenario run scenario.yaml --report build/scenario.json
-```
-
-`--qemu` 可覆盖 QEMU 二进制；`--startup-timeout` 默认 10 秒，`--timeout`
-默认 30 秒，沿用 Arena 的 host 期限和清理规则。UART 输出带成员标签并保留原始
-字节表示，JSON 使用现有 `ArenaResult`。本入口不提供 `--duration`、独立 QMP/GDB
-或暂停参数。CAN 延迟及电机反馈可达性动作支持加载和执行；其它故障注入和 replay 尚未支持。
-
-Scenario 支持以下成员断言，加载时和运行前均校验完整配置。
-省略或使用空列表保持原有执行行为。
-
-```yaml
-assertions:
-  - member: east
-    before: 300ms
-    uart_contains: {endpoint: uart1, text: "ready"}
-  - member: west
-    before: 500ms
-    digital_equals: {endpoint: gpio.A0, value: 1}
-```
-
-`member` 必须是该 Arena 的实际成员名；其余字段复用 Lab 单条断言格式，返回冻结的
-`ScenarioAssertion(member, assertion)`，保留列表顺序和重复项。合计最多 1024 条，
-额度独立于其它事件；`before` 必须为正且不超过 Scenario 的 `duration`。
-UART 只能选该成员已配置的端口：默认 `uart1`，显式 ready 改用其端口；有 referee
-时另加 `uart7`。数字端点支持 `key`、`led`、`gpio.A0` 至 `gpio.H15`。
-CAN 仍由 SharedWorld 独占，本配置不接受 `can_seen`，也不支持表达式语言。
-
-`before` 从各成员实际初始 RESET_ACK 的 QEMU 虚拟时间起算，包含等待 ready 的启动阶段；
-与 `ArenaResult.origin_ns` 的活动世界时长原点不同。UART 使用实际读后快照时间作上界，
-支持跨批次匹配，必须严格早于截止时间；数字断言使用该快照的实际采样值。
-空批次也推进截止时间，失败立即终止并清理整个运行，不重试。全部断言通过且资源清理成功后
-才返回原有 `ArenaResult` 或发布 CLI 成功报告；这些观测不建立 CPU 与世界的全局时间屏障。
-
-Arena 的 Python 运行入口接受 `referee_events=((member, events), ...)`：
-整批类型、具名 referee、顺序、偏移和合计 1024 项限制在创建资源前校验。
-事件元组在共享世界 start 成功后、恢复 QEMU 或首次 step 前原样交付一次，
-使用实际 host Session ID；任一运行时拒绝均终止整个 Arena 并清理资源。
-队列与规则执行仍由既有裁判引擎拥有，发布继续遵循每个成员的实际 ready 和原周期。
-
-Arena 的 Python 入口也接受 `can_delays=((offset_ns, member, delay_ns), ...)`，例如
-`can_delays=((0, "east", 2_000_000), (1_500_000, "east", 0))`。
-列表及各项必须为普通元组，最多 1024 项；成员必须准确匹配 Arena 名称。
-偏移和延迟为普通无符号 64 位整数，偏移非递减且不超过运行时长，同刻按输入顺序执行。
-完整列表在创建资源前校验；最大延迟可以配置，但后续帧时间相加溢出会终止运行。
-
-偏移从实际 host Session RESET 原点计算，ready 等待期间也执行；
-`ArenaResult.origin_ns` 仍是所有请求的 ready 达成后的活动时长起点。
-零偏移动作在 referee 批次入队后、恢复 QEMU 前执行。
-其余动作将原有最多 1 ms 的步进拆到准确截止时间，在成功 step 后、UART 轮询或发布前执行。
-同刻裁判事件已在该 step 内处理；偏移恰等于时长的动作也执行一次。
-已入队命令和该 step 的反馈保留原截止时间，ACK 等待期间准入的输入也使用旧策略；
-随后才读到的输入使用新策略。帧自带时间戳不选择延迟策略，另一成员的总线不受影响。
-拆分会改变 native 积分区间及 STEP 观察次数，不能保证轨迹与未拆分时相同。
-动作、存活检查或步进失败沿用整个 Arena 的终止及清理规则，保留先前效果。
-Python、Scenario 和 CLI 共用上述调度与失败规则，均不建立 QEMU CPU 时间屏障、
-wall-clock pacing 或物理 CAN 时序保证。
-
-配置消费者可调用 `sim.arena.manifest.validate_can_delays(actions, duration_ns=...)`，
-复用上述普通元组、成员字符串、无符号 64 位时间、顺序、额度和截止时间校验。
-该纯函数不创建资源或查询拓扑，允许零时长校验范围；实际运行仍要求 1 ns..3600 秒，
-成员与总线关联由调用者检查。Python 延迟值保持完整 64 位范围，YAML 值遵循 3600 秒配置上限。
-
-Arena Python 入口还接受 `motor_feedback=((offset_ns, member, motor_id, enabled), ...)`，
-例如 `motor_feedback=((0, "east", 1, False), (2_500_000, "east", 1, True))`。
-这会屏蔽或恢复指定实际电机到所属板卡的反馈投递；命令、plant 和其它电机继续运行，
-因此它表示反馈不可达，不能模拟电机断电。普通元组最多 1024 项，偏移为非递减的
-无符号 64 位整数且不超过时长；电机必须唯一匹配该成员声明的 ID 和总线，
-`enabled` 必须为布尔值。完整列表在创建资源前校验。
-动作沿用上述 RESET 原点及准确步进拆分；同刻先执行 CAN 延迟动作，再按输入顺序
-执行反馈动作。截止时间动作在该步反馈交付完成后执行，不能撤回已交付字节；
-尚未 dispatch 的排队帧按新状态决定是否丢弃，恢复不会补发已丢弃帧。
-结束或失败清理时恢复原有总线丢弃回调。Python、Scenario/YAML 和 CLI 共用这套调度；
-下文专用 `DjiFeedbackTest` 已验证固定反馈缺失下的超时与恢复，其它固件配置需独立验证。
-
-Scenario 加载器可解析 `action: motor_feedback`，`target` 使用准确的
-`成员名.电机名`（Robot 中的设备名称），`value` 必须为 YAML 布尔值。
-加载结果保存在不可变 `ScenarioMotorFeedback(offset_ns, member, motor_id, enabled)`
-元组中，默认 `motor_feedback=()`。混合 `events` 必须整体按时间非递减排列；
-CAN 延迟和反馈动作分别最多 1024 项，合计最多 2048 项。
-Scenario runtime 将类型化动作按原顺序交给 Arena，完整准入后再创建资源和执行。
-同刻不同类型动作按 CAN 延迟在前的规则执行，不能依赖它们在 YAML 中的交错顺序。
-
-```yaml
-events:
-  - {at: 0ns, action: motor_feedback, target: east.fl, value: false}
-  - {at: 100ms, action: motor_feedback, target: east.fl, value: true}
-```
-
-上例要求 `east` 的 Robot 声明了名为 `fl` 的电机，且 Scenario 时长至少为 100 ms。
-关闭期间仍接收命令并推进 plant；恢复后只交付后续反馈，不补发已丢弃的帧。
-
-快照容量不足抛出 `BufferError`，不提交新快照或序号；可服务旧队列后重试。
-发布、步进或服务中的其它 IO、引擎、期限或存活检查错误冻结整个 owner，要求重新创建。
-`close()` 独立尝试所有 owned endpoint 和 participant，保留清理异常，
-不关闭借用的 transport。此接口已通过共享时间和实际 socketpair 字节消费测试；
-单板共享路径已通过实际 RefereeTest UART7/HAL/RTOS 消费验证，入口见下文。
-Arena YAML 的裁判配置使用上述 ready 与快照发布策略；
-脚本状态也不代表根据世界碰撞进行实时裁决或实现官方独立消息发送周期。
-
-裁判系统帧封装可独立使用，运行前执行 `uv sync --frozen`：
-
-```python
-from sim.devices.referee import encode_frame, decode_frame
-
-wire = encode_frame(command_id=0x0201, payload=robot_status_bytes, sequence=0)
-frame = decode_frame(wire)
-assert frame.command_id == 0x0201
-```
-
-帧封装依据官方 RoboMaster 2026 通信协议 V1.1.0（20251217）的第 4 页及
-第 77–82 页；官方版本入口见 [RoboMaster 文档](https://bbs.robomaster.com/wiki/20204847/811363)。
-接口使用帧头 `0xa5`、小端 payload 长度、8-bit 序号、CRC8、
-小端 command ID、payload 与 CRC16。CRC 算法来自锁定的 MIT `crccheck 1.3.1`，
-CRC8 初值为 `0xff`，CRC16 初值为 `0xffff`，无最终 XOR。
-当前支持完整帧最多 128 字节（payload 最多 119 字节）；这是公开的模型准入范围。
-参数必须为整数或不可变 `bytes`，bool、越界、截断、多余尾部及 CRC 错误直接拒绝。
-
-`payload` 保持不透明，调用者须按所选协议版本填入准确的数据。接口不判断 command
-是否受固件支持，不自动递增序号，不解析连续 UART 流，也不拥有 UART/socket。
-不能把帧校验通过作为规则正确或真实裁判系统的验证。
-
-四种 outgoing payload 提供固定 2026 V1.1.0 schema：
-
-```python
-from sim.devices.referee import GameStatus, RobotStatus, PowerHeat, Buff, encode_message
-
-wire = encode_message(GameStatus(1, 4, 300, 0), sequence=7)
-# 0x0201：ID、等级、当前/最大 HP、冷却值、热量上限、功率上限、输出 bitmask
-status = RobotStatus(3, 1, 200, 200, 10, 100, 80, 7)
-wire = encode_message(status)
-wire = encode_message(PowerHeat(60, 0, 0))  # J、17mm 热量、42mm 热量
-wire = encode_message(Buff(0, 0, 0, 0, 0, 0x80))
-```
-
-比赛类型支持 1–5，阶段支持 0–5，剩余时间以秒填写；64-bit UNIX timestamp 必须显式
-提供，不从 QEMU/plant 时间推算。`RobotStatus.power_outputs` 使用 bits 0/1/2 表示
-gimbal/chassis/shooter；其余字段按官方 unsigned wire 宽度编码，不夹取数值，也不裁决
-机器人 ID、HP、百分比或赛事规则。`PowerHeat` 的前 8 个保留字节固定输出零。
-
-`Buff` 的 `remaining_energy` 是显式协议 bitmap，默认全量能量可填写 `0x80`；
-编码使用官方第 17 页的 8-byte packed struct，最后字段位于 offset 7。
-第 16 页表格将该偏移写为 6，与总长度/结构冲突；当前消费者结构也支持 offset 7。
-这四类编码不包含接收 payload parser、定时发送或规则状态。
-`0x0206` 等其它命令和赛场仍待独立接入。
-
-独立脚本引擎可用于无赛场的状态回放和固件输入准备：
-
-```python
-from sim.core import Coordinator, Session
-from sim.devices.referee import (
-    RefereeEngine, RefereeState, MatchDurations, ScriptEvent, Hit, Shot,
-)
-
-initial = RefereeState(
-    GameStatus(1, 2, 1, 0),  # 当前自检阶段剩余 1 秒；timestamp 显式填写
-    RobotStatus(3, 1, 200, 200, 10, 100, 80, 7),
-    PowerHeat(60, 0, 0), Buff(0, 0, 0, 0, 0, 0x80),
-)
-engine = RefereeEngine(initial, durations=MatchDurations(countdown_s=3, battle_s=300),
-    events=(ScriptEvent(1_000_000_000, Hit(20)),
-            ScriptEvent(1_000_000_000, Shot(40, 0))))
-coordinator = Coordinator({"referee": engine})
-coordinator.reset(Session(1))
-coordinator.step(2_000_000_000)
-state = engine.get_state()
-assert state.robot.current_hp == 180 and state.power_heat.heat_17mm == 30
-frames = [encode_message(message, sequence=i) for i, message in enumerate(
-    (state.game, state.robot, state.power_heat, state.buff))]
-engine.queue_events((ScriptEvent(2_000_000_000, Hit(5)),), session_id=1)
-assert engine.get_state() is state  # 准入不修改已完成快照
-coordinator.step(1_000_000_000)
-assert engine.get_state().robot.current_hp == 175
-coordinator.close()
-```
-
-事件必须为至多 1024 项的不可变 tuple，时间是相对每次 reset 的非递减纳秒偏移；
-同时间保持输入顺序，零偏移事件在 reset 时执行。事件接受 `Hit`、`Shot` 或上述四种
-消息；消息事件替换对应状态组。`Hit` 使用显式伤害值，HP 最低为零，输入 HP 不得超过
-最大 HP；`Shot` 使用显式热量增量。17mm 冷却率来自 `RobotStatus.cooling_per_s`，
-42mm 使用构造参数 `cooling_42mm_per_s`，默认零。热量保留分数并向下取整输出；
-超过 65535 热量会拒绝整个步进并冻结，需 reset 后才能继续。`PowerHeat` 替换会重置
-热量余量；`Buff` 只更新消息数据。getter 返回不可变的最近完成快照，不推进时间。
-
-运行中的引擎可通过 `queue_events(events, session_id=...)` 接收动态事件，
-复用同一 `ScriptEvent` 格式与校验。入口需要成功 reset、匹配的整数 session ID；
-调用者负责来源时间、session 标识及去重，并顺序调用准入和步进。偏移不得早于
-最近完成时间或最后排队事件，禁止自动重排。同时间静态脚本先执行，再按准入顺序
-处理动态事件，冷却和阶段到期先于两者。等于最近完成时间的事件在下一次成功
-step 的起点生效，已有快照保持可读。
-
-每批至多 1024 项，pending 总数也至多 1024 项；整批准入失败保持原队列。
-有效批次因总容量不足而抛出 `BufferError`，之后可以正常 step 消费到期事件并释放
-空间。只有成功 step 删除已消费项；计算失败冻结引擎，保留最近快照和 pending。
-成功 reset 或 close 清除动态事件，reset 仍从新原点重放静态脚本。
-此入口接收显式输入；自动命中、射弹和赛场事件来源仍需单独接入。
-
-配置工具可以先调用 `validate_referee_configuration(initial, durations=...,
-events=..., cooling_42mm_per_s=...)`。该公共函数与引擎构造器使用相同校验，
-成功时返回 `None`，不创建引擎或执行 reset/step，也不获取外部资源。
-
-阶段 2→3→4→5 按绝对虚拟截止时间推进，当前剩余时间由 `GameStatus` 提供，后续
-倒计时和比赛时长由 `MatchDurations` 明确配置。阶段 2/3/4 的输入剩余秒数与配置时长
-必须为正，输出剩余秒数向上取整；阶段到期先于同时间脚本事件。其它阶段保留显式数据。
-reset 会从新 session 原点重放原脚本，`sync_timestamp` 不随仿真时间自动改变。
-
-热量计算窄移植自 [rm_control](https://github.com/rm-controls/rm_control/blob/c5205eb193a8cda6147efe760eafedd0a3ed0104/rm_common/include/rm_common/decision/heat_limit.h)
-（BSD-3-Clause），阶段转换参考 [XDU referee mock](https://github.com/XDU-IRobot/rm_referee_ros2/blob/45da10a5317d47cc4b5d5968ec553946c43ebe0d/rm_referee_mock/rm_referee_mock/match_control_timing.py)
-（Apache-2.0）；许可证随模块提供。配置时长和脚本数据是测试输入，不能作为官方赛事
-规则常量。自动装甲/弹丸判定、过热扣血、复活、增益叠加和功率惩罚仍未实现；引擎不拥有
-UART、Gazebo、物理时钟或发送序号，不建立 CPU/plant 全局锁步。
-
-UART 输出可借用已有的非阻塞连接：
-
-```python
-from sim.transports import StreamTransport
-from sim.devices.referee import RefereeUartEndpoint
-
-# connected_socket 由调用者连接、设为 nonblocking，并负责关闭。
-transport = StreamTransport(connected_socket, max_pending=16)
-endpoint = RefereeUartEndpoint(transport, sequence=254)
-wire = endpoint.send_state(state)  # 四帧，序号 254/255/0/1，共 82 bytes
-assert endpoint.next_sequence == 2
-endpoint.flush()                  # False 表示仍有未发 suffix
-transport.drain(timeout=1.0)      # 可选，有界 host 等待；不代表 MCU 已消费
-endpoint.close()                  # 不关闭、不 drain 借用的 socket
-```
-
-每份快照以 `GameStatus/RobotStatus/PowerHeat/Buff` 顺序排入一个 transport queue slot；
-所有字段在任何发送前完成校验。队列满时 `BufferError` 拒绝新批次并保留序号，调用者
-可 flush 后重试；容量检查可能已经发送旧队列的字节。其它发送/flush 异常可能发生在
-部分发送后，endpoint 会冻结，禁止自动重发。显式 `reset(sequence=0)` 只恢复逻辑
-序号和状态，保留原队列及 partial suffix；调用者须明确接受该逻辑流重启，协议本身
-没有 session ID。失败后仍须由连接 owner 清理 socket，`close()` 只停用 endpoint。
-
-该 endpoint 只输出显式快照，调用者负责完成的状态、发送频率、读取和连接生命周期，
-并独占该裁判 TX 流的序号所有权。默认 transport 为 256 slots，纯快照最多保留
-20,992 bytes，调用者可以设置更小上限。快照批次没有实现官方不同命令的独立周期
-（`0x0001` 1 Hz、`0x0201/0202` 10 Hz、`0x0204` 3 Hz）；周期组合仍待接入。
-真实固件 UART 消费可用下列专用测试验证。
-
-默认关闭的专用固件测试复用实际 `robomaster::basic`、HAL UART7 RX DMA、BSP
-回调与 FreeRTOS 消息执行器：
-
-```bash
-# 在 trobot 中，使用已有 ARM 工具链环境构建
-cmake --preset RefereeTestDebug
-cmake --build --preset RefereeTestDebug
-# 在 dm-mc02-qemu 中，先完成 QEMU 构建及 uv sync --locked --group dev
-tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
-  build/test-results/referee-debug ../trobot
-```
-
-可将 preset 换成 `RefereeTestRelease`。测试开关需要 `TROBOT_SELFTEST`，与 Motor、
-Dji、Chassis 测试互斥，普通 Debug/Release 均保持关闭。结果目录必须不存在；
-可用 `--qemu` 指定 QEMU。报告保留真实源码、ELF 和 QEMU 哈希、失败及缺失项，
-只有进程清理完成且输入未变后才发布 `passed`。启动总期限为 10 秒，运行总期限为
-20 秒，均从 QEMU 启动前起算，清理有各自的短期限。
-
-固定脚本输出两份四命令快照，检查 17 个固件通过项和一个 `plant.physics` SKIP。
-第二批先发送 19 字节，固件在 100 ms 内观察旧状态，然后主机补发原队列的 63 字节
-尾部，固件检查四组新 payload 和新时间戳。它验证完整帧消费，不能证明 UART 前缀的
-准确到达时间、操作系统背压、官方独立发送周期或 CPU/plant 全局屏障。当前 `0x0206`
-真实一字节格式与固件两字节结构不符，保持未支持，测试不填充字节掩盖差异。
-
-追加 `--shared-world` 可用同一个固件验证共享 owner 的裁判发布路径：
-
-```bash
-tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
-  build/test-results/referee-shared-debug ../trobot --shared-world
-```
-
-此默认关闭的单板夹具使用既有四轮 MuJoCo toy plant、CAN1 和 co-sim transport。
-真实 RESET_ACK 后由 `SharedWorldRuntime` 初始化世界及裁判；固件实际 UART7 ready
-事件触发初始快照，第二阶段由同一个 owner 推进逻辑时间，再发布第二批快照。
-剩余 63 字节由原服务接口发送，保持原来的固件观察窗口和协议预期。
-报告分别保留共享逻辑时间、QEMU ready/RESET/STEP 观测、原生世界调用和清理结果。
-此夹具使用一次 1 秒的 MuJoCo step，不是 1000 次 1 ms 积分；它验证完成状态的
-发布与消费，不能用于判断底盘运动精度。
-
-该夹具用于检验实际 UART7/HAL/RTOS 消费边界，原 `plant.physics` SKIP 继续保留。
-它尚不验证底盘固件闭环、双板 Arena 裁判接线、实物标定或 CPU 时间屏障；
-MuJoCo 可选依赖需要先按环境准备中的说明安装。
-
-双板周期消费者使用默认关闭的 `ArenaRefereeTestDebug` 或
-`ArenaRefereeTestRelease` 固件，以及同一 runner 的 `--arena`：
-
-```bash
-# 在 trobot 中构建
-cmake --preset ArenaRefereeTestDebug
-cmake --build --preset ArenaRefereeTestDebug
-# 在 dm-mc02-qemu 的 MuJoCo 环境中运行
-tools/run-trobot-referee-test.sh ../trobot/build/ArenaRefereeTestDebug/trobot.elf \
-  build/test-results/referee-arena-debug ../trobot --arena
-```
-
-该 profile 调用同一 Arena runtime，两个 QEMU 使用同一 ELF，分别消费 ID 3/103
-的固定状态。各板在 UART7 初始化后输出 ready，检查三次完整新样本、四组
-payload 及各组实际/前次 BSP 时间戳；报告保留缺失项和 `plant.physics` SKIP。
-共享世界运行 1 秒，快照周期为 100 ms，startup/active host 期限为 10/20 秒。
-固件的 1000 ms 等待属于各自 guest 时间，不能由此推断 CPU 与世界同步。
-`--arena` 与 `--shared-world` 互斥，原握手及 partial-frame 测试仍使用原 preset。
-
-定时输入的固件消费者使用默认关闭的 `ScenarioRefereeTestDebug` 或
-`ScenarioRefereeTestRelease`，并选择 `--scenario`：
-
-```bash
-# 在 trobot 中构建
-cmake --preset ScenarioRefereeTestDebug
-cmake --build --preset ScenarioRefereeTestDebug
-# 在 dm-mc02-qemu 的 MuJoCo 环境中运行
-tools/run-trobot-referee-test.sh ../trobot/build/ScenarioRefereeTestDebug/trobot.elf \
-  build/test-results/referee-scenario-debug ../trobot --scenario
-```
-
-夹具生成 Scenario 配置，通过同一 Scenario/Arena 入口运行。共同 reset 后
-200 ms 对 east 注入伤害 30 HP、热量 5/7 和 Buff 替换；west 保持原状态。
-两板首先验证完整初始状态，east 随后验证改变及刷新，west 在 host 已观察到
-east 的完整改变报告后，通过既有应用握手验证两次原状态刷新；第二次观察要求
-四组时间戳相对握手返回后读取的状态均已更新。握手只控制应用
-观察，不改变世界、事件时间或发布周期。初始报告迟于事件、缺失或清理失败均失败。
-该门沿用 100 ms 发布、1 秒活动时长和原 guest 等待；报告保留实际时间戳、
-缺失项和物理 SKIP，不建立 CPU 时间屏障。三个 runner profile 互斥。
-
-同一夹具也可验证实际 CLI 入口，在上面的运行命令末尾添加
-`--cli`。它执行
-`sim scenario run`，同时检查 CLI 的一次运行调用、返回结果和 JSON 报告。
-该选项仅用于 Scenario 测试，沿用相同事件、固件及清理检查；入口在测试进程中
-受观测，独立启动的 `python -m sim` 仍按前述普通使用命令运行。
-
-## Trace event storage
-
-`sim.trace` 提供独立的事件文件读写，依赖由 `uv sync --frozen` 安装的 MCAP 1.5.0。
-`TraceEvent` 包含 `timestamp_ns`、`source`、`endpoint`、`event_type`、原始 `payload`
-字节，以及必填的 `clock` 标签。调用者用标签区分 QEMU reset epoch、worker、Fabric
-或 UART 轮询时钟；文件保留追加顺序，允许时间数值下降，不进行跨时钟排序或换算。
-
-```python
-from sim.trace import TraceEvent, TraceWriter, iter_events
-
-with open("events.mcap", "xb") as output:
-    trace = TraceWriter(output)
-    trace.append(TraceEvent(17, "west", "uart7", "uart.rx", b"READY\x00\n",
-                            "qemu:west:reset0:poll"))
-    trace.finish()
-
-with open("events.mcap", "rb") as source:
-    count = sum(1 for _ in iter_events(source))  # 完整遍历才验证文件结尾
-```
-
-当前 `robot-sim/trace/1` profile 只接受无压缩、无 chunk、无索引/summary 的小事件。
-每个非空标签最多 255 UTF-8 字节且不能含 NUL；单事件 payload 最多 65536 字节，
-每文件最多 256 个 `(source, endpoint, event_type, clock)` 组合和 `2**32` 个事件。
-时间使用无符号 64 位纳秒。MCAP topic 是 endpoint，channel metadata 保存其余三个
-标签；message sequence 是从零开始的全局追加序号，log/publish time 均保存原时间。
-这些文件可由标准 MCAP 读取器读取；本读取入口只接受上述 profile。
-依赖包仍会安装锁定的 lz4/zstandard，本 profile 不执行解压缩。
-
-读写器借用 blocking binary stream，不关闭调用者的文件。输入每次读取必须返回所请求的
-完整字节；截断、未知记录、非规范编码、资源超限、尾部多余数据与已提供 CRC 的错误会失败。
-写入器启用 data CRC；按 MCAP 约定，读取时 CRC 值为零表示未提供校验，不能据此验证完整性。
-任何输出或最终 flush 失败后，写入器冻结，不能重试或回滚已写内容；参数拒绝没有输出副作用。
-`finish()` 成功后可重复调用，失败文件由调用者处理。
-
-读取器在完整遍历结束前返回的事件均为暂定结果；后续回放必须先验证整个文件再产生外部副作用。
-存储层不负责硬件输入回放或调度。UART 事件的
-poll 时间不代表字节实际到达时刻；CAN 原始帧时间与 Fabric 投递时间仍需分别保留。
-
-可把 `ArenaTrace` 接到 Arena 的现有观察回调，记录实际快照及 UART 批次：
-
-```python
-from sim.arena.manifest import load_manifest
-from sim.arena.runtime import run_manifest
-from sim.arena.trace import ArenaTrace, decode_completion, decode_observation
-from sim.trace import TraceWriter, iter_events
-
-arena = load_manifest("arena.yaml")
-# 为实际 manifest 的所有成员填写独立的 QEMU clock/epoch 标签。
-clocks = {member.name: f"qemu:{member.name}:run1:reset0" for member in arena.robots}
-with open("observations.mcap", "xb") as output:
-    trace = TraceWriter(output)
-    capture = ArenaTrace(trace, clocks=clocks)
-    result = run_manifest(arena, on_observation=capture)
-    capture.complete(result)  # 使用成功返回的实际原点、最后时间和批次数
-    trace.finish()  # runtime 成功且清理完成后，再完成文件
-
-# 仅适合可装入内存的小文件；完整读取成功后，再交给观察消费者。
-with open("observations.mcap", "rb") as source:
-    stored = list(iter_events(source))
-observations, completions = [], []
-for event in stored:
-    if event.event_type == "arena.observation/1":
-        observations.append(decode_observation(event, clocks=clocks))
-    else:
-        completions.append(decode_completion(event, clocks=clocks))
-```
-
-Scenario 也接受同一观察回调，可在执行输入动作及检查断言时录制：
-
-```python
-from sim.scenario.manifest import load_manifest as load_scenario
-from sim.scenario.runtime import run_manifest as run_scenario
-from sim.arena.trace import ArenaTrace
-from sim.trace import TraceWriter
-
-scenario = load_scenario("scenario.yaml")
-clocks = {member.name: f"qemu:{member.name}:run1:reset0"
-          for member in scenario.arena.robots}
-with open("scenario-observations.mcap", "xb") as output:
-    trace = TraceWriter(output)
-    capture = ArenaTrace(trace, clocks=clocks)
-    result = run_scenario(scenario, on_observation=capture)
-    capture.complete(result)
-    trace.finish()
-```
-
-`on_observation` 收到每个成员的原始观察对象，包括启动、空批次和未配置断言的成员。
-回调先于 Scenario 内部断言检查，因此导致断言失败的批次也会交给录制器。回调借用快照和
-UART 列表，只能读取，不能重入 runtime。回调失败会跳过该批次的断言检查，原样传播错误
-并执行既有清理；断言失败则保留已经录制的观察。两种情况均不重试，也不返回成功结果。
-调用者拥有输出和 writer；只有成功返回后才能调用 `complete()`。录制器仍可用时，失败后
-可完成仅含观察的诊断文件，但它缺少成功完成元数据，不能用于完整离线断言回放。
-同步回调须自行及时返回；
-既有期限检查包围整个回调组合，不能中断阻塞的回调，也不会在两个消费者之间另查期限。
-
-每次回调保存一条 `arena.observation/1` 事件，source 是成员名，endpoint 为
-`observation`，时间是实际读后快照的 QEMU 时间。payload 使用紧凑 ASCII JSON，
-包含完整 `snapshot` 和有序 `events`；每项保存 `endpoint`、轮询 `timestamp_ns`
-及标准 base64 `data_base64`。原生 JSON 扩展字段保留，空批次也保存，便于重现断言到期。
-单批最多包含六个不同的受支持 UART，每项 1–4096 字节，完整 payload 不超过 65536
-字节。解码入口验证该紧凑表示、快照、时间和 UART 数据；它不接受任意 JSON 表示。
-
-适配器复制并校验非空成员到时钟的字典，要求各标签不同；调用者负责成员覆盖及 reset
-epoch 的真实性。它不查询 manifest、不推断 RESET 原点，也不排序或换算时钟。任何
-回调失败会冻结适配器并由 Arena 执行原有清理；已消耗的观察和已写字节不能重试或回滚。
-调用者拥有 writer 和文件。文件完成只说明容器完整，不证明应用断言成功。
-
-`complete()` 核对全部成员的批次数和首尾时间，再按返回结果中的成员顺序追加
-`arena.completion/1` 记录。记录保留原始 RESET_ACK 的 `reset_qemu_ns`、
-`observation_batches`，事件时间为实际 `end_qemu_ns`；`decode_completion()`
-返回不可变的 `ArenaTraceCompletion`。原点来自运行结果，不取 ready 或首次轮询时间。
-成功后不再接受观察或再次完成；调用失败会冻结适配器，部分元数据和输出副作用保留。
-若运行或清理失败，不能调用 `complete()`。仍可仅使用观察回调，生成没有完成元数据的文件。
-
-完整记录每成员增加一个 channel identity，因此最多容纳 128 个成员，且共享 writer 的
-其余 channel 和 sequence 仍可能耗尽。完成记录只核对调用者传入结果与采集边界的一致性；
-它不认证结果来源，也不代替完整文件中每成员的顺序、计数和结束状态校验。上面的例子只
-展示解码，尚未执行这些整段回放校验。
-
-这是 Arena 实际已打开 UART 与板级快照的观察记录；CAN、world、输入动作和 RESET_ACK
-原始帧不在其中。离线断言仍需另行保留实验配置。命令行当前不自动记录观察，也不提供
-完整系统 trace 或硬件回放调度器。
-
-已完成的观察文件可以用原始 Scenario 配置离线重新判断 UART/数字断言：
-
-```python
-from sim.scenario.manifest import load_manifest
-from sim.scenario.replay import replay_assertions
-
-scenario = load_manifest("scenario.yaml")
-# 使用录制时相同的成员名和真实 epoch 标签。
-clocks = {member.name: f"qemu:{member.name}:run1:reset0"
-          for member in scenario.arena.robots}
-with open("observations.mcap", "rb") as source:
-    report = replay_assertions(source, scenario, clocks=clocks)
-print(report.passed, report.status, report.failures)
-```
-
-`status` 按 Scenario 的原始断言顺序返回 `pass`/`fail`；`failures` 标明全局断言序号和
-成员，`completions` 按 Arena 成员顺序保留原点、结束时间和批次数。结果不可变。有效记录中
-未满足的断言返回 `fail`；配置不符、记录缺失、损坏或 I/O 错误会抛出异常。
-
-输入须为从字节零开始的可回卷阻塞二进制流。函数完整读取两次：首遍取得尾部原点，
-回卷后用同一个 LabExperiment 判断第二遍记录，并重新校验全部成员、顺序、元数据和
-容器 EOF 后才返回。内存不随观察批次数增长；文件完整性验证失败时不会返回部分结果。
-函数借用输入，不关闭、不重试或恢复位置，成功后留在 EOF。不支持不可回卷流。
-
-每个成员都必须有观察和恰好一条完成记录，全部观察位于完成记录之前。批次数、最终时间、
-RESET 下界和实验时长均须一致，包括没有断言的成员。每个 UART 必须是该成员实际配置的
-端口；逐成员的快照和 UART poll 不得早于上一 post-read 快照，首批也不得早于 RESET。
-不同成员的数值时间可交错下降。严格截止时间、空批次过期和 GPIO 判断沿用 LabExperiment。
-
-调用期间须保持输入及配置不变。两遍的完成元数据必须一致；函数判断完整验证后的第二遍
-记录，不认证两遍的字节身份。调用者负责配置、固件和模型与录制来源的对应关系。该入口
-只重新判断观察断言，不执行 Scenario 输入动作、固件或物理仿真，不提供硬件回放。
-
-命令行可以直接使用同一离线回放入口：
-
-```bash
-tools/sim-unmigrated scenario replay scenario.yaml observations.mcap \
-  --clock east=qemu:east:run1:reset0 \
-  --clock west=qemu:west:run1:reset0 \
-  --report replay-result.json
-```
-
-每个成员必须提供一次 `--clock MEMBER=EPOCH`，标签须与录制时一致且彼此不同；
-只在第一个 `=` 处分割，epoch 可以包含 `=`。使用原始 Scenario 文件及其引用的配置，
-录制文件须为可读普通文件。该命令关闭输入文件后才发布结果，不启动 QEMU、物理后端或
-上层进程，也不接受运行时启动选项；`python -m sim.apps.unmigrated_cli scenario replay` 使用同一入口。
-
-全部断言通过时退出码为 `0`；断言未满足、配置/容器损坏或文件错误为 `1`，
-中断或 SIGTERM 为 `130`。可选报告保留逐断言状态、成员完成元数据或失败诊断。
-`--report` 必须指向新文件，已有文件或符号链接会被拒绝；写入失败可能留下部分新文件，
-不会重试。输入关闭或报告失败时不输出通过结果。回放不核实配置、固件或模型的来源身份。
-
-## Contents
-
-- [项目范围](#project-scope)
-- [环境准备](#environment)
-- [获取源码](#get-the-source)
-- [构建](#build)
-- [首次验证](#first-validation)
-- [运行固件](#run-firmware)
-- [Robot 配置](#robot-manifest)
-- [裁判帧封装](#referee-protocol)
-- [Trace 事件文件](#trace-event-storage)
-- [Flash 镜像](#flash-images)
-- [串口、QMP 与 GDB](#serial-qmp-and-gdb)
-- [外部仿真 worker](#external-simulation-worker)
-- [测试与性能](#testing-and-performance)
-- [更新与源码包](#update-and-source-package)
-- [故障排查](#troubleshooting)
-- [目录](#repository-map)
-
-## Project scope
-
-项目基于固定的 QEMU v8.2.2 fork，提供 STM32H723 与 DM-MC02 的数字外设模型，面向固件功能验证。
-
-STM32H723 profile 为原生 NVIC 配置 ST CMSIS 定义的 4 位优先级；这使未经修改的
-FreeRTOS 优先级探测与 HAL 分组设置一致。通用 QEMU 板卡保留原有默认值。该有限
-边界不代表完整 CPU 优先级寄存器或整机 migration 已验证，也不提供实板验证。
-
-项目不依赖 Renode，也不分发 `trobot/` 固件。模型不覆盖完整芯片、电气/物理总线时序或整机 snapshot/live migration。USB 的 DM-MC02 profile 使用 Device 角色，不提供该板的 USB Host 或设备透传。外部后端示例用于连接与协议验证；真实机构闭环和具体固件的完整业务就绪仍需用户验证。
-
-## Environment
+## 原生环境
 
 支持 **Linux x86_64**，推荐使用下面的 Nix 环境；也提供 Ubuntu 24.04 系统依赖方案。Windows、macOS 和 ARM 宿主原生构建未验证。
 
@@ -1544,7 +762,7 @@ sudo apt-get install -y \
 
 QEMU `configure` 会在 `build/qemu/pyvenv` 创建 Python 环境，并从源码携带的 wheel 安装固定的 Meson 1.2.3。Ubuntu 的 `python3-venv` 用于这一配置过程；Nix shell 已提供可用 Python，无需该 apt 包。项目级 Meson 命令通过 `tools/meson` 调用 QEMU 自己的版本。
 
-因此，**只构建并运行 QEMU 不需要 `uv`**。`uv` 管理的是项目 Python 测试环境和可选 worker 依赖；当前 dev group 只安装 pytest，不重复安装 Meson 或 Ninja。需要运行完整回归门禁时，额外安装：
+因此，**只构建并运行 QEMU 不需要 `uv`**。`uv` 管理的是项目 Python 测试环境和可选 worker 依赖；当前 dev group 安装 pytest 与纯 Python 协议/记录测试依赖，不重复安装 Meson 或 Ninja。需要运行完整回归门禁时，额外安装：
 
 ```bash
 sudo apt-get install -y \
@@ -1569,7 +787,9 @@ sudo apt-get install -y libpixman-1-dev
 
 启用 MuJoCo 时再安装项目的可选 Python extra。首次同步 pytest/MuJoCo 或下载所需的 QEMU Meson wraps 需要网络，`/tmp` 必须可写。
 
-## Get the source
+<a id="get-the-source"></a>
+
+## 获取固定原生源码
 
 ```bash
 git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
@@ -1587,7 +807,9 @@ git clone --branch main git@github.com:lym12321/qemu-dm-mc02.git
 
 首次构建不需要递归获取 ROM 子模块。**GitHub 的 main 源码 ZIP 不包含 QEMU 子模块源码，不能直接构建**；请使用 Git clone 并初始化子模块。通过本文快速命令获得的浅子模块足以构建和运行，源码打包时需要的完整历史见[源码包章节](#update-and-source-package)。
 
-## Build
+<a id="build"></a>
+
+## 构建
 
 以下命令均从仓库根目录执行：
 
@@ -1618,7 +840,7 @@ QEMU 默认构建为 Release、`arm-softmmu` 和 DM-MC02 设备 profile。调试
 
 构建目录中的 `.dm-toolchain` 记录 configure 输入。旧目录没有此记录、所选工具/flags 改变或设置 `QEMU_RECONFIGURE=1` 时，脚本重新执行完整 QEMU configure，以更新缓存 compiler 和 Meson 入口；通常无需手动删除构建目录。
 
-## First validation
+### 原生基础检查
 
 不需要外部业务固件即可检查 machine 注册。下面的 guest integration 还需要 ARM 工具链：
 
@@ -1630,7 +852,11 @@ bash tools/run-ospi-smoke.sh
 
 smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后先重新构建。`tools/run-qemu.sh --smoke` 只探测通用空 machine，不会启动业务固件。
 
-## Run firmware
+<a id="native-debug"></a>
+
+## 原生固件、调试与观察接口
+
+### 直接运行固件
 
 输入 ELF 必须面向 DM-MC02 地址空间。先记录用于复现的文件身份，再通过统一入口启动：
 
@@ -1663,7 +889,9 @@ build/qemu/qemu-system-arm -machine dm-mc02,help
 
 具体固件可能等待传感器或外部输入。当前 `trobot` 的可复现启动流程见下文静止输入示例；launcher 不替固件判断应用就绪。
 
-## Flash images
+<a id="flash-images"></a>
+
+### Flash 镜像
 
 在 machine 参数中配置 raw 镜像：
 
@@ -1684,9 +912,11 @@ build/qemu/qemu-system-arm -machine dm-mc02,help
 
 外部 NOR 使用项目独立的 `dm-w25q64` 器件。命令同步完成，quad 使用字节级映射；保护、真实忙时序及器件迁移未支持。
 
-## Serial, QMP and GDB
+<a id="serial-qmp-and-gdb"></a>
 
-### GDB
+### 串口、QMP 与 GDB
+
+#### GDB
 
 终端一启动 QEMU，CPU 在复位处暂停：
 
@@ -1708,7 +938,7 @@ continue
 
 `--debug --gdb-port 2345` 可改变监听端口，GDB 的连接地址相应改变。QEMU 原生对应参数为 `-S -gdb tcp:127.0.0.1:1234`。调试暂停、trace 和外部 worker 都会改变运行场景，不属于默认 Release 性能基准。
 
-### UART and FDCAN slots
+#### UART 与 FDCAN 槽位
 
 重复的 `-serial` 参数按顺序接入 machine 槽位：
 
@@ -1731,7 +961,7 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
 
 FDCAN 使用固定 84 字节二进制帧，经项目 chardev/socket 连接；它不是文本串口，也不是直接的 SocketCAN 设备。使用仓库的 worker 处理该通道，接入 Linux CAN 时使用 worker 的 `--socketcan` 参数。
 
-### QMP
+#### QMP
 
 自动化控制可为每个进程创建独立、较短的 Unix socket 路径：
 
@@ -1747,7 +977,7 @@ rmdir -- "$dm_run_dir"
 实验性原生 QMP 执行接口可让一个 CPU 在指定的绝对虚拟时间暂停。直接启动 QEMU 时使用
 `-accel tcg,thread=single -S -icount shift=0,align=off,sleep=off`，保留原生 QMP 连接。
 该接口要求一个 CPU、固定 icount、paused/prelaunch，且没有 replay、block node/backend、
-用户 IOThread、活动 migration 或后台 dump。Arena 通过 shared-world runtime
+用户 IOThread、活动 migration 或后台 dump。Simulation 的 QEMU Backend
 使用该接口；直接启动的调用方自行拥有执行顺序。
 
 ```json
@@ -1771,7 +1001,173 @@ socket 输出完成、plant 同步和实时性能需要分别验证。原生 Sys
 存在逐段纳秒取整，例如 64 MHz、reload 63 的首次中断可在 999 ns；当前执行测试使用
 正常 RCC 配置的 8 MHz 整数周期，不能据此声明分数时钟或实板时序已验证。
 
-## External simulation worker
+### 只读板级观察与底层通道
+
+板级状态可通过原生 QMP 读取，无需检查固件内存：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"board-state"}}
+```
+
+返回 schema 1 对象：`timestamp_ns` 是 QEMU 虚拟时间，`gpio` 包含 A–H 的
+`moder`、`sampled`（与 IDR 相同）、`odr` 和 `output_mask`；`key` 给出 profile 引脚、
+active-low 按下状态和采样值，`led` 给出引脚、RGB、亮度和来源，`vin_mv` 给出配置电压。
+该属性只读，读取不会推进时间或消费外设状态。输入仍使用 `qom-set` 的 `user-key`
+布尔值或 `gpio-input` 字符串，例如 `A15=0`。
+
+LED 的 `ws2812-dma` 来源是既有 DMA 波形观察近似；`gpio-latch` 来源将 LED 引脚 ODR
+映射成白/黑，适合初期调试。它不表示实际引脚电气驱动，应结合 GPIO mode 和 output mask
+检查。AF/analog、电气波形和全局 CPU/plant 锁步仍未由这个接口验证。
+
+Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是现有
+`tools.dm_mc02_qmp.QmpSession`。`snapshot()` 校验原生对象；`digital("gpio.B0")`、
+`digital("key")` 读取采样值，`digital("led")` 判断 RGB 是否非零。`set_gpio("B0", 1)`、
+`set_key(True)`、`set_vin(24000)` 注入公开输入，`pause()`/`resume()`/`reset()` 使用
+原生 QMP。调用方负责 QMP 的期限和关闭；这些 API 不判断应用是否已启动。
+
+`QmpSession.command_many(((name, arguments), ...))` 可在同一连接上查询 1–8 个
+互相独立的命令，按输入顺序返回结果元组；参数为 `dict` 或 `None`，整组须先通过
+JSON 序列化检查，并配置有限的正超时；组等待和取消清理分别使用该超时。
+它不是原子快照；错误按输入顺序选择首个异常，
+其余异常附入 notes。超时或中断会取消并等待本组请求清理，但已发送的命令仍可能执行。
+失败后应停止当前操作并关闭连接，不得重试整组或跨 I/O、CPU、world 边界复用结果。
+
+外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
+socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
+
+`sim.boards.channels.LabChannels` 可借用既有 UART、CAN 和 co-sim 连接：UART 使用无帧
+`StreamTransport`，CAN 使用固定 84 字节 `CanStream` 与 CAN Fabric，ADC1 使用 v1
+`FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns)`
+每个连接只读一次有界数据；CAN 观察保留原始 QEMU 时间，UART 时间只是调用者的轮询样本。
+需要截止时间判断时，应在读取后再查询 QMP 虚拟时间作为观察上界。
+已有独立 UART TX owner 时可调用 `service(timestamp_ns, flush_uart=False)`，
+继续读取并报告 UART 字节，同时保留其发送队列和后缀；TX owner 负责发送与 flush。
+该参数必须为布尔值，默认仍服务 UART 发送；CAN 和 ADC 服务保持各自原语义。
+
+ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(time)`，输入时间严格递增。
+收到 QEMU RESET 后必须重新显式 reset。逻辑 reset 保留物理流尾部，不提供 CAN/v1 历史输入隔离。
+可运行 `tools/run-lab-channels-smoke.sh` 验证真实固件 UART/CAN/ADC 与按键驱动 LED；
+该裸机测试夹具是数字模型消费者，不代表实板校准或完整 HAL 初始化。
+
+### 原生 CAN 的完成与收发观察
+
+FDCAN 当前发送侧支持 FIFO 模式（`NDTB=0`、`TFQM=0`），容量最多 32 帧；专用 TX
+buffer、混合 buffer/FIFO 和按优先级排序的 TX queue 尚未支持。地址与容量解码修正后，
+旧 FDCAN v1/v2 组件快照及共享 Message RAM link v1 快照会被拒绝；这不影响普通 ELF
+启动。完整 machine migration 仍未支持。
+
+FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发送记录并取消重试；
+已发送的前缀不会在新连接重放。关闭后新提交的完整帧
+仍使用现有有界队列，重连后按顺序发送。`fdcan-host-ack` 和 TXBTO 沿用模型的准入及完成近似，
+不能证明主机已收到完整帧。该规则不保证同一连接上的 reset/断电保留 partial frame，
+也不提供 CPU 暂停时的任意输出排空。
+
+发送遇到部分写入、零写入或 `EAGAIN` 时，支持原生可写通知的 chardev 使用一次性
+可写事件继续发送保留的后缀，无需推进虚拟时间。当前使用默认主循环；不支持可写通知的
+后端继续使用既有的 1 ms 虚拟时间重试。其它写入错误或 HUP 取消可写监听，保留虚拟
+重试，连接关闭仍由原生 chardev 事件处理。成功发送导致的队列排空只表示后端接受了记录，不能证明
+对端解码、CPU 中断处理或外部 plant 已完成。
+
+可通过原生 QMP 读取当前主机发送队列：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"fdcan-tx-state"}}
+```
+
+返回 `schema: 1`、QEMU 虚拟时间 `timestamp_ns` 和 `controllers`；控制器名称来自当前
+板卡 profile，例如 `dm-mc02.fdcan1`。各控制器的 `pending_frames` 是尚未完成的记录数，
+`pending_bytes` 是这些记录剩余的字节数；`tx_dropped`、`tx_short_writes` 是既有累计计数，
+随控制器复位清零。此属性只读，查询不触发发送或推进虚拟时间，尚未初始化时返回错误。
+`pending` 字段只描述当前仍待发送的记录；关闭连接、复位或断电也可能清空队列。
+成功发送引起的排空仅表示后端接受，确认对端收到数据仍需实际读取并校验。查询也不能证明
+此前没有发送错误，或 CPU、IRQ、外部 plant 已完成当前时刻的工作。
+
+接收侧可查询同一 machine 的只读 `fdcan-rx-state`，返回 `schema: 1`、
+`timestamp_ns` 和各控制器的 `completed_frames`、`partial_bytes`、`rx_dropped`。
+`completed_frames` 在每个完整 84 字节 host wire 的同步处理返回后递增，包含格式错误、
+过滤拒绝、INIT、断电或 FIFO 已满而丢弃的记录；部分记录和原生 CAN bus/内部 loopback
+不计数。`partial_bytes` 是当前尚未组成完整记录的字节数（0–83）；查询不执行 IO、
+改写寄存器或推进时间。主机发送队列为空本身不能证明 QEMU 已处理输入。
+
+完成计数随控制器复位清零，不进入组件快照；关闭连接或断电保留计数并按既有规则清除
+部分记录。计数在 `UINT64_MAX` 饱和，该值表示计数已耗尽，调用者发送前须保留严格低于
+此值的余量。确认某一批输入需要原连接、唯一 writer、已知完整记录数量和发送前基线，
+并排除额外输入、复位、restore、重连、断电及其它清理；这些事件使原确认失效。
+`rx_dropped` 沿用既有累计/复位语义，完成计数不证明存储成功、固件中断或 BSP 消费，
+也不按报文时间戳调度输入，不建立 CPU/world 时间屏障。
+
+需要同时观察执行状态和 CAN 时，可读取只读的 `can-execution-state`：
+
+```json
+{"execute":"qom-get","arguments":{"path":"/machine","property":"can-execution-state"}}
+```
+
+返回 `schema: 1`，以及 `execution`、`status`、`fdcan-tx-state`、`fdcan-rx-state`。
+这四项分别沿用 `x-query-virtual-execution`、`query-status` 和上述两个属性的完整返回值。
+附加的 `fdcan-transports` 按控制器名称返回实际绑定的 chardev，例如
+`{"dm-mc02.fdcan1":{"path":"/chardevs/can1","connected":true}}`。
+`path` 是原生 QOM 路径；未绑定时为 `null`。`connected` 读取该对象原生的同名属性，
+没有此属性的后端返回 `null`；后端存在不代表已经连接。调用方应核对路径与预期的连接身份。
+查询不停止 CPU、不排空队列、不推进虚拟时间；任一子查询失败则整次读取失败。
+各项依次取样，运行中的 CPU 或主机输入仍可改变状态，不能将它作为原子快照或时间屏障。
+也可单独读取实际 transport 对应的 `/chardevs/<id>` 的 `connected` 属性进行核对。
+
+共享 chardev 发送 helper 在已写出部分字节后遇到阻塞或错误时，返回已写出的长度，
+调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
+字节数，不证明该次调用中未遇到后续错误，也不代表对端已消费。
+
+主机代码可调用 `sim.boards.drain_paused_can(qmp, stream, sink, *, target_ns,
+controller, chardev, tx_dropped, deadline, check)`，把已准入的 CAN 输出逐帧交给
+`sink(frame)`；frame 沿用 `CanStream.receive()` 的 tuple。此操作要求原生执行目标已
+`reached`、QEMU 保持 `paused`，并使用同一条普通非阻塞 AF_UNIX 连接、唯一 writer 和 reader，
+不使用 mux、TLS 或 FD passing。
+调用者必须在整个区间排除新发送、复位、断电、配置、重连和其它清队列事件，且在 producer
+区间开始前建立 `tx_dropped` 基线。CPU 暂停本身不能证明这些前提。
+
+`deadline` 是有限的 `time.monotonic()` 绝对期限；`check()` 检查进程存活，QMP 的单命令
+超时仍由调用者配置，可复用 `deadline_qmp_call`。操作先观察发送队列为零，再要求一次新的
+空读及空 framing tail，最后复核执行状态和队列。它每轮只读最多 4096 字节，不收集无限结果。
+EOF、解码、状态变化、sink 或超时错误直接失败，保留部分效果和借用连接；调用者须停止该次
+尝试。任意阻塞 callback 无法被此软期限抢占。此操作不推进 world，也不证明全局锁步、
+同一时刻所有 timer/IRQ 已处理、任意复位恢复或真实 CAN 时序。
+
+`sim.boards.wait_paused_can_input(qmp, stream, *, target_ns, controller, chardev,
+completed_frames, deadline, check)` 使用相同的原连接、暂停目标及期限约束，刷新既有
+发送队列，并等待原生接收计数精确达到 `completed_frames`。调用者必须在发送前取得
+基线、知道本批完整记录数，并保证绝对目标严格小于 `UINT64_MAX`；不得用当前队列长度
+推算记录数。整个尝试中须排除额外输入、复位、restore、断电、配置、重连或清队列。
+
+先用既有 reader 排空 QEMU 输出。等待操作只对原 socket 做非消费 peek；存在未读输出、
+framing tail 或原连接 EOF 时直接失败并保留字节，即使原生属性显示另一个 peer 已连接。
+达到目标时还要求发送队列和原生部分记录均为空，再重新查询执行状态与接收计数。
+返回最后一次原生控制器字典；`rx_dropped` 可以增长，因为处理完成包含被拒收的记录。
+此返回值证明同步输入处理已返回，固件消费与存储成功仍须分别验证。错误保留已发生的
+效果、后缀和借用资源，调用者须停止该次尝试；操作不负责恢复或推进 CPU/world。
+
+尚未执行首个目标时，可用 `sim.boards.observe_initial_paused_can(qmp, stream, *,
+timestamp_ns, controller, chardev, deadline, check)` 建立初始 CAN 基线。
+它要求执行状态为 `idle`、没有目标且时间精确等于 RESET_ACK 的原点，QEMU 保持
+`prelaunch` 或 `paused`；原连接、主机队列及原生发送和部分接收记录均须为空。
+函数不读取或刷新字节，以非消费 peek 拒绝未读输出和 EOF，并复核两次完整状态，
+返回最后的 `{"tx": ..., "rx": ...}` 控制器字典。期限、唯一 reader/writer 和排除
+复位、断电、配置、重连等条件与上述函数相同。此操作只建立启动基线，不推进时间。
+
+这三个 CAN 函数在借用对象提供 `command_many` 时，每次观察只查询 `can-execution-state`。
+返回后依次校验执行状态、暂停状态、实际绑定的 chardev 路径与调用方身份一致、连接状态
+及本次所需的 TX/RX 统计，初始观察校验两个方向。它们要求 QEMU 提供包含
+`fdcan-transports` 的上述组合属性；另一个已连接的 socket 不能代替实际 CAN 连接。
+组调用前后检查存活和期限；读取、逐帧 sink、发送刷新及最终复核仍各自保留检查。
+结果只用于当前观察，不跨这些 I/O 边界复用，也不是原子快照。批量调用失败直接终止，
+不会退回逐命令重发。没有该方法或显式为 `None` 的借用对象继续使用原逐命令路径。
+
+<a id="external-simulation-worker"></a>
+
+## 保留的外部 worker 与独立原生后端
+
+这部分保留独特的 legacy v1/v2、MIT/达妙、电机、ROS 2 与 Gazebo 连接能力，
+不作为新 sim/v1 应用的第二个运行入口。新的 CAN/四轮 worker 已复用 Simulation，见下节。
+配置中的 `--backend` / `--backend-registry` 是可信开发者手动选择的旧扩展入口，
+sim/v1 不从不可信 manifest 动态导入路径，也不提供任意主机命令执行。
 
 先运行仓库提供的 co-sim 和 motor fixtures，再连接自己的 plant：
 
@@ -1783,7 +1179,9 @@ bash tools/run-worker.sh --help
 
 手动启动时，入口的 `--cosim PATH` 将 QEMU 第一个 serial 槽位连接到 co-sim Unix socket，UART 仍由 `--uart` 选择。当前 `trobot` 的具体启动步骤见下文。
 
-### trobot stationary startup
+<a id="trobot-stationary-startup"></a>
+
+### trobot 静止启动
 
 当前未经修改的 `trobot` Release 会先完成 INS 初始化，再进入 `example_task`。它需要静止 IMU 样本；未接外部输入时，当前 BMI088 复位寄存器 fallback 不是静止 1 g，不能据此期待 INS 就绪。现有 NullEngine 提供零角速度和 `(0, 0, 1)` g 加速度，可用于启动 fixture；这不是经过校准的真实 plant。
 
@@ -1822,7 +1220,9 @@ continue
 
 命中 `example_task` 后，使用 `x/b &'ins::inited'` 读取初始化标志；本场景已观察到值为 `1`。Release ELF 可能只有符号而没有类型调试信息，直接 `print ins::inited` 会报类型未知。这些符号属于当前 `trobot`，其它固件应选择自己的应用就绪位置。此结果证明该固件在静止输入下进入应用任务，不证明电机、真实机构或所有业务行为完成验证。退出时先关闭 GDB，在 QEMU monitor 中输入 `quit`，再停止 worker。
 
-### trobot Release business fixture
+<a id="trobot-release-business-fixture"></a>
+
+### trobot Release 业务夹具
 
 普通 `trobot` Release 的 `example_task` 使用 PI 速度控制，依次给定 `0→6→0 rad/s`。
 下面的入口自动启动 QEMU 与 MuJoCo worker，验证这一固定业务场景并保存报告。
@@ -1908,7 +1308,7 @@ watchdog、最终暂停计数及输入哈希。CPU 以一个核心为 100%，可
 之前记录，表示轨迹推进；无节流容量、完整 loop 完成延迟、CPU/plant 全局锁步及任意机构
 性能仍需独立验证。
 
-### Backend choices
+### Legacy worker 的后端边界
 
 手动运行 stationary startup 示例只建立 co-sim 控制/采样通道。要交换电机总线数据，还需将 QEMU FDCAN chardev socket 配好并给 worker 传入 `--fdcan`；完整 wiring 示例见 `tools/run-dm-motor-smoke.sh`，上面的业务入口已自动连接该通道。通道联通不等于机构闭环已验证。
 
@@ -1958,10 +1358,51 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 模型中其它原生负载或 actuator 仍会参与动力学，设置的力矩不代表总关节合力矩。
 原生数值异常或无效目标状态会报错，后续推进与观察须先 reset；失败不提供回滚。
 `time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
-不建立 QEMU 时间屏障。四轮底盘、固件 IMU 闭环和物理标定仍需分别验证。
+不建立 QEMU 时间屏障。固件 IMU 闭环和物理标定仍需分别验证。
 `validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 只检查准入，不推进模型或
 改写力矩。`validate_steps((dt1_ns, dt2_ns, ...))` 按顺序检查未来 native 时间，提前
 拒绝浮点时间分辨率不足的后续区间。`close()` 释放此实例持有的原生 model/data；重复关闭无害，关闭后操作拒绝。
+
+### CAN worker 会话
+
+`tools/run-can-worker.py` and `tools/run-chassis-worker.py` now use the same
+`Simulation`/Topology factories as `sim run`. The rotor worker requires the
+default stationary IMU fixture; combining it with an independent legacy engine
+is rejected before connection. The chassis worker preflights the complete
+self-contained MJCF profile and closes that solver before opening transports.
+Includes/assets are rejected by this fixed worker profile; ordinary MuJoCo
+scenes retain their existing model support. Model changes after preflight fail.
+
+Each matching co-sim RESET_ACK closes the previous graph and creates a new
+Simulation with the acknowledged session ID and origin. CAN queues, devices and
+the native World are new resources. Borrowed transport sockets, incomplete RX
+records and queued TX suffixes survive unchanged. During RESET/ACK/DONE waits,
+CAN ingress only queues; it does not advance the World. STEP retries reuse the
+exact frame without another solver advance or IMU sample. A transport submission
+count belongs to its endpoint/session and does not prove firmware consumption.
+
+Known CAN deadlines can split a worker interval into several Simulation cuts.
+The worker wire STEP ID identifies the requested completed target; it is not an
+internal solver-step count. Native World seconds start at zero independently of
+the session's integer epoch. Completed World getters expose SI IMU, joint and
+body state without advancing physics.
+
+`--frames 0` remains continuous operation. Graph startup borrows the finite
+`--connect-timeout` budget; each target advance and its IMU observation borrow a
+2-second host budget. ACK/DONE waits keep their existing separate deadlines.
+Any execution/queue/I/O failure terminates the worker with independent cleanup;
+failed effects are not retried or rolled back. `PYTHON=/path/to/python` selects
+the interpreter for the chassis firmware runner as well as the DJI runner.
+
+The native RESET/suffix regression is included in:
+
+```sh
+QEMU_SYSTEM_ARM=/path/to/pinned/qemu-system-arm \
+  PATH=/path/to/native-env/bin:$PATH bash tools/run-qemu-worker-smoke.sh --chassis
+```
+
+该门补充真实 SPI readback 与 DJI/Chassis 固件消费者测试；它们不能证明全局 CPU/World 屏障、
+物理标定或持续实时性能。
 
 ### Gazebo 原生关节接口（可选）
 
@@ -2017,33 +1458,8 @@ model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的
 当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
 `validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
 
-要由现有 host Coordinator 统一 reset 和推进，可将已构造的 `GazeboPhysics`
-或 `MujocoPhysics` 交给同一个 `PhysicsParticipant`：
-
-```python
-from sim.core import Coordinator, Session
-from sim.physics import GazeboPhysics, PhysicsParticipant
-
-physics = GazeboPhysics("models/gazebo_rotor.sdf",
-                       joints={"shaft": ("rotor", "shaft")})
-coordinator = Coordinator({"world": PhysicsParticipant(physics)})
-try:
-    coordinator.reset(Session(1, 7))
-    physics.set_joint_effort("shaft", 0.4)
-    result = coordinator.step(10_000_000)["world"]
-    print(result.reached_time_ns, result.diagnostics)  # 10000007; native_time_s=.01
-    print(physics.get_joint_state("shaft"))
-finally:
-    coordinator.close()
-```
-
-participant 成功构造后拥有该 physics 的 reset、step 和 close；构造失败时仍由
-调用者清理。可借用 physics 设置 control 或读取观察，不再直接推进、重置，
-也不能与拥有同一 physics 的 `M3508JointPlant` 同时使用。
-每次 step 先复用后端的时长预检，再推进一次；后端失败冻结 participant，须成功 reset。
-session 的整数起点与原生 reset 时间零分别保留，`native_time_s` 是原生浮点秒诊断，
-不用于舍入或重建 session 时间。此 host barrier 不保证目标相机帧已交付或 MCU 同步；
-无关节的渲染 world 同样可以使用这个 participant。
+Gazebo 尚无 sim/v1 World Factory；独立 API 的调用者拥有其唯一 step/reset/close，
+不能与其它拥有相同 solver 的执行者并用。原生 sensor 交付与 CPU 同步仍是独立边界。
 
 可通过原生 SDFormat include 组合本地静态场景，并用 `resource_paths` 指定
 `model://` 的模型目录。目录以调用者当前路径解析，必须存在且不含冒号或 NUL；
@@ -2232,8 +1648,8 @@ CTest 总超时为 30 秒。报告保留子进程退出码、输入哈希和清�
 SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 API 正常析构。
 该门默认关闭，证明固定场景的真实 ROS 交付，不建立 ROS、渲染与 MCU 的全局时间屏障。
 
-这个转子是未标定的验证夹具。可通过下文的 `M3508JointPlant` 使用既有 CAN 电机协议。
-当前接口尚未接入 MCU 或 Robot manifest；ROS consumer 仅覆盖上述固定场景；
+这个转子是未标定的验证夹具。Gazebo 的 sim/v1 多设备组合尚未迁入；
+ROS consumer 仅覆盖上述固定场景；
 上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘
@@ -2318,67 +1734,29 @@ v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，�
 
 worker 每次从 co-sim/FDCAN stream 最多读取 4096 字节，返回完整帧并保留未完成帧；v2 暂存的已解码回复先处理，再读取新输入。因此持续可读输入期间仍有机会检查等待期限并服务其它就绪方向。此策略不保证各方向吞吐相同或固定的主机延迟；自定义 backend 的阻塞调用仍需自行限时。
 
-需要自行连接多个 QEMU 时，可直接使用 `sim.transports.cosim` 的
-`StepFramedSocket`、`wait_v2_response`、`send_v2_step`、`wait_v2_reset_ack`
-和 `QemuTimestampMapper`。唯一 v2 codec 是 `sim.transports.step_codec`；
-旧 `tools/dm_mc02_step_protocol.py` 和 worker 名称继续导出同一对象。
-每个连接分别持有 directional validator、session ID 和 mapper；调用方负责
-socket 的连接、非阻塞配置与清理。初始握手沿用实际 RESET/RESET_ACK：
+多 QEMU 的有限运行使用前述 sim/v1 图。底层 `sim.transports.cosim` 与唯一 STEP codec
+继续承载旧 worker 协议，不给应用建立第二个 scheduler。RESET/ACK/DONE 和原始流尾部
+各自保留其语义；不能从握手元数据推断 MCU、传感器和物理世界的全局锁步。
 
-```python
-from sim.transports import step_codec as wire
-from sim.transports.cosim import StepFramedSocket, wait_v2_response, QemuTimestampMapper
+<a id="testing-and-performance"></a>
 
-# cosim_socket 是调用方已连接的 socket；logical_origin_ns 由执行者选择。
-cosim_socket.setblocking(False)
-stream = StepFramedSocket(cosim_socket)
-tx = wire.StepSessionValidator.host_to_qemu()
-rx = wire.StepSessionValidator.qemu_to_host(require_step_done=False)
-session_id = wire.generate_session_id()
-reset = wire.decode_step_frame(wire.build_step_frame(wire.RESET, 0, 0,
-                                                    session_id=session_id))
-tx.accept(reset)
-rx.begin_reset(0, 0, session_id)
-stream.send(wire.encode_step_frame(reset))
-ack_frame = wait_v2_response(stream, rx, wire.RESET_ACK, 0, 0)
-ack = wire.decode_reset_ack_payload(ack_frame.payload)
-mapper = QemuTimestampMapper(ack.virtual_time_ns, logical_origin_ns)
-```
+## 验证与性能
 
-`send_v2_step` 接收调用方已经校验、编码的 STEP bytes，复用上述重试规则，
-不会生成输入或推进 plant。`wait_v2_response` 收到非预期 RESET 时抛出
-`V2SessionReset`；将它交给 `wait_v2_reset_ack(stream, rx, reset_event)`，
-只会等待实际匹配 ACK 并返回最新 RESET 元数据。重复 RESET 不延长同一个
-2 秒期限。握手不清除已有 RX tail、TX suffix 或已解码回复，也不重置 CAN、
-器件、物理世界或 QEMU；这些效果由调用方明确决定。既有单板 worker 仍在
-成功 ACK 后重置其独占 plant。多板共用一个 plant 可使用下方
-`SharedWorldRuntime`；各板的 RESET epoch、STEP_ACK 和 BMI088 消费 DONE
-仍分别表示时间映射、输入准入和传感器消费。
-`bash tools/run-qemu-v2-step-smoke.sh` 验证旧 worker 和两个真实 QEMU 的独立
-会话、时间原点，以及等待一块板 STEP_ACK 时发现另一块板的原生 RESET，
-随后由调用方完成 RESET_ACK 握手。双板用例复用现有 Lab 测试 ELF；报告保留
-实际 DONE 消费 masks，该用例未构造物理世界。
+本轮或某个历史门通过，不代表所有原生 profile 通过。报告应分别记录命令、退出码、
+环境、ELF SHA、实际 QEMU 路径/版本或能力、诊断与清理状态。缺依赖是 BLOCKED，
+pytest 的 optional skip 不是该层 PASS；没有 Actions 运行记录时不能声称 CI 已通过。
 
-多连接调用方可用 `poll_v2_response(stream, rx)` 检查当前没有等待器读取的
-连接。它非阻塞地返回一个 `(frame, payload)`，无完整回复时返回 `None`；
-使用与等待器相同的会话和 payload 校验，并在校验队首前保留已解码后续帧。
-RESET 原样返回其会话和时间元数据，STEP_DONE 保留实际 status 与消费 masks，
-调用方据此决定是否冻结或握手。每条连接同一时刻只能由 poll 或等待器读取。
-poll 不发送、等待或清理连接；未完成的 RX 字节继续由原 stream 保存。
+| 层级 | 验证入口 | 证据与限制 |
+| --- | --- | --- |
+| Host core | `.github/workflows/host-core.yml` | 安装基础包、纯 Python 合同、checkout 外 CLI；不运行 MCU |
+| 协议与记录 | 同 workflow 的纯 Python extras 阶段 | 实际字节/状态、MCAP 生命周期与离线复核 |
+| 原生 Board | `bash tools/run-simulation-smoke.sh --case all` | ARM ELF + 固定 QEMU；缺依赖退出 78 |
+| 多板 | 同脚本 `--case dual-board` | 独立机器与时间映射，非全局硬件锁步 |
+| 物理 | `python -m pytest -q tests/test_simulation_joints.py tests/test_four_wheel_physics.py` | 需要 MuJoCo；单 solver、异构驱动器和数值状态 |
+| 固件直连 | 下文 HAL/BSP、Motor、DJI、Chassis、Referee runner | 消费行为与清理；不代表实板标定 |
 
-QMP 或固件触发 machine reset 时，同一 co-sim 连接会先完成已开始发送的帧，再发送新会话 RESET、RESET_ACK 和状态快照；尚未开始发送的旧回复会取消。断开连接会清空旧输出，重连建立新会话，不重放丢失的回复。客户端主动发送 RESET 仍按原有队列顺序返回响应；使用严格会话校验的客户端需处理此前的旧会话回复。
-
-同一连接的复位也会保留尚未接收完整的帧前缀。后缀到达后，旧 v2 STEP 按旧会话 ID 整帧拒绝，新会话 STEP 可继续接收；`cosim-diagnostics` 的 `rx_buffered` 表示当前保留的接收字节数。拒绝旧 STEP 会增加 `rx_bad_frames` 和 `rx_dropped_bytes`，不代表帧边界损坏。真正断连会清空旧接收字节。此边界不隔离旧客户端 RESET 帧或无会话 ID 的 v1 输入；会话 ID 完整回绕和客户端主动复用 ID 也不提供历史隔离保证。
-
-v2 控制响应队列满时，已经接收完整但尚未处理的 STEP 也会留在接收缓冲区，不交付设备。读取回复释放队列后可以继续处理；期间发生复位时，该帧保持原字节，按旧会话 ID 拒绝，新会话 STEP 可继续接收。`tx_queue=8` 与非零 `rx_buffered` 可帮助确认此状态。遥测仍按既有拥塞策略丢弃或延后发送，`tx_dropped` 会记录相关事件；此恢复不提供丢失回复的重放。
-
-worker 收到新 RESET 后立即停止旧 STEP 重试，等待对应 RESET_ACK 后重建 plant 会话。此握手另有 2 秒期限；期间再次 RESET 会切换到最新会话，期限保持不变。worker 保留队列中旧 STEP 的完整帧或未发送后缀，按原顺序完成发送，新 STEP 排在其后；QEMU 会按旧会话 ID 拒绝完整旧 STEP。该策略也适用于完成等待中尚未发送完的重放。握手超时、断连或恢复后的 STEP 准入超时会报错并清理资源。连接关闭会终止当前 worker，重新运行 worker 可建立新会话。
-
-初始 RESET 超时、协议错误、运行失败或中断时，worker 会尝试关闭已成功获取的 backend 和所有连接。某项关闭失败时，继续关闭其它连接，并输出 `cleanup <资源>.close() failed`；原始运行错误保持不变。正常运行结束后的关闭失败也会返回非零。连接或配置尚未完成时失败，连接 helper 会尝试关闭它持有的 socket；Unix 连接关闭失败会停止重试，保留原始连接错误及清理诊断。SocketCAN 保留原有接口错误说明。
-
-自定义 backend 返回后，worker 先尝试取得 `close()`，再检查方法；属性 getter 抛错或对象被拒绝时，会尝试调用已取得的关闭方法一次。准入失败且无法取得可调用的关闭方法时，诊断为 `backend cleanup unavailable`，不能保证插件私有资源已释放。自定义 factory 负责其返回前创建的私有资源；自定义 backend 的 getter、调用及关闭操作应及时返回，worker 不强制中断阻塞的插件。
-
-## Testing and performance
+轻量 PR gate 不构建 QEMU、不安装 MuJoCo/ROS/Gazebo，也不依赖未追踪的本地示例。
+原生门应在具备 Nix/ARM GCC/兼容二进制的 Linux 环境中单独执行，并保留构建缓存与产物身份。
 
 日常修改优先运行受影响的原生测试，例如内部 Flash：
 
@@ -2388,7 +1766,9 @@ tools/meson test -C build/qemu --print-errorlogs qtest-arm/dm-mc02-memory-test
 
 该命令复用已有 qtest，不需要业务固件。修改模型后先构建 QEMU；完整回归用于发布和涉及多个入口的变更。
 
-### trobot HAL/BSP firmware test
+<a id="trobot-halbsp-firmware-test"></a>
+
+### trobot HAL/BSP 固件测试
 
 外部 `trobot` 工作区可选择专用测试构建，普通业务 preset 默认关闭测试：
 
@@ -2416,116 +1796,9 @@ POR→软件复位→watchdog 复位并汇总所有启动的结果；FAIL、缺�
 当前固件仅16-bit ADC；低分辨率及其它芯片模式继续由各自下层门验证。此处结果是 HAL/BSP
 consumer 回归，不能据此声明硅级精度、真实电气时序或整机 migration；本轮没有实板烧录。
 
-FDCAN 当前发送侧支持 FIFO 模式（`NDTB=0`、`TFQM=0`），容量最多 32 帧；专用 TX
-buffer、混合 buffer/FIFO 和按优先级排序的 TX queue 尚未支持。地址与容量解码修正后，
-旧 FDCAN v1/v2 组件快照及共享 Message RAM link v1 快照会被拒绝；这不影响普通 ELF
-启动。完整 machine migration 仍未支持。
+<a id="trobot-motormujoco-test"></a>
 
-FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发送记录并取消重试；
-已发送的前缀不会在新连接重放。关闭后新提交的完整帧
-仍使用现有有界队列，重连后按顺序发送。`fdcan-host-ack` 和 TXBTO 沿用模型的准入及完成近似，
-不能证明主机已收到完整帧。该规则不保证同一连接上的 reset/断电保留 partial frame，
-也不提供 CPU 暂停时的任意输出排空。
-
-发送遇到部分写入、零写入或 `EAGAIN` 时，支持原生可写通知的 chardev 使用一次性
-可写事件继续发送保留的后缀，无需推进虚拟时间。当前使用默认主循环；不支持可写通知的
-后端继续使用既有的 1 ms 虚拟时间重试。其它写入错误或 HUP 取消可写监听，保留虚拟
-重试，连接关闭仍由原生 chardev 事件处理。成功发送导致的队列排空只表示后端接受了记录，不能证明
-对端解码、CPU 中断处理或外部 plant 已完成。
-
-可通过原生 QMP 读取当前主机发送队列：
-
-```json
-{"execute":"qom-get","arguments":{"path":"/machine","property":"fdcan-tx-state"}}
-```
-
-返回 `schema: 1`、QEMU 虚拟时间 `timestamp_ns` 和 `controllers`；控制器名称来自当前
-板卡 profile，例如 `dm-mc02.fdcan1`。各控制器的 `pending_frames` 是尚未完成的记录数，
-`pending_bytes` 是这些记录剩余的字节数；`tx_dropped`、`tx_short_writes` 是既有累计计数，
-随控制器复位清零。此属性只读，查询不触发发送或推进虚拟时间，尚未初始化时返回错误。
-`pending` 字段只描述当前仍待发送的记录；关闭连接、复位或断电也可能清空队列。
-成功发送引起的排空仅表示后端接受，确认对端收到数据仍需实际读取并校验。查询也不能证明
-此前没有发送错误，或 CPU、IRQ、外部 plant 已完成当前时刻的工作。
-
-接收侧可查询同一 machine 的只读 `fdcan-rx-state`，返回 `schema: 1`、
-`timestamp_ns` 和各控制器的 `completed_frames`、`partial_bytes`、`rx_dropped`。
-`completed_frames` 在每个完整 84 字节 host wire 的同步处理返回后递增，包含格式错误、
-过滤拒绝、INIT、断电或 FIFO 已满而丢弃的记录；部分记录和原生 CAN bus/内部 loopback
-不计数。`partial_bytes` 是当前尚未组成完整记录的字节数（0–83）；查询不执行 IO、
-改写寄存器或推进时间。主机发送队列为空本身不能证明 QEMU 已处理输入。
-
-完成计数随控制器复位清零，不进入组件快照；关闭连接或断电保留计数并按既有规则清除
-部分记录。计数在 `UINT64_MAX` 饱和，该值表示计数已耗尽，调用者发送前须保留严格低于
-此值的余量。确认某一批输入需要原连接、唯一 writer、已知完整记录数量和发送前基线，
-并排除额外输入、复位、restore、重连、断电及其它清理；这些事件使原确认失效。
-`rx_dropped` 沿用既有累计/复位语义，完成计数不证明存储成功、固件中断或 BSP 消费，
-也不按报文时间戳调度输入，不建立 CPU/world 时间屏障。
-
-需要同时观察执行状态和 CAN 时，可读取只读的 `can-execution-state`：
-
-```json
-{"execute":"qom-get","arguments":{"path":"/machine","property":"can-execution-state"}}
-```
-
-返回 `schema: 1`，以及 `execution`、`status`、`fdcan-tx-state`、`fdcan-rx-state`。
-这四项分别沿用 `x-query-virtual-execution`、`query-status` 和上述两个属性的完整返回值。
-附加的 `fdcan-transports` 按控制器名称返回实际绑定的 chardev，例如
-`{"dm-mc02.fdcan1":{"path":"/chardevs/can1","connected":true}}`。
-`path` 是原生 QOM 路径；未绑定时为 `null`。`connected` 读取该对象原生的同名属性，
-没有此属性的后端返回 `null`；后端存在不代表已经连接。调用方应核对路径与预期的连接身份。
-查询不停止 CPU、不排空队列、不推进虚拟时间；任一子查询失败则整次读取失败。
-各项依次取样，运行中的 CPU 或主机输入仍可改变状态，不能将它作为原子快照或时间屏障。
-也可单独读取实际 transport 对应的 `/chardevs/<id>` 的 `connected` 属性进行核对。
-
-共享 chardev 发送 helper 在已写出部分字节后遇到阻塞或错误时，返回已写出的长度，
-调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
-字节数，不证明该次调用中未遇到后续错误，也不代表对端已消费。
-
-主机代码可调用 `sim.boards.drain_paused_can(qmp, stream, sink, *, target_ns,
-controller, chardev, tx_dropped, deadline, check)`，把已准入的 CAN 输出逐帧交给
-`sink(frame)`；frame 沿用 `CanStream.receive()` 的 tuple。此操作要求原生执行目标已
-`reached`、QEMU 保持 `paused`，并使用同一条普通非阻塞 AF_UNIX 连接、唯一 writer 和 reader，
-不使用 mux、TLS 或 FD passing。
-调用者必须在整个区间排除新发送、复位、断电、配置、重连和其它清队列事件，且在 producer
-区间开始前建立 `tx_dropped` 基线。CPU 暂停本身不能证明这些前提。
-
-`deadline` 是有限的 `time.monotonic()` 绝对期限；`check()` 检查进程存活，QMP 的单命令
-超时仍由调用者配置，可复用 `deadline_qmp_call`。操作先观察发送队列为零，再要求一次新的
-空读及空 framing tail，最后复核执行状态和队列。它每轮只读最多 4096 字节，不收集无限结果。
-EOF、解码、状态变化、sink 或超时错误直接失败，保留部分效果和借用连接；调用者须停止该次
-尝试。任意阻塞 callback 无法被此软期限抢占。此操作不推进 world，也不证明全局锁步、
-同一时刻所有 timer/IRQ 已处理、任意复位恢复或真实 CAN 时序。
-
-`sim.boards.wait_paused_can_input(qmp, stream, *, target_ns, controller, chardev,
-completed_frames, deadline, check)` 使用相同的原连接、暂停目标及期限约束，刷新既有
-发送队列，并等待原生接收计数精确达到 `completed_frames`。调用者必须在发送前取得
-基线、知道本批完整记录数，并保证绝对目标严格小于 `UINT64_MAX`；不得用当前队列长度
-推算记录数。整个尝试中须排除额外输入、复位、restore、断电、配置、重连或清队列。
-
-先用既有 reader 排空 QEMU 输出。等待操作只对原 socket 做非消费 peek；存在未读输出、
-framing tail 或原连接 EOF 时直接失败并保留字节，即使原生属性显示另一个 peer 已连接。
-达到目标时还要求发送队列和原生部分记录均为空，再重新查询执行状态与接收计数。
-返回最后一次原生控制器字典；`rx_dropped` 可以增长，因为处理完成包含被拒收的记录。
-此返回值证明同步输入处理已返回，固件消费与存储成功仍须分别验证。错误保留已发生的
-效果、后缀和借用资源，调用者须停止该次尝试；操作不负责恢复或推进 CPU/world。
-
-尚未执行首个目标时，可用 `sim.boards.observe_initial_paused_can(qmp, stream, *,
-timestamp_ns, controller, chardev, deadline, check)` 建立初始 CAN 基线。
-它要求执行状态为 `idle`、没有目标且时间精确等于 RESET_ACK 的原点，QEMU 保持
-`prelaunch` 或 `paused`；原连接、主机队列及原生发送和部分接收记录均须为空。
-函数不读取或刷新字节，以非消费 peek 拒绝未读输出和 EOF，并复核两次完整状态，
-返回最后的 `{"tx": ..., "rx": ...}` 控制器字典。期限、唯一 reader/writer 和排除
-复位、断电、配置、重连等条件与上述函数相同。此操作只建立启动基线，不推进时间。
-
-这三个 CAN 函数在借用对象提供 `command_many` 时，每次观察只查询 `can-execution-state`。
-返回后依次校验执行状态、暂停状态、实际绑定的 chardev 路径与调用方身份一致、连接状态
-及本次所需的 TX/RX 统计，初始观察校验两个方向。它们要求 QEMU 提供包含
-`fdcan-transports` 的上述组合属性；另一个已连接的 socket 不能代替实际 CAN 连接。
-组调用前后检查存活和期限；读取、逐帧 sink、发送刷新及最终复核仍各自保留检查。
-结果只用于当前观察，不跨这些 I/O 边界复用，也不是原子快照。批量调用失败直接终止，
-不会退回逐命令重发。没有该方法或显式为 `None` 的借用对象继续使用原逐命令路径。
-
-### trobot motor/MuJoCo test
+### trobot Motor/MuJoCo 测试
 
 在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
 
@@ -2552,7 +1825,7 @@ P/V/T=12.5/30/10 是测试 profile，状态 nibble=0 和温度=25°C 是固定�
 达妙清除错误命令，既有 `reset()` API 不表示机械位置归零。真实物理标定仍显式 SKIP。
 省略 ELF 参数运行原有最小 guest 与 NullEngine smoke，经 v2 RESET/STEP 交换反馈。
 
-### Canonical test gate
+### 完整回归门
 
 完整门禁中的 MuJoCo Python 行为测试需要安装 `mujoco` extra；仅同步 `dev` 时，该测试会跳过并使完整门禁返回 BLOCKED。基础 QEMU 构建和最小 guest smoke 不需要此 extra：
 
@@ -2580,7 +1853,7 @@ python3 tools/dm_mc02_test_gate.py --no-build --jobs 4
 python3 tools/dm_mc02_test_gate.py --smoke-only --jobs 4
 ```
 
-### Firmware RTF
+### 固件实时系数
 
 短采样用于诊断固件 tick 推进和 watchdog 状态：
 
@@ -2599,9 +1872,117 @@ bash tools/run-release-rtf-gate.sh
 
 性能结果只适用于本次的固件、宿主负载和运行配置；启用外部后端或更换固件后需要重新测量。
 
-## Update and source package
+### Referee 固件消费者
 
-### Update a checkout
+在外部 trobot 工作区构建默认关闭的专用固件；普通业务 Debug/Release 不启用这些开关：
+
+```bash
+cd ../trobot
+cmake --preset RefereeTestDebug
+cmake --build --preset RefereeTestDebug
+cd ../dm-mc02-qemu
+tools/run-trobot-referee-test.sh ../trobot/build/RefereeTestDebug/trobot.elf \
+  build/test-results/referee-debug ../trobot
+```
+
+固定两批共四种消息，第二批先发 19 bytes，固件保持旧状态观察 100ms 后才补发原 63-byte 后缀；
+实际 UART7/HAL DMA/BSP/RTOS 消费检查四组 payload 与非零新时间戳。
+结果目录须不存在，输入哈希与进程清理后才发布结果；物理标定保持 SKIP。
+双板与脚本消费者分别构建 `ArenaRefereeTestDebug/Release`、`ScenarioRefereeTestDebug/Release`，
+同 runner 使用 `--arena` 或 `--scenario`；后者可加 `--cli` 检查真正的 `sim run` 路径。
+这些是 fixture profile 名称，内部均组合普通 sim/v1 场景；没有独立 Arena/Scenario runtime。
+它们仍使用固定 1s 活动时长、100ms 发布和原 host 期限，不通过扩大期限掩盖失败。
+
+<a id="trobot-dji-driver-test"></a>
+
+### trobot DJI 驱动测试
+
+使用默认关闭的专用固件验证实际 `motor::dji` 驱动。普通业务 preset 不启用它，
+`DjiTest` 与 `MotorTest` 不能同时选择：
+
+```bash
+cd ../trobot
+cmake --preset DjiTestDebug
+cmake --build --preset DjiTestDebug --clean-first
+cmake --preset DjiTestRelease
+cmake --build --preset DjiTestRelease
+cd ../dm-mc02-qemu
+bash tools/run-trobot-dji-test.sh ../trobot/build/DjiTestRelease/trobot.elf \
+  build/test-results/trobot-dji.json ../trobot
+```
+
+第三个参数是产生 ELF 的固件源码目录，报告保存实际文件哈希；使用独立构建副本时，
+应传该副本。可用 Debug ELF 和 `QEMU_SYSTEM_ARM` 指定的 QEMU 重复验证。
+runner 通过 ID1/ID5 覆盖两个电流命令组，独立 literal 反馈检查实际角度、转子 RPM、
+减速后速度、电流和转矩解码，再检查正反向输出、禁用、重新启用、定向掉线与恢复。
+掉线阶段只丢弃 `0x201`，保留 `0x205`；固件持续刷新命令，证明 50 ms 反馈超时
+导致实际驱动任务清零。报告同时保留真实零电流 wire、冻结的反馈时间戳与新鲜命令时间。
+
+夹具用 QEMU CAN 时间戳决定可推进的 1 ms host ticks，同一 tick 的两个命令组只推进
+一次；tick 内到达的命令在下一边界交付，最多量化 1 ms。它不建立 CPU/plant 全局锁步。
+观测与追赶有界，FAIL、缺失项、清理失败或输入哈希变化均返回非零并保留报告；实物
+plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续性能门分别执行。
+
+Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
+
+该固定场景曾有 Release 复测在原 20 秒 host 期限内只完成 1090 步，最终暂停
+watchdog 观察缺失，历史失败保留。逐切点交换收敛后，Debug/Release 在原期限下
+各复测通过一次；单次通过不证明期限稳定性，也不构成实时性能证据。
+
+```bash
+cd ../trobot
+cmake --preset DjiScenarioTestRelease
+cmake --build --preset DjiScenarioTestRelease --clean-first
+cd ../dm-mc02-qemu
+.venv/bin/python tools/dm_mc02_dji_test.py --scenario \
+  ../trobot/build/DjiScenarioTestRelease/trobot.elf \
+  build/test-results/dji-scenario-release ../trobot \
+  --qemu build/qemu/qemu-system-arm
+```
+
+夹具生成固定双板 sim/v1 场景，通过同一 Simulation 运行。两个 MCU
+使用相同 ELF，真实驱动 ID1/2 输出 `64/-64`；另外两个命令槽保持零。east 总线在
+RESET 相对 0ms 设置 5ms 入队延迟，在 250ms 恢复零延迟，west 保持零延迟。
+已排队帧保留原截止时间；报告分别记录来源、交付时间、原始 CAN 字节和固件复制的
+反馈字段及 BSP 时间戳。相同反馈字节只能证明来源匹配，不能识别唯一一次固件回调。
+两边第一次完整反馈报告必须早于 250ms，否则测试失败。
+命令观察逐条校验并计数；`transition_count` 保存实际切换总数，`transitions` 仅保留
+最初 8 次切换，`last` 始终记录最后一条命令。该诊断摘要不提供完整命令轨迹。
+
+恢复延迟后，既有 UART1 握手释放第二次应用观察；握手不改变事件时间或推进世界。
+结果目录必须不存在。缺失样本、FAIL、发送或清理失败、输入变化均保留失败报告。
+该门不证明动态延迟下的 50ms 超时、物理 CAN 时序、CPU/plant 全局锁步或实时性能；
+物理校准保持显式 SKIP。旧 ID1/ID5 独立掉线测试沿用上述入口。
+
+反馈丢失的固件消费者使用独立、默认关闭的 `DjiFeedbackTestDebug/Release`，
+与 `DjiScenarioTest` 互斥：
+
+```bash
+cd ../trobot
+cmake --preset DjiFeedbackTestRelease
+cmake --build --preset DjiFeedbackTestRelease --clean-first
+cd ../dm-mc02-qemu
+.venv/bin/python tools/dm_mc02_dji_test.py --feedback-scenario \
+  ../trobot/build/DjiFeedbackTestRelease/trobot.elf \
+  build/test-results/dji-feedback-release ../trobot \
+  --qemu build/qemu/qemu-system-arm
+```
+
+新结果目录必须不存在。固定场景在 RESET 后 200 ms 屏蔽两成员各自 ID1 的反馈，
+350 ms 恢复，实际 ready 后运行 400 ms；启动期限 10 秒、host 总期限 20 秒。
+固件持续请求 ID1/2 电流 `64/-64`，检查反馈时间戳冻结、年龄超过配置的 50 ms、
+应用非零命令仍新鲜时驱动任务清零输出，以及恢复后新反馈和非零输出。
+ID2 是各成员的持续在线对照。主机还检查真实 CAN 命令、器件来源、丢弃范围、
+物理发送完成及最终 watchdog，清理和输入哈希核验完成后才发布通过。
+
+这是反馈不可达测试；50 ms 是该驱动的应用配置，不能据此声明电机断电、精确中断
+时刻、全局锁步或实时性能。物理校准保留 SKIP；本门不替代上面的固定 Release 场景门。
+
+<a id="update-and-source-package"></a>
+
+## 更新与源码包
+
+### 更新 checkout
 
 ```bash
 git pull --ff-only
@@ -2610,7 +1991,7 @@ git submodule update --init --depth 1 qemu/upstream
 
 子模块通常处于 detached HEAD，这是固定版本的正常状态。更新后重新运行构建脚本；切换 Nix 与 Ubuntu 依赖环境时，脚本会自动刷新 QEMU configure 元数据。
 
-### Create and restore a source package
+### 创建与恢复源码包
 
 首次构建获取所需 Meson wraps 后，可以创建可校验源码包：
 
@@ -2630,7 +2011,9 @@ git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2
 
 源码包不含 `.git`、ROM 子模块工作树、构建二进制或固件；ELF 仅按哈希识别。restore 的目标目录必须不存在，源码落在其 `project/` 子目录。`verify` 证明包内容与 manifest 一致，不代表已独立构建或测试；完整验收要在恢复环境重新配置、构建并执行测试门。
 
-## Troubleshooting
+<a id="troubleshooting"></a>
+
+## 故障排查
 
 | 现象 | 优先检查 |
 | --- | --- |
@@ -2707,609 +2090,24 @@ build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
 EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被拒绝，
 这仍不代表整机快照支持。CORDIC 使用官方 H723 地址 `0x48024400`。
 
-## Repository map
+## 能力边界与目录
 
-| 路径 | 用途 |
+- 当前真实 MCU 是 STM32H723 / DM-MC02。SPI/I2C/ADC 网络连接、第二块真实 MCU、Windows 原生全功能均未交付。
+- `net.digital` 是完成态采样，QEMU GPIO `event-output` 原生门仍 BLOCKED；没有逐位 UART、电气争用或 PWM 负载求解。
+- UART5 是遥控器 RX 原始输入，不提供 SBUS-A/DR16 编码、反相电平真实性或 TX。
+- MuJoCo/四轮 toy 参数未标定；CAN 故障为主机交付策略，不模拟真实仲裁、bus-off 或电气错误。
+- 固定 shift0 是虚拟指令计时，不是 H723 周期模型；CPU 切点、FIFO 到达和固件应用消费分别验证。
+- 独立 Gazebo/ROS/MIT legacy worker 与原生自由运行 Lab 暂保留其独特能力，不给新场景复制运行时。
+- 不提供完整硅级模型、整机 migration、硬实时保证、分布式仿真、OJ 服务或任意不可信 manifest 的主机沙箱。
+
+| 路径 | 职责 |
 | --- | --- |
-| `qemu/upstream/` | 固定的 QEMU fork、芯片/板级模型和 QEMU 原生测试 |
-| `cosim/` | 板卡无关的 C 模型、wire protocol 与 transport adapter |
-| `sim/` | 通用 host coordinator、transport、CAN Fabric、器件和简单 plant |
-| `tools/` | 构建、worker、QMP、RTF、源码包和测试 gate |
-| `tests/` | Host C、Python 与协议测试 |
-| `flake.nix`、`flake.lock` | Nix 环境与依赖锁定 |
-| `build/` | 本地构建产物、测试报告和运行文件 |
-
-## Virtual CAN and M3508
-
-`sim/core` 提供板卡无关的 session/participant 协调器；`sim/transports` 保留有界的
-stream/datagram 队列。`sim/fabric` 在主机侧按时间戳、固定延迟和准入顺序交付 CAN 帧，
-可配置 loopback、drop predicate 和日志 sink。已有 worker 入口与默认电机协议保持兼容。
-
-Python 的 `CanBus.delay_ns` 可在该总线的交付回调之外修改，接受
-`0..2^64-1` 的普通 `int` 纳秒值（不含 `bool`）。
-新值只影响后续入队帧；已经排队的截止时间和等时 FIFO 顺序保留，减小延迟时
-新帧可以先于旧帧交付。无效值或该总线交付回调内的修改会拒绝，reset 保留当前配置。
-交付仍由现有 step 完成；这是主机侧队列策略，不建立 QEMU CPU 时间屏障。
-Scenario 的 `can_delay` 动作通过既有 Arena 和共享世界接口修改此策略。
-
-连接已有 QEMU co-sim 和 FDCAN Unix socket 时，可使用专用 M3508 入口：
-
-```bash
-python3 tools/run-can-worker.py --cosim /path/to/cosim.sock --fdcan /path/to/can.sock \
-  --protocol v2 --realtime --m3508-id 1 --m3508-id 5
-python3 tools/run-can-worker.py --help
-```
-
-ESC ID 可重复指定，但必须互不重复且在 1–8；可添加 `--socketcan can0` 接入已有 Linux
-CAN 接口。参数 `--can-delay-ns` 默认 0，`--m3508-timeout-ms` 默认 100，
-`--torque-per-amp` 默认 0.02 Nm/A。配置在连接前校验；消息或发送队列耗尽时明确失败。
-
-M3508 接收 C620 标准 DATA DLC8 的 `0x200`/`0x1ff` 分组电流命令，输出 `0x201`–`0x208`
-转子角度、转子 RPM、电流与温度反馈。固件负责减速比换算。当前使用未标定的简单转子
-(J=0.02 kg·m²、阻尼 0.08 Nm/(rad/s))、固定 25°C、命令电流代替实际电流测量。
-默认每虚拟毫秒反馈，较大 step 只发送最新样本；100 ms 命令超时后零驱动并继续反馈。
-这些是公开的模型近似；C620 手册没有提供这里使用的数值超时保证。
-
-需要由外部 plant 驱动时，使用 `sim.devices.dji.M3508Device`：先
-`prepare_step(ctx)` 取得转子力矩与命令截止时间，推进物理模型，再用
-`complete_step(plan, position_rad, velocity_rad_s)` 提交转子采样。准备阶段不推进时间
-或发送反馈；完成阶段只接受该器件返回的原 plan。一次只允许一个 pending plan，
-reset/close 会取消它。发送失败保留已提交状态，调用方必须冻结并 reset，不能重复完成
-或重复推进 plant。`M3508` 保留原简单转子用法，并复用这一协议边界。
-
-`M3508JointPlant` 把多个协议器件绑定到同一个 `MujocoPhysics` 或 `GazeboPhysics`，取得这些器件与
-物理模型的独占执行所有权。绑定必须使用 `M3508Device`，每个 joint 在 world 内唯一，
-电机 ID 在各自 CAN bus 内唯一；独立总线可以复用同一 ID。四轮模型的完整组合如下：
-
-```python
-from sim.core import Coordinator, Session
-from sim.devices.dji import M3508Device, M3508JointPlant
-from sim.fabric import CanBus
-from sim.fabric.runtime import CanParticipant
-from sim.physics import MujocoPhysics
-
-corners = ("fl", "fr", "rl", "rr")
-physics = MujocoPhysics.from_xml_path(
-    "models/four_wheel.xml",
-    joints={f"wheel_{c}": f"drive_{c}" for c in corners},
-    imus={"imu": ("imu_gyro", "imu_accel")},
-)
-bus = CanBus()
-devices = {M3508Device(bus, i): f"wheel_{corner}"
-           for i, corner in enumerate(corners, 1)}
-# 在 reset/step 前把主机或 QEMU CAN endpoint 接到 bus。
-shared = M3508JointPlant(physics, devices)
-coordinator = Coordinator({"can": CanParticipant(bus, [shared])})
-coordinator.reset(Session(1))
-coordinator.step(1_000_000)
-coordinator.close()
-```
-
-`QemuCanEndpoint.submitted_frames` 是端点生命周期内发送调用正常返回的累计帧数，
-包括仍留在 transport 队列中的完整帧或未发送后缀；更换 RESET mapper 或逻辑 reset
-保留这个只读计数。它不表示 socket 接收、QEMU 处理、FIFO 接受或固件消费。
-发送异常可能已经产生部分 I/O，但不增加计数；调用方须冻结，不能据此重放或恢复发送。
-
-在 Gazebo SDK Python 环境中也可用同一 owner 绑定公开转子：
-
-```python
-from sim.core import Coordinator, Session
-from sim.devices.dji import M3508Device, M3508JointPlant
-from sim.fabric import CanBus
-from sim.fabric.runtime import CanParticipant
-from sim.physics import GazeboPhysics
-
-physics = GazeboPhysics("models/gazebo_rotor.sdf",
-                        joints={"shaft": ("rotor", "shaft")})
-bus = CanBus()
-device = M3508Device(bus, 1)
-try:
-    shared = M3508JointPlant(physics, {device: "shaft"})
-except BaseException:
-    device.close()
-    physics.close()
-    raise
-coordinator = Coordinator({"can": CanParticipant(bus, [shared])})
-try:
-    coordinator.reset(Session(1))
-    coordinator.step(1_000_000)
-finally:
-    coordinator.close()  # closes owned devices and physics
-```
-
-默认减速比 `g=3591/187` 来自 [DJI M3508 P19 V1.0 手册](https://rm-static.djicdn.com/tem/17348/RoboMaster%20M3508%20P19%20Brushless%20DC%20Gear%20Motor%20V1.0.pdf)
-的规格表。adapter 使用理想无损换算：转子角度和速度为 joint 的 `g` 倍，joint
-力矩为转子力矩的 `g` 倍；XML motor 保持 gear=1。效率、背隙及转子惯量未经标定。
-每个命令截止区间只推进一次共享物理模型，收齐全部终点采样后才生成反馈。
-构造时先检查所有绑定、初始采样及 ±20 A 对应的最大 joint 力矩；失败时输入仍由
-调用方拥有。每次推进先检查总步长、按顺序投影的全部超时分段和力矩，再写入控制。总步长必须
-符合后端单次 step 的限制，Gazebo 为 1–10000 个实际 native ticks；每个超时分段也
-须精确对齐。命令超时或分段不对齐会拒绝并冻结 owner，不能自动舍入；Session
-绝对起点不需要对齐 native tick。反馈周期不用于物理分段。
-reset 只重置一次物理模型；native 时间归零，CAN/session 时间仍以所给 Session 为原点。
-任一运行失败会冻结这个 owner，直到成功 reset；已推进的物理状态和已排队反馈不回滚。
-`close()` 独立尝试关闭所有拥有的器件与 physics，保留首个错误及其它清理诊断；重复
-调用不重试。借用的 CAN bus 和 transport 由调用方负责。
-
-多条独立 CAN bus 可共用一个 `M3508JointPlant`，所有命令截止时间仍在同一 world
-内合并，每个区间只积分一次。plant 不推进或重置总线；用
-`CanParticipant((bus_a, bus_b), [shared])` 统一交付起点命令、推进这个唯一 plant，
-再交付目标反馈。总线集合须为非空 tuple，身份唯一；list、set 和 iterator 拒绝。
-`.buses` 保留准入顺序，`.bus` 仅用于单总线。不要为每条总线构造拥有相同 physics
-的 plant；固定四轮 worker 场景仍只接单条 CAN 总线。
-
-这个示例把未标定四轮夹具的前、后轮分别接到独立总线，每条总线使用 ID 1、2：
-
-```python
-from sim.core import Coordinator, Session
-from sim.devices.dji import M3508Device, M3508JointPlant
-from sim.fabric import CanBus
-from sim.fabric.runtime import CanParticipant
-from sim.physics import MujocoPhysics
-
-corners = ("fl", "fr", "rl", "rr")
-physics = MujocoPhysics.from_xml_path(
-    "models/four_wheel.xml",
-    joints={f"wheel_{c}": f"drive_{c}" for c in corners})
-buses = (CanBus(), CanBus())
-bindings = {M3508Device(buses[i // 2], i % 2 + 1): f"wheel_{c}"
-            for i, c in enumerate(corners)}
-try:
-    shared = M3508JointPlant(physics, bindings)
-except BaseException:
-    for device in bindings:
-        device.close()
-    physics.close()
-    raise
-coordinator = Coordinator({"can": CanParticipant(buses, [shared])})
-try:
-    coordinator.reset(Session(1, 7))
-    result = coordinator.step(1_000_000)["can"]
-    print(result.reached_time_ns, result.diagnostics)  # 1000007; target broadcasts=4
-finally:
-    coordinator.close()
-```
-
-编排先校验目标 CAN 时间和全部总线起点，再按 tuple 顺序各交付一次起点帧。
-全部总线的起点到期帧须清空后才推进器件。回调可向其它总线入队；后面的总线向已
-访问总线入队起点帧时，本次 step 会在 plant 推进前失败，需成功 reset 才能继续。
-回调不得自行推进或重置总线。目标时刻同样各交付一次，积压可留到下一步起点；
-诊断的 `delivered_start`、`delivered_target` 是全部总线的广播数之和，`pending`
-为总积压。失败保留已产生的效果，不回滚或重放。这一固定顺序不提供跨总线仲裁、
-公平性或多 MCU 的虚拟时间屏障。
-
-每个主机 step 先交付起点命令，再推进器件，最后交付目标时刻反馈；区间内才到期的
-命令在目标时刻交付，并从下一区间生效。ACK/DONE 等待只收发和入队，不推进器件。
-RESET 保留 transport 的 partial bytes，并更新 QEMU/worker 时间原点。CAN wire 没有
-session 标识，因此不提供跨 reset 的 CAN 历史输入隔离。这个调度不提供位级仲裁、
-真实电气总线、CPU 全局锁步或实物电机标定。
-
-### Shared board/world runtime
-
-`sim.robots.shared_world.SharedWorldRuntime` 将多个独立 QEMU 连接接到同一个
-`M3508JointPlant`。调用方先构造各板的 `QemuCanEndpoint`，再用非空 tuple
-绑定名称、endpoint、`StepFramedSocket` 和具名 IMU。运行时从 endpoint 的只读
-`.stream` 取得实际 CAN transport；所有连接须已打开、非阻塞且互不重复，
-plant 中的器件总线须与绑定总线完全一致。总节点数（板组、各总线、plant、裁判）
-须在 64 以内，构造在资源副作用前检查。构造会检查全部具名 IMU，成功后
-运行时独占 plant 的推进和关闭；构造失败时仍由调用方清理 plant。
-
-```python
-import time
-from sim.core import Session
-from sim.robots.shared_world import BoardBinding, SharedWorldRuntime
-
-# plant、endpoint_a/b、cosim_a/b 已由调用方配置和连接。
-runtime = SharedWorldRuntime(plant, (
-    BoardBinding("a", endpoint_a, cosim_a, "imu_a"),
-    BoardBinding("b", endpoint_b, cosim_b, "imu_b"),
-))
-try:
-    reset_acks = runtime.start(Session(1, 7), (101, 102),
-                               deadline=time.monotonic() + 2)
-    runtime.set_can_delay("a", 5_000_000)
-    step_acks = runtime.step(1_000_000, deadline=time.monotonic() + 2)
-    runtime.service(deadline=time.monotonic() + 2, timeout=0)
-finally:
-    runtime.close()
-    # 调用方另行关闭所有借用连接，并清理 QEMU/QMP。
-```
-
-上例由调用方拥有 CPU 执行。需要运行时分段推进所有 CPU 时，为每个绑定增加
-`BoardExecution(bounded_command, "dm-mc02.fdcan1", "can1")`；必须全部提供或全部省略。
-`bounded_command(name, arguments=None)` 借用原生 QMP，并由调用方限制每条命令耗时。
-可用末尾关键字 `command_many=bounded_command_many` 提供公开批量查询；省略或为
-`None` 时保留逐条查询。批量 callable 借用同一 QMP 连接，须有自己的有限期限。
-运行时只合并每次暂停 CAN 观测中的独立查询，整组前后检查进程和期限；不会合并
-CPU 执行、收发或世界推进，也不缓存观测。批次失败直接终止，不重试或回退。
-Arena 始终通过原生 `QmpSession.command_many` 和既有 host deadline 执行这些查询；
-不提供该公开方法的 QMP 对象在取得连接后被拒绝并清理。
-QEMU 须以 `-S -accel tcg,thread=single -icount shift=0,align=off,sleep=off`
-启动。CAN 必须使用原始非阻塞 AF_UNIX socket 和标准 `CanStream`，运行时独占其
-读写；期间保持连接、配置、dispatch budget 和复位状态不变，回调不得直接提交 CAN。
-
-`start()` 只允许尝试一次：全部实际 RESET_ACK 到齐后，将各自 QEMU 时间原点
-映射到所给 Session 原点，再统一重置总线和世界一次。启动期间保留物理 CAN
-输入，不提前消费。`step()` 通过唯一 Simulation 推进；可用构造参数 `quantum_ns`
-限制每个内部区间的长度，默认 `UINT64_MAX`；已知 CAN `next_due_ns` 也会切分区间。
-每条借用总线独立暴露 dispatch 能力，Simulation 直接拥有 plant 的 reset/step/close，
-每次 settle 的单总线预算覆盖回调生成的消息，不会再在 plant.step 中重复派发。
-同刻消息按总线绑定顺序、各总线入队顺序处理；跨总线回调在同一有界 settle 中收敛。
-例如提前已知 1.5 ms 到期命令，`step(4ms)` 先完成 1.5 ms World，再交付命令，
-然后以新控制完成余下 2.5 ms。plant 仍沿用既有命令超时分段，物理子区间不增加 CPU/STEP。每个内部切点先完成 CPU/World、采样和目标交付，再收齐并编码
-全部 IMU，逐板发送 STEP、等待实际 ACK 和原生 CAN 输入处理回执，最后提交逻辑时间。
-`step()` 返回最后完成切点的 ACK tuple，`on_response` 可观察全部内部切点。
-原协议允许的重发复用相同编码 bytes，不重复推进或采样；初始化、重复 settle 和
-`service()` 不生成新的 STEP，`service()` 只收发和入队。
-不提供 `BoardExecution` 时，ACK 等待保留物理 CAN 输入，到下一次 World 前服务才读取；
-此时才发现的旧时间戳消息在所选目标交付并标记 late，不追溯切点。零时间戳使用读取时
-上一完整逻辑切点作为 fallback，不制造字节发送或固件消费时间。
-外层 quantum 分段数只给出最少切点数；新增到期切点逐个检查 sample ID、映射时间和计数余量。
-因此后续切点可能在已有切点提交后失败；最后完整提交与已发生的 I/O/物理效果均保留。
-
-提供 `BoardExecution` 时，启动还检查各原点处的初始空 CAN 基线；初始 settle 产生的
-虚拟设备输入使用现有 idle/prelaunch 回执门验证，计数仍相对原始基线计算。每步先检查全部
-目标和输入计数余量，再请求所有 CPU 执行到映射后的目标；实际 `reached/paused`
-到齐并排空所有 CAN 输出后，才推进一次既有世界和发送 IMU。全部反馈达到精确的
-原生输入处理计数后才返回，下一步 CPU 执行须等到此处。此模式的 `service()` 和
-ACK 等待不额外读取或刷新 CAN。`can_input_states` 返回最近完成的各板原生 RX
-快照副本；初始化、过滤或 FIFO 拒绝也计入处理数，`rx_dropped` 保留为诊断。
-区间内命令仍在目标边界交付并从下一区间影响物理世界。CPU 目标完成不代表同刻
-IRQ/器件事件全部闭合，输入处理也不代表固件消费；此组合不提供硅级时序或实时保证。
-
-`set_can_delay(name, delay_ns)` 在 start 成功后修改指定成员总线的后续入队延迟。
-值遵守 `CanBus.delay_ns` 的整数范围；命令和反馈共用该策略，已排队帧保留原截止时间。
-尚未读取的物理输入在后续入队时使用新值。调用本身不收发、推进世界或发布裁判数据；
-无效名称或数值保留原策略及运行状态，执行和清理回调内的调用拒绝。
-关闭 owner 保留借用总线的配置。最大合法延迟可能使后续 step 的时间范围检查失败，
-该执行失败仍冻结 owner。此接口不提供 Scenario 动作调度或 QEMU CPU 时间屏障。
-
-`set_motor_feedback_enabled(name, motor_id, enabled)` 在 start 成功后控制一个成员、
-一个实际 M3508 到该板 CAN endpoint 的反馈投递；`enabled` 必须为布尔值。
-禁用期间命令、plant、器件超时、其它电机和其它目的端照常处理，因此这表示反馈不可达，
-不能用来模拟电机断电。总线在实际 dispatch 时决定是否丢弃，已排队帧保留字节、
-顺序和截止时间；恢复不补发已经丢弃的帧。
-既有 `CanBus.drop` 策略先执行，原有拒绝和异常仍生效。首个禁用安装临时组合回调，
-最后一个禁用解除或 owner 关闭时恢复原回调；即使 plant 清理失败也尝试恢复。
-调用方在临时策略生效时不得替换 `bus.drop`；后续反馈设置或运行检查会拒绝该替换，清理报告错误
-并保留调用方的新回调。无效身份或类型不改变策略及运行状态，执行和清理回调内拒绝调用。
-本接口不调度 Scenario 动作，也不证明固件已观察到反馈缺失。
-
-可传入 `check_running()` 检查调用方拥有的进程；
-`on_response(name, frame, decoded_payload)` 观察返回的 ACK 和闲置连接的回复，
-DONE 保留实际 status/consumed/missing，提交只等待 ACK/传输回执，不等待未来 CPU
-执行才能产生的消费。切点提交期间，公开 `t_sim_ns`/`step_id` 仍表示上一完整切点；
-当前响应的时间和序号应取自实际帧头。既有主动等待器会跳过部分 advisory
-回复，因此此回调不是完整录制接口。每条连接的 RX 由主动等待器或闲置 poll
-独占。绝对 monotonic deadline 在收发及推进前后检查；阻塞 solver/callback
-仍须由外层进程限时。ACK 服务期间的回调或 transport `TimeoutError` 会以
-`RuntimeError` 传播并保留原 cause；只有 ACK 等待器自身的超时可以触发重试。
-任一运行失败或观测到原生 RESET 都冻结 owner，须重新
-创建完整 owner 和板卡进程；失败切点不提交逻辑时间，已推进世界和已发送数据保留，
-不回滚或重放。`close()` 仅关闭
-拥有的 plant，不 flush 或关闭借用的连接和总线。
-
-`bash tools/run-qemu-shared-world-smoke.sh` 使用两个真实 QEMU 和同一四 hinge
-MuJoCo 夹具，验证独立会话、实际 CAN 电流命令/反馈、具名 IMU 和 BMI088 raw
-消费。固件先经 ready/按键发送命令，主机保留完整 wire 后暂停 CPU，统一完成
-RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。报告分别保留
-实际 ACK、DONE masks、UART 完成标记以及失败/清理结果；这是固定 bare-MMIO
-夹具，尚未验证 HAL/BSP 闭环、CPU 全局时间屏障或
-实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
-
-额外的到期切分原生验收：
-
-```bash
-uv run --frozen --extra mujoco --extra referee bash tools/run-qemu-shared-world-smoke.sh --arena-runtime --can-deadlines
-```
-
-该门给左侧 CAN 配置 250 μs 延迟，保留默认 quantum、外层 1 ms 和原有 50 ms 活跃时长，
-验证实际 1.25 ms 等截止切点、每切点 CPU/World/STEP/ACK/原生传输回执，以及真实固件
-CAN/BMI088 raw 读取。结束时尚未到期的反馈单独报告并保留，不为清空队列额外推进。
-这只证明已知队列到期调度；CPU 区间内新发现的输出仍在完成态边界交付，不能反向影响本区间。
-
-### MuJoCo 双底盘场景
-
-`models/two_four_wheel.xml` 在同一个原生世界中组合两个现有四轮夹具，
-名称分别以 `alpha/`、`bravo/` 开头。两个底盘的初始位置为 `(0, 0, .03)`
-和 `(0, .6, .03)` 米，共用一个地面。模型直接引用 `four_wheel.xml`，
-由 MuJoCo 3.12 的 `attach` 处理名称、关节、执行器和传感器引用；
-`compiler conflict="error"` 拒绝子模型与世界的全局参数冲突。
-
-既有物理接口可以直接加载该场景：
-
-```python
-from sim.physics.mujoco import MujocoPhysics
-
-corners = ("fl", "fr", "rl", "rr")
-names = ("alpha", "bravo")
-physics = MujocoPhysics.from_xml_path(
-    "models/two_four_wheel.xml",
-    joints={f"{name}/wheel_{corner}": f"{name}/drive_{corner}"
-            for name in names for corner in corners},
-    imus={name: (f"{name}/imu_gyro", f"{name}/imu_accel") for name in names},
-)
-try:
-    physics.step(1_000_000)
-    for name in names:
-        print(physics.get_body_pose(f"{name}/chassis"), physics.get_imu(name))
-finally:
-    physics.close()
-```
-
-接入电机时，一个 `M3508JointPlant` 拥有全部八个器件和这一个 physics，
-SharedWorld 使用两条借用 CAN dispatcher 和同一个 plant；每条总线可独立使用 ID 1–4。
-上面的手动 Coordinator 例子仍是 host fixture，不参与 SharedWorld 调度。
-隔离和直接消费者测试可运行：
-
-```bash
-uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
-```
-
-测试覆盖两个底盘的地面支撑、跨底盘接触、独立电流命令、运动、IMU、反馈和复位。
-尺寸、质量、摩擦及齿轮参数仍未标定。
-
-两个真实 QEMU 接入此固定场景的验证入口为：
-
-```bash
-uv run --frozen --extra mujoco bash tools/run-qemu-shared-world-smoke.sh --two-chassis
-```
-
-该选项默认关闭，两个 bare-MMIO 固件分别使用独立 CAN 总线上的 ID 1–4。
-`alpha` 发送四路 `+64` 电流命令，`bravo` 左轮发送 `-21`、右轮发送 `-107`。
-主机从全新原生复位状态推进一次 10 ms，记录两个底盘的位姿、八个关节、
-实际反馈和各自具名 IMU。这里的一次调用只执行一次原生积分，不包含预热或
-十次 1 ms 子步。实际 float32 STEP 与完成的 SI 样本逐轴对应，固件读取的
-BMI088 raw 数据须落在各自半 LSB 区间，并排除另一底盘的来源。
-报告同时要求两个真实 full-consumed DONE 和最终 sensortime 写回后的 UART 标记。
-
-可追加 `--reset` 或 `--peer-exit` 验证单板复位或退出使共享 owner 冻结，
-不再推进世界；这些负例按预期返回非零并保留失败 JSON。原四 hinge 默认门仍
-独立验证其解析轨迹。此入口验证固定双底盘数据交付，HAL/BSP 闭环、
-实物标定和 CPU 全局时间屏障仍需后续验证。
-
-### trobot DJI driver test
-
-使用默认关闭的专用固件验证实际 `motor::dji` 驱动。普通业务 preset 不启用它，
-`DjiTest` 与 `MotorTest` 不能同时选择：
-
-```bash
-cd ../trobot
-cmake --preset DjiTestDebug
-cmake --build --preset DjiTestDebug --clean-first
-cmake --preset DjiTestRelease
-cmake --build --preset DjiTestRelease
-cd ../dm-mc02-qemu
-bash tools/run-trobot-dji-test.sh ../trobot/build/DjiTestRelease/trobot.elf \
-  build/test-results/trobot-dji.json ../trobot
-```
-
-第三个参数是产生 ELF 的固件源码目录，报告保存实际文件哈希；使用独立构建副本时，
-应传该副本。可用 Debug ELF 和 `QEMU_SYSTEM_ARM` 指定的 QEMU 重复验证。
-runner 通过 ID1/ID5 覆盖两个电流命令组，独立 literal 反馈检查实际角度、转子 RPM、
-减速后速度、电流和转矩解码，再检查正反向输出、禁用、重新启用、定向掉线与恢复。
-掉线阶段只丢弃 `0x201`，保留 `0x205`；固件持续刷新命令，证明 50 ms 反馈超时
-导致实际驱动任务清零。报告同时保留真实零电流 wire、冻结的反馈时间戳与新鲜命令时间。
-
-夹具用 QEMU CAN 时间戳决定可推进的 1 ms host ticks，同一 tick 的两个命令组只推进
-一次；tick 内到达的命令在下一边界交付，最多量化 1 ms。它不建立 CPU/plant 全局锁步。
-观测与追赶有界，FAIL、缺失项、清理失败或输入哈希变化均返回非零并保留报告；实物
-plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续性能门分别执行。
-
-Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
-
-该固定场景曾有 Release 复测在原 20 秒 host 期限内只完成 1090 步，最终暂停
-watchdog 观察缺失，历史失败保留。逐切点交换收敛后，Debug/Release 在原期限下
-各复测通过一次；单次通过不证明期限稳定性，也不构成实时性能证据。
-
-```bash
-cd ../trobot
-cmake --preset DjiScenarioTestRelease
-cmake --build --preset DjiScenarioTestRelease --clean-first
-cd ../dm-mc02-qemu
-.venv/bin/python tools/dm_mc02_dji_test.py --scenario \
-  ../trobot/build/DjiScenarioTestRelease/trobot.elf \
-  build/test-results/dji-scenario-release ../trobot \
-  --qemu build/qemu/qemu-system-arm
-```
-
-夹具生成固定双机器人 Scenario，并通过同一 Scenario/Arena 入口运行。两个 MCU
-使用相同 ELF，真实驱动 ID1/2 输出 `64/-64`；另外两个命令槽保持零。east 总线在
-RESET 相对 0ms 设置 5ms 入队延迟，在 250ms 恢复零延迟，west 保持零延迟。
-已排队帧保留原截止时间；报告分别记录来源、交付时间、原始 CAN 字节和固件复制的
-反馈字段及 BSP 时间戳。相同反馈字节只能证明来源匹配，不能识别唯一一次固件回调。
-两边第一次完整反馈报告必须早于 250ms，否则测试失败。
-命令观察逐条校验并计数；`transition_count` 保存实际切换总数，`transitions` 仅保留
-最初 8 次切换，`last` 始终记录最后一条命令。该诊断摘要不提供完整命令轨迹。
-
-恢复延迟后，既有 UART1 握手释放第二次应用观察；握手不改变事件时间或推进世界。
-结果目录必须不存在。缺失样本、FAIL、发送或清理失败、输入变化均保留失败报告。
-该门不证明动态延迟下的 50ms 超时、物理 CAN 时序、CPU/plant 全局锁步或实时性能；
-物理校准保持显式 SKIP。旧 ID1/ID5 独立掉线测试沿用上述入口。
-
-反馈丢失的固件消费者使用独立、默认关闭的 `DjiFeedbackTestDebug/Release`，
-与 `DjiScenarioTest` 互斥：
-
-```bash
-cd ../trobot
-cmake --preset DjiFeedbackTestRelease
-cmake --build --preset DjiFeedbackTestRelease --clean-first
-cd ../dm-mc02-qemu
-.venv/bin/python tools/dm_mc02_dji_test.py --feedback-scenario \
-  ../trobot/build/DjiFeedbackTestRelease/trobot.elf \
-  build/test-results/dji-feedback-release ../trobot \
-  --qemu build/qemu/qemu-system-arm
-```
-
-新结果目录必须不存在。固定场景在 RESET 后 200 ms 屏蔽两成员各自 ID1 的反馈，
-350 ms 恢复，实际 ready 后运行 400 ms；启动期限 10 秒、host 总期限 20 秒。
-固件持续请求 ID1/2 电流 `64/-64`，检查反馈时间戳冻结、年龄超过配置的 50 ms、
-应用非零命令仍新鲜时驱动任务清零输出，以及恢复后新反馈和非零输出。
-ID2 是各成员的持续在线对照。主机还检查真实 CAN 命令、器件来源、丢弃范围、
-物理发送完成及最终 watchdog，清理和输入哈希核验完成后才发布通过。
-
-这是反馈不可达测试；50 ms 是该驱动的应用配置，不能据此声明电机断电、精确中断
-时刻、全局锁步或实时性能。物理校准保留 SKIP；本门不替代上面的固定 Release 场景门。
-
-
-## 已知事件与运行切点
-
-`quantum` 是机器运行区间的上限。`step(dt_ns)` 和 `run_until(target_ns)` 都在已排队
-输入及传输到期时间切步：10ms 请求中3ms按下、4ms松开，机器实际运行0→3→4→10ms。
-每个切点先完成前一区间，再交付事件；当前时刻输入先交付，终点输入在返回前交付。
-`run_until(now)` 只处理当前事件，不新增运行区间。quantum不要求固定网格。
-
-`step_id` 按成功的内部区间递增。公开 `StepResult` 返回实际时间、最后组件结果，及
-`requested_time_ns`、`step_id`、`substeps_completed`。两入口都在完成切点响应pause；
-提前返回的status为`paused`。中途失败保留此前已提交时间和外部效果，禁止自动重试。
-CAN全局及每总线派发预算在回调前执行，过载冻结；队列容量拒绝不删除已有事件。
-
-上述承诺只适用于运行请求前已知的事件。区间内才观察到的CPU输出仍在区间末变为可交付；
-CAN保留来源时间并应用区间末下限和链路延迟，UART保持读取后时间上界。
-这仍是采样式co-simulation，不是跨MCU指令级或事件级锁步。
-
-短脉冲原生门：`tools/run-simulation-smoke.sh --case pulse --qemu /path/to/qemu-system-arm`。
-它编译独立、默认关闭的`SIM_KEY_PULSE_TEST`变体，延后transition UART，使用真实GPIO
-证明3–4ms期间固件执行；普通minimal-board固件保持原有日志行为。
-
-
-外部输入在`schedule_input()`入队前完成纯准入：端口必须声明`external_input`能力，
-工厂提供`validate_input(spec, port, payload, *, connected_ports)`并返回规范化数据。
-方向、类型、时间错误在纯准入阶段拒绝，不执行设备操作，也不令健康Simulation失败。
-执行队列容量耗尽则冻结Simulation，保留此前效果和原异常；回调捕获异常也不能继续交付。
-内部连接能力与外部注入独立；QEMU的FDCAN端口仅接受总线连接，不能通过inject直接输入。
-QEMU按键要求bool，GPIO要求整数0/1，UART接受bytes或UTF-8字符串（编码后最多4096字节，
-保留NUL）。连接占用的输入及物理别名拒绝外部注入。交互inject同样使用工厂准入，
-错误后仍可继续；执行阶段的设备错误则冻结并走统一清理。
-
-
-连接所有者声明`connection`与`dispatch`能力，按需声明`sample`。它们只拥有协议队列，
-不能声明machine或step；每条link恰有一个owner，每个端点只接一个owner。
-`attach_port(endpoint, *, descriptor, endpoint_name, owner_port, context)`返回借用句柄。
-`dispatch(cut_ns, budget)`返回实际广播次数，`next_due_ns`和`dispatch_budget`分别公开
-下一到期时刻与每切点预算；无进展、非法计数、超时或预算耗尽均冻结执行。
-所有组件启动后先采样并交付初始切点；每一区间完成全部machine/step后，先采样所有源，
-再交付输入和连接队列。接收端写入不会触发同切点重新采样。Runtime不解析CAN或GPIO协议。
-
-
-数字GPIO连接：`net.digital`的`signal`端口连接恰好一个out驱动与至少一个in接收端。
-QEMU用`gpio.B0.out`暴露已完成快照的公开数字投影；`gpio.B0`和`key`是输入。
-同一物理pin只能被一个连接占用；key与PA15互为别名，连接占用后拒绝外部注入。
-key外部输入为pressed布尔值，线传递的是整数电平：低电平按下，高电平释放。
-初始GPIO未配置输出时记录inactive且不驱动；激活后失去输出模式立即失败。
-每切点先采样所有源，再在同切点传播已知电平变化；接收固件只能在后续CPU区间消费。
-单驱动冲突静态拒绝，fanout按连接次序稳定交付；一次广播计一个预算单位，
-默认队列及预算256，可用`max_pending`/`dispatch_budget`显式收紧。
-不模拟模拟电压、开漏/上拉、电路延迟或同切点组合反馈。观察事件
-`net.digital.sample`/`net.digital.delivery`保留native来源时间、mapped/delivery切点和sampled质量。
-
-无CAN的真实双板例子见`examples/digital-link/README.txt`；构建普通minimal-board后：
-`sim validate examples/digital-link/scene.yaml`，
-`bash tools/run-simulation-smoke.sh --case digital-link --qemu /path/to/qemu-system-arm`。
-调试可将该scene仅保留一块机器后用`sim run ... --gdb-port 1234`；多机器须分别配置独立
-QEMU factory端点，不共享单一GDB/QMP路径。
-
-
-### CAN 故障实验
-
-`bus.can` 可以预声明故障策略，通过同一 Simulation 输入队列定时切换。下面的策略只阻断
-`host.can` 到 `main.fdcan1` 的 ID `0x321`，其他接收端和 CAN ID 继续交付：
-
-```yaml
-nodes:
-  can0:
-    kind: bus.can
-    fault_profiles:
-      delayed:
-        delay_ns: 7000000
-      receive_loss:
-        drop:
-          - {source: host.can, destination: main.fdcan1, can_id: 801}
-# 其余节点与 CAN links 按普通场景配置。
-experiment:
-  inputs:
-    - {at: 20ms, endpoint: can0.fault, value: receive_loss}
-    - {at: 50ms, endpoint: can0.fault, value: normal}
-    - {at: 60ms, endpoint: can0.fault, value: delayed}
-    - {at: 80ms, endpoint: can0.fault, value: normal}
-```
-
-每条总线最多声明 16 个策略，所有策略合计最多 64 条丢弃规则。策略名遵循节点名的 ASCII
-identifier 规则，`normal` 是保留的恢复名称。策略可省略 `delay_ns` 或 `drop`，分别使用
-总线初始延迟和空规则；每次切换都完整替换声明式策略。健康 Simulation reset 后也恢复初始状态。
-Python 中同样使用 `simulation.schedule_input("can0.fault", "receive_loss", at_ns=...)`。
-
-规则只接受 `source`、`destination` 和 `can_id`，至少指定一项；同一规则内取“且”，多条规则取“或”。
-端点必须实际连接在该总线上，未知或跨总线端点在静态校验时拒绝。`can_id` 精确比较数值 ID，
-不区分相同数值的标准帧和扩展帧，也不改写 flags、DLC 或数据。`fault` 是外部控制端口，不能接内部连线。
-原有 Python drop callback 继续逐目标执行一次，与声明式规则取“或”；`normal` 不撤销该 callback。
-
-时间语义沿用总线合同：延迟只影响切换之后入队的帧，已经排队的 due time 不变；后发帧可能先到。
-丢弃在 dispatch 时判断，所以切换也会影响尚未交付的旧 pending。相同时刻外部输入按声明/入队顺序执行，
-然后 dispatch；若 host 帧要使用新延迟，应先排策略输入再排发送输入。该切点之前 CPU 区间产生、
-已经入队的帧仍使用旧延迟，但可受新丢弃策略影响。恢复不补发已丢弃帧，不追溯影响已完成的 CPU。
-
-`can.fault.applied` 记录实际应用的策略与切点；`can.delivery` 保留逐目标 `dropped` 和原始帧、due、
-source/mapped/delivery 时间。`input.delivered` 或发送成功只证明输入处理，不能证明固件消费。
-当前 `can_seen` 不表达指定目标的一段静默期；故障验收检查逐目标交付记录和实际接收端响应。
-容量、callback 或 I/O 失败会冻结当前 Simulation，不重放已有副作用。
-
-无需原生依赖的三端点实例：
-
-```bash
-sim validate examples/can-faults/host-only.yaml
-sim run examples/can-faults/host-only.yaml --report build/can-fault-host.json
-```
-
-真实固件门使用 ARM GCC、CMake 和项目 QEMU，分别验证 Debug/Release 的实际 CAN 序号应答、
-心跳超时、恢复及不匹配 ID 的持续通信，不需要 MuJoCo：
-
-```bash
-bash tools/run-simulation-smoke.sh --case can-faults --build-type Debug --qemu /path/to/qemu-system-arm
-bash tools/run-simulation-smoke.sh --case can-faults --build-type Release --qemu /path/to/qemu-system-arm
-```
-
-这是主机通信交付层的确定性故障，未模拟电气仲裁、ACK 错误、错误计数器或 bus-off，也不证明物理校准、
-持续实时性能或 CPU/World 全局屏障。原 Scenario 的其他独特能力仍保留。
-
-### CAN worker sessions
-
-`tools/run-can-worker.py` and `tools/run-chassis-worker.py` now use the same
-`Simulation`/Topology factories as `sim run`. The rotor worker requires the
-default stationary IMU fixture; combining it with an independent legacy engine
-is rejected before connection. The chassis worker preflights the complete
-self-contained MJCF profile and closes that solver before opening transports.
-Includes/assets are rejected by this fixed worker profile; ordinary MuJoCo
-scenes retain their existing model support. Model changes after preflight fail.
-
-Each matching co-sim RESET_ACK closes the previous graph and creates a new
-Simulation with the acknowledged session ID and origin. CAN queues, devices and
-the native World are new resources. Borrowed transport sockets, incomplete RX
-records and queued TX suffixes survive unchanged. During RESET/ACK/DONE waits,
-CAN ingress only queues; it does not advance the World. STEP retries reuse the
-exact frame without another solver advance or IMU sample. A transport submission
-count belongs to its endpoint/session and does not prove firmware consumption.
-
-Known CAN deadlines can split a worker interval into several Simulation cuts.
-The worker wire STEP ID identifies the requested completed target; it is not an
-internal solver-step count. Native World seconds start at zero independently of
-the session's integer epoch. Completed World getters expose SI IMU, joint and
-body state without advancing physics.
-
-`--frames 0` remains continuous operation. Graph startup borrows the finite
-`--connect-timeout` budget; each target advance and its IMU observation borrow a
-2-second host budget. ACK/DONE waits keep their existing separate deadlines.
-Any execution/queue/I/O failure terminates the worker with independent cleanup;
-failed effects are not retried or rolled back. `PYTHON=/path/to/python` selects
-the interpreter for the chassis firmware runner as well as the DJI runner.
-
-The native RESET/suffix regression is included in:
-
-```sh
-QEMU_SYSTEM_ARM=/path/to/pinned/qemu-system-arm \
-  PATH=/path/to/native-env/bin:$PATH bash tools/run-qemu-worker-smoke.sh --chassis
-```
-
-It complements the actual guest SPI readback and existing DJI/Chassis firmware
-consumer gates. These gates do not establish a global CPU/World barrier,
-physical calibration or sustained real-time performance.
+| `sim/api`, `sim/runtime` | 纯公共合同、唯一生命周期/时间/调度 |
+| `sim/config`, `sim/fabric` | 无资源场景准入、CAN/UART/数字/IMU 连接 Owner |
+| `sim/machines/qemu` | 进程/QMP Backend、DM-MC02 Profile 与外设 adapter |
+| `sim/devices`, `sim/physics` | 具体协议设备与单一 World / joint driver |
+| `sim/apps`, `sim/trace` | 可选预设、可信进程与实验消费者；记录/离线复核 |
+| `sim/lab` | 纯断言复用与保留的原生自由运行交互 |
+| `examples`, `smoke`, `tests` | 自包含场景、真实 ELF 门、Python 合同 |
+| `qemu/upstream`, `qemu.lock` | 固定 fork 与独立的原生器件/板级测试 |
+| `models`, `third_party` | 固定物理/教学来源、许可证与来源声明 |

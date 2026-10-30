@@ -1,0 +1,45 @@
+name: Installed host core
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  host-core:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install core without native backends
+        run: python -m pip install . 'pytest>=8,<9'
+      - name: API, runtime, connections and static application admission
+        run: >-
+          python -m pytest -q
+          tests/test_topology.py tests/test_simulation.py
+          tests/test_simulation_inputs.py tests/test_simulation_session.py
+          tests/test_simulation_supervision.py tests/test_can_fabric.py
+          tests/test_uart_fabric.py tests/test_digital_fabric.py
+          tests/test_edge_fabric.py tests/test_imu_fabric.py
+          tests/test_simulation_digital.py tests/test_simulation_imu.py
+          tests/test_simulation_rotor.py tests/test_qemu_machine.py
+          tests/test_scene_admission.py tests/test_scene_cli.py
+          tests/test_sim_experiment.py tests/test_application_presets.py
+      - name: Installed CLI outside checkout
+        working-directory: /tmp
+        run: |
+          sim --help
+          sim validate "$GITHUB_WORKSPACE/examples/can-faults/host-only.yaml"
+          sim run "$GITHUB_WORKSPACE/examples/can-faults/host-only.yaml" --report host-core.json
+          python -c 'import json; r=json.load(open("host-core.json")); assert r["status"] == "passed"; assert r["result"]["status"] == ["pass"] * 5'
+      - name: Install optional pure observation and protocol libraries
+        run: python -m pip install '.[trace,referee]'
+      - name: Recording, offline re-evaluation and referee contracts
+        run: >-
+          python -m pytest -q
+          tests/test_experiment_trace.py tests/test_experiment_replay.py
+          tests/test_experiment_trace_cli.py tests/test_referee_factory.py
