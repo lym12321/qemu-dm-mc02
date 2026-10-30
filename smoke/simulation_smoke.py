@@ -466,24 +466,7 @@ class Observations:
         native_receipts = sorted((row for row in self.receipts
             if row["source"] == "main" and row["endpoint"] == "fdcan1"),
             key=lambda row: row["event_sequence"])
-        if len(native_receipts) != len(native_deliveries):
-            raise AssertionError("matching native per-frame CAN input completion receipt is missing")
-        receipt_by_delivery = {}
-        # QemuMachine.receive waits for one additional completed frame, then
-        # emits its receipt before returning to Fabric's next delivery. The
-        # fresh guest starts at counter0; two frames at one cut have distinct
-        # receipts and consecutive counters, never one combined receipt.
-        for index, (delivery, receipt) in enumerate(zip(native_deliveries, native_receipts)):
-            next_sequence = (native_deliveries[index + 1]["event_sequence"]
-                             if index + 1 < len(native_deliveries) else math.inf)
-            if (not delivery["event_sequence"] < receipt["event_sequence"] < next_sequence
-                    or receipt["mapped_time_ns"] != delivery["delivery_time_ns"]
-                    or receipt["payload"]["rx_dropped"] != 0
-                    or receipt["payload"]["partial_bytes"] != 0):
-                raise AssertionError("matching next native per-frame CAN input completion receipt is missing")
-            if receipt["payload"]["completed_frames"] != index + 1:
-                raise AssertionError("native per-frame completion counter must advance exactly once per delivery")
-            receipt_by_delivery[delivery["event_sequence"]] = receipt
+        receipt_by_delivery = verify_native_can_receipts(native_deliveries, native_receipts)
 
         def delivered(row):
             matches = [item for item in self.deliveries
@@ -839,6 +822,29 @@ class Observations:
                 and (row["payload"]["session_id"], row["payload"]["step_id"]) not in completed]
 
 
+def verify_native_can_receipts(deliveries, receipts, *, sequence_key="event_sequence"):
+    """One native receipt closes all admitted frames at a cut, before next CPU work."""
+    groups = {}
+    for delivery in deliveries:
+        groups.setdefault(delivery["delivery_time_ns"], []).append(delivery)
+    if len(receipts) != len(groups):
+        raise AssertionError("native per-cut CAN input completion receipts are incomplete")
+    matched, count = {}, 0
+    batches = list(groups.items())
+    for index, ((cut, batch), receipt) in enumerate(zip(batches, receipts)):
+        count += len(batch)
+        next_sequence = (min(row[sequence_key] for row in batches[index + 1][1])
+                         if index + 1 < len(batches) else math.inf)
+        if (receipt["payload"] != {"completed_frames": count, "rx_dropped": 0, "partial_bytes": 0}
+                or receipt["mapped_time_ns"] != cut
+                or not max(row[sequence_key] for row in batch)
+                    < receipt["event_sequence"] < next_sequence):
+            raise AssertionError("native per-cut receipt lost its matching successful deliveries")
+        for delivery in batch:
+            matched[delivery[sequence_key]] = receipt
+    return matched
+
+
 def verify_can_faults(observations, experiment):
     """Host-origin challenges, actual per-peer policy, then real guest replies.
 
@@ -943,15 +949,7 @@ def verify_can_faults(observations, experiment):
     main_deliveries = sorted((row for row in delivery_events
         if row["payload"]["destination"] == "main.fdcan1" and not row["payload"]["dropped"]),
         key=lambda row: row["sequence"])
-    receipts = observations.receipts
-    if len(receipts) != len(main_deliveries):
-        raise AssertionError("native CAN input completion receipts are incomplete")
-    for index, (delivery, receipt) in enumerate(zip(main_deliveries, receipts)):
-        next_sequence = main_deliveries[index + 1]["sequence"] if index + 1 < len(main_deliveries) else math.inf
-        if (receipt["payload"] != {"completed_frames": index + 1, "rx_dropped": 0, "partial_bytes": 0}
-                or receipt["mapped_time_ns"] != delivery["delivery_time_ns"]
-                or not delivery["sequence"] < receipt["event_sequence"] < next_sequence):
-            raise AssertionError("native per-frame receipt lost its matching successful delivery")
+    verify_native_can_receipts(main_deliveries, observations.receipts, sequence_key="sequence")
 
     def marker_bound(marker):
         end, length = uart.index(marker) + len(marker), 0

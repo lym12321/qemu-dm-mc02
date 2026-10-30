@@ -232,14 +232,27 @@ class QemuMachine:
             raise RuntimeError('QEMU must remain paused at each completed target')
 
     def validate_cut(self):
-        execution = self.command('x-query-virtual-execution')
+        execution, status = self._execution_observation()
         initial = self._last_time_ns == self._ctx.session.t_sim_ns
         expected = self.to_native(self._last_time_ns)
         if (not isinstance(execution, dict) or execution.get('current-ns') != expected
                 or execution.get('state') != ('idle' if initial else 'reached')
                 or (('target-ns' in execution) if initial else execution.get('target-ns') != expected)):
             raise RuntimeError('QEMU completed cut changed outside Simulation control')
-        self.require_paused(initial=initial)
+        self._validate_status(status, initial=initial)
+
+    @staticmethod
+    def _validate_status(status, *, initial=False):
+        allowed = ('paused', 'prelaunch') if initial else ('paused',)
+        if (not isinstance(status, dict) or status.get('running') is not False
+                or status.get('status') not in allowed):
+            raise RuntimeError('QEMU must remain paused at each completed target')
+
+    def _execution_observation(self):
+        observe = getattr(self._adapter, 'execution_observation', None)
+        if callable(observe):
+            return observe()
+        return self.command('x-query-virtual-execution'), self.command('query-status')
 
     @property
     def connection_info(self):
@@ -274,7 +287,7 @@ class QemuMachine:
         previous = self.to_native(self._last_time_ns)
         while True:
             self._adapter.service(step.t_sim_ns)
-            execution = self.command('x-query-virtual-execution')
+            execution, status = self._execution_observation()
             if not isinstance(execution, dict):
                 raise TypeError('invalid native execution observation')
             current = _native_time(execution.get('current-ns'), 'native execution time')
@@ -284,12 +297,12 @@ class QemuMachine:
             if state == 'reached':
                 if current != target:
                     raise RuntimeError('native execution reached an incorrect time')
+                self._validate_status(status)
                 break
             if state != 'running':
                 raise RuntimeError(f'native execution target was interrupted: {state}')
             previous = current
             select.select([], [], [], min(.001, self._remaining()))
-        self.require_paused()
         self._adapter.service(step.t_sim_ns)
         self._adapter.complete_cut(step.t_sim_ns, target)
         self.require_paused()

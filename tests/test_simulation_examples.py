@@ -408,12 +408,11 @@ def _joint_observations():
             result.can.append(row)
             result.deliveries.append({**row, "event_sequence": tick * 100 + index * 3 + 40,
                 "destination": "main.fdcan1", "dropped": False})
-            # The canonical receiver processes and receipts one frame before
-            # Fabric delivers the next, including two frames at the same cut.
-            result.receipts.append({"event_sequence": tick * 100 + index * 3 + 41,
+        # One fresh exact-goal receipt closes both same-cut deliveries.
+        result.receipts.append({"event_sequence": tick * 100 + 49,
                 "source": "main", "endpoint": "fdcan1", "mapped_time_ns": cut,
                 "source_time_ns": cut, "delivery_time_ns": cut, "quality": "exact",
-                "payload": {"completed_frames": 2 * tick - 1 + index,
+                "payload": {"completed_frames": 2 * tick,
                             "rx_dropped": 0, "partial_bytes": 0}})
     result.uart_batches = [{"source": "main", "event_sequence": 1250,
         "mapped_time_ns": 12_000_000, "quality": "upper_bound",
@@ -443,8 +442,8 @@ def test_joint_loop_rejects_motor2_sent_feedback_without_actual_delivery_despite
     ("sign", "independent signed joint wire"),
     ("same_joint", "independent joint mechanics"),
     ("early_zero", "motor0 lacks moving/coast"),
-    ("late_motion_receipt", "next native per-frame"),
-    ("stale_receipt", "counter must advance exactly once"),
+    ("late_motion_receipt", "native per-cut receipt"),
+    ("stale_receipt", "native per-cut receipt"),
     ("early_uart", "later UART observation"),
 ])
 def test_joint_loop_rejects_false_two_motor_consumption_evidence(change, error):
@@ -462,7 +461,7 @@ def test_joint_loop_rejects_false_two_motor_consumption_evidence(change, error):
             if row["source"] == "main" and row["data"] == "0000000000000000":
                 row["source_time_ns"] = 2_500_000
     elif change == "late_motion_receipt":
-        observations.receipts[4]["event_sequence"] = 600
+        observations.receipts[4]["event_sequence"] = 700
     elif change == "stale_receipt":
         observations.receipts[12]["payload"]["completed_frames"] = 12
     elif change == "early_uart":
@@ -471,10 +470,10 @@ def test_joint_loop_rejects_false_two_motor_consumption_evidence(change, error):
         observations.verify("joint-loop")
 
 
-def test_joint_loop_rejects_a_combined_receipt_in_place_of_per_frame_completion():
+def test_joint_loop_rejects_a_missing_cut_receipt():
     observations = _joint_observations()
     observations.receipts = observations.receipts[1::2]
-    with pytest.raises(AssertionError, match="per-frame CAN input completion receipt"):
+    with pytest.raises(AssertionError, match="per-cut CAN input completion receipts"):
         observations.verify("joint-loop")
 
 

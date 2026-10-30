@@ -191,6 +191,28 @@ def _paused_can_io(qmp, stream, *, target_ns, controller, chardev,
     return guard, observe
 
 
+def validate_can_execution_snapshot(value, transports):
+    """Admit one native aggregate without assuming its CPU has reached a cut.
+
+    This is a fresh observation, never a receipt cache. Paused drain/receipt
+    consumers still validate their own before/after IO closure observations.
+    ``transports`` maps actual controller identities to chardev names.
+    """
+    state = _object(value, 'can-execution-state')
+    if type(state.get('schema')) is not int or state['schema'] != 1:
+        raise ValueError('unsupported can-execution-state schema')
+    execution = _object(_field(state, 'execution', 'can-execution-state'), 'execution')
+    status = _object(_field(state, 'status', 'can-execution-state'), 'status')
+    observed = _object(_field(state, 'fdcan-transports', 'can-execution-state'),
+                       'fdcan-transports')
+    for controller, chardev in transports.items():
+        transport = _object(_field(observed, controller, 'fdcan-transports'), controller)
+        if _field(transport, 'path', controller) != f'/chardevs/{chardev}':
+            raise RuntimeError('CAN execution transport identity changed')
+        _can_connection_state(_field(transport, 'connected', controller), 'execution')
+    return execution, status
+
+
 def _can_execution_state(value, target_ns, direction, initial):
     execution = _object(value, "execution")
     for field in (("current-ns",) if initial else ("current-ns", "target-ns")):

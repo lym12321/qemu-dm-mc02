@@ -5,6 +5,7 @@ from pathlib import Path
 from sim.api.topology import immutable as _freeze
 from sim.boards import (QemuBoard, digital_level, drain_paused_can,
                         observe_initial_paused_can, wait_paused_can_input)
+from sim.boards.qemu import validate_can_execution_snapshot
 from sim.fabric.digital import DigitalSample
 from sim.fabric.frame import CanFrame
 from sim.transports import StreamTransport
@@ -255,6 +256,7 @@ class DmMc02Adapter:
         self._board = self._snapshot = None
         self._streams = {}
         self._can_state = {}
+        self._can_goals = {}
         self._closed = False
         self.stream_types = {}
         if self._imu_connected or self._adc:
@@ -301,7 +303,35 @@ class DmMc02Adapter:
         if self._cosim is not None:
             self._cosim.service(cut_ns)
 
+    def execution_observation(self):
+        if not self._can_ports:
+            return (self._backend.command('x-query-virtual-execution'),
+                    self._backend.command('query-status'))
+        state = self._backend.command('qom-get', {'path': '/machine',
+                                                 'property': 'can-execution-state'})
+        return validate_can_execution_snapshot(state, {
+            f'dm-mc02.{port}': port.replace('fdcan', 'can') for port in self._can_ports})
+
     def commit_inputs(self, cut_ns):
+        self._backend.check()
+        if self._backend.pending is not None:
+            raise RuntimeError('input commit requires a completed paused QEMU cut')
+        if cut_ns != self._backend.t_sim_ns:
+            raise ValueError('input commit must match the native completed cut')
+        for port, goal in tuple(self._can_goals.items()):
+            stamp = self._backend.to_native(cut_ns)
+            wire = port.replace('fdcan', 'can')
+            receipt = wait_paused_can_input(
+                self._backend, self._streams[wire], target_ns=stamp,
+                controller=f'dm-mc02.{port}', chardev=wire,
+                completed_frames=goal, deadline=self._backend.deadline_monotonic,
+                check=self._backend.check,
+                initial=self._backend.t_sim_ns == self._ctx.session.t_sim_ns)
+            self._can_state[port]['rx'] = receipt
+            del self._can_goals[port]
+            self._ctx.emit(port, 'can-input-processed', _freeze(receipt),
+                           source_time_ns=stamp, mapped_time_ns=cut_ns,
+                           delivery_time_ns=cut_ns, quality='exact')
         if self._cosim is not None:
             self._backend.check()
             if self._backend.pending is not None:
@@ -398,28 +428,22 @@ class DmMc02Adapter:
         stamp = self._backend.to_native(self._ctx.t_sim_ns)
         wire = port.replace('fdcan', 'can')
         state = self._can_state[port]
-        goal = state['rx']['completed_frames'] + 1
+        goal = self._can_goals.get(port, state['rx']['completed_frames']) + 1
         if goal >= 0xffffffffffffffff:
             raise OverflowError('QEMU CAN input receipt counter exhausted')
         stream = self._streams[wire]
+        # Reserve before IO: failure retains the original goal and physical tail.
+        self._can_goals[port] = goal
         stream.send(frame.can_id, frame.flags, frame.dlc, stamp, frame.data)
-        receipt = wait_paused_can_input(
-            self._backend, stream, target_ns=stamp,
-            controller=f'dm-mc02.{port}', chardev=wire,
-            completed_frames=goal, deadline=self._backend.deadline_monotonic, check=self._backend.check,
-            initial=self._backend.t_sim_ns == self._ctx.session.t_sim_ns)
-        state['rx'] = receipt
-        self._ctx.emit(port, 'can-input-processed', _freeze(receipt),
-                       source_time_ns=stamp, mapped_time_ns=self._ctx.t_sim_ns,
-                       delivery_time_ns=self._ctx.t_sim_ns, quality='exact')
 
     def _receive_imu(self, sample):
         self._backend.check()
         self._ctx.check_io()
         if self._backend.pending is not None or self._cosim is None:
             raise RuntimeError('IMU input requires a completed paused QEMU cut')
-        self._backend.validate_cut()
-        # Native time admission precedes any protocol or transport effect.
+        # Staging only: no native IO occurs until commit_inputs, which takes
+        # its own fresh execution observation immediately before transmission.
+        # Bounds still precede wire encoding and staged-state mutation.
         self._backend.to_native(self._ctx.t_sim_ns)
         self._cosim.receive_imu(sample)
 

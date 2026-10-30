@@ -61,6 +61,11 @@ def evidence():
             observations.can.append({"source": "main", "can_id": frame["can_id"] + 0x100,
                 "data": raw.hex(), "flags": 0, "dlc": 8, "source_time_ns": source_ns,
                 "wire_timestamp_ns": source_ns, "quality": "exact", "event_sequence": 10000 + sequence})
+    # input_commit receipts cover the complete admitted group at each cut.
+    groups = {}
+    for item in observations.receipts:
+        groups[item["mapped_time_ns"]] = item
+    observations.receipts = list(groups.values())
     for data, cut in ((b"SIM_READY can-faults\n", origin), (b"HB_ACTIVE\n", origin + 6_000_000),
             (b"HB_TIMEOUT\n", origin + 30_000_000), (b"HB_RECOVERED\n", origin + 51_000_000),
             (b"CAN_FAULT_PASS\n", origin + 111_000_000)):
