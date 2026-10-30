@@ -925,6 +925,29 @@ def test_dji_scenario_command_admission_rejects_literal_profile_and_observation_
     assert len(summary["transitions"]) <= 8
 
 
+@pytest.mark.parametrize("fixture_name", ["dji_scenario_observation", "dji_feedback_observation"])
+def test_dji_observed_step_capacity_includes_can_deadline_cuts_and_refuses_before_native_step(
+        request, fixture_name):
+    fixture = request.getfixturevalue(fixture_name)
+    native = fixture.observer.world(fixture.scenario.arena).physics
+    trace = fixture.report["native_calls"]["step_ns"]
+    assert fixture.observer.step_bound == 31250
+    assert fixture.observer.feedback_bound == 10000
+    # Preload the trace so this boundary check does not repeat native work.
+    trace.extend([1] * 1250)
+    native.step(7)
+    assert len(trace) == 1251 and trace[-1] == 7
+    assert fixture.environment.native.steps == [7]
+    trace.extend([1] * (31249 - len(trace)))
+    native.step(11)
+    assert len(trace) == 31250 and trace[-1] == 11
+    assert fixture.environment.native.steps == [7, 11]
+    with pytest.raises(BufferError, match="step_ns trace exhausted"):
+        native.step(13)
+    assert len(trace) == 31250 and trace[-1] == 11
+    assert fixture.environment.native.steps == [7, 11]
+
+
 @pytest.mark.parametrize("corruption", ["partial", "future", "peer", "raw"])
 def test_dji_scenario_copied_sample_requires_completed_same_peer_source_before_observation(
         dji_scenario_observation, corruption):
@@ -1014,6 +1037,9 @@ def test_dji_scenario_runner_publishes_only_after_cleanup_and_preserves_primary_
     assert (options["duration"], options["startup_timeout"], options["timeout"]) == (1., 10., 20.)
     report_path = output / "report.json"
     report = json.loads(report_path.read_text())
+    assert report["observation_bounds"] == {"feedback": 10000, "steps": 31250,
+        "pending_per_device": 256, "commands_per_peer": 10000,
+        "sampled_command_transitions_per_peer": 8}
     assert report["scenario_input"]["duration_ns"] == 1_000_000_000
     assert report["physical_can_suffixes"] == []
     if mode == "success":
@@ -1387,6 +1413,9 @@ def test_dji_feedback_runner_verifies_cleanup_and_preserves_failed_primary(
     assert signal.getsignal(signal.SIGTERM) == saved_signal and len(calls) == 1
     assert [calls[0][1][key] for key in ("duration", "startup_timeout", "timeout")] == [.4, 10., 20.]
     report = json.loads((output / "report.json").read_text())
+    assert report["observation_bounds"] == {"feedback": 10000, "steps": 31250,
+        "pending_per_device": 256, "commands_per_peer": 10000,
+        "sampled_command_transitions_per_peer": 8}
     assert report["feedback_scenario"] and report["scenario_input"]["duration_ns"] == 400_000_000
     if mode == "success":
         assert report["result"] == "passed" and report["cleanup_verified"] and report["source_preserved"]

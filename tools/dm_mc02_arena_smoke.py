@@ -38,6 +38,7 @@ from qemu.qmp import ExecInterruptedError
 COMMANDS = ("0040004000400040", "ffebff95ffebff95")
 LITERAL_ARGS = ("$HOME", "$(touch forbidden)", "a b", "")
 MULTI_CUT_QUANTUM_NS = 400_000
+CAN_DEADLINE_DELAY_NS = 250_000
 
 
 def append_bounded(report, key, event, maximum=2048):
@@ -65,23 +66,28 @@ def check_multi_cut_observations(report):
     steps = report["native_calls"]["step_ns"]
     if not steps or len(steps) % 3 or steps != [400_000, 400_000, 200_000] * (len(steps) // 3):
         raise ValueError("multi-cut World steps must be400/400/200us per outer1ms")
+    evidence.update(verified=True, **_check_cut_observations(report, evidence, steps, "multi-cut"))
+
+
+def _check_cut_observations(report, evidence, steps, label):
+    """Share the actual CPU/World/STEP/ACK/CAN consumer checks across profiles."""
     events = evidence["events"]
     resets = {row["name"]: row["decoded"]["virtual_time_ns"] for row in report["responses"]
               if row["header"]["kind"] == codec.RESET_ACK}
     names = evidence["members"]
     if len(names) != 2 or set(resets) != set(names):
-        raise ValueError("multi-cut requires both actual RESET_ACK origins")
+        raise ValueError(label + " requires both actual RESET_ACK origins")
     baselines = {}
     for event in events:
         if event["kind"] == "can-observation" and event["state"]["execution"]["state"] == "idle":
             baselines.setdefault(event["peer"], event["state"]["fdcan-rx-state"]
                                  ["controllers"]["dm-mc02.fdcan1"]["completed_frames"])
     if set(baselines) != {0, 1}:
-        raise ValueError("multi-cut lacks actual initial native CAN baselines")
+        raise ValueError(label + " lacks actual initial native CAN baselines")
     starts = [index for index, row in enumerate(events)
               if row["kind"] == "cpu-request" and row["peer"] == 0]
     if len(starts) != len(steps):
-        raise ValueError("multi-cut CPU request count differs from World cuts")
+        raise ValueError(label + " CPU request count differs from World cuts")
     target = 0
     unchanged_goals = 0
     previous_goals = dict(baselines)
@@ -91,11 +97,11 @@ def check_multi_cut_observations(report):
         cut = events[start:end]
         requests = [(row["peer"], row["target_ns"]) for row in cut if row["kind"] == "cpu-request"]
         if requests != [(peer, resets[name] + target) for peer, name in enumerate(names)]:
-            raise ValueError("multi-cut CPU targets do not match independent RESET epochs")
+            raise ValueError(label + " CPU targets do not match independent RESET epochs")
         worlds = [(index, row) for index, row in enumerate(cut) if row["kind"] == "world-completed"]
         if (len(worlds) != 1 or worlds[0][1]["dt_ns"] != dt_ns
                 or not math.isclose(worlds[0][1]["native_time_s"], target / 1e9, rel_tol=0, abs_tol=1e-12)):
-            raise ValueError("multi-cut requires exactly one completed World step per cut")
+            raise ValueError(label + " requires exactly one completed World step per cut")
         acknowledgements = []
         for peer, name in enumerate(names):
             sends = [(index, row["event"]) for index, row in enumerate(cut)
@@ -103,20 +109,20 @@ def check_multi_cut_observations(report):
             acks = [(index, row["event"]) for index, row in enumerate(cut)
                     if row["kind"] == "step-ack" and row["peer"] == peer]
             if len(sends) != 1 or len(acks) != 1:
-                raise ValueError("multi-cut requires exactly one STEP and ACK per board/cut")
+                raise ValueError(label + " requires exactly one STEP and ACK per board/cut")
             send_index, sent = sends[0]
             ack_index, ack = acks[0]
             if sent["header"]["kind"] != codec.STEP or ack["header"]["kind"] != codec.STEP_ACK:
-                raise ValueError("multi-cut STEP/ACK message kinds disagree")
+                raise ValueError(label + " STEP/ACK message kinds disagree")
             expected = (2, peer + 1, step_id, target, dt_ns)
             for event in (sent, ack):
                 header = event["header"]
                 if tuple(header[key] for key in ("version", "flags", "step_id", "t_sim_ns", "dt_ns")) != expected:
-                    raise ValueError("multi-cut STEP/ACK wire identity differs from actual cut")
+                    raise ValueError(label + " STEP/ACK wire identity differs from actual cut")
             if (not sent["accepted"] or sent["imu"]["sample_id"] != step_id
                     or sent["imu"]["sensor_time_ns"] != target or ack["decoded"]["status"] != 0
                     or not worlds[0][0] < send_index < ack_index):
-                raise ValueError("multi-cut native exchange did not follow completed World state")
+                raise ValueError(label + " native exchange did not follow completed World state")
             acknowledgements.append(ack_index)
         # Each segment ends before the next CPU request. Require a fresh native
         # observation after both ACKs even when no1ms CAN producer was due.
@@ -139,13 +145,67 @@ def check_multi_cut_observations(report):
                         and state["fdcan-transports"]["dm-mc02.fdcan1"]["connected"] is True):
                     complete.append(goal)
             if not complete or complete[-1] < previous_goals[peer]:
-                raise ValueError("multi-cut lacks completed native CAN receipt before next CPU target")
+                raise ValueError(label + " lacks completed native CAN receipt before next CPU target")
             unchanged_goals += complete[-1] == previous_goals[peer]
             previous_goals[peer] = complete[-1]
     if report["runtime_result"]["steps"] != len(steps) or report["runtime_result"]["end_ns"] != target:
-        raise ValueError("multi-cut final result differs from completed native cuts")
-    evidence.update(verified=True, cuts=len(steps), unchanged_receipt_goals=unchanged_goals,
-                    final_receipt_goals=previous_goals)
+        raise ValueError(label + " final result differs from completed native cuts")
+    return dict(cuts=len(steps), unchanged_receipt_goals=unchanged_goals,
+                final_receipt_goals=previous_goals)
+
+
+def check_can_deadline_observations(report):
+    """Check known queued dues, without extending execution to drain the future."""
+    evidence = report["can_deadlines"]
+    if evidence["delay_ns"] != CAN_DEADLINE_DELAY_NS or evidence["outer_step_ns"] != 1_000_000:
+        raise ValueError("CAN-deadlines requires fixed250us left delay and original1ms outer steps")
+    steps = report["native_calls"]["step_ns"]
+    if not steps or any(not 0 < value <= 1_000_000 for value in steps):
+        raise ValueError("CAN-deadlines World cuts must remain inside original1ms outer steps")
+    result = report["runtime_result"]
+    if result["end_ns"] - result["origin_ns"] != 50_000_000:
+        raise ValueError("CAN-deadlines changed the original50ms duration")
+    checked = _check_cut_observations(report, evidence, steps, "CAN-deadlines")
+    cuts, target = set(), 0
+    for dt_ns in steps:
+        target += dt_ns
+        cuts.add(target)
+    produced = {(row["peer"], row["can_id"], row["world_ns"]): row
+                for row in evidence["events"] if row["kind"] == "feedback-produced"}
+    delivered = {(row["peer"], row["can_id"], row["world_ns"]): row for row in report["feedback"]}
+    pending = {(row["peer"], row["can_id"], row["world_ns"]): row for row in evidence["pending_feedback"]}
+    if (not produced or len(delivered) != len(report["feedback"])
+            or len(pending) != len(evidence["pending_feedback"])
+            or set(delivered) & set(pending) or set(produced) != set(delivered) | set(pending)):
+        raise ValueError("CAN-deadlines feedback producer/delivery/pending attribution differs")
+    delayed_cuts = set()
+    for key, source in produced.items():
+        delay = CAN_DEADLINE_DELAY_NS if key[0] == 0 else 0
+        due = source["world_ns"] + delay
+        if source["due_ns"] != due:
+            raise ValueError("CAN-deadlines source timestamp and due differ")
+        if due <= target:
+            row = delivered.get(key)
+            if (row is None or not row["accepted"] or row["due_ns"] != due
+                    or row["delivered_ns"] != due or row["data_hex"] != source["data_hex"]
+                    or due not in cuts):
+                raise ValueError("CAN-deadlines feedback did not deliver at its actual due cut")
+            if delay:
+                delayed_cuts.add(due)
+        elif key not in pending or pending[key]["due_ns"] != due:
+            raise ValueError("CAN-deadlines future feedback must remain explicitly pending")
+    if 1_250_000 not in delayed_cuts or not pending or any(key[0] != 0 for key in pending):
+        raise ValueError("CAN-deadlines lacks the1.25ms cut or final future left feedback")
+    buses = evidence["final_buses"]
+    if len(buses) != 2:
+        raise ValueError("CAN-deadlines requires both final borrowed bus observations")
+    for peer, bus in enumerate(buses):
+        future = [row["due_ns"] for key, row in pending.items() if key[0] == peer]
+        if (bus["time_ns"] != target or bus["pending"] != len(future)
+                or bus["next_due_ns"] != (min(future) if future else None)):
+            raise ValueError("CAN-deadlines final bus state differs from retained future feedback")
+    evidence.update(verified=True, **checked, delayed_delivery_cuts=sorted(delayed_cuts),
+                    delivered_feedback=len(delivered), future_feedback=len(pending))
 
 
 def write_manifests(directory, firmwares, *, referees=False, dji_scenario=False):
@@ -203,8 +263,9 @@ class Observation:
         self.run_result = self.run_error = None
 
     def multi_event(self, kind, **values):
-        if "multi_cut" in self.report:
-            append_bounded(self.report["multi_cut"], "events", {"kind": kind, **values}, 32768)
+        for profile in ("multi_cut", "can_deadlines"):
+            if profile in self.report:
+                append_bounded(self.report[profile], "events", {"kind": kind, **values}, 32768)
 
     def run(self, manifest, **options):
         """Observe the actual CLI's single call; never execute another loop."""
@@ -264,7 +325,7 @@ class Observation:
         def observed_step(dt_ns):
             append_bounded(self.report["native_calls"], "step_ns", dt_ns, self.step_bound)
             result = step(dt_ns)
-            if "multi_cut" in self.report:
+            if "multi_cut" in self.report or "can_deadlines" in self.report:
                 self.multi_event("world-completed", dt_ns=dt_ns, native_time_s=native.time_s)
             return result
 
@@ -293,11 +354,18 @@ class Observation:
                     raise ValueError("Arena fixture duplicate feedback source timestamp")
                 if len(self.feedback_sources[index]) >= 256:
                     raise BufferError("Arena fixture pending feedback source exhausted")
+                if "can_deadlines" in self.report:
+                    source["due_ns"] = frame.timestamp_ns + device.bus.delay_ns
+                    self.multi_event("feedback-produced", peer=index // 4,
+                        can_id=frame.can_id, **source)
                 self.feedback_sources[index][frame.timestamp_ns] = source
                 return frame
 
             device.feedback = observed_feedback
-        for peer, bus in enumerate(dict.fromkeys(device.bus for device in plant.devices)):
+        buses = tuple(dict.fromkeys(device.bus for device in plant.devices))
+        if "can_deadlines" in self.report:
+            buses[0].delay_ns = CAN_DEADLINE_DELAY_NS
+        for peer, bus in enumerate(buses):
             self.feedback_deliveries[peer] = None
             log = bus.log
 
@@ -394,7 +462,7 @@ class Observation:
                 # these are not individual reply-arrival timestamps.
                 for (name, arguments), value in zip(requests, values, strict=True):
                     observe_value(name, arguments, value)
-                    if ("multi_cut" in self.report and name == "qom-get"
+                    if (("multi_cut" in self.report or "can_deadlines" in self.report) and name == "qom-get"
                             and arguments.get("property") == "can-execution-state"):
                         self.multi_event("can-observation", peer=index,
                             state=json.loads(json.dumps(value)),
@@ -548,6 +616,14 @@ class Observation:
             # The runtime publishes only complete groups; a failed step may
             # have later native effects beyond this retained diagnostic cut.
             self.report["can_input_states"] = runtime.can_input_states
+            if "can_deadlines" in self.report:
+                evidence = self.report["can_deadlines"]
+                evidence["pending_feedback"] = [dict(peer=index // 4,
+                    can_id=0x201 + index % 4, **source)
+                    for index, sources in self.feedback_sources.items() for source in sources.values()]
+                evidence["final_buses"] = [dict(time_ns=item.endpoint.bus.t_sim_ns,
+                    pending=item.endpoint.bus.pending, next_due_ns=item.endpoint.bus.next_due_ns)
+                    for item in runtime.bindings]
             if self.mode == "interrupt" and self.report.get("injected"):
                 before = list(self.report["native_calls"]["step_ns"])
                 self.report["failed_before_close"] = runtime.failed
@@ -1534,7 +1610,10 @@ class DjiScenarioObservation(FirmwareObservation):
     """Observe the existing Scenario and release only later guest observations."""
 
     consumer_label = "DJI Scenario"
-    feedback_bound, step_bound = 10000, 1250
+    feedback_bound = 10000
+    # Storage covers the outer cuts plus one distinct due per admitted command
+    # and feedback. Shared deadlines can reduce this count, never increase it.
+    step_bound = 1250 + len(DJI_SCENARIO_MEMBERS) * 10000 + feedback_bound
 
     def __init__(self, report, manifest):
         super().__init__(report, manifest)
@@ -1824,7 +1903,8 @@ def run_dji_scenario(elf, output, firmware, *, qemu=None):
         "missing": {name: sorted(DJI_SCENARIO_REQUIRED) for name in DJI_SCENARIO_MEMBERS},
         "skips": {name: [] for name in DJI_SCENARIO_MEMBERS},
         "missing_skips": {name: ["plant.physics"] for name in DJI_SCENARIO_MEMBERS},
-        "observation_bounds": {"feedback": 10000, "steps": 1250, "pending_per_device": 256,
+        "observation_bounds": {"feedback": DjiScenarioObservation.feedback_bound,
+            "steps": DjiScenarioObservation.step_bound, "pending_per_device": 256,
             "commands_per_peer": 10000, "sampled_command_transitions_per_peer": 8},
         "limitations": ["Actual motor::dji/BSP/HAL/FDCAN consumer of one eight-device native world.",
             "Every command is checked and counted; transition_count is exact, transitions retains only the first8 changes and last is the actual last row.",
@@ -1893,7 +1973,8 @@ def run_dji_scenario(elf, output, firmware, *, qemu=None):
         calls = report["native_calls"]
         if (result.end_ns - result.origin_ns != 1_000_000_000 or result.origin_ns >= DJI_SCENARIO_EVENT_NS
                 or calls["reset"] != 1 or calls["close"] != 1 or len(calls["step_ns"]) != result.steps
-                or sum(calls["step_ns"]) != result.end_ns or set(calls["step_ns"]) != {1_000_000}
+                or sum(calls["step_ns"]) != result.end_ns
+                or any(not 0 < dt <= 1_000_000 for dt in calls["step_ns"])
                 or len(result.boards) != 2 or result.referees or result.children):
             raise ValueError("DJI Scenario world/result scope disagrees")
         for wire_session, board in enumerate(result.boards, 1):
@@ -2252,7 +2333,8 @@ def run_dji_feedback_scenario(elf, output, firmware, *, qemu=None):
         "missing": {name: sorted(DJI_FEEDBACK_REQUIRED) for name in DJI_SCENARIO_MEMBERS},
         "skips": {name: [] for name in DJI_SCENARIO_MEMBERS},
         "missing_skips": {name: ["plant.physics"] for name in DJI_SCENARIO_MEMBERS},
-        "observation_bounds": {"feedback": 10000, "steps": 1250, "pending_per_device": 256,
+        "observation_bounds": {"feedback": DjiFeedbackObservation.feedback_bound,
+            "steps": DjiFeedbackObservation.step_bound, "pending_per_device": 256,
             "commands_per_peer": 10000, "sampled_command_transitions_per_peer": 8},
         "limitations": ["Fixed two-board IDs1/2 CURRENT64/-64; both ID1 feedback paths denied200..350ms; ID2 is the live control.",
             "Actual commands are checked/counted; first8 transitions and four witnesses are bounded observations, not a full trace.",
@@ -2311,7 +2393,8 @@ def run_dji_feedback_scenario(elf, output, firmware, *, qemu=None):
         calls = report["native_calls"]
         if (result.end_ns - result.origin_ns != 400_000_000 or result.origin_ns >= DJI_FEEDBACK_LOSS_NS
                 or calls["reset"] != 1 or calls["close"] != 1 or len(calls["step_ns"]) != result.steps
-                or sum(calls["step_ns"]) != result.end_ns or set(calls["step_ns"]) != {1_000_000}
+                or sum(calls["step_ns"]) != result.end_ns
+                or any(not 0 < dt <= 1_000_000 for dt in calls["step_ns"])
                 or len(result.boards) != 2 or result.referees or result.children):
             raise ValueError("DJI feedback world/result scope disagrees")
         for wire_session, board in enumerate(result.boards, 1):
@@ -2525,6 +2608,8 @@ def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
 def main(args):
     if args.multi_cut and (args.cli or args.mode != "normal"):
         raise ValueError("--multi-cut requires the normal Arena runtime consumer")
+    if args.can_deadlines and (args.multi_cut or args.cli or args.mode != "normal"):
+        raise ValueError("--can-deadlines requires normal mode without --cli or --multi-cut")
     result_path = Path(args.result)
     if result_path.exists():
         raise FileExistsError("Arena fixture refuses to overwrite a result")
@@ -2556,6 +2641,11 @@ def main(args):
                                "members": [member.name for member in manifest.robots], "events": []}
         report["limitations"].append(
             "400/400/200us World cuts retain1ms CAN feedback phase; unchanged receipt goals and missing IMU consumption are permitted.")
+    if args.can_deadlines:
+        report["can_deadlines"] = {"delay_ns": CAN_DEADLINE_DELAY_NS, "outer_step_ns": 1_000_000,
+            "members": [member.name for member in manifest.robots], "events": []}
+        report["limitations"].append(
+            "Known queued CAN dues add actual CPU/World/STEP cuts; interval outputs remain end-sampled. Future feedback stays pending at the original50ms duration without an extra drain step.")
     observer = Observation(report, manifest, args.mode)
     observer.binary = binary
     if args.cli:
@@ -2615,12 +2705,15 @@ def main(args):
         assert calls["reset"] == calls["close"] == 1 and calls["step_ns"]
         if args.multi_cut:
             check_multi_cut_observations(report)
+        elif args.can_deadlines:
+            check_can_deadline_observations(report)
         else:
             assert all(dt == 1_000_000 for dt in calls["step_ns"])
         assert len(observer.plant.devices) == 8 and report["world"]["distinct_buses"] == 2
         assert all(device.closed for device in observer.plant.devices)
         assert len(observer.owners) == 2 and len(observer.children) == 1
-        assert all(not pending for pending in observer.feedback_sources.values())
+        if not args.can_deadlines:
+            assert all(not pending for pending in observer.feedback_sources.values())
         assert all(delivery is None for delivery in observer.feedback_deliveries.values())
         assert all(not item.endpoint.stream.tx_pending for item in observer.runtime.bindings)
         report["device_cleanup"] = [device.closed for device in observer.plant.devices]
@@ -2727,6 +2820,8 @@ if __name__ == "__main__":
     parser.add_argument("--cli", action="store_true", help="exercise the real sim module CLI entry")
     parser.add_argument("--multi-cut", action="store_true",
                         help="verify400/400/200us cuts inside each normal Arena runtime1ms step")
+    parser.add_argument("--can-deadlines", action="store_true",
+                        help="verify known250us delayed CAN dues with original1ms outer steps and50ms duration")
     parser.add_argument("--mode", choices=("normal", "reset", "peer-exit", "upper-exit", "interrupt"), default="normal")
     parser.add_argument("--result", required=True)
     args = parser.parse_args()
@@ -2734,6 +2829,8 @@ if __name__ == "__main__":
         parser.error("--mode interrupt requires --cli")
     if args.multi_cut and (args.cli or args.mode != "normal"):
         parser.error("--multi-cut requires normal mode without --cli")
+    if args.can_deadlines and (args.multi_cut or args.cli or args.mode != "normal"):
+        parser.error("--can-deadlines requires normal mode without --cli or --multi-cut")
     try:
         sys.exit(main(args))
     except ModuleNotFoundError as error:

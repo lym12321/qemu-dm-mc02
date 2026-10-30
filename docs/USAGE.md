@@ -2890,7 +2890,8 @@ session 标识，因此不提供跨 reset 的 CAN 历史输入隔离。这个调
 `M3508JointPlant`。调用方先构造各板的 `QemuCanEndpoint`，再用非空 tuple
 绑定名称、endpoint、`StepFramedSocket` 和具名 IMU。运行时从 endpoint 的只读
 `.stream` 取得实际 CAN transport；所有连接须已打开、非阻塞且互不重复，
-plant 中的器件总线须与绑定总线完全一致。构造会检查全部具名 IMU，成功后
+plant 中的器件总线须与绑定总线完全一致。总节点数（板组、各总线、plant、裁判）
+须在 64 以内，构造在资源副作用前检查。构造会检查全部具名 IMU，成功后
 运行时独占 plant 的推进和关闭；构造失败时仍由调用方清理 plant。
 
 ```python
@@ -2930,14 +2931,24 @@ QEMU 须以 `-S -accel tcg,thread=single -icount shift=0,align=off,sleep=off`
 `start()` 只允许尝试一次：全部实际 RESET_ACK 到齐后，将各自 QEMU 时间原点
 映射到所给 Session 原点，再统一重置总线和世界一次。启动期间保留物理 CAN
 输入，不提前消费。`step()` 通过唯一 Simulation 推进；可用构造参数 `quantum_ns`
-限制每个内部区间的长度，默认 `UINT64_MAX` 保持由调用方决定步长。plant 仍沿用
-既有命令超时分段。每个内部切点先完成 CPU/World、采样和目标交付，再收齐并编码
+限制每个内部区间的长度，默认 `UINT64_MAX`；已知 CAN `next_due_ns` 也会切分区间。
+每条借用总线独立暴露 dispatch 能力，Simulation 直接拥有 plant 的 reset/step/close，
+每次 settle 的单总线预算覆盖回调生成的消息，不会再在 plant.step 中重复派发。
+同刻消息按总线绑定顺序、各总线入队顺序处理；跨总线回调在同一有界 settle 中收敛。
+例如提前已知 1.5 ms 到期命令，`step(4ms)` 先完成 1.5 ms World，再交付命令，
+然后以新控制完成余下 2.5 ms。plant 仍沿用既有命令超时分段，物理子区间不增加 CPU/STEP。每个内部切点先完成 CPU/World、采样和目标交付，再收齐并编码
 全部 IMU，逐板发送 STEP、等待实际 ACK 和原生 CAN 输入处理回执，最后提交逻辑时间。
 `step()` 返回最后完成切点的 ACK tuple，`on_response` 可观察全部内部切点。
 原协议允许的重发复用相同编码 bytes，不重复推进或采样；初始化、重复 settle 和
 `service()` 不生成新的 STEP，`service()` 只收发和入队。
+不提供 `BoardExecution` 时，ACK 等待保留物理 CAN 输入，到下一次 World 前服务才读取；
+此时才发现的旧时间戳消息在所选目标交付并标记 late，不追溯切点。零时间戳使用读取时
+上一完整逻辑切点作为 fallback，不制造字节发送或固件消费时间。
+外层 quantum 分段数只给出最少切点数；新增到期切点逐个检查 sample ID、映射时间和计数余量。
+因此后续切点可能在已有切点提交后失败；最后完整提交与已发生的 I/O/物理效果均保留。
 
-提供 `BoardExecution` 时，启动还检查各原点处的初始空 CAN 基线。每步先检查全部
+提供 `BoardExecution` 时，启动还检查各原点处的初始空 CAN 基线；初始 settle 产生的
+虚拟设备输入使用现有 idle/prelaunch 回执门验证，计数仍相对原始基线计算。每步先检查全部
 目标和输入计数余量，再请求所有 CPU 执行到映射后的目标；实际 `reached/paused`
 到齐并排空所有 CAN 输出后，才推进一次既有世界和发送 IMU。全部反馈达到精确的
 原生输入处理计数后才返回，下一步 CPU 执行须等到此处。此模式的 `service()` 和
@@ -2986,6 +2997,17 @@ RESET 和一个 10 ms world tick，再恢复 CPU 读取反馈与 SPI 数据。�
 夹具，尚未验证 HAL/BSP 闭环、CPU 全局时间屏障或
 实物标定。没有安装 MuJoCo 时该原生门明确返回 SKIP 77。
 
+额外的到期切分原生验收：
+
+```bash
+uv run --frozen --extra mujoco --extra referee bash tools/run-qemu-shared-world-smoke.sh --arena-runtime --can-deadlines
+```
+
+该门给左侧 CAN 配置 250 μs 延迟，保留默认 quantum、外层 1 ms 和原有 50 ms 活跃时长，
+验证实际 1.25 ms 等截止切点、每切点 CPU/World/STEP/ACK/原生传输回执，以及真实固件
+CAN/BMI088 raw 读取。结束时尚未到期的反馈单独报告并保留，不为清空队列额外推进。
+这只证明已知队列到期调度；CPU 区间内新发现的输出仍在完成态边界交付，不能反向影响本区间。
+
 ### MuJoCo 双底盘场景
 
 `models/two_four_wheel.xml` 在同一个原生世界中组合两个现有四轮夹具，
@@ -3016,7 +3038,8 @@ finally:
 ```
 
 接入电机时，一个 `M3508JointPlant` 拥有全部八个器件和这一个 physics，
-一个 `CanParticipant` 统一服务两条总线；每条总线可独立使用 ID 1–4。
+SharedWorld 使用两条借用 CAN dispatcher 和同一个 plant；每条总线可独立使用 ID 1–4。
+上面的手动 Coordinator 例子仍是 host fixture，不参与 SharedWorld 调度。
 隔离和直接消费者测试可运行：
 
 ```bash

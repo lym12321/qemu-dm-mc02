@@ -129,7 +129,7 @@ jobs:
           python-version: '3.11'
       - name: Install host contract dependencies
         run: python -m pip install '.[referee]' 'pytest>=8,<9'
-      - name: SharedWorld cuts, wire admission and cleanup without native backends
+      - name: SharedWorld CAN deadlines, cut admission and cleanup without native backends
         run: python -m pytest -q tests/test_sim_shared_world.py
 
   experiment-recording:
