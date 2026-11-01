@@ -531,9 +531,9 @@ class Simulation:
     def _commit_inputs(self, cut: int) -> None:
         """Flush admitted protocol batches after all delivery at this cut.
 
-        A hook may enqueue future inputs. Reopening its own cut would make
-        earlier I/O depend on owner iteration order, so that attempt freezes
-        the run, even when its callback catches the exception. A later public
+        A hook may enqueue future inputs or network deliveries. Reopening its
+        own cut would make earlier I/O depend on owner iteration order, so
+        that attempt freezes the run before any later hook. A later public
         operation may still settle ordinary inputs at the completed cut.
         """
         previous_phase = self._phase
@@ -545,6 +545,12 @@ class Simulation:
                     self._check_deadline()
                     component.commit_inputs(cut)
                     self._check_deadline()
+                    for dispatcher_name, dispatcher in self._owned:
+                        if "dispatch" in self._descriptions[dispatcher_name].capabilities:
+                            due = self._next_due(dispatcher_name, dispatcher)
+                            if due is not None and due <= cut:
+                                raise RuntimeError(f"input commit by {name} reopened dispatcher "
+                                                   f"{dispatcher_name} at {due} ns during cut {cut} ns")
         finally:
             self._committing_cut = None
             self._phase = previous_phase

@@ -2,7 +2,8 @@
 
 import pytest
 
-from sim.api import NodeDescription, NodeSpec, PortSpec, Topology
+from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
+from sim.fabric import CanBusFactory, CanFrame
 from sim.runtime import Simulation, SimulationState
 
 
@@ -159,3 +160,82 @@ def test_caught_capacity_failure_still_stops_dispatch_and_preserves_primary(surf
         assert sim.state == 'failed' and sim.t_sim_ns == sim.step_id == 0
         assert owner.applied == [('value', 1)]
         assert len(sim.events) == (1 if surface == 'event' else 0)
+
+
+def commit_can_scene(delay_ns):
+    commits = []
+
+    class Endpoint:
+        def __init__(self, spec, context):
+            self.name = spec.name
+            self.connection = context.attach("can", self)
+            self.received = []
+            self.sent = False
+            self.close_count = 0
+
+        def receive(self, frame):
+            self.received.append(frame)
+
+        def commit_inputs(self, cut):
+            commits.append((self.name, cut))
+            if self.name == "source" and cut == 10 and not self.sent:
+                self.sent = True
+                self.connection.send(CanFrame(0x123, data=b"command", timestamp_ns=cut))
+
+        def close(self):
+            self.close_count += 1
+
+    class Factory:
+        def describe(self, _spec):
+            return NodeDescription((PortSpec("can", "can"),), {"input_commit"})
+
+        def create(self, spec, context):
+            return Endpoint(spec, context)
+
+    topology = Topology((NodeSpec("bus", "bus", {"delay_ns": delay_ns}),
+                         NodeSpec("source", "endpoint"), NodeSpec("sink", "endpoint")),
+                        (LinkSpec("source.can", "bus.can"), LinkSpec("sink.can", "bus.can")))
+    sim = Simulation(topology, {"bus": CanBusFactory(), "endpoint": Factory()}, quantum_ns=10)
+    return sim, commits
+
+
+def test_input_commit_cannot_reopen_network_cut_or_run_later_hooks():
+    sim, commits = commit_can_scene(0)
+    with sim:
+        source, sink, bus = (sim.components[name] for name in ("source", "sink", "bus"))
+        sim.run_until(5)
+        commits.clear()
+        with pytest.raises(RuntimeError, match="input commit by source reopened dispatcher bus") as raised:
+            sim.run_until(10)
+        assert raised.value is sim.failure and sim.state == SimulationState.FAILED
+        assert (sim.t_sim_ns, sim.step_id) == (5, 1)
+        assert commits == [("source", 5), ("sink", 5), ("source", 10)]
+        assert bus.pending == 1 and bus.next_due_ns == 10
+        assert sink.received == []
+        with pytest.raises(RuntimeError, match="healthy"):
+            sim.run_until(20)
+        with pytest.raises(RuntimeError, match="healthy"):
+            sim.reset()
+        assert bus.pending == 1 and commits[-1] == ("source", 10)
+        assert sum(event.kind == "can.sent" for event in sim.events) == 1
+    sim.close()
+    assert source.close_count == sink.close_count == 1
+    assert bus.pending == 0 and not sim.components
+
+
+def test_input_commit_can_queue_future_network_deadline_without_repeating_send():
+    sim, commits = commit_can_scene(3)
+    with sim:
+        source, sink = (sim.components[name] for name in ("source", "sink"))
+        sim.run_until(5)
+        sim.run_until(10)
+        assert sim.components["bus"].next_due_ns == 13 and sink.received == []
+        assert commits[-2:] == [("source", 10), ("sink", 10)]
+        sim.run_until(20)
+        assert sink.received == [CanFrame(0x123, data=b"command", timestamp_ns=13)]
+        delivered, = (event for event in sim.events if event.kind == "can.delivery")
+        assert (delivered.source_time_ns, delivered.mapped_time_ns,
+                delivered.delivery_time_ns, delivered.payload["due_ns"]) == (10, 10, 13, 13)
+        assert sim.step_id == 4 and sim.state == SimulationState.PAUSED
+        assert sum(event.kind == "can.sent" for event in sim.events) == 1
+    assert source.close_count == sink.close_count == 1
