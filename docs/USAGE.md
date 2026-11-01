@@ -112,6 +112,7 @@ links:
 准入拒绝未知字段、重复 key、anchor/alias、不支持的 kind/model/端口、方向/能力不匹配和重复连接。
 文件最多 1 MiB、64 个节点、256 条连接；时间使用整数 `ns/us/ms/s`，配置时长最多 3600s。
 实验因增加一个无资源观察节点，最多接收 63 个用户节点。`validate` 不创建进程、socket 或求解器。
+机器描述只检查固件路径形式；文件存在且可读的检查在执行准入时完成，早于端口附着和原生进程启动。
 
 Python API 与 CLI 共用 Factory admission 和执行路径：
 
@@ -146,6 +147,9 @@ socket 和 CPU request/finish，Profile 不能推进 CPU。Fake Profile 只证�
    settle 后仍不晚于 `t` 的 deadline 是错误，不能回退或零步自旋。
 3. 先预检全部 Machine 的目标，再请求全部 Machine，完成全部 CPU，随后推进非 Machine 组件。
 4. 采样完成的源状态，交付目标切点输入与网络事件，提交输入批次，最后提交 Simulation 时间和 step ID。
+
+提交钩子只能产生未来输入或网络工作。每个钩子返回后，若任何 Owner 留有不晚于当前切点的工作，
+立即冻结，后续钩子与逻辑时间均不提交；已经发生的 I/O 保留，不重新 settle 或重试提交。
 
 初始化只采样一次。plant 使用区间开始已生效的控制；本区间产生的 CAN/IMU/GPIO 最早在
 区间末交付，只能影响下一段 CPU/物理执行。已知输入可精确切分区间；GPIO 快照无法恢复
@@ -344,6 +348,7 @@ bash tools/run-simulation-smoke.sh --case can-faults --build-type Release --qemu
 ## 有限实验与观察
 
 `sim.apps.experiment.run_experiment` 使用同一个 Simulation 的输入队列、公开 Event 和纯断言 evaluator。
+公共解析和求值由 `sim.testing` 唯一拥有；调用者提供端口准入，在线运行与离线复核使用相同匹配规则。
 单板、外设、多机器均可使用 `experiment`，输入与断言各最多 1024 项：
 
 ```yaml
@@ -1748,15 +1753,40 @@ pytest 的 optional skip 不是该层 PASS；没有 Actions 运行记录时不�
 
 | 层级 | 验证入口 | 证据与限制 |
 | --- | --- | --- |
-| Host core | `.github/workflows/host-core.yml` | 安装基础包、纯 Python 合同、checkout 外 CLI；不运行 MCU |
-| 协议与记录 | 同 workflow 的纯 Python extras 阶段 | 实际字节/状态、MCAP 生命周期与离线复核 |
-| 原生 Board | `bash tools/run-simulation-smoke.sh --case all` | ARM ELF + 固定 QEMU；缺依赖退出 78 |
+| Host core | `.github/workflows/host-core.yml` 的 `host-core` Job | 安装基础包、纯 Python 合同、checkout 外 CLI；不运行 MCU |
+| 协议与记录 | 同 workflow 的 `application-contracts` Job | 按需安装 trace/referee；实际字节/状态、MCAP 生命周期与离线复核 |
+| 原生 Board | 下方逐项手动验收命令 | ARM ELF + 固定 QEMU；缺依赖退出 78 |
 | 多板 | 同脚本 `--case dual-board` | 独立机器与时间映射，非全局硬件锁步 |
 | 物理 | `python -m pytest -q tests/test_simulation_joints.py tests/test_four_wheel_physics.py` | 需要 MuJoCo；单 solver、异构驱动器和数值状态 |
 | 固件直连 | 下文 HAL/BSP、Motor、DJI、Chassis、Referee runner | 消费行为与清理；不代表实板标定 |
 
 轻量 PR gate 不构建 QEMU、不安装 MuJoCo/ROS/Gazebo，也不依赖未追踪的本地示例。
 原生门应在具备 Nix/ARM GCC/兼容二进制的 Linux 环境中单独执行，并保留构建缓存与产物身份。
+轻量工作流明确报告 Native NOT RUN；手动门的 PASS、FAIL、BLOCKED 和有依据的 SKIPPED 分开记录。
+`--case all` 当前只运行五个基础场景，完整外设验收需要显式逐项调用：
+
+```bash
+for build_type in Debug Release; do
+  for case in minimal-board pulse digital-link can-motor rotor-loop dual-board joint-loop imu-readback uart-link can-faults; do
+    python smoke/simulation_smoke.py --build-type "$build_type" --case "$case"
+  done
+  python smoke/automatic_lab_smoke.py --build-type "$build_type" --case all
+done
+```
+
+每次报告记录实际 ELF 哈希、QEMU 路径/哈希/版本、输入与观察时间及清理结果。
+ADC 接受不等于 DR 读取；IMU ACK 不等于完整消费 DONE；UART 是字节流，读取批次不代表消息边界。
+GPIO 完成态快照不提供未记录的中间边沿。硬件和物理标定仍需独立证据。
+
+使用同一 Runtime 和上述最小固件测量短运行开销：
+
+```bash
+python tools/benchmark_simulation.py --case host --report build/host-benchmark.json
+python tools/benchmark_simulation.py --case all --qemu /path/to/compatible/qemu-system-arm --report build/platform-benchmark.json
+```
+
+默认三次固定工作量，报告排他创建，保留 Cut、CAN、QMP、事件数据量、启动/运行耗时和内存样本。
+Host 模式无需 QEMU 或物理引擎；原生模式复用真实验收断言。观察与 JSON 编码也有开销，短运行不能证明持续实时能力。
 
 日常修改优先运行受影响的原生测试，例如内部 Flash：
 

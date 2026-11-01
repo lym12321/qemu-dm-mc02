@@ -1250,7 +1250,10 @@ def main(argv=None):
         if not args.qemu.is_file() or not os.access(args.qemu, os.X_OK):
             raise Blocked(f"project dm-mc02 QEMU executable is missing: {args.qemu}")
         payload["qemu"] = {"path": str(args.qemu.resolve()),
-                           "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest()}
+                           "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
+                           "version": subprocess.run([str(args.qemu), "--version"], check=True,
+                               capture_output=True, text=True, timeout=5).stdout.splitlines()[0]}
+        payload["python"] = {"executable": sys.executable, "version": sys.version}
         for case in NATIVE_CASES if args.case == "all" else (args.case,):
             if case == "hal-gpio":
                 if not args.hal_elf.is_file():

@@ -13,9 +13,9 @@ for argument in "$@"; do
         *) printf 'usage: %s [--multi-cut|--can-deadlines] [--cli] [--peer-exit|--reset|--upper-exit|--interrupt]\n' "$0" >&2; exit 2 ;;
     esac
 done
-[[ -x "$qemu_bin" ]] || { printf 'BLOCKED: QEMU not found: %s\n' "$qemu_bin" >&2; exit 77; }
-command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'BLOCKED: arm-none-eabi-gcc required' >&2; exit 77; }
-"$scene_python" -c 'import mujoco,crccheck,yaml,qemu.qmp' || { printf '%s\n' 'BLOCKED: native Python dependencies required' >&2; exit 77; }
+[[ -x "$qemu_bin" ]] || { printf 'BLOCKED: QEMU not found: %s\n' "$qemu_bin" >&2; exit 78; }
+command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'BLOCKED: arm-none-eabi-gcc required' >&2; exit 78; }
+"$scene_python" -c 'import mujoco,crccheck,yaml,qemu.qmp' || { printf '%s\n' 'BLOCKED: native Python dependencies required' >&2; exit 78; }
 run_dir=$(mktemp -d '/tmp/dm-qemu.shared-world.XXXXXX')
 trap 'rm -rf -- "$run_dir"' EXIT
 for peer in 0 1; do
