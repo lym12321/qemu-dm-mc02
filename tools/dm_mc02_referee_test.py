@@ -24,7 +24,8 @@ from dm_mc02_qmp import QmpSession
 from dm_mc02_test_harness import running_qemu
 from dm_mc02_trobot_business import _identity
 from sim.boards import QemuBoard
-from sim.boards.launch import qemu_command, regular_file, resolve_qemu
+from sim.boards.launch import qemu_command
+from sim.machines.qemu.launch import regular_file, resolve_qemu
 from sim.api import Session, StepContext
 from sim.devices.referee import Buff, GameStatus, Hit, MatchDurations, PowerHeat, RefereeEngine, RefereeState, RefereeUartEndpoint, RobotStatus, ScriptEvent, Shot
 from sim.transports import StreamTransport, connect_unix

@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 from crccheck.crc import Crc8MaximDow, Crc16Mcrf4Xx
 from sim.apps.experiment import run_experiment
 from sim.apps.presets import four_wheel_document, add_can_faults
-from sim.boards.launch import resolve_qemu
+from sim.machines.qemu.launch import resolve_qemu
 from sim.composition import builtin_registry
 from sim.config.scene import load_scene
 from sim.transports import step_codec as codec

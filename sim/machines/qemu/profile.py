@@ -17,7 +17,8 @@ from .cosim import QemuCosimEndpoint, admit_adc
 
 from sim.api import NodeDescription, PortSpec
 from sim.api.events import check_timestamp
-from sim.boards.launch import UARTS, regular_file
+from sim.boards.launch import UARTS
+from .launch import regular_file, native_qemu_command
 from sim.gpio import validate_gpio_pin
 
 CAN_PORTS = ('fdcan1', 'fdcan2', 'fdcan3')
@@ -43,7 +44,6 @@ def admit_options(spec):
     path = Path(firmware)
     if not path.is_absolute():
         path = Path(spec.base_dir) / path
-    path = regular_file(path, 'firmware')
     selected = options.get('uarts', ('uart1',))
     if not isinstance(selected, (list, tuple)):
         raise ValueError('QEMU machine uarts must be a list')
@@ -235,6 +235,7 @@ class DmMc02Adapter:
 
     def __init__(self, spec, ctx, backend):
         self._firmware, self._uarts = admit_options(spec)
+        self._firmware = regular_file(self._firmware, 'firmware')
         self._remote = spec.options.get('remote', False)
         self._adc = spec.options.get('adc', False)
         self._ctx, self._backend = ctx, backend
@@ -267,9 +268,9 @@ class DmMc02Adapter:
         self.stream_types.update({port.replace('fdcan', 'can'): CanStream for port in self._can_ports})
 
     def launch_command(self, qemu, sockets, *, qmp_path, gdb_port):
-        from sim.boards.launch import qemu_command
-        return qemu_command(self._firmware, qemu, sockets,
-                            qmp_path=qmp_path, gdb_port=gdb_port)
+        return native_qemu_command(qemu, sockets,
+            machine_arguments=DmMc02Profile.machine_arguments(self._firmware),
+            serial_slots=DmMc02Profile.serial_slots, qmp_path=qmp_path, gdb_port=gdb_port)
 
     def start(self):
         self._streams = self._backend.streams

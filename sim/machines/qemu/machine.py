@@ -14,7 +14,7 @@ from types import MappingProxyType
 
 from sim.api import StepResult
 from sim.api.topology import immutable as _freeze
-from sim.boards.launch import qmp_socket_path, resolve_qemu
+from sim.machines.qemu.launch import qmp_socket_path, resolve_qemu
 from sim.transports import connect_unix
 
 from .deadline import deadline_qmp_call

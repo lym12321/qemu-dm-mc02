@@ -95,6 +95,41 @@ def test_firmware_resolves_against_manifest_directory(firmware):
         description.port('uart1')
 
 
+def test_description_does_not_access_firmware_and_execution_rechecks_it(firmware, backend, monkeypatch):
+    spec = NodeSpec('board', 'machine.qemu', {'firmware': firmware})
+    factory = QemuFactory()
+    firmware.unlink()
+    with monkeypatch.context() as guard:
+        guard.setattr(Path, 'stat', lambda *_args, **_kwargs: pytest.fail('description accessed filesystem'))
+        assert factory.describe(spec).port('uart1').protocol == 'uart'
+        assert factory.validate_input(spec, 'key', True) is True
+    sim = Simulation(Topology((spec,)), {'machine.qemu': factory})
+    with pytest.raises(ValueError, match='firmware is not readable'):
+        sim.start()
+    assert sim.state == SimulationState.FAILED
+    assert backend.calls == backend.commands == backend.sockets == []
+    sim.close()
+
+
+def test_injected_profile_imports_no_board_implementation():
+    code = '''
+import importlib.abc, sys
+from types import SimpleNamespace
+class NoBoard(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == 'sim.boards' or fullname.startswith('sim.boards.') or fullname == 'sim.machines.qemu.profile':
+            raise AssertionError('unexpected board dependency: ' + fullname)
+sys.meta_path.insert(0, NoBoard())
+from sim.api import NodeDescription, NodeSpec
+from sim.machines.qemu import QemuFactory
+profile = SimpleNamespace(describe=lambda _: NodeDescription(capabilities={'machine'}),
+    validate_input=lambda *a, **k: None, validate_connections=lambda *a: None,
+    create_adapter=lambda *a: None)
+assert QemuFactory(profile=profile).describe(NodeSpec('cpu', 'fixture')).capabilities == {'machine'}
+'''
+    subprocess.run([sys.executable, '-c', code], check=True, timeout=5)
+
+
 @pytest.mark.parametrize('port, payload, expected', [
     ('key', True, True),
     ('gpio.A0', 1, 1),
@@ -265,12 +300,13 @@ def test_described_but_unimplemented_connections_reject_explicitly_before_acquis
 def backend(monkeypatch, tmp_path):
     """Substitute acquisition only; all adapter/transport/lifecycle code is real."""
     calls, clients, sockets, commands = [], [], [], []
-    state = SimpleNamespace(origin=71, commands_available=True, close_error=None,
-                            external_change=False, read_snapshot=None)
+    state = SimpleNamespace(origin=71, origins=None, processes=[], commands_available=True,
+                            close_error=None, external_change=False, read_snapshot=None)
 
     class Qmp:
         def __init__(self, *_args, **_kwargs):
-            self.current, self.target = state.origin, None
+            self.current = state.origin if state.origins is None else state.origins[len(clients)]
+            self.target = None
             self.index, self.key_pressed = len(clients), False
             self.timeouts = []
             clients.append(self)
@@ -314,11 +350,12 @@ def backend(monkeypatch, tmp_path):
     @contextmanager
     def owner(command, *, sockets, startup_timeout):
         calls.append(('start', command, tuple(sockets), startup_timeout))
-        paths = {name: tmp_path / f'{name}.sock' for name in sockets}
+        paths = {name: tmp_path / str(len(state.processes)) / f'{name}.sock' for name in sockets}
+        process = SimpleNamespace(pid=123 + len(state.processes), returncode=None)
+        process.poll = lambda: process.returncode
+        state.processes.append(process)
         try:
-            yield SimpleNamespace(process=SimpleNamespace(poll=lambda: None, pid=123,
-                                                          returncode=None),
-                                  start_ns=100, sockets=paths)
+            yield SimpleNamespace(process=process, start_ns=100, sockets=paths)
         finally:
             calls.append('process close')
 
@@ -865,10 +902,11 @@ def test_real_shared_cosim_socket_through_machine_commit_and_cleanup(
 class FakeProfile:
     """A test profile using the same backend; it models no real board."""
 
-    def __init__(self):
+    def __init__(self, machine_name='fixture-board'):
         self.actions = []
         self.close_error = None
         self.adapters = []
+        self.machine_name = machine_name
 
     def describe(self, spec):
         assert not spec.options
@@ -895,10 +933,10 @@ class FakeProfile:
                 self.completed = None
 
             def launch_command(self, qemu, sockets, *, qmp_path, gdb_port):
-                from sim.boards.launch import native_qemu_command
+                from sim.machines.qemu.launch import native_qemu_command
                 assert sockets == ['qmp', 'data']
                 return native_qemu_command(qemu, sockets,
-                    machine_arguments=('-machine', 'fixture-board'), serial_slots=('data',),
+                    machine_arguments=('-machine', profile.machine_name), serial_slots=('data',),
                     qmp_path=qmp_path, gdb_port=gdb_port)
 
             def start(self):
@@ -974,6 +1012,45 @@ def test_profile_cleanup_error_still_closes_every_native_owner(backend):
     assert caught.value is profile.close_error
     assert backend.calls[-2:] == ['QMP close', 'process close']
     assert backend.sockets[0][1].fileno() == -1
+
+
+def test_two_profiles_keep_epochs_streams_and_cleanup_independent_and_peer_exit_freezes(backend):
+    left, right = FakeProfile('fixture-left'), FakeProfile('fixture-right')
+    backend.state.origins = (71, 901)
+    sim = Simulation(Topology((NodeSpec('left', 'left.qemu'), NodeSpec('right', 'right.qemu'))),
+        {'left.qemu': QemuFactory(profile=left, qemu='/explicit/qemu'),
+         'right.qemu': QemuFactory(profile=right, qemu='/explicit/qemu')})
+    sim.start()
+    try:
+        machines = sim.components
+        assert machines['left'].to_native(5) == 76
+        assert machines['right'].to_native(5) == 906
+        assert machines['left'].connection_info['sockets'] != machines['right'].connection_info['sockets']
+        sim.schedule_input('left.feed', b'left\0')
+        sim.schedule_input('right.feed', b'right\xff')
+        backend.sockets[0][2].sendall(b'reply-left')
+        backend.sockets[1][2].sendall(b'reply-right')
+        sim.run_until(5)
+        assert [peer.recv(4096) for _, _, peer in backend.sockets] == [b'left\0', b'right\xff']
+        assert [machines[name].observe() for name in ('left', 'right')] == [
+            (5, b'reply-left'), (5, b'reply-right')]
+        assert [client.target for client in backend.clients] == [76, 906]
+        starts = [call[1] for call in backend.calls if isinstance(call, tuple) and call[0] == 'start']
+        assert [command[command.index('-machine') + 1] for command in starts] == [
+            'fixture-left', 'fixture-right']
+        requests = sum(name == 'x-run-to-virtual-time' for name, _ in backend.commands)
+        backend.state.processes[1].returncode = 0
+        with pytest.raises(RuntimeError, match=r'QEMU exited \(0\)') as failure:
+            sim.run_until(10)
+        assert sim.failure is failure.value and sim.t_sim_ns == 5
+        assert sum(name == 'x-run-to-virtual-time' for name, _ in backend.commands) == requests
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step()
+    finally:
+        sim.close()
+    assert left.actions.count(('close',)) == right.actions.count(('close',)) == 1
+    assert backend.calls.count('QMP close') == backend.calls.count('process close') == 2
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
 
 
 def test_invalid_profile_adapter_is_closed_before_process_acquisition(backend):

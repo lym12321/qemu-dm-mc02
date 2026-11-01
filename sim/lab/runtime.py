@@ -14,9 +14,10 @@ import time
 
 from sim.boards import QemuBoard
 from sim.boards.channels import ChannelEvent, LabChannels
-from sim.boards.launch import (UARTS, CANS, PROJECT_ROOT, positive_seconds,
+from sim.boards.launch import UARTS, CANS, qemu_command
+from sim.machines.qemu.launch import (PROJECT_ROOT, positive_seconds,
                                regular_file as _regular_file, resolve_qemu as _qemu_path,
-                               qmp_socket_path as _external_qmp, qemu_command)
+                               qmp_socket_path as _external_qmp)
 from sim.transports import StreamTransport, connect_unix
 from sim.machines.qemu.deadline import deadline_qmp_call
 from sim.machines.qemu.qmp import qmp_session_class

@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from sim.boards import QemuBoard, digital_level
-from sim.boards.launch import regular_file, resolve_qemu
+from sim.machines.qemu.launch import regular_file, resolve_qemu
 from sim.lab.runtime import open_lab
 from sim.processes import ChildProcess
 from tools.dm_mc02_firmware_rtf import deadline_qmp_call

@@ -29,7 +29,8 @@ from dm_mc02_test_harness import running_qemu
 from qemu.machine.qtest import QEMUQtestProtocol
 from sim.boards import (drain_paused_can, observe_initial_paused_can,
                         wait_paused_can_input)
-from sim.boards.launch import qemu_command, resolve_qemu
+from sim.boards.launch import qemu_command
+from sim.machines.qemu.launch import resolve_qemu
 from sim.transports.can_stream import CanStream
 from sim.transports.unix import connect_unix
 
