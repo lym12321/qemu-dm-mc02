@@ -262,7 +262,7 @@ def test_wire_time_matches_before_expiry_but_never_recovers_failed_empty_cut(qua
 def test_can_lower_bound_cannot_prove_strict_before_assertion():
     from sim.api import Event
     from sim.apps.experiment import _Consumer
-    from sim.lab.manifest import parse_assertion
+    from sim.testing import parse_assertion
 
     assertion = parse_assertion({"before": "5ns", "can_seen": {
         "endpoint": "board.can", "id": 0x123}}, 0,
@@ -332,7 +332,7 @@ def test_optional_legacy_runners_and_backends_are_not_imported(tmp_path):
     script = """import sys
 from sim.apps.experiment import run_experiment
 for name in sys.modules:
-    assert not name.startswith(('tools.', 'sim.arena', 'sim.lab.runtime', 'mujoco', 'mcap', 'qemu.')), name
+    assert not name.startswith(('tools.', 'sim.arena', 'sim.lab', 'mujoco', 'mcap', 'qemu.')), name
 """
     env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
     result = subprocess.run([sys.executable, "-c", script], cwd=tmp_path, env=env,

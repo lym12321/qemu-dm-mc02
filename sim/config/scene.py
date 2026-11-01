@@ -12,6 +12,9 @@ from sim.runtime import Simulation, Topology
 from .yaml import ManifestError, fields, identifier, load_document, parse_time, text_bytes
 
 
+MAX_EXPERIMENT_ITEMS = 1024
+
+
 @dataclass(frozen=True)
 class ExperimentInput:
     at_ns: int
@@ -60,7 +63,7 @@ class ExperimentSpec:
         object.__setattr__(self, "ready", validate_ready(self.ready))
         for name in ("inputs", "assertions"):
             values = getattr(self, name)
-            if not isinstance(values, (tuple, list)) or len(values) > 1024:
+            if not isinstance(values, (tuple, list)) or len(values) > MAX_EXPERIMENT_ITEMS:
                 raise ValueError(f"experiment.{name} requires at most 1024 entries")
             object.__setattr__(self, name, tuple(immutable(value) for value in values))
 
@@ -146,7 +149,7 @@ def load_scene(path: str | Path, registry: Mapping) -> Scene:
     inputs = experiment.get("inputs", [])
     assertions = experiment.get("assertions", [])
     for label, values in (("inputs", inputs), ("assertions", assertions)):
-        if type(values) is not list or len(values) > 1024:
+        if type(values) is not list or len(values) > MAX_EXPERIMENT_ITEMS:
             raise ManifestError(f"experiment.{label} must be a list with at most 1024 entries")
     queued = []
     for index, value in enumerate(inputs):

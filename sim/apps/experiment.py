@@ -2,7 +2,7 @@
 
 Inputs use the runtime's queue and cuts. A resource-free sample consumer marks
 already completed cuts for assertion expiry; it never advances CPU or physics.
-Matching reuses the pure Lab evaluator, without importing a legacy runner.
+Matching uses the shared pure evaluator, without importing a native Lab adapter.
 """
 
 from collections.abc import Mapping
@@ -15,11 +15,11 @@ from sim.api import (BackendUnavailable, Endpoint, Event, NodeDescription, NodeS
                      PortSpec, TimeQuality, Topology)
 from sim.api.events import check_timestamp
 from sim.boards import digital_level
-from sim.config.scene import ExperimentInput, ExperimentReady, Scene, load_scene, validate_ready
+from sim.config.scene import (MAX_EXPERIMENT_ITEMS, ExperimentInput, ExperimentReady,
+                              Scene, load_scene, validate_ready)
 from sim.fabric import CanFrame
 from sim.gpio import validate_gpio_pin
-from sim.lab.experiment import AssertionEvaluator, AssertionObservation
-from sim.lab.manifest import MAX_ITEMS, parse_assertion
+from sim.testing import AssertionEvaluator, AssertionObservation, parse_assertion
 from sim.runtime import Simulation, SimulationState
 
 
@@ -296,7 +296,7 @@ def _admit_observations(duration_ns, descriptions, connected, assertions, ready)
     check_timestamp(duration_ns)
     if duration_ns == 0:
         raise ValueError("experiment scene duration must be positive")
-    if not isinstance(assertions, (tuple, list)) or len(assertions) > MAX_ITEMS:
+    if not isinstance(assertions, (tuple, list)) or len(assertions) > MAX_EXPERIMENT_ITEMS:
         raise ValueError("experiment requires at most 1024 assertion mappings")
     ready = validate_ready(ready)
     snapshots = {}
@@ -356,7 +356,7 @@ def admit_experiment(scene, registry, *, inputs=(), assertions=(), ready=(),
         raise ValueError("experiment scene requires at most 63 nodes")
     if scene.mode != "stepped":
         raise ValueError("finite experiment requires stepped scene mode")
-    if (not isinstance(inputs, (tuple, list)) or len(inputs) > MAX_ITEMS
+    if (not isinstance(inputs, (tuple, list)) or len(inputs) > MAX_EXPERIMENT_ITEMS
             or any(type(item) is not ExperimentInput for item in inputs)):
         raise ValueError("experiment requires bounded typed inputs and assertion mappings")
     if descriptions is None:
@@ -645,7 +645,7 @@ def _replay_plan(config, assertions):
     ready = validate_ready(tuple(ExperimentReady(**_exact_mapping(
         value, ("name", "endpoint", "text"), "ready declaration")) for value in ready))
     inputs = config["inputs"]
-    if type(inputs) is not tuple or len(inputs) > MAX_ITEMS:
+    if type(inputs) is not tuple or len(inputs) > MAX_EXPERIMENT_ITEMS:
         raise ValueError("experiment trace requires bounded input declarations")
     names = {"marker:" + item.name for item in ready}
     for value in inputs:
@@ -761,7 +761,7 @@ def replay_experiment(source, assertions=None) -> ExperimentResult:
     if type(position) is not int or position != 0:
         raise ValueError("experiment replay input must start at byte zero")
     if assertions is not None and (not isinstance(assertions, (tuple, list)) or
-                                   len(assertions) > MAX_ITEMS):
+                                   len(assertions) > MAX_EXPERIMENT_ITEMS):
         raise ValueError("experiment requires at most 1024 assertion mappings")
     first = _DigestInput(source)
     config, _ = _replay_pass(first, records, assertions)
