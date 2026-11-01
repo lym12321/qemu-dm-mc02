@@ -306,6 +306,8 @@ def test_reset_ack_status_capabilities_and_native_origin_reject_and_freeze(statu
 
 
 def test_older_done_is_retained_while_waiting_for_new_ack_and_missing_is_advisory():
+    done_written = threading.Event()
+
     def respond(peer, frame):
         if frame.header.kind == wire.RESET:
             peer.reset_ack(frame)
@@ -315,17 +317,105 @@ def test_older_done_is_retained_while_waiting_for_new_ack_and_missing_is_advisor
             peer.ack(frame)
             if frame.header.step_id == 2:
                 peer.done(frame)
+                done_written.set()
 
     with endpoint(respond) as (receiver, _, context, _):
         receiver.start(0)
         deliver(receiver, context, 10)
         deliver(receiver, context, 17)
+        # ACK admission does not wait for the peer's later DONE write.
+        assert done_written.wait(1)
         receiver.service(20)
         done = events(context, 'imu-consumption')
         assert [(e.payload['step_id'], e.payload['status'], e.payload['consumed_mask'],
                  e.payload['missing_mask']) for e in done] == [(1, 2, 1, 2), (2, 0, 3, 0)]
         assert done[0].mapped_time_ns == 10 and done[0].delivery_time_ns == 17
         assert done[0].source_time_ns is None
+
+
+def test_delayed_fragmented_done_is_observed_only_after_its_actual_suffix():
+    release_prefix = threading.Event()
+    prefix_written = threading.Event()
+    release_suffix = threading.Event()
+    done_written = threading.Event()
+
+    def respond(peer, frame):
+        if frame.header.kind == wire.RESET:
+            peer.reset_ack(frame)
+            return
+        peer.ack(frame)
+        encoded = wire.build_step_frame(
+            wire.STEP_DONE, frame.header.step_id, frame.header.t_sim_ns,
+            frame.header.dt_ns, session_id=frame.header.session_id,
+            payload=wire.encode_step_done_payload(wire.StepDonePayload(0, 3, 0, 0, 0)))
+        assert release_prefix.wait(1)
+        peer.sock.sendall(encoded[:19])
+        prefix_written.set()
+        assert release_suffix.wait(1)
+        peer.sock.sendall(encoded[19:])
+        done_written.set()
+
+    with endpoint(respond) as (receiver, peer, context, stream):
+        try:
+            receiver.start(0)
+            deliver(receiver, context, 10)
+            receiver.service(11)
+            assert not events(context, 'imu-consumption')
+
+            release_prefix.set()
+            assert prefix_written.wait(1)
+            receiver.service(12)
+            assert len(stream.buffer) == 19
+            assert not events(context, 'imu-consumption')
+
+            release_suffix.set()
+            assert done_written.wait(1)
+            receiver.service(20)
+            done, = events(context, 'imu-consumption')
+            assert (done.payload['step_id'], done.payload['status'],
+                    done.payload['consumed_mask'], done.payload['missing_mask']) == (1, 0, 3, 0)
+            assert done.source_time_ns is None
+            assert (done.mapped_time_ns, done.delivery_time_ns, done.quality) == (10, 20, 'sampled')
+            assert not stream.buffer and not receiver._pending
+            assert [frame.header.kind for frame in peer.frames] == [wire.RESET, wire.STEP]
+        finally:
+            release_prefix.set()
+            release_suffix.set()
+
+
+@pytest.mark.parametrize('mode', ['done-before-ack', 'out-of-order-done', 'duplicate-done'])
+def test_invalid_done_order_freezes_without_replaying_input(mode):
+    def respond(peer, frame):
+        if frame.header.kind == wire.RESET:
+            peer.reset_ack(frame)
+        elif mode == 'done-before-ack':
+            peer.done(frame)
+        else:
+            peer.ack(frame)
+
+    with endpoint(respond) as (receiver, peer, context, _):
+        receiver.start(0)
+        if mode == 'done-before-ack':
+            with pytest.raises(wire.StepProtocolError, match='outstanding STEP_ACK'):
+                deliver(receiver, context, 10)
+            assert not events(context, 'imu-input-accepted')
+        else:
+            deliver(receiver, context, 10)
+            deliver(receiver, context, 17)
+            if mode == 'duplicate-done':
+                peer.done(peer.frames[1])
+                receiver.service(20)
+                assert [event.payload['step_id']
+                        for event in events(context, 'imu-consumption')] == [1]
+            peer.done(peer.frames[2] if mode == 'out-of-order-done' else peer.frames[1])
+            with pytest.raises(wire.StepProtocolError, match='out of order'):
+                receiver.service(21)
+        sent = len(peer.frames)
+        with pytest.raises(RuntimeError, match='frozen'):
+            receiver.service(22)
+        with pytest.raises(RuntimeError, match='frozen'):
+            deliver(receiver, context, 23)
+        assert len(peer.frames) == sent == (2 if mode == 'done-before-ack' else 3)
 
 
 def test_capacity_is_atomic_at_64_inputs_without_done_and_never_replays():
