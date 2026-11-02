@@ -52,6 +52,7 @@ jobs:
           tests/test_simulation_rotor.py tests/test_qemu_machine.py
           tests/test_qemu_imu.py tests/test_qemu_can_commit.py
           tests/test_qmp_distribution.py tests/test_scene_admission.py tests/test_scene_cli.py
+          tests/test_simulation_benchmark.py
       - name: Installed CLI and missing native backend
         working-directory: /tmp
         env:
