@@ -306,8 +306,7 @@ class DmMc02Adapter:
 
     def execution_observation(self):
         if not self._can_ports:
-            return (self._backend.command('x-query-virtual-execution'),
-                    self._backend.command('query-status'))
+            return self._backend.query_execution()
         state = self._backend.command('qom-get', {'path': '/machine',
                                                  'property': 'can-execution-state'})
         return validate_can_execution_snapshot(state, {

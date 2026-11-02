@@ -233,10 +233,17 @@ class QemuMachine:
             raise RuntimeError('QEMU must remain paused at each completed target')
 
     def validate_cut(self):
-        execution, status = self._execution_observation()
         initial = self._last_time_ns == self._ctx.session.t_sim_ns
-        expected = self.to_native(self._last_time_ns)
-        if (not isinstance(execution, dict) or execution.get('current-ns') != expected
+        self._validate_completed_cut(self.to_native(self._last_time_ns), initial=initial)
+
+    def _validate_completed_cut(self, expected, *, initial=False):
+        execution, status = self._execution_observation()
+        if not isinstance(execution, dict):
+            raise TypeError('invalid native execution observation')
+        current = _native_time(execution.get('current-ns'), 'native execution time')
+        if not initial:
+            _native_time(execution.get('target-ns'), 'native execution target')
+        if (current != expected
                 or execution.get('state') != ('idle' if initial else 'reached')
                 or (('target-ns' in execution) if initial else execution.get('target-ns') != expected)):
             raise RuntimeError('QEMU completed cut changed outside Simulation control')
@@ -249,11 +256,20 @@ class QemuMachine:
                 or status.get('status') not in allowed):
             raise RuntimeError('QEMU must remain paused at each completed target')
 
+    def query_execution(self):
+        """Read execution and run status together; this is not an atomic snapshot."""
+        values = self.command_many((('x-query-virtual-execution', None), ('query-status', None)))
+        if type(values) is not tuple:
+            raise TypeError('QMP command_many result must be a plain tuple')
+        if len(values) != 2:
+            raise ValueError('QMP command_many result has wrong arity')
+        return values
+
     def _execution_observation(self):
         observe = getattr(self._adapter, 'execution_observation', None)
         if callable(observe):
             return observe()
-        return self.command('x-query-virtual-execution'), self.command('query-status')
+        return self.query_execution()
 
     @property
     def connection_info(self):
@@ -314,7 +330,9 @@ class QemuMachine:
             select.select([], [], [], min(.001, self._remaining()))
         self._adapter.service(step.t_sim_ns)
         self._adapter.complete_cut(step.t_sim_ns, target)
-        self.require_paused()
+        # Completion emits synchronous observers. Recheck the pending identity
+        # after they return, before accepting this native interval as complete.
+        self._validate_completed_cut(target)
         self.check()
         self._last_time_ns = step.t_sim_ns
         self._pending = None

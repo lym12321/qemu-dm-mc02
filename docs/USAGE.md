@@ -137,6 +137,10 @@ with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
 `QemuFactory(profile=...)` 注入板级端口、输入规则和外设 adapter；Backend 独占进程、QMP、
 socket 和 CPU request/finish，Profile 不能推进 CPU。Fake Profile 只证明接口合同，不代表第二颗 MCU。
 
+Machine 完成采样及同步观察回调后，Backend 重新核验本次目标、原生时间、执行状态与暂停状态，
+通过后才提交 Machine 完成时间。回调期间原生目标发生变化会使当前 Simulation 失败，已产生的输出保留。
+非 CAN 执行观察复用批量 QMP 查询；批量不等于原子快照，CPU 运行控制仍由 Backend 独占。
+
 ### 时间、状态与失败合同
 
 一次非零区间从完成切点 `t` 开始：

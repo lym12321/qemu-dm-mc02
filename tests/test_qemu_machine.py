@@ -299,9 +299,10 @@ def test_described_but_unimplemented_connections_reject_explicitly_before_acquis
 @pytest.fixture
 def backend(monkeypatch, tmp_path):
     """Substitute acquisition only; all adapter/transport/lifecycle code is real."""
-    calls, clients, sockets, commands = [], [], [], []
+    calls, clients, sockets, commands, groups = [], [], [], [], []
     state = SimpleNamespace(origin=71, origins=None, processes=[], commands_available=True,
-                            close_error=None, external_change=False, read_snapshot=None)
+                            close_error=None, external_change=False, read_snapshot=None,
+                            read_status=None)
 
     class Qmp:
         def __init__(self, *_args, **_kwargs):
@@ -330,6 +331,8 @@ def backend(monkeypatch, tmp_path):
                     result['state'] = 'cancelled'
                 return result
             if name == 'query-status':
+                if state.read_status is not None:
+                    return state.read_status(self)
                 return {'running': False, 'status': 'prelaunch' if self.target is None else 'paused'}
             if name == 'qom-get':
                 assert arguments == {'path': '/machine', 'property': 'board-state'}
@@ -341,6 +344,10 @@ def backend(monkeypatch, tmp_path):
             if arguments['property'] == 'user-key':
                 self.key_pressed = arguments['value']
             return {}
+
+        def command_many(self, requests):
+            groups.append(requests)
+            return tuple(self.command(name, arguments) for name, arguments in requests)
 
         def close(self):
             calls.append('QMP close')
@@ -371,7 +378,8 @@ def backend(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, 'qmp_session_class', lambda: Qmp)
     monkeypatch.setattr(adapter, 'running_qemu', owner)
     monkeypatch.setattr(adapter, 'connect_unix', connect)
-    yield SimpleNamespace(calls=calls, clients=clients, sockets=sockets, commands=commands, state=state)
+    yield SimpleNamespace(calls=calls, clients=clients, sockets=sockets, commands=commands,
+                         groups=groups, state=state)
     for _, host, peer in sockets:
         host.close()
         peer.close()
@@ -999,6 +1007,201 @@ def test_injected_profile_uses_same_native_target_lifecycle_without_dm_queries(b
     assert profile.actions.count(('close',)) == 2
     assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
     assert backend.calls[-2:] == ['QMP close', 'process close']
+
+
+@pytest.mark.parametrize('change', ['time', 'target', 'cancelled', 'running'])
+def test_completion_callback_requires_fresh_exact_native_receipt_before_world_step(backend, change):
+    from sim.api import StepResult
+
+    profile, world_steps, world_closes = FakeProfile(), [], []
+
+    class World:
+        def step(self, step):
+            world_steps.append(step.t_sim_ns)
+            return StepResult('ok', step.t_sim_ns)
+
+        def close(self):
+            world_closes.append('closed')
+
+    world = World()
+    world_factory = SimpleNamespace(describe=lambda _: NodeDescription(capabilities={'step'}),
+                                   create=lambda *_: world)
+
+    def change_after_completion(event):
+        if event.kind != 'fake.bytes' or event.mapped_time_ns != 38:
+            return
+        native = backend.clients[0]
+        if change == 'time':
+            native.current += 7
+        elif change == 'target':
+            native.target += 7
+        elif change == 'cancelled':
+            backend.state.external_change = True
+        else:
+            # Native reached is historical; an external cont need not change it.
+            backend.state.read_status = lambda _: {'running': True, 'status': 'running'}
+
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'), NodeSpec('world', 'fixture.world'))),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu'),
+         'fixture.world': world_factory}, on_event=change_after_completion)
+    sim.start()
+    machine = sim.components['cpu']
+    try:
+        sim.step(19)
+        assert world_steps == [19]
+        with pytest.raises(RuntimeError) as failure:
+            sim.step(19)
+        assert sim.failure is failure.value
+        assert sim.state == SimulationState.FAILED and sim.t_sim_ns == machine.t_sim_ns == 19
+        assert machine.pending is not None and machine.pending.t_sim_ns == 38
+        assert machine.observe()[0] == 38  # Completed adapter effects are not rolled back.
+        assert world_steps == [19]
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step(19)
+        assert backend.commands == before
+        assert sum(name == 'x-run-to-virtual-time' for name, _ in before) == 2
+    finally:
+        sim.close()
+        sim.close()
+    assert profile.actions.count(('close',)) == 1 and world_closes == ['closed']
+    assert backend.calls.count('QMP close') == backend.calls.count('process close') == 1
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+
+
+@pytest.mark.parametrize('profile_kind', ['generic', 'dm-mc02'])
+def test_noncan_execution_observations_use_fresh_readonly_pairs(backend, firmware, profile_kind):
+    if profile_kind == 'generic':
+        profile = FakeProfile()
+        sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),)),
+            {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')})
+    else:
+        sim = simulation(firmware)
+    pair = (('x-query-virtual-execution', None), ('query-status', None))
+    with sim:
+        backend.groups.clear()
+        backend.commands.clear()
+        sim.step(19)
+        # Preflight, native completion, and post-callback receipt are fresh reads.
+        assert backend.groups == [pair, pair, pair]
+        assert sum(name == 'x-query-virtual-execution' for name, _ in backend.commands) == 3
+        assert sum(name == 'query-status' for name, _ in backend.commands) == 3
+        assert sim.t_sim_ns == 19 and sim.step_id == 1
+        assert sum(name == 'x-run-to-virtual-time' for name, _ in backend.commands) == 1
+        if profile_kind == 'generic':
+            assert profile.adapters[0].observe() == (19, b'')
+            assert all(name not in ('qom-get', 'qom-set', 'qom-list')
+                       for name, _ in backend.commands)
+
+
+def test_final_native_timestamp_rejects_bool_even_when_equal_to_target(backend):
+    backend.state.origin = 0
+
+    def invalid_timestamp(event):
+        if event.kind == 'fake.bytes':
+            backend.clients[0].current = True
+
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),)),
+        {'fixture.qemu': QemuFactory(profile=FakeProfile(), qemu='/explicit/qemu')},
+        on_event=invalid_timestamp)
+    with sim:
+        machine = sim.components['cpu']
+        with pytest.raises(ValueError, match='signed64') as failure:
+            sim.step(1)
+        assert sim.failure is failure.value and sim.state == SimulationState.FAILED
+        assert sim.t_sim_ns == machine.t_sim_ns == 0 and machine.pending.t_sim_ns == 1
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+
+
+@pytest.mark.parametrize('shape, error, match', [
+    ('list', TypeError, 'plain tuple'),
+    ('missing', ValueError, 'wrong arity'),
+    ('extra', ValueError, 'wrong arity'),
+])
+def test_malformed_final_execution_pair_freezes_without_committing_or_replay(backend, monkeypatch,
+                                                                          shape, error, match):
+    profile = FakeProfile()
+
+    def corrupt_pair(event):
+        if event.kind != 'fake.bytes':
+            return
+        native = backend.clients[0]
+        original = native.command_many
+
+        def malformed(requests):
+            values = original(requests)
+            return {'list': list(values), 'missing': values[:1], 'extra': values + ({},)}[shape]
+
+        monkeypatch.setattr(native, 'command_many', malformed)
+
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),)),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')}, on_event=corrupt_pair)
+    sim.start()
+    machine = sim.components['cpu']
+    try:
+        with pytest.raises(error, match=match) as failure:
+            sim.step(19)
+        assert sim.failure is failure.value and sim.state == SimulationState.FAILED
+        assert sim.t_sim_ns == machine.t_sim_ns == 0 and machine.pending is not None
+        assert machine.observe() == (19, b'')
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step(19)
+        assert backend.commands == before
+        assert sum(name == 'x-run-to-virtual-time' for name, _ in before) == 1
+    finally:
+        sim.close()
+    assert profile.actions.count(('close',)) == 1
+    assert backend.calls[-2:] == ['QMP close', 'process close']
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+
+
+@pytest.mark.parametrize('operation, error', [
+    ('x-query-virtual-execution', RuntimeError('native query rejected')),
+    ('query-status', EOFError('native QMP peer closed')),
+    ('x-query-virtual-execution', TimeoutError('native QMP stalled')),
+])
+def test_final_execution_query_failure_preserves_cause_and_closes_resources(backend, monkeypatch,
+                                                                          operation, error):
+    profile = FakeProfile()
+
+    def fail_query(event):
+        if event.kind != 'fake.bytes':
+            return
+        native = backend.clients[0]
+        original = native.command
+
+        def failed(name, arguments=None):
+            if name == operation:
+                raise error
+            return original(name, arguments)
+
+        monkeypatch.setattr(native, 'command', failed)
+
+    sim = Simulation(Topology((NodeSpec('cpu', 'fixture.qemu'),)),
+        {'fixture.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')}, on_event=fail_query)
+    sim.start()
+    machine = sim.components['cpu']
+    try:
+        with pytest.raises((RuntimeError, EOFError)) as failure:
+            sim.step(19)
+        if isinstance(error, TimeoutError):
+            assert failure.value.__cause__ is error
+        else:
+            assert failure.value is error
+        assert sim.failure is failure.value and sim.state == SimulationState.FAILED
+        assert sim.t_sim_ns == machine.t_sim_ns == 0 and machine.pending is not None
+        assert machine.observe() == (19, b'')
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='healthy'):
+            sim.step(19)
+        assert backend.commands == before
+    finally:
+        sim.close()
+        sim.close()
+    assert profile.actions.count(('close',)) == 1
+    assert backend.calls.count('QMP close') == backend.calls.count('process close') == 1
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
 
 
 def test_profile_cleanup_error_still_closes_every_native_owner(backend):
