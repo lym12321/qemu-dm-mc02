@@ -1792,6 +1792,43 @@ python tools/benchmark_simulation.py --case all --qemu /path/to/compatible/qemu-
 默认三次固定工作量，报告排他创建，保留 Cut、CAN、QMP、事件数据量、启动/运行耗时和内存样本。
 Host 模式无需 QEMU 或物理引擎；原生模式复用真实验收断言。观察与 JSON 编码也有开销，短运行不能证明持续实时能力。
 
+需要区分固件执行、通信、物理与输出成本时，显式运行归因矩阵：
+
+```bash
+python tools/benchmark_simulation.py --case attribution --repeat 3 \
+  --qemu /path/to/compatible/qemu-system-arm --report build/execution-cost.json
+```
+
+该矩阵使用未修改的 minimal-board WFI 固件和 Lab 忙 MMIO 固件，分别运行单 Machine 与
+四轮单 World 组合，并比较仅统计、JSON 编码、实际 CLI 文件输出三种观察方式。
+每个样本独立执行 200ms，quantum 为 1ms，固定 `icount shift=0`；默认每格三次，共 36 个样本。
+报告和旁边的资产目录保留真实固件、身份、原始测量及失败诊断；缺少原生依赖返回 BLOCKED/78。
+QMP、Machine 完成等待及观察回调的耗时存在嵌套，QMP 等待也包含 guest 执行等待，不能相加。
+CPU 时间、wall time 和采样 RSS 分别报告；文件输出包含真实编码、写入与 flush 成本。
+`shift=0` 是每条指令一纳秒的虚拟计时约定，不是 H723 周期模型。忙轮询与 WFI 负载不可互换，
+该短矩阵不证明恢复历史 Robot 10s 预算，也不证明电机/IMU 已被固件消费或持续实时能力。
+
+本地实测（Linux、i5-12400、Python 3.12.3、QEMU 8.2.2、MuJoCo 3.12.0），
+每格三次独立运行的 active wall time 中位数如下，单位为秒；均完成 200 Cut：
+
+| 固件 / 组合 | 仅统计 | JSON 编码 | CLI 文件输出 |
+| --- | ---: | ---: | ---: |
+| WFI / 单 Machine | 0.597 | 0.592 | 0.601 |
+| WFI / 四轮单 World | 1.348 | 1.484 | 1.560 |
+| 忙 MMIO / 单 Machine | 8.118 | 8.133 | 8.035 |
+| 忙 MMIO / 四轮单 World | 8.853 | 9.048 | 9.107 |
+
+忙 MMIO 四轮文件模式中，QEMU 进程采样 CPU 中位数为 9.75s，Machine 完成等待为
+8.155s；World.step 为 0.094s（包含驱动器反馈及其同步观察），编码为 0.129s，
+写入与 flush 为 0.020s，输出约 2.53MB。CPU 可与 Host 并行，QEMU CPU 包含
+TCG、外设及 I/O 线程；它不是纯指令执行成本。观察回调计时还包含本工具的测量包装。
+这组短样本说明当前忙 MMIO 的原生执行路径值得优先剖析，不能据此把差值视为独占成本。
+
+另行复测既有 Robot 2s 忙 MMIO 夹具：原 10s host 预算仍 FAIL（完成 214ms），
+既有 120s 功能预算 PASS，含 ready 的 2.001s 逻辑时间实际用时 93.34s。
+后者 QEMU 采样 CPU 为 103.42s，主 CLI 为 16.17s，输出约 47.1MB。
+两次使用同一 ELF，未改变 quantum、shift 或阈值；功能通过不代表原预算恢复。
+
 日常修改优先运行受影响的原生测试，例如内部 Flash：
 
 ```bash
