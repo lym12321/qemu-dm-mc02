@@ -44,7 +44,7 @@ def test_namespace_shadow_is_rejected_before_its_init_can_execute(tmp_path, monk
 
 
 @contextmanager
-def batch_peer(test, handler):
+def batch_peer(test, handler, *, opening_events=()):
     """Real socket framing; isolate only the independent native QMP producer."""
     with tempfile.TemporaryDirectory(prefix="dm-qmp-batch-") as directory:
         address = str(Path(directory) / "qmp.sock")
@@ -82,6 +82,10 @@ def batch_peer(test, handler):
                     capability = read()
                     test.assertEqual(capability["execute"], "qmp_capabilities")
                     reply(capability, **{"return": {}})
+                    for event in opening_events:
+                        raw = (json.dumps(event) + "\r\n").encode()
+                        peer.sendall(raw[:7])
+                        peer.sendall(raw[7:])
                     if handler(peer, read, reply) is not False:
                         test.assertEqual(buffered, "")
                         test.assertEqual(peer.recv(1), b"")
@@ -99,6 +103,66 @@ def batch_peer(test, handler):
 
 
 class QmpClientTest(unittest.TestCase):
+    def test_event_retention_admission_precedes_connection(self):
+        with patch.object(QmpSession, "connect") as connect:
+            for value in (None, 0, "false"):
+                with self.subTest(value=value), self.assertRaisesRegex(TypeError, "retain_events.*bool"):
+                    QmpSession("/unused/qmp.sock", retain_events=value)
+            connect.assert_not_called()
+
+    def test_event_discard_filter_is_installed_before_connect(self):
+        failure = RuntimeError("connect boundary")
+
+        def connect(client):
+            self.assertFalse(client._qmp.events.accept(Message({"event": "RESET"})))
+            raise failure
+
+        with patch.object(QmpSession, "connect", connect), self.assertRaises(RuntimeError) as caught:
+            QmpSession("/unused/qmp.sock", retain_events=False)
+        self.assertIs(caught.exception, failure)
+
+    def test_event_discard_is_session_local_and_preserves_command_routing(self):
+        opening = ({"event": "RESET", "data": {"phase": "opening"}},)
+        burst = tuple({"event": name, "data": {"sequence": index}}
+                      for index in range(64) for name in ("RESUME", "STOP"))
+
+        def serve(label):
+            def handler(peer, read, reply):
+                for names in (("scalar",), ("first", "second"), ("bad",)):
+                    requests = [read() for _ in names]
+                    self.assertEqual([row["execute"] for row in requests], list(names))
+                    raw = b"".join((json.dumps(event) + "\r\n").encode() for event in burst)
+                    peer.sendall(raw[:11])
+                    peer.sendall(raw[11:])
+                    for request in reversed(requests):
+                        if request["execute"] == "bad":
+                            reply(request, error={"class": "GenericError", "desc": label + " rejection"})
+                        else:
+                            reply(request, **{"return": [label, request["execute"]]})
+            return handler
+
+        with batch_peer(self, serve("discard"), opening_events=opening) as (discard_address, _), \
+                batch_peer(self, serve("retain"), opening_events=opening) as (retain_address, _):
+            with QmpSession(discard_address, retain_events=False) as discard, \
+                    QmpSession(retain_address) as retain:
+                for client, label in ((discard, "discard"), (retain, "retain")):
+                    self.assertEqual(client.command("scalar"), [label, "scalar"])
+                    self.assertEqual(client.command_many((("first", None), ("second", None))),
+                                     ([label, "first"], [label, "second"]))
+                    with self.assertRaisesRegex(Exception, label + " rejection"):
+                        client.command("bad")
+                    self.assert_batch_settled(client)
+                self.assertIsNone(discard.pull_event())
+                self.assertTrue(discard._qmp.events.empty())
+                self.assertEqual(discard._qmp.events.history, ())
+                expected = [*opening, *burst, *burst, *burst]
+                self.assertEqual(retain.get_events(), expected)
+                self.assertTrue(retain._qmp.events.empty())
+                self.assertEqual([dict(row) for row in retain._qmp.events.history], expected)
+            discard.close()
+            retain.close()
+            self.assertEqual(asyncio.all_tasks(discard._aloop), set())
+
     def test_disabled_debug_hooks_preserve_message_without_formatting(self):
         client = QMPClient()
         client.logger = logging.Logger("qmp-test-child", logging.NOTSET)

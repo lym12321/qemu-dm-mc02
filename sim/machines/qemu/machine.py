@@ -209,7 +209,8 @@ class QemuMachine:
         self.check()
         remaining = min(2.0, self._remaining())
         self._qmp = session_class(str(self._owner.sockets['qmp']), timeout=remaining,
-                                  connect_timeout=remaining, close_timeout=2.0)
+                                  connect_timeout=remaining, close_timeout=2.0,
+                                  retain_events=False)
         for port in sockets[1:]:
             sock = connect_unix(str(self._owner.sockets[port]), min(2.0, self._remaining()))
             self._peers.append((port, sock))

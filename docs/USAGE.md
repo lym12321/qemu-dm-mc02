@@ -140,6 +140,9 @@ socket 和 CPU request/finish，Profile 不能推进 CPU。Fake Profile 只证�
 Machine 完成采样及同步观察回调后，Backend 重新核验本次目标、原生时间、执行状态与暂停状态，
 通过后才提交 Machine 完成时间。回调期间原生目标发生变化会使当前 Simulation 失败，已产生的输出保留。
 非 CAN 执行观察复用批量 QMP 查询；批量不等于原子快照，CPU 运行控制仍由 Backend 独占。
+Machine 的内部 QMP 连接在协商前关闭异步事件保留，避免每个 Cut 的 RESUME/STOP 持续积压；
+Reset 创建的新连接使用同一策略。完成态仍由原生查询确认。需要检查 RESET/watchdog 事件的
+独立工具连接继续接收事件；此策略只限制 Machine 内部连接的事件队列和历史。
 
 ### 时间、状态与失败合同
 

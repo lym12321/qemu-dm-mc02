@@ -306,6 +306,7 @@ def backend(monkeypatch, tmp_path):
 
     class Qmp:
         def __init__(self, *_args, **_kwargs):
+            self.retain_events = _kwargs['retain_events']
             self.current = state.origin if state.origins is None else state.origins[len(clients)]
             self.target = None
             self.index, self.key_pressed = len(clients), False
@@ -491,6 +492,7 @@ def test_native_target_mapping_uart_bound_and_immutable_observation(firmware, ba
     sim.start()
     machine = sim.components['board']
     info = machine.connection_info
+    assert backend.clients[0].retain_events is False
     assert info['pid'] == 123 and info['native_origin_ns'] == 71
     assert tuple(info['sockets']) == ('qmp', 'uart1')
     command = backend.calls[0][1]
@@ -839,6 +841,7 @@ def test_imu_reset_recreates_connection_and_native_origin(firmware, backend, mon
         sim.reset()
         assert old_stream.sock.fileno() == -1
         assert sim.components['board'] is not old and sim.session.session_id == 2
+        assert [client.retain_events for client in backend.clients] == [False, False]
         assert [a for a in actions if a[0] == 'imu receive'] == [('imu receive', 0, 71)]
         assert len([a for a in actions if a[0] == 'imu start']) == 1
 

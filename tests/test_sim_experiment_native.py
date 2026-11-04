@@ -269,3 +269,190 @@ def test_real_external_qmp_advance_during_snapshot_freezes_before_host_step(tmp_
         (tmp_path / "external-monitor-evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
         if failures and active_error is None:
             raise error
+
+
+def test_real_qemu_cuts_and_reset_do_not_retain_internal_qmp_events(tmp_path, monkeypatch):
+    """Actual STOP/RESUME traffic stays unretained across fresh native sessions."""
+    configured = os.environ.get("DM_MC02_EXPERIMENT_QEMU")
+    if configured is None:
+        pytest.skip("set DM_MC02_EXPERIMENT_QEMU for the separate actual firmware gate")
+    from smoke.simulation_smoke import Observations, build_example
+    from sim.machines.qemu import QemuFactory
+    from sim.machines.qemu import machine as adapter
+    from sim.machines.qemu.qmp import qmp_client_provenance, qmp_session_class
+    from sim.runtime import Simulation, SimulationState
+
+    qemu = Path(configured).resolve(strict=True)
+    digest = hashlib.sha256(qemu.read_bytes()).hexdigest()
+    build = build_example("minimal-board", build_dir=tmp_path / "firmware")
+    root = Path(__file__).resolve().parents[1]
+    evidence = {"gate_status": "FAIL", "execution": {"status": "NOT RUN"},
+        "python": sys.version, "build": build,
+        "qemu": {"path": str(qemu), "sha256": digest,
+            "version": subprocess.check_output([str(qemu), "--version"], text=True, timeout=3)},
+        "qmp_client": qmp_client_provenance(),
+        "conditions": {"quantum_ns": 1_000_000, "cuts_per_session": 1000,
+            "sessions": 2, "startup_timeout_s": 10, "host_timeout_s": 60,
+            "uart_timestamp_quality": "upper_bound", "snapshot_timestamp_quality": "exact"},
+        "source_sha256": {name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+            for name in ("sim/machines/qemu/machine.py", "sim/machines/qemu/qmp.py",
+                         "tests/test_sim_experiment_native.py")},
+        "resources": [], "checkpoints": [], "firmware_acceptance": [], "cleanup_errors": []}
+    clients, observations = [], {}
+    session_class = qmp_session_class()
+    # Test-only capture of the real installed client. A separate upstream
+    # listener counts native events without retaining them; it neither changes
+    # the default listener nor manufactures protocol or execution results.
+    from qemu.qmp.events import EventListener
+
+    class CapturedSession(session_class):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            row = {"client": self, "retain_events": kwargs.get("retain_events", True),
+                   "native_events": {"STOP": 0, "RESUME": 0, "other": 0}}
+            clients.append(row)
+
+            def count_native_event(event):
+                name = event["event"]
+                counts = row["native_events"]
+                counts[name if name in ("STOP", "RESUME") else "other"] += 1
+                return False
+
+            self._qmp.register_listener(EventListener(event_filter=count_native_event))
+
+    monkeypatch.setattr(adapter, "qmp_session_class", lambda: CapturedSession)
+    simulation = None
+    verified = False
+
+    def resource_released(resource):
+        stat = Path(f"/proc/{resource['pid']}/stat")
+        assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[19] != resource["starttime"]
+        assert not any(Path(path).exists() for path in resource["sockets"].values())
+        assert not any(Path(path).exists() for path in resource["private_directories"])
+
+    def observe(event):
+        if event.session_id not in observations:
+            observations[event.session_id] = Observations()
+        observations[event.session_id](event)
+        if event.kind != "snapshot":
+            return
+        resource = next((row for row in evidence["resources"]
+                         if row["session_id"] == event.session_id), None)
+        if resource is None:
+            info = simulation.components["main"].connection_info
+            pid = info["pid"]
+            sockets = dict(info["sockets"])
+            resource = {"session_id": event.session_id, "pid": pid,
+                "starttime": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+                "argv": Path(f"/proc/{pid}/cmdline").read_bytes().decode().rstrip("\0").split("\0"),
+                "native_origin_ns": info["native_origin_ns"], "sockets": sockets,
+                "socket_inodes": {name: Path(path).stat().st_ino for name, path in sockets.items()},
+                "private_directories": sorted({str(Path(path).parent) for path in sockets.values()})}
+            evidence["resources"].append(resource)
+        assert event.source_time_ns == event.payload["timestamp_ns"]
+        assert event.source_time_ns == resource["native_origin_ns"] + event.mapped_time_ns
+        assert event.delivery_time_ns == event.mapped_time_ns and event.quality == "exact"
+
+    def checkpoint(cuts):
+        client = clients[-1]["client"]
+        machine = simulation.components["main"]
+        execution, status = machine.command_many(
+            (("x-query-virtual-execution", None), ("query-status", None)))
+        listener = client._qmp.events
+        row = {"session_id": simulation.session.session_id, "cuts": cuts,
+            "simulation_time_ns": simulation.t_sim_ns, "machine_time_ns": machine.t_sim_ns,
+            "execution": execution, "status": status,
+            "queue_size": listener._queue.qsize(), "history_size": len(listener.history),
+            "native_events": dict(clients[-1]["native_events"]),
+            "retain_events": clients[-1]["retain_events"]}
+        evidence["checkpoints"].append(row)
+        assert row["retain_events"] is False
+        assert row["queue_size"] == row["history_size"] == 0
+        assert simulation.state == SimulationState.PAUSED
+        assert simulation.step_id == cuts
+        assert simulation.t_sim_ns == machine.t_sim_ns == cuts * 1_000_000
+        expected = machine.native_origin_ns + simulation.t_sim_ns
+        assert execution == ({"state": "reached", "current-ns": expected, "target-ns": expected}
+                             if cuts else {"state": "idle", "current-ns": expected})
+        assert status["running"] is False and status["status"] in (("paused",) if cuts else ("paused", "prelaunch"))
+        assert row["native_events"]["STOP"] == row["native_events"]["RESUME"] == cuts
+
+    simulation = Simulation(Topology((NodeSpec("main", "machine", {"firmware": build["elf"]}),)),
+        {"machine": QemuFactory(qemu=qemu)}, quantum_ns=1_000_000,
+        startup_timeout_s=10, host_timeout_s=60, event_history=16, on_event=observe)
+    try:
+        simulation.start()
+        for session_index in range(2):
+            assert len(clients) == session_index + 1
+            checkpoint(0)
+            simulation.schedule_input("main.key", True, at_ns=40_000_000)
+            simulation.schedule_input("main.key", False, at_ns=90_000_000)
+            for cuts in (100, 250, 500, 1000):
+                simulation.run_until(cuts * 1_000_000)
+                checkpoint(cuts)
+            actual = observations[simulation.session.session_id]
+            acceptance = actual.verify("minimal-board")
+            evidence["firmware_acceptance"].append({"session_id": simulation.session.session_id,
+                                                    "observations": acceptance})
+            assert [row["mapped_time_ns"] for row in actual.snapshots] == [
+                cut * 1_000_000 for cut in range(1001)]
+            assert [(row["value"], row["source_time_ns"], row["delivery_time_ns"])
+                    for row in actual.inputs] == [(True, 40_000_000, 40_000_000),
+                                                  (False, 90_000_000, 90_000_000)]
+            origin = evidence["resources"][-1]["native_origin_ns"]
+            assert actual.uart_batches
+            assert all(row["source_time_ns"] == origin + row["mapped_time_ns"]
+                       and row["delivery_time_ns"] == row["mapped_time_ns"]
+                       and row["quality"] == "upper_bound" for row in actual.uart_batches)
+            assert len(simulation.events) <= 16
+            if session_index == 0:
+                simulation.reset()
+                resource_released(evidence["resources"][0])
+                assert clients[0]["client"] is not clients[1]["client"]
+                first, second = evidence["resources"]
+                assert (first["pid"], first["starttime"]) != (second["pid"], second["starttime"])
+                assert set(first["sockets"].values()).isdisjoint(second["sockets"].values())
+        evidence["execution"] = {"status": "PASS", "completed_cuts": 2000}
+        verified = True
+    except BaseException as error:
+        evidence["execution"] = {"status": "FAIL", "error_type": type(error).__name__,
+            "error": str(error), "notes": list(getattr(error, "__notes__", ()))}
+        raise
+    finally:
+        active_error = sys.exception()
+        failures = []
+        try:
+            simulation.close()
+            simulation.close()
+        except BaseException as error:
+            failures.append(("Simulation cleanup", error))
+        try:
+            for resource in evidence["resources"]:
+                resource_released(resource)
+            assert simulation.state == SimulationState.CLOSED
+            assert hashlib.sha256(qemu.read_bytes()).hexdigest() == digest
+            assert hashlib.sha256(Path(build["elf"]).read_bytes()).hexdigest() == build["sha256"]
+            assert all(hashlib.sha256((root / name).read_bytes()).hexdigest() == expected
+                       for name, expected in evidence["source_sha256"].items())
+            for row in clients:
+                assert row["client"]._qmp.events.empty()
+                assert row["client"]._qmp.events.history == ()
+        except BaseException as error:
+            failures.append(("cleanup or input identity verification", error))
+        for label, failure in failures:
+            if active_error is not None and failure is not active_error:
+                active_error.add_note(f"{label}: {type(failure).__name__}: {failure}")
+            evidence["cleanup_errors"].append(f"{label}: {type(failure).__name__}: {failure}")
+        evidence["clients"] = [{"retain_events": row["retain_events"],
+            "native_events": row["native_events"],
+            "queue_size": row["client"]._qmp.events._queue.qsize(),
+            "history_size": len(row["client"]._qmp.events.history)} for row in clients]
+        evidence["partial_observations"] = {str(session): actual.report()
+                                             for session, actual in observations.items()}
+        evidence["cleanup_completed"] = not failures
+        evidence["gate_status"] = "PASS" if verified and active_error is None and not failures else "FAIL"
+        if active_error is not None:
+            evidence["execution"]["notes"] = list(getattr(active_error, "__notes__", ()))
+        (tmp_path / "event-retention-evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
+        if failures and active_error is None:
+            raise failures[0][1]

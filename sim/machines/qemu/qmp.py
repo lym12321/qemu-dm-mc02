@@ -89,15 +89,23 @@ def qmp_session_class():
         raise BackendUnavailable('the pinned QMP client requires bounded cmd_many')
 
     class QmpSession(legacy.QEMUMonitorProtocol):
-        """Connect/negotiate once, retaining the existing scripts' conventions."""
+        """Connect once; event consumers retain the upstream queue and history.
+
+        Query-only owners disable retention before negotiation so unsolicited
+        events never enter either upstream store. This does not affect replies.
+        """
 
         def __init__(self, address, timeout=2.0, connect_timeout=None,
-                     close_timeout=2.0):
+                     close_timeout=2.0, *, retain_events=True):
             self._initial_connect_timeout = None
             self._disconnect_timeout = None
             self._close_timeout = close_timeout
             self._atexit_registered = False
             super().__init__(address)
+            if type(retain_events) is not bool:
+                raise TypeError('retain_events must be a boolean')
+            if not retain_events:
+                self._qmp.events.event_filter = lambda _event: False
             self.settimeout(timeout)
             self._initial_connect_timeout = timeout if connect_timeout is None else connect_timeout
             try:
