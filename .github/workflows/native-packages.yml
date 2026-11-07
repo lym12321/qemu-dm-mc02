@@ -125,7 +125,6 @@ jobs:
             --disable-docs --disable-werror --disable-capstone --disable-slirp \
             --disable-sdl --disable-gtk --disable-plugins --enable-fdt=internal \
             --enable-download -Dbuildtype=release -Dqom_cast_debug=false
-          sed -i 's/^werror = true$/werror = false/' config-meson.cross
           ninja qemu-system-arm.exe
       - name: Package binary and recursive MinGW DLL dependencies
         shell: msys2 {0}
