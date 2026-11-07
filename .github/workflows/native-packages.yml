@@ -1,0 +1,154 @@
+name: Native packages
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main, refactor/composable-platform]
+    paths:
+      - '.github/workflows/native-packages.yml'
+      - 'qemu/upstream'
+      - 'qemu.lock'
+      - 'cosim/**'
+      - 'tools/build-qemu.sh'
+      - 'tools/qemu-build-env.sh'
+      - 'tools/package-qemu.py'
+      - 'tools/check-qemu-package.py'
+      - 'sim/apps/firmware.py'
+      - 'sim/machines/qemu/launch.py'
+
+permissions:
+  contents: read
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the existing bare-metal example
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi cmake
+          cmake -S examples/minimal-board -B build/guest -DCMAKE_BUILD_TYPE=Debug
+          cmake --build build/guest
+      - uses: actions/upload-artifact@v4
+        with:
+          name: package-test-firmware
+          path: build/guest/firmware.elf
+          if-no-files-found: error
+
+  linux:
+    needs: firmware
+    runs-on: ubuntu-24.04
+    container: ubuntu:24.04
+    timeout-minutes: 45
+    steps:
+      - name: Install standard Ubuntu build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential pkg-config libglib2.0-dev zlib1g-dev python3 \
+            python3-venv python3-pip ninja-build git ca-certificates
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-test-firmware
+          path: build/guest
+      - name: Build the pinned QEMU with system tools
+        run: bash tools/build-qemu.sh
+      - name: Package binary, licenses and corresponding sources
+        run: |
+          python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm --output dist/dm-mc02-linux-x86_64
+          python3 -m venv build/cli-env
+          build/cli-env/bin/python -m pip wheel --no-deps --wheel-dir dist/dm-mc02-linux-x86_64/wheels .
+          build/cli-env/bin/python -m pip install dist/dm-mc02-linux-x86_64/wheels/*.whl
+          cp build/guest/firmware.elf dist/dm-mc02-linux-x86_64/example.elf
+      - name: Run the packaged binary through the installed public CLI
+        run: |
+          ldd dist/dm-mc02-linux-x86_64/bin/qemu-system-arm | tee dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          ! grep -E '/nix/|not found' dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          cd /tmp
+          "$GITHUB_WORKSPACE/build/cli-env/bin/python" "$GITHUB_WORKSPACE/tools/check-qemu-package.py" \
+            --qemu "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/bin/qemu-system-arm" \
+            --firmware "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/example.elf" \
+            --report "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/smoke.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dm-mc02-linux-x86_64
+          path: dist/dm-mc02-linux-x86_64/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record verification
+        run: echo 'Ubuntu 24.04 x86_64 package — real firmware UART, monitor exit and reset-paused GDB port passed; no Nix runtime.' >> "$GITHUB_STEP_SUMMARY"
+
+  windows:
+    needs: firmware
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            git make diffutils bison flex
+            mingw-w64-x86_64-gcc mingw-w64-x86_64-binutils
+            mingw-w64-x86_64-glib2 mingw-w64-x86_64-zlib
+            mingw-w64-x86_64-pkgconf mingw-w64-x86_64-python
+            mingw-w64-x86_64-python-pip mingw-w64-x86_64-ninja
+      - uses: actions/download-artifact@v4
+        with:
+          name: package-test-firmware
+          path: build/guest
+      - name: Build using upstream QEMU's MinGW support
+        shell: msys2 {0}
+        run: |
+          mkdir -p build/qemu
+          cd build/qemu
+          ../../qemu/upstream/configure --target-list=arm-softmmu --with-devices-arm=dm-mc02 \
+            --disable-docs --disable-werror --disable-capstone --disable-slirp \
+            --disable-sdl --disable-gtk --disable-plugins --enable-fdt=internal \
+            --enable-download -Dbuildtype=release -Dqom_cast_debug=false
+          sed -i 's/^werror = true$/werror = false/' config-meson.cross
+          ninja qemu-system-arm.exe
+      - name: Package binary and recursive MinGW DLL dependencies
+        shell: msys2 {0}
+        run: |
+          python tools/package-qemu.py --qemu build/qemu/qemu-system-arm.exe \
+            --dll-dir "$(cygpath -m /mingw64/bin)" --output dist/dm-mc02-windows-x86_64
+      - name: Install the ordinary Windows Python CLI
+        shell: pwsh
+        run: |
+          python -m pip wheel --no-deps --wheel-dir dist/dm-mc02-windows-x86_64/wheels .
+          $wheel = (Get-ChildItem dist/dm-mc02-windows-x86_64/wheels/*.whl).FullName
+          python -m pip install $wheel
+          Copy-Item build/guest/firmware.elf dist/dm-mc02-windows-x86_64/example.elf
+      - name: Run on native Windows without MSYS2 in PATH
+        shell: pwsh
+        run: |
+          $python = (Get-Command python).Source
+          $root = $env:GITHUB_WORKSPACE
+          $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+          Set-Location $env:RUNNER_TEMP
+          & $python "$root/tools/check-qemu-package.py" `
+            --qemu "$root/dist/dm-mc02-windows-x86_64/bin/qemu-system-arm.exe" `
+            --firmware "$root/dist/dm-mc02-windows-x86_64/example.elf" `
+            --report "$root/dist/dm-mc02-windows-x86_64/smoke.json"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dm-mc02-windows-x86_64
+          path: dist/dm-mc02-windows-x86_64/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Record verification boundary
+        shell: pwsh
+        run: Add-Content $env:GITHUB_STEP_SUMMARY 'Windows x86_64 package — real firmware UART, monitor exit and reset-paused GDB port passed without MSYS2 runtime. Full Simulation/Lab runtime requires Linux or WSL2.'

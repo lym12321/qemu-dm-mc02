@@ -2,10 +2,11 @@
 
 项目以真实 MCU ELF 为输入，用一个 `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
 当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
-Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。完整原生运行以
-Linux x86_64 为交付环境；其它宿主的原生构建尚未验证。
+Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。
+原生下载包面向 Windows x86_64 的固件终端/GDB 监听，以及 Ubuntu 24.04+ x86_64；
+新增包的 CI 结果待实际运行记录确认。完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2。
 
-命令默认从仓库根目录执行。按需要阅读：
+下载包命令从解压目录执行；源码命令默认从仓库根目录执行。按需要阅读：
 
 - [安装](#installation)、[原生构建](#build)与[直接运行 ELF](#native-debug)
 - [sim/v1 场景与唯一运行时](#simulation)
@@ -19,6 +20,65 @@ Linux x86_64 为交付环境；其它宿主的原生构建尚未验证。
 <a id="installation"></a>
 
 ## 安装
+
+### 下载原生包
+
+普通固件运行无需 Nix 或本地编译 QEMU。登录 GitHub，打开
+[Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
+选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载对应包：
+
+| Artifact | 宿主与范围 |
+| --- | --- |
+| `dm-mc02-windows-x86_64` | Windows x86_64，固件终端和从复位暂停的原生 GDB 监听 |
+| `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64；完整场景、Lab 与外部通道使用 Linux/WSL2 |
+
+Artifacts 保留 30 天，下载需要 GitHub 登录。工作流仅在该平台门成功后上传，
+每包附 `smoke.json`；当前新增 CI 门的实际结果待运行记录确认。该门检查实际示例固件 UART、
+monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simulation/Lab 或实板校准。
+
+解压后包括：
+
+| 路径 | 内容 |
+| --- | --- |
+| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | 项目 QEMU；Windows 同目录带所需 DLL |
+| `wheels/*.whl` | 可安装的 Python 命令行工具 |
+| `example.elf` | 已编译的 minimal-board 固件 |
+| `smoke.json` | 该包的固件运行与清理报告 |
+| `sources/`、`licenses/` | 对应源码归档、QEMU 及运行库许可证 |
+
+宿主需另装 Python 3.11+；包不内置 Python、ARM 编译器或 GDB。
+pip 会在线安装 Python 依赖。运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
+
+Windows PowerShell，在解压目录执行：
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install (Get-ChildItem .\wheels\*.whl).FullName
+$env:QEMU_SYSTEM_ARM = (Resolve-Path .\bin\qemu-system-arm.exe).Path
+.\.venv\Scripts\sim.exe firmware .\example.elf
+```
+
+Ubuntu 24.04+ x86_64：
+
+```bash
+sudo apt-get install -y python3-venv libglib2.0-0t64 zlib1g
+chmod +x bin/qemu-system-arm
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install wheels/*.whl
+export QEMU_SYSTEM_ARM="$PWD/bin/qemu-system-arm"
+sim firmware example.elf
+```
+
+Actions ZIP 不保留 Linux 执行权限，因此解压后需运行 `chmod`。
+把 `example.elf` 替换为自己的 DM-MC02 ELF，`--debug` 启用 `127.0.0.1:1234` 并从复位暂停。
+Windows 使用 `.\.venv\Scripts\sim.exe` 调用同一命令；完整 Simulation、Lab、SocketCAN
+请进入 Linux 或 WSL2，Windows 原生包不覆盖这些运行时。
+
+### 从源码安装
+
+开发、构建新固件和自动场景使用源码 checkout；默认按 [Ubuntu 系统依赖](#ubuntu)准备，
+[Nix](#nix) 是可选的固定环境。
 
 ```bash
 git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
@@ -45,7 +105,7 @@ python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
 
 ### 原生后端与可安装 QMP client
 
-先[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
+可使用上面的原生包，或[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
 直接终端/GDB 运行使用 `sim firmware app.elf`，不需要 YAML、Python QMP client 或 MuJoCo；
 完整参数见[原生固件入口](#native-debug)。QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、
 checkout 中的 `build/qemu/qemu-system-arm`。普通系统 QEMU 没有本项目板卡，不能替代。
@@ -550,7 +610,7 @@ Buff 按官方 8-byte packed struct 在 offset7 编码 remaining_energy；文档
 松开为 0，按下为 1。它不依赖 `trobot`、FreeRTOS 或物理仿真后端。
 B0 是本课观察的数字输出；板载 A7 是 WS2812 数据线，普通 GPIO 高电平不等同于驱动该 LED。
 
-先按[环境准备](#environment)及[构建](#build)得到项目 QEMU，再进入 `nix develop`。
+先按 [Ubuntu 环境准备](#ubuntu)及[构建](#build)得到项目 QEMU，安装 ARM GCC、CMake 和 Ninja。
 官方 STM32CubeH7 v1.12.1 所需 HAL/CMSIS 源码随仓库固定，来源和逐文件校验值见
 `third_party/stm32h7/SOURCES.json`，构建时不下载 SDK，也不需要 CubeMX。
 
@@ -631,7 +691,7 @@ GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字�
 uv run tools/sim validate path/to/scene.yaml
 uv run tools/sim run path/to/scene.yaml --report build/lab-result.json
 # 自动编译真实专用固件，保留直接通道及原生交互/GDB验收：
-nix develop -c bash tools/run-lab-channels-smoke.sh
+bash tools/run-lab-channels-smoke.sh
 ```
 
 [board-io.yaml](../examples/labs/board-io.yaml) 展示 UART、按键/LED、GPIO、CAN 和 ADC1。
@@ -717,38 +777,8 @@ Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `a
 
 ## 原生环境
 
-支持 **Linux x86_64**，推荐使用下面的 Nix 环境；也提供 Ubuntu 24.04 系统依赖方案。Windows、macOS 和 ARM 宿主原生构建未验证。
-
-### Nix
-
-按 [Nix 官方安装说明](https://nix.dev/install-nix.html)安装 Nix。若尚未启用 flakes，在 `~/.config/nix/nix.conf` 中加入以下配置，保留已有的其他设置：
-
-```ini
-experimental-features = nix-command flakes
-```
-
-获取源码后运行：
-
-```bash
-nix develop
-bash tools/build-qemu.sh
-```
-
-也可以不进入交互 shell，直接构建：
-
-```bash
-nix develop --command bash tools/build-qemu.sh
-```
-
-`flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包或通用发行二进制。
-
-构建和运行都在 `nix develop` 内执行，包括 QEMU、测试、worker 和 Python 环境同步。`nix develop` 中的 `PYTHON` 指向固定的 Nix Python；同步项目测试环境使用：
-
-```bash
-uv sync --locked --group dev --python "$PYTHON"
-```
-
-退出 shell 用 `exit`。更换机器后使用同一 `flake.lock` 可恢复相同工具和依赖版本。普通 Nix profile 中只有编译器并不足以构建本项目；请使用这里的完整 shell，使编译器、GLib、zlib 与 pkg-config 保持一致。MuJoCo Python 包通过项目 extra 按需安装；Nix shell 提供其 C++ 运行库，并默认使用 `MUJOCO_GL=disable` 运行无渲染后端。ROS 2 需要另行安装和配置。
+源码构建默认使用 **Ubuntu 24.04 x86_64** 系统工具链，Nix 是可选的固定环境。
+Windows 下载包的范围与 CI 状态见[安装](#installation)；macOS 和 ARM 宿主原生构建尚未验证。
 
 ### Ubuntu
 
@@ -802,6 +832,39 @@ sudo apt-get install -y libpixman-1-dev
 
 启用 MuJoCo 时再安装项目的可选 Python extra。首次同步 pytest/MuJoCo 或下载所需的 QEMU Meson wraps 需要网络，`/tmp` 必须可写。
 
+<a id="nix"></a>
+
+### Nix（可选）
+
+按 [Nix 官方安装说明](https://nix.dev/install-nix.html)安装 Nix。若尚未启用 flakes，在 `~/.config/nix/nix.conf` 中加入以下配置，保留已有的其他设置：
+
+```ini
+experimental-features = nix-command flakes
+```
+
+获取源码后运行：
+
+```bash
+nix develop
+bash tools/build-qemu.sh
+```
+
+也可以不进入交互 shell，直接构建：
+
+```bash
+nix develop --command bash tools/build-qemu.sh
+```
+
+`flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包。
+
+选择 Nix 时，构建和运行都在 `nix develop` 内执行，包括 QEMU、测试、worker 和 Python 环境同步。`nix develop` 中的 `PYTHON` 指向固定的 Nix Python；同步项目测试环境使用：
+
+```bash
+uv sync --locked --group dev --python "$PYTHON"
+```
+
+退出 shell 用 `exit`。更换机器后使用同一 `flake.lock` 可恢复相同工具和依赖版本。普通 Nix profile 中只有编译器并不足以构建本项目；请使用这里的完整 shell，使编译器、GLib、zlib 与 pkg-config 保持一致。MuJoCo Python 包通过项目 extra 按需安装；Nix shell 提供其 C++ 运行库，并默认使用 `MUJOCO_GL=disable` 运行无渲染后端。ROS 2 需要另行安装和配置。
+
 <a id="get-the-source"></a>
 
 ## 获取固定原生源码
@@ -832,7 +895,7 @@ git clone --branch main git@github.com:lym12321/qemu-dm-mc02.git
 bash tools/build-qemu.sh
 ```
 
-Nix shell 已包含测试所需的 CMake、ARM 工具链、ripgrep 和 uv；Ubuntu 用户请先安装上一节的额外依赖。构建 Host 测试程序：
+Ubuntu 用户请先安装[环境章节](#ubuntu)的额外依赖；可选 Nix shell 已包含 CMake、ARM 工具链、ripgrep 和 uv。构建 Host 测试程序：
 
 ```bash
 uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"
@@ -873,7 +936,7 @@ smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后�
 
 ### 直接运行固件
 
-输入 ELF 必须面向 DM-MC02 地址空间。安装核心命令行工具并构建项目 QEMU 后，
+输入 ELF 必须面向 DM-MC02 地址空间。安装核心命令行工具，并下载或构建项目 QEMU 后，
 直接传入已有 ELF；此入口不需要 YAML、Python QMP client 或 MuJoCo：
 
 ```bash
@@ -894,8 +957,8 @@ ELF 是必填位置参数，不读取 `DM_MC02_ELF`。QEMU 选择顺序为 `--qe
 | `--debug` | 从复位暂停，启用原生 GDB；默认 `127.0.0.1:1234` |
 | `--gdb-port PORT` | 配合 `--debug` 指定 GDB 端口，范围 1–65535 |
 | `--uart NAME` | `uart1`（默认）、`uart2`、`uart3`、`uart5`、`uart7`、`uart10` 或 `none` |
-| `--qmp PATH` | 创建 QMP Unix socket，`server=on,wait=off` |
-| `--cosim PATH` | 创建 co-sim Unix socket，`server=on,wait=off`；worker 单独启动 |
+| `--qmp PATH` | Linux/WSL2：创建 QMP Unix socket，`server=on,wait=off` |
+| `--cosim PATH` | Linux/WSL2：创建 co-sim Unix socket，`server=on,wait=off`；worker 单独启动 |
 | `--qemu PATH` | 指定兼容的项目 QEMU 二进制 |
 | `--machine NAME` | `dm-mc02`，可附加逗号分隔的原生 machine 属性 |
 
@@ -942,7 +1005,7 @@ build/qemu/qemu-system-arm -machine dm-mc02,help
 sim firmware /absolute/path/to/app.elf --debug
 ```
 
-终端二加载同一 ELF 并连接。Nix 的固定 ARM 工具链已提供 `arm-none-eabi-gdb`；Ubuntu 用户可使用自己的 ARM 工具链 GDB，或执行 `sudo apt-get install -y gdb-multiarch` 并将下面命令的程序名替换为它：
+终端二加载同一 ELF 并连接。Ubuntu 可执行 `sudo apt-get install -y gdb-multiarch`，并将下面的程序名替换为 `gdb-multiarch`；Windows 另装 ARM GDB，可选 Nix 环境已提供 `arm-none-eabi-gdb`：
 
 ```bash
 arm-none-eabi-gdb /absolute/path/to/app.elf
@@ -1204,7 +1267,7 @@ bash tools/run-worker.sh --help
 
 当前未经修改的 `trobot` Release 会先完成 INS 初始化，再进入 `example_task`。它需要静止 IMU 样本；未接外部输入时，当前 BMI088 复位寄存器 fallback 不是静止 1 g，不能据此期待 INS 就绪。现有 NullEngine 提供零角速度和 `(0, 0, 1)` g 加速度，可用于启动 fixture；这不是经过校准的真实 plant。
 
-在三个终端中均进入仓库根目录和相同 Nix 环境。终端一启动 QEMU，输出的临时目录供终端二使用：
+在三个终端中均进入仓库根目录，并使用构建 QEMU 时的相同系统或可选 Nix 环境。终端一启动 QEMU，输出的临时目录供终端二使用：
 
 ```bash
 export DM_MC02_ELF=/absolute/path/to/trobot.elf
@@ -1775,7 +1838,7 @@ pytest 的 optional skip 不是该层 PASS；没有 Actions 运行记录时不�
 | 固件直连 | 下文 HAL/BSP、Motor、DJI、Chassis、Referee runner | 消费行为与清理；不代表实板标定 |
 
 轻量 PR gate 不构建 QEMU、不安装 MuJoCo/ROS/Gazebo，也不依赖未追踪的本地示例。
-原生门应在具备 Nix/ARM GCC/兼容二进制的 Linux 环境中单独执行，并保留构建缓存与产物身份。
+原生门应在具备 ARM GCC、兼容二进制及对应系统依赖的 Linux 环境中单独执行，并保留构建缓存与产物身份。
 轻量工作流明确报告 Native NOT RUN；手动门的 PASS、FAIL、BLOCKED 和有依据的 SKIPPED 分开记录。
 `--case all` 当前只运行五个基础场景，完整外设验收需要显式逐项调用：
 

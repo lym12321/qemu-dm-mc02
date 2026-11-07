@@ -16,41 +16,53 @@ Python 核心可独立安装；原生固件运行需要固定的项目 QEMU。�
 | [共享世界与异构驱动器](examples/shared-world/) | 单一 MuJoCo World、M3508 和非 DJI joint driver |
 | [HAL 教学](docs/USAGE.md#hal-teaching) | 固定 HAL/CMSIS 的独立工程 |
 
-## 构建并运行真实固件
+## 下载并运行固件
 
-Linux x86_64 推荐使用固定 Nix 环境；[Ubuntu 依赖](docs/USAGE.md#ubuntu)也有说明。
-先在本地构建项目 QEMU，并在同一环境安装 Python 3.11+ 命令行工具：
+无需 Nix。打开 [Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
+选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载
+`dm-mc02-windows-x86_64` 或 `dm-mc02-linux-x86_64` 并解压。下载需要登录 GitHub，包保留 30 天。
+每包包含 QEMU、Python wheel、`example.elf`、`smoke.json`、对应源码和许可证；
+工作流仅在该平台固件门成功后上传，当前新增 CI 门的实际结果待运行记录确认。
+
+先安装 Python 3.11+。包不内置 Python、ARM 编译器或 GDB；pip 安装 Python 依赖需要联网。
+在解压目录执行：
+
+Windows x86_64，PowerShell：
+
+```powershell
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install (Get-ChildItem .\wheels\*.whl).FullName
+$env:QEMU_SYSTEM_ARM = (Resolve-Path .\bin\qemu-system-arm.exe).Path
+.\.venv\Scripts\sim.exe firmware .\example.elf
+```
+
+Ubuntu 24.04+ x86_64：
 
 ```bash
-git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
-cd qemu-dm-mc02
-git submodule update --init --depth 1 qemu/upstream
-nix develop
-bash tools/build-qemu.sh
+sudo apt-get install -y python3-venv libglib2.0-0t64 zlib1g
+chmod +x bin/qemu-system-arm
 python3 -m venv .venv
 . .venv/bin/activate
-python -m pip install -e .
+python -m pip install wheels/*.whl
+export QEMU_SYSTEM_ARM="$PWD/bin/qemu-system-arm"
+sim firmware example.elf
 ```
 
-运行已有 ELF，只需 `sim firmware /path/to/app.elf`。也可用 ARM GCC/CMake 构建真实裸机示例：
-
-```bash
-cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
-cmake --build examples/minimal-board/build
-sim firmware examples/minimal-board/build/firmware.elf
-```
+`chmod` 恢复 Actions ZIP 未保留的执行权限。将 `example.elf` 换为自己的 DM-MC02 ELF 即可。
+Windows 原生包面向固件终端和从复位暂停的 GDB 监听；完整 Simulation、Lab 和 SocketCAN
+使用 Linux 或 WSL2。
 
 默认 UART1 与原生 monitor 共用终端；`Ctrl-a c` 切换，`Ctrl-a h` 查看帮助。
 在 monitor 输入 `quit` 退出。调试时从复位暂停并打开 `127.0.0.1:1234`：
 
 ```bash
-sim firmware examples/minimal-board/build/firmware.elf --debug
+sim firmware example.elf --debug
 ```
 
 另一个终端用同一 ELF 连接 GDB：
 
 ```bash
-arm-none-eabi-gdb examples/minimal-board/build/firmware.elf
+arm-none-eabi-gdb example.elf
 ```
 
 ```gdb
@@ -62,13 +74,27 @@ continue
 直接运行不需要 YAML、Python QMP client 或 MuJoCo。QEMU 选择顺序为 `--qemu`、
 `QEMU_SYSTEM_ARM`、checkout 中的 `build/qemu/qemu-system-arm`。
 系统 QEMU 不含本项目板卡；GitHub 源码 ZIP 不含子模块，请使用 Git clone。
-当前提供本地 Nix 构建环境，未提供通用发行二进制。其它 UART、machine 属性、QMP 和外部输入
-见[原生接口](docs/USAGE.md#native-debug)。
+其它 UART、machine 属性、QMP 和外部输入见[原生接口](docs/USAGE.md#native-debug)。
 
-## 自动场景
+## 源码构建与自动场景
+
+源码开发默认使用 [Ubuntu 系统依赖](docs/USAGE.md#ubuntu)，Nix 是可选环境：
+
+```bash
+git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+cd qemu-dm-mc02
+git submodule update --init --depth 1 qemu/upstream
+bash tools/build-qemu.sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -e .
+cmake -S examples/minimal-board -B examples/minimal-board/build -DCMAKE_BUILD_TYPE=Debug
+cmake --build examples/minimal-board/build
+sim firmware examples/minimal-board/build/firmware.elf
+```
 
 自动场景继续使用 `sim run scene.yaml`。安装[固定 QMP client](docs/USAGE.md#原生后端与可安装-qmp-client)
-后，可运行上面固件的有限实验：
+后，在源码目录可运行上面固件的有限实验：
 
 ```bash
 sim validate examples/minimal-board/scene.yaml
