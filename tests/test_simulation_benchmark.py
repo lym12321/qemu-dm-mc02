@@ -1,14 +1,30 @@
 """Tool instrumentation contracts; fake acquisition is never native evidence."""
 
 import io
+import hashlib
+import errno
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 
 from sim.api import Event, StepContext, StepResult
 from tools import benchmark_simulation as benchmark
+
+
+# Literal QEMU log records follow system/trace-events and translate-all.c.
+# They are parser fixtures, never evidence of a native firmware execution.
+MMIO_READ = (
+    "memory_region_ops_read cpu 0 mr 0x7f1000 addr 0x4001101c "
+    "value 0xc0 size 4 name 'dm-mc02-uart'\n"
+)
+MMIO_WRITE = (
+    "memory_region_ops_write cpu 0 mr 0x7f1000 addr 0x40011028 "
+    "value 0x41 size 1 name 'dm-mc02-uart'\n"
+)
+MMIO_RECOMPILE = "cpu_io_recompile: rewound execution of TB to 000000000800012c\n"
 
 
 @pytest.mark.parametrize("mode", ("count", "json", "file"))
@@ -67,7 +83,12 @@ def fake_native(monkeypatch, tmp_path):
 
     clock = [0.0]
     state = SimpleNamespace(machines=[], sessions=[], alive=set(), close_calls=0,
-                            run_error=None, close_error=None, diagnostic_error=False, failed=False)
+                            run_error=None, run_error_step=3, close_error=None,
+                            diagnostic_error=False, failed=False, commands=[],
+                            native_origin_ns=71, trace_available=True, trace_payload=None,
+                            command_error=None, receipt_error=False, limited_pids=[],
+                            failed_qmp=[], native_status="paused", enabled_trace_state="enabled",
+                            log_none_response="", mutate_log_on_close=False)
 
     def advance(seconds):
         clock[0] += seconds
@@ -76,11 +97,12 @@ def fake_native(monkeypatch, tmp_path):
         def __init__(self):
             self.pid = 100 + len(state.machines)
             self.started, self._pending = False, None
+            self.cut_ns, self.trace, self.log_exec, self.log_path = 0, {}, False, None
             state.machines.append(self)
 
         @property
         def connection_info(self):
-            return {"pid": self.pid, "native_origin_ns": 0,
+            return {"pid": self.pid, "native_origin_ns": state.native_origin_ns,
                     "sockets": {"qmp": str(tmp_path / str(self.pid) / "qmp.sock")}}
 
         @property
@@ -91,19 +113,78 @@ def fake_native(monkeypatch, tmp_path):
 
         def command(self, name, arguments=None):
             advance(.001)
+            state.commands.append((self.pid, self.cut_ns, name, arguments))
+            if state.failed:
+                state.failed_qmp.append(name)
+            if state.command_error is not None:
+                error = state.command_error(name, arguments)
+                if error is not None:
+                    raise error
+            return self.response(name, arguments)
+
+        def response(self, name, arguments):
+            if name == "query-commands":
+                return [{"name": command} for command in (
+                    "human-monitor-command", "trace-event-get-state", "trace-event-set-state",
+                    "x-query-jit", "x-query-virtual-execution", "query-status")]
+            if name == "x-query-jit":
+                return {"human-readable-text": "Translation buffer state:\nTB count            19\n"
+                        "TB flush count      0\nTB invalidate count 0\n"}
+            if name == "trace-event-get-state":
+                assert arguments == {"name": "memory_region_ops_*"}
+                return [{"name": event, "state": state.enabled_trace_state if self.trace.get(event)
+                         else "disabled", "vcpu": False}
+                        for event in ("memory_region_ops_read", "memory_region_ops_write")
+                        if state.trace_available]
+            if name == "trace-event-set-state":
+                self.trace[arguments["name"]] = arguments["enable"]
+                return {}
+            if name == "human-monitor-command":
+                line = arguments["command-line"]
+                if line.startswith("logfile "):
+                    self.log_path = Path(line[len("logfile "):].strip('"'))
+                    self.log_path.touch()
+                elif line == "log exec":
+                    self.log_exec = True
+                elif line == "log none":
+                    self.log_exec = False
+                    return state.log_none_response
+                else:
+                    raise AssertionError(f"unexpected HMP command: {line}")
+                return ""
+            if name == "x-query-virtual-execution":
+                native = state.native_origin_ns + self.cut_ns
+                return {"state": "reached", "current-ns": native + int(state.receipt_error),
+                        "target-ns": native}
+            if name == "query-status":
+                return {"running": False, "status": state.native_status}
             return {}
 
         def command_many(self, requests):
             advance(.002)
-            return tuple({} for _ in requests)
+            if state.failed:
+                state.failed_qmp.extend(name for name, _ in requests)
+            return tuple(self.response(name, arguments) for name, arguments in requests)
+
+        def to_native(self, cut):
+            return state.native_origin_ns + cut
 
         def finish_step(self, context):
             self._pending = context
             self.command_many((("x-query-virtual-execution", None), ("query-status", None)))
             advance(.003)
-            if state.run_error is not None and context.step_id == 3:
+            if state.run_error is not None and context.step_id == state.run_error_step:
                 state.failed = True
                 raise state.run_error
+            if self.log_exec and any(self.trace.values()):
+                assert self.log_path is not None
+                payload = state.trace_payload
+                if payload is None:
+                    payload = b"" if self.workload == "wfi" else (
+                        MMIO_READ + MMIO_READ + MMIO_WRITE + MMIO_RECOMPILE).encode()
+                with self.log_path.open("ab") as stream:
+                    stream.write(payload)
+            self.cut_ns = context.t_sim_ns
             self._pending = None
             return StepResult("ok", context.t_sim_ns)
 
@@ -130,6 +211,7 @@ def fake_native(monkeypatch, tmp_path):
 
         def start(self):
             self.machine = self.registry["machine.qemu"].create()
+            self.machine.workload = self.workload
             self.machine.started = True
             self.components["main"] = self.machine
             state.alive.add(self.machine.pid)
@@ -141,12 +223,17 @@ def fake_native(monkeypatch, tmp_path):
             self.emit("snapshot", {}, 0)
 
         def run_until(self, target):
-            assert target == 200_000_000
+            assert target >= self.t_sim_ns
             ready = b"SIM_READY minimal-board\n" if self.workload == "wfi" else b"LAB_READY\n"
-            for index in range(1, 201):
-                cut = index * 1_000_000
-                context = StepContext(self.session.session_id, index, cut, 1_000_000)
-                self.machine.finish_step(context)
+            while self.t_sim_ns < target:
+                cut = min(self.t_sim_ns + 1_000_000, target)
+                index = self.step_id + 1
+                context = StepContext(self.session.session_id, index, cut, cut - self.t_sim_ns)
+                try:
+                    self.machine.finish_step(context)
+                except BaseException:
+                    self.state = "failed"
+                    raise
                 if "world" in self.components:
                     self.components["world"].step(context)
                 self.t_sim_ns, self.step_id = cut, index
@@ -161,6 +248,9 @@ def fake_native(monkeypatch, tmp_path):
             self.components.clear()
             if hasattr(self, "machine"):
                 state.alive.discard(self.machine.pid)
+                if state.mutate_log_on_close and self.machine.log_path is not None:
+                    with self.machine.log_path.open("ab") as stream:
+                        stream.write(MMIO_READ.encode())
             if state.close_error is not None:
                 raise state.close_error
 
@@ -176,6 +266,8 @@ def fake_native(monkeypatch, tmp_path):
     monkeypatch.setattr(benchmark, "Simulation", Simulation)
     monkeypatch.setattr(benchmark, "perf_counter", lambda: clock[0])
     monkeypatch.setattr(benchmark, "_process_sample", process)
+    monkeypatch.setattr(benchmark, "_limit_capture_file_size", state.limited_pids.append,
+                        raising=False)
     monkeypatch.setattr(benchmark, "usage", lambda: {"host_cpu_s": clock[0], "children_cpu_s": clock[0] / 2,
         "host_peak_rss_bytes": 8192, "host_current_rss_bytes": 4096})
     monkeypatch.setattr(benchmark, "_attribution_scene", lambda workload, topology, *_:
@@ -280,3 +372,299 @@ def test_interrupt_preserves_partial_report_and_returns130(fake_native, tmp_path
     row = payload["cases"]["attribution"]["cells"][0]["runs"][0]
     assert payload["interrupted"] and row["error"] == "KeyboardInterrupt: "
     assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_native_cost_defaults_to_two_guests_without_world_or_trace(fake_native, tmp_path):
+    report = tmp_path / "native-cost.json"
+    assert benchmark.main(["--case", "native-cost", "--report", str(report)]) == 0
+    item = json.loads(report.read_text())["cases"]["native-cost"]
+    assert item["status"] == "PASS"
+    assert [(cell["workload"], cell["topology"], cell["output"]) for cell in item["cells"]] == [
+        ("wfi", "machine", "count"), ("busy-mmio", "machine", "count")]
+    assert len(fake_native.sessions) == fake_native.close_calls == 6
+    assert not fake_native.limited_pids
+    assert all(name == "query-commands" for _, _, name, _ in fake_native.commands)
+    for cell in item["cells"]:
+        assert cell["passed_runs"] == 3 and cell["summary_valid"]
+        for row in cell["runs"]:
+            assert row["capture"] == {"mode": "none"}
+            assert row["ready"] and row["finish_calls"] == row["cuts"] == 200
+            assert row["world_step_calls"] == row["output_bytes"] == row["encoded_bytes"] == 0
+            assert row["last_committed_cut_ns"] == 200_000_000
+            assert all(row["resource_cleanup"].values())
+
+
+@pytest.mark.parametrize("case,capture", [("host", "none"), ("attribution", "mmio")])
+def test_capture_option_is_rejected_outside_native_cost_before_acquisition(
+        fake_native, tmp_path, case, capture):
+    report = tmp_path / "invalid.json"
+    with pytest.raises(SystemExit) as raised:
+        benchmark.main(["--case", case, "--capture", capture, "--report", str(report)])
+    assert raised.value.code == 2
+    assert not report.exists() and not fake_native.sessions
+
+
+def test_mmio_windows_bound_execution_restore_grid_and_use_native_receipts(fake_native, tmp_path):
+    report = tmp_path / "capture.json"
+    assert benchmark.main(["--case", "native-cost", "--capture", "mmio", "--repeat", "1",
+                           "--report", str(report)]) == 0
+    item = json.loads(report.read_text())["cases"]["native-cost"]
+    assert item["status"] == "PASS"
+    assert fake_native.limited_pids == [machine.pid for machine in fake_native.machines]
+    starts = [1_000_000, 10_000_000, 100_000_000, 199_000_000]
+    for cell, machine in zip(item["cells"], fake_native.machines):
+        row = cell["runs"][0]
+        assert row["cuts"] == row["finish_calls"] == 204
+        assert row["last_committed_cut_ns"] == 200_000_000
+        assert row["world_step_calls"] == 0 and row["ready"]
+        assert row["capture"]["mode"] == "mmio"
+        windows = row["capture"]["windows"]
+        assert [window["start_ns"] for window in windows] == starts
+        for window in windows:
+            assert window["status"] == "PASS"
+            assert window["end_ns"] == window["start_ns"] + 10_000
+            for name, cut in (("before", window["start_ns"]), ("after", window["end_ns"])):
+                receipt = window[name]
+                assert receipt["mapped_time_ns"] == cut
+                assert receipt["native_time_ns"] == cut + 71
+                assert receipt["execution"] == {
+                    "state": "reached", "current-ns": cut + 71, "target-ns": cut + 71}
+                assert receipt["status"] == {"running": False, "status": "paused"}
+            assert window["jit_before"]["tb_count"] == window["jit_after"]["tb_count"] == 19
+            if cell["workload"] == "wfi":
+                assert window["log"]["bytes"] == window["log"]["lines"] == 0
+                assert window["log"]["accesses"] == window["log"]["recompiles"] == []
+            else:
+                assert window["log"]["lines"] == 4
+                assert sum(access["count"] for access in window["log"]["accesses"]) == 3
+                assert window["log"]["recompiles"] == [{"pc": "0x800012c", "count": 1}]
+        commands = [(cut, name, args) for pid, cut, name, args in fake_native.commands
+                    if pid == machine.pid]
+        enabled = [(cut, args["name"]) for cut, name, args in commands
+                   if name == "trace-event-set-state" and args["enable"]]
+        assert enabled == [(cut, name) for cut in starts
+                           for name in ("memory_region_ops_read", "memory_region_ops_write")]
+        disabled = [(cut, args["name"]) for cut, name, args in commands
+                    if name == "trace-event-set-state" and not args["enable"]]
+        assert disabled == [(cut + 10_000, name) for cut in starts
+                            for name in ("memory_region_ops_read", "memory_region_ops_write")]
+        stopped = [cut for cut, name, args in commands
+                   if name == "human-monitor-command" and args["command-line"] == "log none"]
+        assert stopped == [cut + 10_000 for cut in starts]
+        assert not any(machine.trace.values()) and not machine.log_exec
+        assert all(row["resource_cleanup"].values())
+
+
+def test_missing_mmio_trace_capability_is_blocked_and_closes_session(fake_native, tmp_path):
+    fake_native.trace_available = False
+    row = {}
+    benchmark.attribution_run("wfi", "machine", "count", fake_native.assets,
+                              tmp_path / "missing-trace", row, capture="mmio")
+    assert row["status"] == "BLOCKED"
+    assert row["cuts"] == 0 and not row["capture"]["windows"]
+    assert not any(name == "trace-event-set-state" for _, _, name, _ in fake_native.commands)
+    assert [arguments for _, _, name, arguments in fake_native.commands
+            if name == "trace-event-get-state"] == [{"name": "memory_region_ops_*"}]
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+@pytest.mark.parametrize("mismatch", ["time", "status"])
+def test_mmio_native_receipt_mismatch_fails_before_logging(fake_native, tmp_path, mismatch):
+    if mismatch == "time":
+        fake_native.receipt_error = True
+    else:
+        fake_native.native_status = "shutdown"
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "bad-receipt", row, capture="mmio")
+    assert row["status"] == "FAIL" and row["last_committed_cut_ns"] == 1_000_000
+    assert not any(name == "trace-event-set-state" and args["enable"]
+                   for _, _, name, args in fake_native.commands)
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_native_capture_failure_stops_qmp_and_preserves_close_error(fake_native, tmp_path):
+    primary = fake_native.run_error = RuntimeError("native interval failed")
+    fake_native.run_error_step = 2
+    fake_native.close_error = OSError("simulation cleanup failed")
+
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "capture-failed", row, capture="mmio")
+    assert row["status"] == "FAIL" and row["error"] == "RuntimeError: native interval failed"
+    assert row["last_committed_cut_ns"] == 1_000_000 and row["finish_calls"] == 2
+    assert len(row["capture"]["windows"]) == 1
+    assert row["capture"]["windows"][0]["status"] == "FAIL"
+    assert any("simulation cleanup failed" in note for note in row["notes"])
+    assert list(primary.__notes__) == row["notes"]
+    disable_attempts = [arguments["name"] for _, _, name, arguments in fake_native.commands
+                        if name == "trace-event-set-state" and not arguments["enable"]]
+    assert disable_attempts == []
+    assert not fake_native.failed_qmp
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_paused_diagnostic_failure_keeps_primary_and_attempts_each_capture_cleanup(fake_native, tmp_path):
+    fake_native.enabled_trace_state = "disabled"
+
+    def command_error(name, arguments):
+        if name == "trace-event-set-state" and not arguments["enable"]:
+            return OSError("trace disable failed")
+
+    fake_native.command_error = command_error
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "diagnostic-failed", row, capture="mmio")
+    assert row["status"] == "FAIL"
+    assert row["error"].startswith("RuntimeError: unexpected QEMU trace state:")
+    assert len(row["notes"]) == 2
+    assert all("trace disable failed" in note for note in row["notes"])
+    assert row["last_committed_cut_ns"] == 1_000_000 and row["finish_calls"] == 1
+    assert len(row["capture"]["windows"]) == 1
+    disabled = [arguments["name"] for _, _, name, arguments in fake_native.commands
+                if name == "trace-event-set-state" and not arguments["enable"]]
+    assert disabled == ["memory_region_ops_read", "memory_region_ops_write"]
+    assert not fake_native.machines[0].log_exec
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_hmp_log_disable_error_is_not_reported_as_success(fake_native, tmp_path):
+    fake_native.log_none_response = "Error: logging unavailable\r\n"
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "log-disable-failed", row, capture="mmio")
+    assert row["status"] == "FAIL" and "log none" in row["error"]
+    assert row["last_committed_cut_ns"] == 1_010_000 and row["finish_calls"] == 2
+    assert len(row["capture"]["windows"]) == 1
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_capture_log_changed_during_cleanup_invalidates_completed_windows(fake_native, tmp_path):
+    fake_native.mutate_log_on_close = True
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "changed-log", row, capture="mmio")
+    assert row["status"] == "FAIL" and "MMIO log changed" in row["error"]
+    assert row["last_committed_cut_ns"] == 200_000_000 and row["cuts"] == 204
+    assert all(window["status"] == "PASS" for window in row["capture"]["windows"])
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+def test_mmio_parser_keeps_addresses_sizes_and_pc_counts_with_wall_prefix(tmp_path):
+    path = tmp_path / "window.log"
+    data = (MMIO_READ + "123@1780000000.123456:" + MMIO_READ + MMIO_WRITE +
+            MMIO_RECOMPILE + MMIO_RECOMPILE +
+            "Trace 0: 0x7f1200 [00000000/0800012c/01000020/ff000200]\n"
+            "Linking TBs 0x7f1200 index 0 -> 0x7f1400\n"
+            "Stopped execution of TB chain before 0x7f1400 [08000130]\n").encode()
+    path.write_bytes(data)
+    result = benchmark._parse_mmio_log(path)
+    assert result["bytes"] == len(data) and result["lines"] == 8
+    assert result["sha256"] == hashlib.sha256(data).hexdigest()
+    assert result["accesses"] == [
+        {"operation": "read", "address": "0x4001101c", "size": 4,
+         "region": "dm-mc02-uart", "count": 2},
+        {"operation": "write", "address": "0x40011028", "size": 1,
+         "region": "dm-mc02-uart", "count": 1}]
+    assert result["recompiles"] == [{"pc": "0x800012c", "count": 2}]
+    assert result["exec_lines"] == {"trace": 1, "link": 1, "stop": 1}
+
+
+@pytest.mark.parametrize("data", [MMIO_READ.rstrip("\n").encode(), b"unrecognized diagnostic\n",
+                                  b"memory_region_ops_read cpu 0 broken\n", b"\xff\n",
+                                  b"Trace 0: 0x7f1200 [////]\n",
+                                  b"Linking TBs 0x7f1200 index 2 -> 0x7f1400\n"])
+def test_mmio_parser_rejects_truncated_malformed_and_unknown_records(tmp_path, data):
+    path = tmp_path / "bad.log"
+    path.write_bytes(data)
+    with pytest.raises((ValueError, RuntimeError, UnicodeError)):
+        benchmark._parse_mmio_log(path)
+
+
+@pytest.mark.parametrize("limit", ["bytes", "lines", "line-bytes"])
+def test_mmio_capture_reports_log_capacity_failure_without_continuing(
+        fake_native, tmp_path, monkeypatch, limit):
+    if limit == "bytes":
+        monkeypatch.setattr(benchmark, "MMIO_MAX_BYTES", len(MMIO_READ.encode()) - 1)
+        fake_native.trace_payload = MMIO_READ.encode()
+    elif limit == "lines":
+        monkeypatch.setattr(benchmark, "MMIO_MAX_LINES", 1)
+        fake_native.trace_payload = (MMIO_READ * 2).encode()
+    else:
+        fake_native.trace_payload = b"x" * 4096 + b"\n"
+    row = {}
+    benchmark.attribution_run("busy-mmio", "machine", "count", fake_native.assets,
+                              tmp_path / "capacity", row, capture="mmio")
+    assert row["status"] == "FAIL"
+    assert row["last_committed_cut_ns"] == 1_010_000 and row["finish_calls"] == 2
+    assert len(row["capture"]["windows"]) == 1
+    assert not any(fake_native.machines[0].trace.values())
+    assert not fake_native.machines[0].log_exec
+    assert fake_native.close_calls == 1 and all(row["resource_cleanup"].values())
+
+
+@pytest.mark.parametrize("soft", [-1, 16 * 1024 * 1024])
+def test_capture_file_limit_caps_owned_child_without_changing_hard_limit(monkeypatch, soft):
+    current, calls = [soft, 32 * 1024 * 1024], []
+
+    def prlimit(pid, resource, limits=None):
+        calls.append((pid, resource, limits))
+        previous = tuple(current)
+        if limits is not None:
+            current[:] = limits
+        return previous
+
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        prlimit=prlimit, RLIMIT_FSIZE=1, RLIM_INFINITY=-1))
+    benchmark._limit_capture_file_size(123)
+    assert current == [8 * 1024 * 1024, 32 * 1024 * 1024]
+    assert calls == [(123, 1, None), (123, 1, (8 * 1024 * 1024, 32 * 1024 * 1024)),
+                     (123, 1, None)]
+
+
+def test_capture_file_limit_does_not_relax_lower_inherited_bound(monkeypatch):
+    calls = []
+
+    def prlimit(*args):
+        calls.append(args)
+        return 4096, 32 * 1024 * 1024
+
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        prlimit=prlimit, RLIMIT_FSIZE=1, RLIM_INFINITY=-1))
+    with pytest.raises(benchmark.Blocked):
+        benchmark._limit_capture_file_size(123)
+    assert calls == [(123, 1)]
+
+
+@pytest.mark.parametrize("code,fail_call,expected", [
+    (errno.EPERM, 1, benchmark.Blocked), (errno.ENOSYS, 2, benchmark.Blocked),
+    (errno.ESRCH, 1, ProcessLookupError)])
+def test_capture_file_limit_distinguishes_unavailable_facility_from_dead_process(
+        monkeypatch, code, fail_call, expected):
+    calls = []
+
+    def prlimit(*args):
+        calls.append(args)
+        if len(calls) == fail_call:
+            raise OSError(code, "injected prlimit error")
+        return -1, -1
+
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        prlimit=prlimit, RLIMIT_FSIZE=1, RLIM_INFINITY=-1))
+    with pytest.raises(expected):
+        benchmark._limit_capture_file_size(123)
+    assert len(calls) == fail_call
+
+
+def test_capture_file_limit_verifies_limit_after_setting(monkeypatch):
+    calls = []
+
+    def prlimit(*args):
+        calls.append(args)
+        return -1, -1
+
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        prlimit=prlimit, RLIMIT_FSIZE=1, RLIM_INFINITY=-1))
+    with pytest.raises(RuntimeError, match="not applied"):
+        benchmark._limit_capture_file_size(123)
+    assert calls == [(123, 1), (123, 1, (8 * 1024 * 1024, -1)), (123, 1)]

@@ -4,12 +4,14 @@
 import argparse
 from collections import Counter
 from contextlib import ExitStack
+import errno
 import hashlib
 from importlib import metadata
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shutil
 from statistics import median
 import subprocess
@@ -26,6 +28,175 @@ from sim.api import BackendUnavailable, LinkSpec, NodeSpec, Topology
 from sim.fabric import CanBusFactory, CanFrame
 from sim.devices.can_host import CanHostFactory
 from sim.runtime import Simulation
+
+
+MMIO_WINDOWS_NS = (1_000_000, 10_000_000, 100_000_000, 199_000_000)
+MMIO_WINDOW_NS = 10_000
+MMIO_MAX_BYTES = 8 * 1024 * 1024
+MMIO_MAX_LINES = 65536
+MMIO_MAX_LINE_BYTES = 4096
+_MMIO_EVENTS = ("memory_region_ops_read", "memory_region_ops_write")
+
+
+def _parse_mmio_log(path):
+    """Bounded reader for the pinned QEMU log backend, not a guest clock."""
+    accesses, recompiles, exec_lines = Counter(), Counter(), Counter()
+    digest, size, lines = hashlib.sha256(), 0, 0
+    mmio = re.compile(r"memory_region_ops_(read|write) cpu (\d+) mr 0x[0-9a-fA-F]+ "
+                      r"addr (0x[0-9a-fA-F]+) value (0x[0-9a-fA-F]+) size (\d+) name '([^']*)'")
+    rewind = re.compile(r"cpu_io_recompile: rewound execution of TB to ([0-9a-fA-F]{1,16})")
+    execution = {
+        "trace": re.compile(r"Trace \d+: 0x[0-9a-fA-F]+ \["
+                            r"[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+/[0-9a-fA-F]+\](?: .*)?"),
+        "link": re.compile(r"Linking TBs 0x[0-9a-fA-F]+ index [01] -> 0x[0-9a-fA-F]+"),
+        "stop": re.compile(r"Stopped execution of TB chain before 0x[0-9a-fA-F]+ \[[0-9a-fA-F]+\](?: .*)?"),
+    }
+    with Path(path).open("rb") as source:
+        while raw := source.readline(MMIO_MAX_LINE_BYTES + 1):
+            size += len(raw)
+            lines += 1
+            if size >= MMIO_MAX_BYTES or lines > MMIO_MAX_LINES or len(raw) > MMIO_MAX_LINE_BYTES:
+                raise BufferError("MMIO log capacity exceeded")
+            if not raw.endswith(b"\n"):
+                raise ValueError("truncated MMIO log record")
+            digest.update(raw)
+            # QEMU's optional prefix is a host timestamp, never a guest timestamp.
+            line = re.sub(r"^\d+@\d+\.\d+: ?", "", raw.decode("utf-8").rstrip("\n"))
+            if match := mmio.fullmatch(line):
+                operation, cpu, address, value, width, region = match.groups()
+                if (int(cpu) > 0x7fffffff or int(address, 16) > 0xffffffffffffffff
+                        or int(value, 16) > 0xffffffffffffffff or int(width) not in (1, 2, 4, 8)):
+                    raise ValueError(f"invalid MMIO fields at line {lines}")
+                accesses[(operation, hex(int(address, 16)), int(width), region)] += 1
+            elif match := rewind.fullmatch(line):
+                recompiles[hex(int(match[1], 16))] += 1
+            else:
+                kind = next((name for name, pattern in execution.items() if pattern.fullmatch(line)), None)
+                if kind is None:
+                    raise ValueError(f"unrecognized MMIO log record at line {lines}")
+                exec_lines[kind] += 1
+    return {"path": str(Path(path).resolve()), "sha256": digest.hexdigest(), "bytes": size,
+            "lines": lines, "accesses": [dict(operation=op, address=addr, size=width, region=region, count=n)
+                for (op, addr, width, region), n in sorted(accesses.items())],
+            "recompiles": [dict(pc=pc, count=n) for pc, n in sorted(recompiles.items())],
+            "exec_lines": dict(exec_lines)}
+
+
+def _limit_capture_file_size(pid):
+    """Bound this owned Linux child, without relaxing an inherited limit."""
+    import resource
+    if not hasattr(resource, "prlimit"):
+        raise Blocked("Linux prlimit is required for bounded native capture")
+    try:
+        soft, hard = resource.prlimit(pid, resource.RLIMIT_FSIZE)
+        if soft != resource.RLIM_INFINITY and soft < MMIO_MAX_BYTES:
+            raise Blocked("inherited QEMU file limit is below the fixed8MiB capture budget")
+        resource.prlimit(pid, resource.RLIMIT_FSIZE, (MMIO_MAX_BYTES, hard))
+        if resource.prlimit(pid, resource.RLIMIT_FSIZE) != (MMIO_MAX_BYTES, hard):
+            raise RuntimeError("QEMU capture file limit was not applied")
+    except OSError as error:
+        if error.errno in (errno.EPERM, errno.EACCES, errno.ENOSYS):
+            raise Blocked("cannot establish QEMU capture file limit: " + str(error)) from error
+        raise
+
+
+def _capture_receipt(machine, cut):
+    execution, status = machine.command_many((("x-query-virtual-execution", None), ("query-status", None)))
+    native = machine.to_native(cut)
+    if (execution.get("state") != "reached" or execution.get("target-ns") != native
+            or execution.get("current-ns") != native or status.get("running") is not False
+            or status.get("status") != "paused"):
+        raise RuntimeError("MMIO window lacks an exact paused native receipt")
+    return {"mapped_time_ns": cut, "native_time_ns": native, "execution": execution, "status": status}
+
+
+def _capture_jit(machine):
+    raw = machine.command("x-query-jit")["human-readable-text"]
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 65536:
+        raise BufferError("JIT diagnostic exceeds65536 bytes")
+    result = {"raw": raw}
+    for field, label in (("tb_count", "TB count"), ("tb_flush_count", "TB flush count"),
+                         ("tb_invalidate_count", "TB invalidate count")):
+        matches = re.findall(r"^" + label + r"\s+(\d+)\s*$", raw, re.MULTILINE)
+        if len(matches) != 1:
+            raise ValueError("JIT diagnostic lacks unique " + label)
+        result[field] = int(matches[0])
+    return result
+
+
+def _capture_trace_state(machine, expected):
+    # Unknown exact names are QMP errors; a wildcard safely discovers absence.
+    states = machine.command("trace-event-get-state", {"name": "memory_region_ops_*"})
+    for name in _MMIO_EVENTS:
+        found = [state for state in states if state.get("name") == name]
+        if not found or any(state.get("state") == "unavailable" for state in found):
+            raise Blocked("QEMU log trace is unavailable: " + name)
+        if len(found) != 1 or found[0].get("state") != expected:
+            raise RuntimeError("unexpected QEMU trace state: " + repr(states))
+
+
+def _mmio_capture(simulation, machine, directory, row):
+    capture = row["capture"] = {"mode": "mmio", "windows": []}
+    available = {item["name"] for item in machine.command("query-commands")}
+    needed = {"human-monitor-command", "trace-event-get-state", "trace-event-set-state", "x-query-jit"}
+    if missing := needed - available:
+        raise Blocked("QEMU capture commands unavailable: " + ", ".join(sorted(missing)))
+    _capture_trace_state(machine, "disabled")
+    _limit_capture_file_size(machine.connection_info["pid"])
+    for start in MMIO_WINDOWS_NS:
+        window = {"start_ns": start, "end_ns": start + MMIO_WINDOW_NS, "status": "FAIL"}
+        capture["windows"].append(window)
+        simulation.run_until(start)
+        window["before"] = _capture_receipt(machine, start)
+        window["jit_before"] = _capture_jit(machine)
+        path = (directory / f"mmio-{start}.log").resolve()
+        window["log_path"] = str(path)
+        if path.exists():
+            raise FileExistsError(path)
+        primary = None
+        try:
+            quoted = '"' + str(path).replace('\\', '\\\\').replace('"', '\\"') + '"'
+            for command in ("logfile " + quoted, "log exec"):
+                if machine.command("human-monitor-command", {"command-line": command}) != "":
+                    raise RuntimeError("QEMU rejected capture command: " + command)
+            # HMP logfile errors may only go to stderr. Do not manufacture this file.
+            if not path.is_file() or path.is_symlink() or path.stat().st_size != 0:
+                raise RuntimeError("QEMU did not create an empty capture file")
+            for name in _MMIO_EVENTS:
+                machine.command("trace-event-set-state", {"name": name, "enable": True})
+            _capture_trace_state(machine, "enabled")
+            simulation.run_until(start + MMIO_WINDOW_NS)
+        except BaseException as error:
+            primary = error
+        finally:
+            # Once failed, the existing Simulation.close/reap is the only cleanup
+            # authority; no further command can safely use the failed Machine.
+            if str(simulation.state) == "paused":
+                commands = [("trace-event-set-state", {"name": name, "enable": False})
+                            for name in _MMIO_EVENTS]
+                commands.append(("human-monitor-command", {"command-line": "log none"}))
+                for name, arguments in commands:
+                    if str(simulation.state) != "paused":
+                        break
+                    try:
+                        result = machine.command(name, arguments)
+                        if name == "human-monitor-command" and result != "":
+                            raise RuntimeError("QEMU rejected log none during capture cleanup")
+                    except BaseException as error:
+                        if primary is None:
+                            primary = error
+                        else:
+                            primary.add_note(f"trace disable failed: {type(error).__name__}: {error}")
+            if primary is not None:
+                raise primary
+        _capture_trace_state(machine, "disabled")
+        window["after"] = _capture_receipt(machine, start + MMIO_WINDOW_NS)
+        window["jit_after"] = _capture_jit(machine)
+        window["log"] = _parse_mmio_log(path)
+        window["status"] = "PASS"
+        # Restore the ordinary cut grid; each diagnostic window adds one cut.
+        simulation.run_until(start + 1_000_000)
+    simulation.run_until(200_000_000)
 
 
 def json_bytes(value):
@@ -290,17 +461,21 @@ def _attribution_output(mode, output, row):
     return observe
 
 
-def attribution_run(workload, topology, mode, assets, directory, row):
+def attribution_run(workload, topology, mode, assets, directory, row, *, capture="none"):
     """One fresh Simulation; instrumentation has no execution authority."""
     from sim.composition import builtin_registry
     from sim.machines.qemu.machine import QemuMachine
 
+    if capture not in ("none", "mmio") or capture == "mmio" and (topology, mode) != ("machine", "count"):
+        raise ValueError("MMIO capture requires the fixed machine/count workload")
+    if capture == "mmio" and any(c == "%" or ord(c) < 32 for c in str(directory.resolve())):
+        raise ValueError("MMIO capture path cannot contain control characters or QEMU '%' templates")
     row.update(status="FAIL", qmp_calls=Counter(), qmp_commands=Counter(), qmp_wall_s={},
         finish_calls=0, finish_step_s=0.0, world_step_calls=0, world_step_s=0.0,
         encoding_s=0.0, writing_s=0.0, output_callback_s=0.0, output_bytes=0,
         encoded_bytes=0, output_events=0, events=0, snapshots=0, uart_hex="",
         startup_s=0.0, active_s=0.0, cleanup_s=0.0, identities=[], qemu_samples=0,
-        qemu_peak_rss_bytes=0, qemu_cpu_sampled_s=0.0)
+        qemu_peak_rss_bytes=0, qemu_cpu_sampled_s=0.0, capture={"mode": capture})
     directory.mkdir(exist_ok=False)
     output = simulation = primary = None
     machines, identities, uart = [], {}, bytearray()
@@ -356,7 +531,8 @@ def attribution_run(workload, topology, mode, assets, directory, row):
 
     try:
         registry = builtin_registry(qemu=assets["qemu"]["path"])
-        world_factory, create_world = registry["physics.mujoco"], registry["physics.mujoco"].create
+        world_factory = registry["physics.mujoco"] if topology == "four-wheel" else None
+        create_world = world_factory.create if world_factory is not None else None
         machine_factory, create_machine = registry["machine.qemu"], registry["machine.qemu"].create
 
         def machine_created(*args, **kwargs):
@@ -406,14 +582,19 @@ def attribution_run(workload, topology, mode, assets, directory, row):
         with ExitStack() as stack:
             for owner, name, replacement in ((QemuMachine, "command", single),
                     (QemuMachine, "command_many", grouped), (QemuMachine, "finish_step", finished),
-                    (world_factory, "create", world_created), (machine_factory, "create", machine_created)):
+                    (machine_factory, "create", machine_created)):
                 stack.enter_context(patch.object(owner, name, replacement))
+            if world_factory is not None:
+                stack.enter_context(patch.object(world_factory, "create", world_created))
             simulation.start()
             row["session_id"] = simulation.session.session_id
             row["startup_s"] = perf_counter() - phase_begun
             started_usage = usage()
             phase, phase_begun = "active", perf_counter()
-            simulation.run_until(200_000_000)
+            if capture == "mmio":
+                _mmio_capture(simulation, simulation.components["main"], directory, row)
+            else:
+                simulation.run_until(200_000_000)
             row["active_s"] = perf_counter() - phase_begun
             active_usage = usage()
             phase = "acceptance"
@@ -422,8 +603,13 @@ def attribution_run(workload, topology, mode, assets, directory, row):
             ready = b"SIM_READY minimal-board\n" if workload == "wfi" else b"LAB_READY\n"
             if ready not in uart or b"FAIL" in uart:
                 raise AssertionError("actual firmware ready is missing or firmware reported failure")
-            if simulation.t_sim_ns != 200_000_000 or simulation.step_id != 200 or last_snapshot != 200_000_000:
-                raise AssertionError("benchmark did not complete the fixed200ms/200cuts workload")
+            expected_cuts = 204 if capture == "mmio" else 200
+            if (simulation.t_sim_ns != 200_000_000 or simulation.step_id != expected_cuts
+                    or last_snapshot != 200_000_000):
+                raise AssertionError(f"benchmark did not complete the fixed200ms/{expected_cuts}cuts workload")
+            if capture == "mmio" and workload == "busy-mmio" and any(
+                    not window["log"]["accesses"] for window in row["capture"]["windows"]):
+                raise AssertionError("busy firmware produced no MMIO evidence in a capture window")
             row["ready"] = True
     except BaseException as error:
         primary = error
@@ -481,6 +667,11 @@ def attribution_run(workload, topology, mode, assets, directory, row):
                 "event_file_closed": output is None or output.closed}
             if not all(row["resource_cleanup"].values()):
                 raise RuntimeError("attribution resources were not completely released")
+            for window in row["capture"].get("windows", ()):
+                log = window.get("log")
+                if log is not None and (Path(log["path"]).stat().st_size != log["bytes"]
+                        or _identity(log["path"])["sha256"] != log["sha256"]):
+                    raise RuntimeError("MMIO log changed after its paused capture window")
             for expected in (assets["qemu"], assets["compiler"], assets["model"], *assets["inputs"],
                              {"path": assets["firmware"][workload]["elf"],
                               "sha256": assets["firmware"][workload]["sha256"]}):
@@ -517,7 +708,7 @@ def attribution_run(workload, topology, mode, assets, directory, row):
         raise primary
 
 
-def attribution(item, qemu, directory, repeat):
+def attribution(item, qemu, directory, repeat, *, native_cost=False, capture="none"):
     directory = directory.resolve()
     item.update(status="FAIL", conditions={"duration_ns": 200_000_000, "quantum_ns": 1_000_000,
         "startup_timeout_s": 10, "host_timeout_s": 30, "icount": "shift=0,align=off,sleep=off",
@@ -532,10 +723,21 @@ def attribution(item, qemu, directory, repeat):
         "Host peak RSS is cumulative. QEMU RSS/CPU are sampled for the entire process, not guest-only; "
         "CPU resolution is1/CLK_TCK. Reaped child CPU includes optional dependency probes. "
         "Ready verifies actual UART and does not establish a CPU/physics barrier."}, assets={}, cells=[])
+    if native_cost:
+        item["conditions"].update(capture=capture, cuts=204 if capture == "mmio" else 200,
+            windows_ns=list(MMIO_WINDOWS_NS) if capture == "mmio" else [],
+            window_duration_ns=MMIO_WINDOW_NS if capture == "mmio" else None,
+            log_max_bytes=MMIO_MAX_BYTES, log_max_lines=MMIO_MAX_LINES, log_max_line_bytes=MMIO_MAX_LINE_BYTES,
+            interpretation="Single-machine/count only. MMIO capture adds four cuts and trace IO; "
+            "its timings are diagnostic, not a baseline. Log prefixes are host wall time, not guest timestamps. "
+            "MMIO addresses are absolute; PCs identify icount rewind sites, not extra device deliveries. "
+            "JIT TB count is resident blocks, not total translations; retain flush/invalidation counts. "
+            "External sampling is separate: preserve collector warnings and unresolved PCs. "
+            "Capture=none disables this tool's tracing, not externally applied profilers.")
     attribution_assets(qemu, directory, item["assets"])
     for workload in ("wfi", "busy-mmio"):
-        for topology in ("machine", "four-wheel"):
-            for mode in ("count", "json", "file"):
+        for topology in (("machine",) if native_cost else ("machine", "four-wheel")):
+            for mode in (("count",) if native_cost else ("count", "json", "file")):
                 cell = {"workload": workload, "topology": topology, "output": mode,
                         "status": "FAIL", "planned_runs": repeat, "runs": []}
                 item["cells"].append(cell)
@@ -543,7 +745,7 @@ def attribution(item, qemu, directory, repeat):
                     row = {"run": index + 1}
                     cell["runs"].append(row)
                     attribution_run(workload, topology, mode, item["assets"],
-                        directory / f"{workload}-{topology}-{mode}-{index + 1}", row)
+                        directory / f"{workload}-{topology}-{mode}-{index + 1}", row, capture=capture)
                 statuses = {row["status"] for row in cell["runs"]}
                 cell["status"] = "FAIL" if "FAIL" in statuses else "BLOCKED" if "BLOCKED" in statuses else "PASS"
                 passed = [row for row in cell["runs"] if row["status"] == "PASS"]
@@ -560,12 +762,16 @@ def attribution(item, qemu, directory, repeat):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--case", choices=("host", "single", "dual", "all", "attribution"), default="all")
+    parser.add_argument("--case", choices=("host", "single", "dual", "all", "attribution", "native-cost"), default="all")
+    parser.add_argument("--capture", choices=("none", "mmio"), default=None,
+                        help="native-cost only: bounded QEMU MMIO/EXEC logs (default: none)")
     parser.add_argument("--repeat", type=int, choices=range(1, 11), default=3)
     parser.add_argument("--qemu", type=Path, default=Path(os.environ.get(
         "QEMU_SYSTEM_ARM", ROOT / "build/qemu/qemu-system-arm")))
     parser.add_argument("--report", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.capture is not None and args.case != "native-cost":
+        parser.error("--capture is only valid with --case native-cost")
     payload = {"status": "FAIL", "python": sys.version, "platform": platform.platform(),
         "initial_usage": usage(), "cases": {}, "limits":
         "Instrumented fixed workloads, observer/JSON costs included; no realtime claim. "
@@ -573,19 +779,23 @@ def main(argv=None):
         "Native scenes: 200ms/1ms quantum; host: 10000 idle cuts or 100x100 CAN frames. "
         "Host queues128/history16; native observation budget8192; build Debug. "
         "No trace file is produced; JSON volume is measured separately from MCAP."}
-    if args.case == "attribution":
+    if args.case in ("attribution", "native-cost"):
         payload["limits"] = ("Fixed12-cell execution attribution,65536 event/16384 UART byte bounds per run, "
             "200ms/1ms quantum, startup10s/host30s. File mode creates CLI JSONL; no MCAP. "
             "See cases.attribution.conditions for inclusive instrumentation and precision limits.")
+    if args.case == "native-cost":
+        payload["limits"] = ("Fixed WFI/busy-MMIO single-machine/count workloads;200ms, "
+            "200cuts without trace or204cuts with four10us trace windows. See cases.native-cost.conditions. "
+            "Log capacity exhaustion/truncation fails. Trace/sampling times do not establish baseline performance.")
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("x", encoding="utf-8") as output:
         try:
             for name in (("host", "single", "dual") if args.case == "all" else (args.case,)):
                 item = payload["cases"][name] = {"status": "FAIL", "runs": []}
                 try:
-                    if name == "attribution":
+                    if name in ("attribution", "native-cost"):
                         attribution(item, args.qemu, args.report.parent / (args.report.stem + "-assets"),
-                                    args.repeat)
+                                    args.repeat, native_cost=name == "native-cost", capture=args.capture or "none")
                         continue
                     if name != "host":
                         if not args.qemu.is_file() or not os.access(args.qemu, os.X_OK):
