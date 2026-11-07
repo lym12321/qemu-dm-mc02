@@ -1,6 +1,5 @@
 """Pure referee-domain configuration; no board, application or native owner."""
 
-from collections.abc import Mapping
 from dataclasses import fields as dataclass_fields
 
 from sim.config.yaml import ManifestError, fields
@@ -12,15 +11,9 @@ from .engine import (
 from .messages import Buff, GameStatus, PowerHeat, RobotStatus
 
 
-def _mapping(value, allowed, required, label):
-    if not isinstance(value, Mapping):
-        raise ManifestError(f"{label} must be a mapping")
-    return fields(dict(value), allowed, required, label)
-
-
 def _record(record_type, value, label):
     names = tuple(field.name for field in dataclass_fields(record_type))
-    return record_type(**_mapping(value, names, names, label))
+    return record_type(**fields(value, names, names, label))
 
 
 def parse_referee_events(value, label="referee events"):
@@ -32,7 +25,7 @@ def parse_referee_events(value, label="referee events"):
     result = []
     for index, configuration in enumerate(value):
         where = f"{label}[{index}]"
-        item = _mapping(configuration, ("offset_ns", *kinds), ("offset_ns",), where)
+        item = fields(configuration, ("offset_ns", *kinds), ("offset_ns",), where)
         selected = [kind for kind in kinds if kind in item]
         if len(selected) != 1:
             raise ManifestError(f"{where} must contain exactly one referee event value")
@@ -49,10 +42,10 @@ def parse_referee_events(value, label="referee events"):
 def parse_referee_configuration(options, label="referee"):
     """Return existing engine constructor values without constructing an engine."""
     required = ("initial", "durations")
-    item = _mapping(options, (*required, "events", "cooling_42mm_per_s"), required, label)
+    item = fields(options, (*required, "events", "cooling_42mm_per_s"), required, label)
     groups = {"game": GameStatus, "robot": RobotStatus,
               "power_heat": PowerHeat, "buff": Buff}
-    initial_values = _mapping(item["initial"], groups, groups, label + ".initial")
+    initial_values = fields(item["initial"], groups, groups, label + ".initial")
     initial = RefereeState(**{name: _record(kind, initial_values[name], label + ".initial." + name)
                               for name, kind in groups.items()})
     result = {"initial": initial,

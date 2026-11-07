@@ -48,7 +48,7 @@ def _imu_bindings(value):
 
 
 def _configuration(spec):
-    options = dict(spec.options)
+    options = spec.options
     fields(options, {"model", "joints", "control", "imus"}, {"model"}, spec.name)
     if options.get("control", "direct") not in ("direct", "bound"):
         raise ValueError("MuJoCo control must be direct or bound")

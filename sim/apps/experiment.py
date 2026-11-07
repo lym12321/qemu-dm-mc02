@@ -7,7 +7,6 @@ Matching uses the shared pure evaluator, without importing a native Lab adapter.
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-import hashlib
 from pathlib import Path
 from time import monotonic
 
@@ -54,14 +53,6 @@ class ExperimentResult:
     @property
     def passed(self):
         return not self.failures and all(item == "pass" for item in self.status)
-
-
-def _plain(value):
-    if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, tuple):
-        return tuple(_plain(item) for item in value)
-    return value
 
 
 class _Consumer:
@@ -178,8 +169,7 @@ class _Consumer:
         if event.kind == "snapshot" and event.source_node in self.snapshot_endpoints:
             if event.mapped_time_ns != event.delivery_time_ns:
                 raise ValueError("digital snapshot requires its completed observation cut")
-            snapshot = _plain(event.payload)
-            digital = {qualified: digital_level(local, snapshot)
+            digital = {qualified: digital_level(local, event.payload)
                        for qualified, local in self.snapshot_endpoints[event.source_node]}
         elif event.kind in ("uart", "net.uart.delivery"):
             data = event.payload
@@ -333,14 +323,14 @@ def _admit_observations(duration_ns, descriptions, connected, assertions, ready)
         assertion_endpoint("uart_contains", str(item.endpoint))
     admitted, origins = [], []
     for index, value in enumerate(assertions):
-        value = _plain(value)
-        if not isinstance(value, dict):
+        if not isinstance(value, Mapping):
             raise TypeError("experiment assertions require mappings")
-        origin = value.pop("origin", "ready")
+        origin = value.get("origin", "ready")
         if origin not in ("session", "ready"):
             raise ValueError("assertion origin must be session or ready")
         origins.append(origin)
-        admitted.append(parse_assertion(value, index, endpoint_validator=assertion_endpoint))
+        condition = {key: item for key, item in value.items() if key != "origin"}
+        admitted.append(parse_assertion(condition, index, endpoint_validator=assertion_endpoint))
     admitted = tuple(admitted)
     if any(item.before_ns > duration_ns for item in admitted):
         raise ValueError("assertion deadline exceeds scene duration")
@@ -410,7 +400,7 @@ def _trace_config(scene, descriptions, assertions, ready):
         "quantum_ns": scene.quantum_ns,
         "ready": tuple({"name": item.name, "endpoint": str(item.endpoint), "text": item.text}
                        for item in ready),
-        "assertions": tuple(_plain(value) for value in assertions),
+        "assertions": tuple(assertions),
         # Preserve all declared observation capabilities for replacement
         # assertions, including snapshot-backed GPIOs not named in this run.
         "descriptions": {name: {
@@ -665,21 +655,19 @@ def _replay_plan(config, assertions):
     return _ReplayPlan(duration, quantum, ready, admitted, snapshots, observations, descriptions, origins)
 
 
-class _DigestInput:
-    """Hash exactly the bytes consumed by the canonical bounded MCAP reader."""
+def replay_experiment(source, assertions=None) -> ExperimentResult:
+    """Reevaluate a complete finite transcript without factories or native IO.
 
-    def __init__(self, source):
-        self.source = source
-        self.digest = hashlib.sha256()
-
-    def read(self, size):
-        data = self.source.read(size)
-        if type(data) is bytes:
-            self.digest.update(data)
-        return data
-
-
-def _replay_pass(source, records, assertions, expected_config=None):
+    Default assertions are the recorded originals. Replacement mappings use the
+    same grammar and all captured public capabilities. Read the borrowed blocking
+    binary stream from its MCAP header through EOF once. Container and lifecycle
+    validation complete before returning any result. The stream remains open;
+    errors propagate without retry.
+    """
+    _, records = _trace_api()
+    if assertions is not None and (not isinstance(assertions, (tuple, list)) or
+                                   len(assertions) > MAX_EXPERIMENT_ITEMS):
+        raise ValueError("experiment requires at most 1024 assertion mappings")
     config = plan = consumer = summary = None
     previous_cut = pending_cut = None
     cuts_total = 0
@@ -688,8 +676,6 @@ def _replay_pass(source, records, assertions, expected_config=None):
             if config is not None:
                 raise ValueError("duplicate experiment trace configuration")
             config = record.data
-            if expected_config is not None and config != expected_config:
-                raise ValueError("experiment trace configuration changed between passes")
             plan = _replay_plan(config, assertions)
             consumer = _Consumer(plan.assertions, plan.duration_ns, plan.snapshots,
                                  plan.observations, ready=plan.ready, assertion_origins=plan.assertion_origins,
@@ -741,36 +727,4 @@ def _replay_pass(source, records, assertions, expected_config=None):
             consumer.boards != summary["boards"]):
         raise ValueError("experiment trace completion differs from its captured lifecycle")
     consumer.finish(end)
-    result = _result(consumer, end, consumer.sequence + 1)
-    return config, result
-
-
-def replay_experiment(source, assertions=None) -> ExperimentResult:
-    """Reevaluate a complete finite transcript without factories or native IO.
-
-    Default assertions are the recorded originals. Replacement mappings use the
-    same grammar and all captured public capabilities. The borrowed blocking
-    read/seek/tell stream must start at zero and remain unchanged. Two complete
-    container/lifecycle passes and equal SHA256 digests precede any result.
-    Successful calls leave EOF; errors neither retry, rewind again nor close.
-    """
-    _, records = _trace_api()
-    if any(not callable(getattr(source, name, None)) for name in ("read", "seek", "tell")):
-        raise TypeError("experiment replay input requires read/seek/tell")
-    position = source.tell()
-    if type(position) is not int or position != 0:
-        raise ValueError("experiment replay input must start at byte zero")
-    if assertions is not None and (not isinstance(assertions, (tuple, list)) or
-                                   len(assertions) > MAX_EXPERIMENT_ITEMS):
-        raise ValueError("experiment requires at most 1024 assertion mappings")
-    first = _DigestInput(source)
-    config, _ = _replay_pass(first, records, assertions)
-    source.seek(0)
-    position = source.tell()
-    if type(position) is not int or position != 0:
-        raise ValueError("experiment replay could not rewind to byte zero")
-    second = _DigestInput(source)
-    _, result = _replay_pass(second, records, assertions, expected_config=config)
-    if first.digest.digest() != second.digest.digest():
-        raise ValueError("experiment trace bytes changed between passes")
-    return result
+    return _result(consumer, end, consumer.sequence + 1)

@@ -9,6 +9,7 @@ approximation of the GPIO latch and does not establish electrical LED drive.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 import re
 import socket
@@ -25,19 +26,19 @@ def _integer(value, name: str, maximum: int | None = None) -> None:
         raise ValueError(f"{name} is out of range")
 
 
-def _object(value, name: str) -> dict:
-    if not isinstance(value, dict):
+def _object(value, name: str) -> Mapping:
+    if not isinstance(value, Mapping):
         raise TypeError(f"{name} must be an object")
     return value
 
 
-def _field(value: dict, name: str, path: str):
+def _field(value: Mapping, name: str, path: str):
     if name not in value:
         raise ValueError(f"{path}.{name} is missing")
     return value[name]
 
 
-def validate_snapshot(value) -> dict:
+def validate_snapshot(value) -> Mapping:
     """Validate schema 1 in place; preserve the native object and extra fields."""
     state = _object(value, "board-state")
     schema = _field(state, "schema", "board-state")
@@ -83,7 +84,7 @@ def _digital_pin(endpoint: str) -> str | None:
     return None
 
 
-def digital_level(endpoint: str, snapshot: dict) -> int:
+def digital_level(endpoint: str, snapshot: Mapping) -> int:
     """Project an admitted native snapshot without QMP or hardware state."""
     pin = _digital_pin(endpoint)
     state = validate_snapshot(snapshot)

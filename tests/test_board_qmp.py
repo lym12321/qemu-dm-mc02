@@ -13,6 +13,7 @@ from sim.boards import (
     QemuBoard, drain_paused_can, observe_initial_paused_can, validate_gpio_pin,
     validate_snapshot, wait_paused_can_input,
 )
+from sim.api.topology import immutable
 from sim.transports.can_stream import CanStream
 
 
@@ -75,6 +76,20 @@ def test_literal_snapshot_and_digital_aliases_preserve_native_fields():
     assert board.digital("led", state) == 0
     assert len(qmp.commands) == 1
     assert not qmp.closed
+
+
+def test_completed_event_snapshot_can_be_projected_without_copying():
+    state = immutable(native_state())
+    board = QemuBoard(Qmp())
+    assert validate_snapshot(state) is state
+    assert board.digital("gpio.B0", state) == 1
+    assert board.digital("gpio.B4", state) == 0
+    assert board.digital("key", state) == 0
+    assert board.digital("led", state) == 1
+    invalid = native_state()
+    invalid["gpio"]["B"]["sampled"] = True
+    with pytest.raises(TypeError, match="gpio.B.sampled"):
+        board.digital("gpio.B0", immutable(invalid))
 
 
 @pytest.mark.parametrize("method,args", [

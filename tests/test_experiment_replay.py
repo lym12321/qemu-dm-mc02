@@ -332,85 +332,58 @@ def test_no_result_before_complete_container_validation(damage):
         replay_experiment(BytesIO(data))
 
 
-def test_stream_is_borrowed_bounded_and_read_twice_with_one_rewind():
+def test_stream_is_borrowed_bounded_and_read_once_without_seek_or_tell():
     data, online = capture()
 
-    class Borrowed(BytesIO):
+    class Borrowed:
         def __init__(self, data):
-            super().__init__(data)
-            self.rewinds = self.eofs = 0
+            self.source = BytesIO(data)
+            self.bytes_read = self.eofs = 0
+            self.closed = False
 
         def read(self, size):
             assert 0 <= size < 70000
-            result = super().read(size)
+            assert self.eofs == 0
+            result = self.source.read(size)
+            self.bytes_read += len(result)
             self.eofs += not result
             return result
 
-        def seek(self, offset, whence=0):
-            assert offset == whence == 0
-            self.rewinds += 1
-            return super().seek(offset, whence)
+        def close(self):
+            self.closed = True
 
     source = Borrowed(data)
     assert replay_experiment(source) == online
-    assert source.rewinds == 1 and source.eofs == 2 and not source.closed
-    source = BytesIO(data)
-    source.seek(1)
-    with pytest.raises(ValueError, match="byte zero"):
-        replay_experiment(source)
-    with pytest.raises(TypeError, match="read/seek/tell"):
+    assert source.bytes_read == len(data) and source.eofs == 1 and not source.closed
+    with pytest.raises(TypeError, match="callable read"):
         replay_experiment(object())
 
 
-@pytest.mark.parametrize("operation", ["read", "seek", "tell"])
-def test_replay_stream_errors_propagate_without_close_or_retry(operation):
+@pytest.mark.parametrize("at_eof", [False, True])
+def test_replay_read_errors_propagate_without_close_or_retry(at_eof):
     data, _ = capture()
     primary = OSError("borrowed input diagnostic")
 
     class Input(BytesIO):
-        rewinds = 0
+        failed = False
 
         def read(self, size):
-            if operation == "read":
+            assert not self.failed
+            if not at_eof or super().tell() == len(data):
+                self.failed = True
                 raise primary
             return super().read(size)
 
         def seek(self, offset, whence=0):
-            self.rewinds += 1
-            if operation == "seek":
-                raise primary
-            return super().seek(offset, whence)
+            raise AssertionError("replay must not seek its input")
 
         def tell(self):
-            if operation == "tell":
-                raise primary
-            return super().tell()
+            raise AssertionError("replay must not inspect its input position")
 
     source = Input(data)
     with pytest.raises(OSError) as caught:
         replay_experiment(source)
-    assert caught.value is primary and not source.closed
-    assert source.rewinds == (1 if operation == "seek" else 0)
-
-
-def test_individually_valid_changed_second_pass_is_rejected_by_byte_digest():
-    data, _ = capture(inputs=(ExperimentInput(3, "board.uart", b"unused A"),))
-
-    def change(records):
-        return [replace(item, data=replace(item.data, payload=b"unused B"))
-                if item.kind == "event" and item.data.kind == "uart" else item for item in records]
-
-    second = rewrite(data, change)
-    assert replay_experiment(BytesIO(data)) == replay_experiment(BytesIO(second))
-
-    class Changing(BytesIO):
-        def seek(self, offset, whence=0):
-            assert offset == whence == 0
-            self.__init__(second)
-            return 0
-
-    with pytest.raises(ValueError, match="bytes changed between passes"):
-        replay_experiment(Changing(data))
+    assert caught.value is primary and source.failed and not source.closed
 
 
 @pytest.mark.parametrize("failure", ["runtime", "cleanup", "both", "write", "flush"])
@@ -559,7 +532,7 @@ def multi_machine_capture():
                     uart_assert("west.uart", "startup", "10ns")))
 
 
-def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive_two_pass_replay():
+def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive_replay():
     data, online = multi_machine_capture()
     assert replay_experiment(BytesIO(data)) == online
     assert (online.origin_ns, online.end_ns, online.status) == (10, 30, ("pass", "fail"))

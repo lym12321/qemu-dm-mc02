@@ -4,6 +4,7 @@ This module reads configuration files only; it opens no simulation resources.
 UART text may include NUL bytes. Consumers separately admit process paths/argv.
 """
 
+from collections.abc import Mapping
 from pathlib import Path
 import re
 
@@ -71,9 +72,9 @@ def _unique_mapping(loader, node):
 _BoundedLoader.add_constructor("tag:yaml.org,2002:map", _unique_mapping)
 
 
-def fields(value, allowed, required, label: str) -> dict:
+def fields(value, allowed, required, label: str) -> Mapping:
     """Reject unknown or absent keys in one schema mapping."""
-    if type(value) is not dict:
+    if not isinstance(value, Mapping):
         raise ManifestError(f"{label} must be a mapping")
     unknown = set(value) - set(allowed)
     missing = set(required) - set(value)

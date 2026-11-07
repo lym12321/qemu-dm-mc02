@@ -419,12 +419,12 @@ sim replay observations.mcap --assertions assertions.yaml --report revised.json
 沿用相同 endpoint、origin、before 和断言语法，不能为未记录能力制造观察。
 
 在线与离线共用消费者，不按源时间重排。离线重新构建 ready receipts、每板 epoch 与 batch 汇总，
-并与结束记录核对；两遍完整校验 MCAP CRC/footer/EOF、计数和字节 SHA256 后才返回。
+并与结束记录核对；单遍读取完整校验 MCAP CRC/footer/EOF 和计数后才返回结果。
 离线只重新评估捕获观察，**不会重跑固件、输入或物理演化**，也不认证文件作者或硬件真实性。
 
 Python 使用借用的 binary stream：`run_experiment(..., trace=output)` 与
 `replay_experiment(source, assertions=None)` 返回同一 `ExperimentResult`。
-输入需 `read/seek/tell`、从字节 0 开始且调用期间不变；函数不关闭借用流。
+输入只需阻塞式 `read(size)`，从 MCAP 文件头读到 EOF；无需 seek/tell，函数不关闭借用流。
 CLI 排他创建 trace/report，不覆盖已有文件。失败断言也可得到完整记录；执行、清理、
 写入或晚期 flush/close 错误均不发布成功，已发生 I/O 不回滚。
 

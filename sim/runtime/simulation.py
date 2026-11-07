@@ -76,7 +76,7 @@ class ComponentContext:
     @property
     def not_before_ns(self) -> int:
         self._check_active()
-        return self._simulation._not_before_ns
+        return self._simulation._dispatch_time_ns
 
     @property
     def connected_ports(self) -> tuple[str, ...]:
@@ -252,7 +252,6 @@ class Simulation:
         self._host_deadline = math.inf
         self._borrowed_deadline = False
         self._dispatch_time_ns = 0
-        self._not_before_ns = 0
         self._phase = "new"
         self._stepping = False
         self._closing = False
@@ -461,7 +460,7 @@ class Simulation:
             self._host_deadline = begun + self.host_timeout_s
             self._deadline = min(self._host_deadline, begun + self.startup_timeout_s)
         self.session = self._initial_session
-        self.t_sim_ns = self._dispatch_time_ns = self._not_before_ns = self.session.t_sim_ns
+        self.t_sim_ns = self._dispatch_time_ns = self.session.t_sim_ns
         try:
             self._create_resources()
             self._check_deadline()
@@ -531,7 +530,6 @@ class Simulation:
 
     def _settle(self, cut: int) -> None:
         self._dispatch_time_ns = cut
-        self._not_before_ns = cut
         remaining = self.dispatch_budget
         dispatchers = tuple((name, component) for name, component in self._owned
                             if "dispatch" in self._descriptions[name].capabilities)
@@ -609,7 +607,6 @@ class Simulation:
                           target, target - self.t_sim_ns)
         results = {}
         self._dispatch_time_ns = target
-        self._not_before_ns = target
         self._phase = "machine preflight"
         for name, component in self._owned:
             if "machine" in self._descriptions[name].capabilities:
@@ -753,7 +750,7 @@ class Simulation:
         self._inputs.clear()
         self.step_id = 0
         self.session = Session(previous_session + 1, self._initial_session.t_sim_ns)
-        self.t_sim_ns = self._dispatch_time_ns = self._not_before_ns = self.session.t_sim_ns
+        self.t_sim_ns = self._dispatch_time_ns = self.session.t_sim_ns
         self._deadline = (self._host_deadline if self._borrowed_deadline else
                           min(self._host_deadline, monotonic() + self.startup_timeout_s))
         try:

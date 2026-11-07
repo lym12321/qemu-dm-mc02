@@ -35,7 +35,6 @@ class DigitalNet(_SampledFanout):
 
     def _reset_sample_state(self):
         self._level = None
-        self._active = False
 
     def _validate_sample(self, sample, cut):
         if not isinstance(sample, DigitalSample):
@@ -46,17 +45,16 @@ class DigitalNet(_SampledFanout):
                 sample.mapped_time_ns < self._sample.mapped_time_ns
                 or sample.source_time_ns < self._sample.source_time_ns):
             raise ValueError(f'digital source {self._driver[0]} sample time must not decrease')
-        if self._active and sample.level is None:
+        if self._level is not None and sample.level is None:
             raise RuntimeError(f'digital source {self._driver[0]} lost output drive after activation; '
                                'release is unsupported')
         return sample.level is not None and sample.level != self._level
 
     def _commit_sample(self, sample):
         self._level = sample.level
-        self._active = sample.level is not None
 
     def _sample_payload(self, sample, changed):
-        return {'level': sample.level, 'active': self._active, 'changed': changed}
+        return {'level': sample.level, 'active': self._level is not None, 'changed': changed}
 
     def _delivery_value(self, sample):
         return sample.level
@@ -65,7 +63,7 @@ class DigitalNet(_SampledFanout):
         return {'level': sample.level}
 
     def observe(self):
-        return immutable({'active': self._active, 'level': self._level,
+        return immutable({'active': self._level is not None, 'level': self._level,
                           'sample_time_ns': self._sample_cut, 'pending': self.pending,
                           'failed': self._failed is not None})
 

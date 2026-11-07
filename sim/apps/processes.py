@@ -40,7 +40,7 @@ def admit_commands(value, cwd):
     result = []
     for name, configuration in value.items():
         identifier(name, 'command name')
-        item = fields(dict(configuration), {'command'}, {'command'}, name)
+        item = fields(configuration, {'command'}, {'command'}, name)
         argv = item['command']
         if not isinstance(argv, (list, tuple)) or not 1 <= len(argv) <= 128:
             raise ManifestError('command must contain 1..128 arguments')
@@ -139,7 +139,7 @@ class HostProcessesFactory:
         self.allow_launch = allow_launch
 
     def _commands(self, spec):
-        fields(dict(spec.options), {'commands'}, {'commands'}, spec.name)
+        fields(spec.options, {'commands'}, {'commands'}, spec.name)
         return admit_commands(spec.options['commands'], spec.base_dir)
 
     def describe(self, spec):

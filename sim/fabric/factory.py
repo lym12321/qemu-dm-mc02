@@ -280,7 +280,8 @@ class CanBusFactory:
         CanBusFactory.describe(spec).port(port)
         if port != "fault" or "fault" in connected_ports:
             raise ValueError("CAN fault accepts external input only")
-        if type(payload) is not str or payload not in _fault_profiles(spec):
+        if (type(payload) is not str or
+                payload != "normal" and payload not in spec.options["fault_profiles"]):
             raise ValueError("CAN fault input requires a configured profile name or normal")
         return payload
 

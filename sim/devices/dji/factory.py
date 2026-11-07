@@ -8,7 +8,7 @@ from sim.fabric.factory import BorrowedCanPort
 
 
 def _configuration(spec):
-    options = dict(spec.options)
+    options = spec.options
     joint = options.get("plant") == "joint"
     state_fields = {"joint"} if joint else {"position_rad", "velocity_rad_s"}
     fields(options, {"motor_id", "plant", "position_rad", "velocity_rad_s",
@@ -76,9 +76,8 @@ def _configuration(spec):
 class FixedRotor:
     """Own one protocol device with configured, unchanging rotor state."""
 
-    def __init__(self, spec, context):
+    def __init__(self, spec, context, options):
         from .device import M3508Device
-        options = _configuration(spec)
         self.position = options.pop("position_rad")
         self.velocity = options.pop("velocity_rad_s")
         self.device = M3508Device(BorrowedCanPort(context), name=spec.name, **options)
@@ -138,7 +137,7 @@ class M3508Factory:
     def create(self, spec, context):
         options = _configuration(spec)
         if spec.options["plant"] == "fixed-rotor":
-            return FixedRotor(spec, context)
+            return FixedRotor(spec, context, options)
         if spec.options["plant"] == "joint":
             return _JointMotor(spec, context, options)
         from sim.physics import Rotor
