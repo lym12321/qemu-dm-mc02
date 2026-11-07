@@ -117,9 +117,11 @@ jobs:
           # QEMU 8.2's mkvenv generates a malformed file://D:/ wheel URL.
           # Install the same source-pinned wheel using pip's normal path input.
           python -m pip install --no-index --find-links qemu/upstream/python/wheels meson==1.2.3
+          package_prefix=$(cygpath -m "$PWD/build/install")
           mkdir -p build/qemu
           cd build/qemu
           ../../qemu/upstream/configure --target-list=arm-softmmu --with-devices-arm=dm-mc02 \
+            --prefix="$package_prefix" \
             --disable-docs --disable-werror --disable-capstone --disable-slirp \
             --disable-sdl --disable-gtk --disable-plugins --enable-fdt=internal \
             --enable-download -Dbuildtype=release -Dqom_cast_debug=false
