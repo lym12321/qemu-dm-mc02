@@ -28,7 +28,7 @@ jobs:
       - name: Build the existing bare-metal example
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi cmake
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi cmake
           cmake -S examples/minimal-board -B build/guest -DCMAKE_BUILD_TYPE=Debug
           cmake --build build/guest
       - uses: actions/upload-artifact@v4
@@ -57,7 +57,10 @@ jobs:
           name: package-test-firmware
           path: build/guest
       - name: Build the pinned QEMU with system tools
-        run: bash tools/build-qemu.sh
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE/qemu/upstream"
+          bash tools/build-qemu.sh
       - name: Package binary, licenses and corresponding sources
         run: |
           python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm --output dist/dm-mc02-linux-x86_64
@@ -111,6 +114,9 @@ jobs:
       - name: Build using upstream QEMU's MinGW support
         shell: msys2 {0}
         run: |
+          # QEMU 8.2's mkvenv generates a malformed file://D:/ wheel URL.
+          # Install the same source-pinned wheel using pip's normal path input.
+          python -m pip install --no-index --find-links qemu/upstream/python/wheels meson==1.2.3
           mkdir -p build/qemu
           cd build/qemu
           ../../qemu/upstream/configure --target-list=arm-softmmu --with-devices-arm=dm-mc02 \
