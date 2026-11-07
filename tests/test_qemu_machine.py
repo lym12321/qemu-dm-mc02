@@ -769,7 +769,8 @@ def test_connected_imu_uses_one_owned_cosim_and_completed_cut_delivery(firmware,
         assert actions[0][:2] == ('imu start', 71)
         # start() shares the startup deadline; successful startup then exposes
         # the longer active deadline through the same live context property.
-        assert sim._deadline - actions[0][2] == sim.host_timeout_s - sim.startup_timeout_s
+        assert sim._deadline - actions[0][2] == pytest.approx(
+            sim.host_timeout_s - sim.startup_timeout_s, rel=0, abs=1e-9)
         assert actions[1:] == [('source', 0), ('imu receive', 0, 71), ('imu commit', 0, 71)]
         assert not any(name == 'x-run-to-virtual-time' for name, _ in backend.commands)
         with pytest.raises(ValueError, match='cannot accept external'):
