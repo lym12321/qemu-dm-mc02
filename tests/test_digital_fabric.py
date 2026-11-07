@@ -6,11 +6,20 @@ import pytest
 
 from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Session, Topology
 from sim.fabric.digital import DigitalNet, DigitalNetFactory, DigitalSample
+from sim.runtime import Simulation, SimulationState
 
 
 class Context:
     def __init__(self):
         self.events = []
+        self.failures = []
+
+    def fail(self, error):
+        self.failures.append(error)
+        return error
+
+    def check_io(self):
+        pass
 
     def emit(self, port, kind, payload, **metadata):
         self.events.append((port, kind, payload, metadata))
@@ -196,7 +205,7 @@ def test_sink_failure_preserves_partial_effects_and_freezes_without_replaying_br
     net.sample(0)
     with pytest.raises(OSError) as caught:
         net.dispatch(0, 1)
-    assert caught.value is error
+    assert caught.value is error and context.failures == [error]
     assert any('source.pin to sink1.pin' in note for note in error.__notes__)
     assert order == [('sink0', 1)] and net.pending == 0
     assert [event[2]['destination'] for event in context.events
@@ -265,3 +274,32 @@ def test_fanout_is_bounded_before_callbacks_or_source_reads():
         attach(fresh, Sink('extra', order), 'extra', 'in')
     assert source.reads == 0 and order == []
     fresh.close()
+
+
+def test_direct_paused_sample_failure_freezes_before_more_source_reads():
+    graph, registry = topology('out', 'in')
+    reads, deliveries = [], []
+    sample = DigitalSample(1, 0, 0)
+
+    def create(spec, context):
+        if spec.options['role'] == 'out':
+            def read():
+                reads.append(context.t_sim_ns)
+                return sample
+            peer = SimpleNamespace(read_digital=read, close=lambda: None)
+        else:
+            peer = SimpleNamespace(receive_digital=deliveries.append, close=lambda: None)
+        context.attach('pin', peer)
+        return peer
+
+    registry['fixture.endpoint'].create = create
+    with Simulation(graph, registry) as sim:
+        assert deliveries == [1] and reads == [0]
+        sample = DigitalSample(None, 1, 1)
+        with pytest.raises(RuntimeError, match='lost output drive') as caught:
+            sim.components['wire'].sample(1)
+        assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+        assert sim.t_sim_ns == 0 and deliveries == [1] and reads == [0, 0]
+        with pytest.raises(RuntimeError):
+            sim.components['wire'].sample(2)
+        assert reads == [0, 0]

@@ -85,7 +85,32 @@ class ComponentContext:
 
     def check_deadline(self) -> None:
         self._check_active()
-        self._simulation._check_deadline()
+        if self._simulation._closing or self._simulation.state == SimulationState.CLOSED:
+            raise RuntimeError("component deadline checks cannot run during cleanup")
+        try:
+            self._simulation._check_deadline()
+        except BaseException as error:
+            raise self.fail(error)
+
+    def fail(self, error: BaseException) -> BaseException:
+        """Report a terminal component error and return the session's first error.
+
+        Borrowed operations can fail while Simulation is paused. Report only
+        errors that make continued execution unsafe, not pure admission errors
+        or explicitly retryable backpressure. Effects are retained; this does
+        not close resources, retry work or advance time. Failed runs require a
+        new Simulation. If this session has ended or is closing, re-raise the
+        supplied error without changing Simulation. This preserves errors from
+        callbacks that reset/close their session; cleanup errors still travel
+        through the resource close path.
+        """
+        if not isinstance(error, BaseException):
+            raise TypeError("component failure requires an exception")
+        sim = self._simulation
+        if (not self._active or self.session is not sim.session
+                or sim._closing or sim.state == SimulationState.CLOSED):
+            raise error
+        return sim._freeze_failure(error)
 
     def check_io(self) -> None:
         """Admit borrowed-handle IO only after wiring and before cleanup."""
@@ -134,6 +159,8 @@ class ComponentContext:
              delivery_time_ns: int | None = None,
              quality: TimeQuality | str = TimeQuality.EXACT) -> Event:
         self._check_active()
+        if self._simulation._closing or self._simulation.state == SimulationState.CLOSED:
+            raise RuntimeError("component observations cannot run during cleanup")
         if port is not None:
             self._simulation._descriptions[self.node_id].port(port)
         return self._simulation._emit(self.node_id, port, kind, payload,
@@ -311,7 +338,13 @@ class Simulation:
               quality: TimeQuality | str = TimeQuality.EXACT) -> Event:
         if self.session is None:
             raise RuntimeError("observations require an active session")
-        self._check_deadline()
+        session = self.session
+        try:
+            self._check_deadline()
+        except BaseException as error:
+            if self.session is not session or self._closing or self.state == SimulationState.CLOSED:
+                raise
+            raise self._freeze_failure(error)
         mapped = self._dispatch_time_ns if mapped_time_ns is None else mapped_time_ns
         delivery = self._dispatch_time_ns if delivery_time_ns is None else delivery_time_ns
         event = Event(self.session.session_id, self.events_total, node, port, kind,
@@ -320,9 +353,17 @@ class Simulation:
             self.events_dropped += 1
         self._events.append(event)
         self.events_total += 1
-        if self.on_event is not None:
-            self.on_event(event)
-            self._check_deadline()
+        try:
+            if self.on_event is not None:
+                self.on_event(event)
+                if self.session is session and not self._closing and self.state != SimulationState.CLOSED:
+                    self._check_deadline()
+        except BaseException as error:
+            # A paused observer may have reset/closed the session. Its later
+            # error still escapes, but cannot freeze a replacement or reopen it.
+            if self.session is not session or self._closing or self.state == SimulationState.CLOSED:
+                raise
+            raise self._freeze_failure(error)
         return event
 
     def _create_resources(self) -> None:

@@ -65,6 +65,27 @@ def test_host_capacity_failure_freezes_and_never_replays_frames():
         host.input("tx", CanFrame(1))
 
 
+def test_paused_can_capacity_failure_immediately_freezes_other_bus():
+    nodes = tuple(node for i in range(2) for node in (
+        NodeSpec(f'bus{i}', 'bus', {'max_pending': 1}),
+        NodeSpec(f'host{i}', 'host'), NodeSpec(f'peer{i}', 'host')))
+    links = tuple(LinkSpec(f'{side}{i}.can', f'bus{i}.can')
+                  for i in range(2) for side in ('host', 'peer'))
+    with Simulation(Topology(nodes, links), {
+            'bus': CanBusFactory(), 'host': CanHostFactory()}) as sim:
+        first, other = (sim.components[f'host{i}'] for i in range(2))
+        first.input('tx', CanFrame(1, data=b'accepted'))
+        with pytest.raises(BufferError) as caught:
+            first.input('tx', CanFrame(2))
+        assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+        assert sim.components['bus0'].pending == 1
+        with pytest.raises(RuntimeError):
+            other.input('tx', CanFrame(3))
+        assert sim.components['bus1'].pending == 0
+        assert not any(event.kind == 'can-host.received' for event in sim.events)
+        assert sim.t_sim_ns == 0
+
+
 def test_host_requires_one_existing_can_owner_before_resource_acquisition():
     with pytest.raises(ValueError):
         Simulation(Topology((NodeSpec("host", "host"),)), {"host": CanHostFactory()})

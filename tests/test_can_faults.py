@@ -17,6 +17,7 @@ class Context:
     def __init__(self):
         self.t_sim_ns = 0
         self.events = []
+        self.failures = []
         self.on_emit = None
         self.io_checks = 0
 
@@ -25,6 +26,10 @@ class Context:
 
     def check_deadline(self):
         pass
+
+    def fail(self, error):
+        self.failures.append(error)
+        return error
 
     def emit(self, port, kind, payload, **times):
         self.events.append((port, kind, payload, times))

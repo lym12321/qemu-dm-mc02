@@ -140,6 +140,7 @@ class _SampledFanout:
     def _check(self, cut):
         if self._closed or not self._initialized or self._failed is not None:
             raise RuntimeError(f'{self._protocol} net requires a successful reset and healthy open state')
+        self._context.check_io()
         if self._busy:
             raise RuntimeError(f'{self._protocol} net execution cannot be reentered')
         check_timestamp(cut)
@@ -151,6 +152,7 @@ class _SampledFanout:
                            source_time_ns=sample.source_time_ns,
                            mapped_time_ns=sample.mapped_time_ns,
                            delivery_time_ns=cut, quality='sampled')
+        self._context.check_io()
 
     def sample(self, cut):
         self._check(cut)
@@ -159,6 +161,7 @@ class _SampledFanout:
         self._busy = True
         try:
             sample = self._driver[1]()
+            self._context.check_io()
             enqueue = self._validate_sample(sample, cut)
             if enqueue and len(self._queue) >= self.max_pending:
                 raise BufferError(f'{self._protocol} pending sample capacity exhausted')
@@ -171,9 +174,9 @@ class _SampledFanout:
             payload = {'source': self._driver[0], **self._sample_payload(sample, enqueue)}
             self._emit(f'net.{self._protocol}.sample', payload, sample, cut)
         except BaseException as error:
-            self._failed = error
-            error.add_note(f'{self._protocol} sampling failed: {self._driver[0]} at {cut} ns')
-            raise
+            self._failed = self._context.fail(error)
+            self._failed.add_note(f'{self._protocol} sampling failed: {self._driver[0]} at {cut} ns')
+            raise self._failed
         finally:
             self._busy = False
 
@@ -191,6 +194,7 @@ class _SampledFanout:
                 for name, receive in self._sinks:
                     try:
                         receive(self._delivery_value(sample))
+                        self._context.check_io()
                         payload = {'source': self._driver[0], 'destination': name,
                                    **self._delivery_payload(sample), 'sequence': sequence, 'due_ns': due}
                         self._emit(f'net.{self._protocol}.delivery', payload, sample, cut)
@@ -200,8 +204,8 @@ class _SampledFanout:
                         raise
             return count
         except BaseException as error:
-            self._failed = error
-            raise
+            self._failed = self._context.fail(error)
+            raise self._failed
         finally:
             self._busy = False
 

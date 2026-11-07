@@ -9,6 +9,8 @@ import importlib.util
 from pathlib import Path
 import sys
 
+from types import SimpleNamespace
+
 import pytest
 
 from sim.fabric import CanBus, CanFrame, VirtualCanDevice
@@ -250,7 +252,9 @@ def test_capacity_rejection_retains_pending_but_freezes_until_reset():
     bus.send(source, first)
     with pytest.raises(BufferError, match="capacity exhausted") as caught:
         bus.send(source, CanFrame(2))
-    assert bus.pending == 1
+    assert bus.pending == 1 and bus.failure is caught.value
+    with pytest.raises(AttributeError):
+        bus.failure = None
     for operation in (lambda: bus.send(source, CanFrame(3)), lambda: bus.step(0),
                       lambda: bus.next_due_ns, lambda: bus.has_due(0)):
         with pytest.raises(BufferError) as repeated:
@@ -258,7 +262,7 @@ def test_capacity_rejection_retains_pending_but_freezes_until_reset():
         assert repeated.value is caught.value
     assert sink.frames == [] and bus.pending == 1
     bus.reset()
-    assert bus.pending == 0 and bus.next_due_ns is None
+    assert bus.pending == 0 and bus.next_due_ns is None and bus.failure is None
     bus.send(source, CanFrame(3))
     assert bus.step(0) == 1
     assert sink.frames == [CanFrame(3)]
@@ -457,3 +461,25 @@ def test_literal_classic_and_fd_records_keep_field_and_padding_bytes():
     assert codec.unpack_wire_frame(wire) == fd
     assert codec.pack_can_frame(fd) == native
     assert codec.unpack_can_frame(native, 9) == fd
+
+
+def test_connection_reports_only_terminal_bus_failures_and_preserves_pure_admission():
+    from sim.fabric.factory import CanConnection
+
+    events, failures = [], []
+    context = SimpleNamespace(
+        not_before_ns=0, check_io=lambda: None,
+        fail=lambda error: failures.append(error) or error,
+        emit=lambda *args, **kwargs: events.append((args, kwargs)))
+    bus = CanBus(max_pending=1)
+    peer = Sink('source')
+    bus.attach(peer)
+    connection = CanConnection(context, 'can', bus, peer)
+    with pytest.raises(ValueError, match='CanFrame'):
+        connection.send(b'not a CAN frame')
+    assert bus.failure is None and failures == events == []
+    connection.send(CanFrame(1))
+    with pytest.raises(BufferError) as caught:
+        connection.send(CanFrame(2))
+    assert failures == [caught.value] and bus.failure is caught.value
+    assert bus.pending == len(events) == 1

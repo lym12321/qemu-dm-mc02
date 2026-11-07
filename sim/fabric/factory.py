@@ -82,7 +82,14 @@ class CanConnection:
 
     def send(self, frame):
         self._context.check_io()
-        self._bus.send(self._endpoint, frame, not_before_ns=self._context.not_before_ns)
+        try:
+            self._bus.send(self._endpoint, frame, not_before_ns=self._context.not_before_ns)
+        except BaseException:
+            # Admission errors leave the independent bus healthy. Only its
+            # terminal latch freezes the enclosing Simulation.
+            if self._bus.failure is not None:
+                raise self._context.fail(self._bus.failure)
+            raise
         self._context.emit(self.port, "can.sent", {"frame": frame},
                            source_time_ns=frame.timestamp_ns,
                            mapped_time_ns=frame.timestamp_ns)
@@ -110,8 +117,9 @@ class CanNetwork:
             raise self._failed
 
     def _freeze(self, error):
+        primary = self._context.fail(error)
         if self._failed is None:
-            self._failed = error
+            self._failed = primary
         return self._failed
 
     def _check_mutation(self):
@@ -121,11 +129,14 @@ class CanNetwork:
             raise self._freeze(RuntimeError("CAN network policy/lifecycle cannot change from a callback"))
 
     def _drop(self, source, destination, frame):
+        self._check_failed()
+        self._context.check_io()
         # Do not short-circuit the borrowed callback: it may observe each peer
         # or raise its own primary error even when a declared rule matches.
         inherited = (bool(self._inherited_drop(source, destination, frame))
                      if self._inherited_drop is not None else False)
         self._check_failed()
+        self._context.check_io()
         rules = self._profiles[self._profile]["drop"]
         if not rules:
             return inherited
@@ -212,12 +223,14 @@ class CanNetwork:
         if self._closed:
             raise RuntimeError("CAN network is closed")
         self._check_failed()
+        self._context.check_io()
         if self._dispatching or self._applying:
             raise self._freeze(RuntimeError("CAN network dispatch cannot reenter"))
         self._dispatching = True
         try:
             result = self.bus.step(cut, max_dispatch=budget)
             self._check_failed()
+            self._context.check_io()
             return result
         except BaseException as error:
             raise self._freeze(error)

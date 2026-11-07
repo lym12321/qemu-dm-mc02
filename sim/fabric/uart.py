@@ -101,6 +101,7 @@ class UartNet:
     def _check(self):
         if self._closed or not self._initialized or self._failed is not None:
             raise RuntimeError('UART net requires a successful reset and healthy open state')
+        self._context.check_io()
 
     def _raise_failure(self):
         if self._failed is not None:
@@ -130,6 +131,7 @@ class UartNet:
                            mapped_time_ns=chunk.mapped_time_ns,
                            delivery_time_ns=cut, quality=chunk.quality)
         self._raise_failure()
+        self._context.check_io()
 
     def _send(self, name, data, context, *, source_time_ns, mapped_time_ns, quality):
         self._check()
@@ -162,8 +164,9 @@ class UartNet:
             self._last_mapped[name] = mapped
             self._emit('net.uart.sent', chunk, sequence, due, context.t_sim_ns)
         except BaseException as error:
+            primary = self._context.fail(error)
             if self._failed is None:
-                self._failed = error
+                self._failed = primary
             raise self._failed
 
     def dispatch(self, cut, budget):
@@ -186,11 +189,13 @@ class UartNet:
                 destination = next(name for name in self._endpoints if name != chunk.source)
                 self._endpoints[destination][1](chunk.data)
                 self._raise_failure()
+                self._context.check_io()
                 self._emit('net.uart.delivery', chunk, sequence, due, cut, destination)
             return count
         except BaseException as error:
+            primary = self._context.fail(error)
             if self._failed is None:
-                self._failed = error
+                self._failed = primary
             self._failed.add_note(f'UART delivery failed at {cut} ns; partial effects are not replayed')
             raise self._failed
         finally:

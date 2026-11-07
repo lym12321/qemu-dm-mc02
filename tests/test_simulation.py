@@ -835,6 +835,125 @@ def test_bounded_event_history_full_callback_and_immutable_payload():
         assert (events[0].source_time_ns, events[0].mapped_time_ns, events[0].delivery_time_ns) == (4, 7, 9)
 
 
+def test_context_failure_immediately_freezes_only_its_simulation_and_keeps_primary():
+    simulation, factory = input_scene()
+    independent, _ = input_scene()
+    with simulation, independent:
+        simulation.step()
+        context = factory.instances[0].context
+        with pytest.raises(TypeError):
+            context.fail("not an exception")
+        assert simulation.state == SimulationState.PAUSED
+        primary = OSError("borrowed IO failed after effect")
+        assert context.fail(primary) is primary
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.failure is primary
+        assert (simulation.t_sim_ns, simulation.step_id) == (10, 1)
+        assert context.fail(ValueError("later failure")) is primary
+        assert any("later failure" in note for note in primary.__notes__)
+        for operation in (context.check_io, simulation.reset, simulation.step):
+            with pytest.raises(RuntimeError):
+                operation()
+        independent.step()
+        assert independent.state == SimulationState.PAUSED
+    assert factory.instances[0].close_count == 1
+
+
+def test_context_failure_cannot_reopen_cleanup_or_contaminate_new_session():
+    rejected = []
+
+    class Closing(Component):
+        def close(self):
+            super().close()
+            for error_type, operation in (
+                    (OSError, lambda: self.context.fail(OSError("cleanup report"))),
+                    (RuntimeError, lambda: self.context.emit(None, "cleanup event", None))):
+                with pytest.raises(error_type):
+                    operation()
+                rejected.append(self.context.session.session_id)
+
+    factory = Factory(Closing)
+    simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory})
+    with simulation:
+        old = factory.instances[0].context
+        simulation.reset()
+        old_error = OSError("old session")
+        with pytest.raises(OSError) as caught:
+            old.fail(old_error)
+        assert caught.value is old_error
+        assert simulation.state == SimulationState.PAUSED and simulation.failure is None
+        current = factory.instances[1].context
+    closed_error = OSError("already closed")
+    with pytest.raises(OSError) as caught:
+        current.fail(closed_error)
+    assert caught.value is closed_error
+    assert simulation.state == SimulationState.CLOSED and simulation.failure is None
+    assert rejected == [1, 1, 2, 2]
+    assert simulation.events_total == 0
+    assert all(item.close_count == 1 for item in factory.instances)
+
+
+@pytest.mark.parametrize("mode", ["raise", "swallow", "replace"])
+def test_paused_observer_failure_freezes_before_emit_returns(mode):
+    primary = ValueError("observer failed after recording")
+    simulation, factory = input_scene()
+    with simulation:
+        context = factory.instances[0].context
+
+        def observe(event):
+            if mode != "raise":
+                assert context.fail(primary) is primary
+                if mode == "swallow":
+                    return
+                raise OSError("replacement")
+            raise primary
+
+        simulation.on_event = observe
+        with pytest.raises(ValueError) as caught:
+            context.emit(None, "recorded", b"effect")
+        assert caught.value is simulation.failure is primary
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.events_total == 1 and simulation.events[0].payload == b"effect"
+        with pytest.raises(ValueError) as repeated:
+            context.emit(None, "must not record", None)
+        assert repeated.value is primary
+        assert simulation.events_total == 1
+        assert simulation.t_sim_ns == simulation.step_id == 0
+
+
+def test_component_deadline_failure_while_paused_is_immediately_terminal(monkeypatch):
+    current = [0.0]
+    monkeypatch.setattr(runtime, "monotonic", lambda: current[0])
+    simulation, factory = input_scene(host_timeout_s=1)
+    with simulation:
+        current[0] = 2
+        with pytest.raises(TimeoutError) as caught:
+            factory.instances[0].context.check_deadline()
+        assert simulation.state == SimulationState.FAILED
+        assert simulation.failure is caught.value
+    assert factory.instances[0].close_count == 1
+
+
+@pytest.mark.parametrize("transition", ["reset", "close"])
+def test_old_observer_failure_cannot_freeze_replaced_or_closed_session(transition):
+    simulation, factory = input_scene()
+    primary = OSError("old observer failed after lifecycle transition")
+    with simulation:
+        old = factory.instances[0].context
+
+        def observe(event):
+            getattr(simulation, transition)()
+            raise primary
+
+        simulation.on_event = observe
+        with pytest.raises(OSError) as caught:
+            old.emit(None, "old session", None)
+        assert caught.value is primary
+        assert simulation.failure is None
+        assert simulation.state == (SimulationState.PAUSED if transition == "reset"
+                                    else SimulationState.CLOSED)
+
+
 def test_reset_rebuilds_every_owned_instance_and_invalidates_old_context():
     simulation, machine, plant, trace = scene()
     with simulation:
@@ -983,9 +1102,11 @@ def test_can_self_excitation_and_queue_capacity_are_bounded(failure):
         if failure == "capacity":
             with pytest.raises(BufferError) as caught:
                 factory.instances[0].link.send(CanFrame(2))
-            with pytest.raises(BufferError) as repeated:
+            assert simulation.state == SimulationState.FAILED
+            assert simulation.failure is caught.value
+            with pytest.raises(RuntimeError, match="paused, healthy"):
                 simulation.step()
-            assert repeated.value is caught.value
+            assert simulation.failure is caught.value
         else:
             with pytest.raises(RuntimeError, match="dispatch budget"):
                 simulation.step()

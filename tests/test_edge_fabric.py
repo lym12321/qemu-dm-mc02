@@ -72,13 +72,93 @@ def test_failure_freezes_without_replaying_delivered_or_pending_edges(failure):
                 source.output.send(DigitalEdge(0, 5000, 2))
         else:
             source.output.send(DigitalEdge(1, 5000, 0))
-        with pytest.raises((BufferError, ValueError, OSError)):
-            sim.run_until(1)
+        if failure == 'receiver':
+            with pytest.raises(OSError):
+                sim.run_until(1)
+        else:
+            assert sim.state == SimulationState.FAILED
+            with pytest.raises(RuntimeError):
+                sim.run_until(1)
         assert sim.state == SimulationState.FAILED
         assert sim.t_sim_ns == 0
         assert sink.received == ([1] if failure == 'receiver' else [])
         with pytest.raises(RuntimeError):
             sim.step()
+
+
+def test_paused_overflow_immediately_freezes_other_network_without_delivery():
+    base = DEMO['simulation']()
+    graph = Topology(tuple(NodeSpec(f'{node.name}{i}', node.kind, node.options)
+                           for i in range(2) for node in base.topology.nodes),
+                     tuple(LinkSpec(f'source{i}.out', f'wire{i}.signal')
+                           for i in range(2)) +
+                     tuple(LinkSpec(f'sink{i}.in', f'wire{i}.signal') for i in range(2)))
+    with Simulation(graph, base.registry) as sim:
+        first, other = (sim.components[f'source{i}'] for i in range(2))
+        first.sent = other.sent = True
+        wire, other_wire = (sim.components[f'wire{i}'] for i in range(2))
+        wire.max_pending = 1
+        first.output.send(DigitalEdge(1, 5000, 0))
+        with pytest.raises(BufferError) as caught:
+            first.output.send(DigitalEdge(0, 5001, 1))
+        assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+        assert sim.t_sim_ns == 0 and wire.pending == 1
+        with pytest.raises(RuntimeError):
+            other.output.send(DigitalEdge(1, 5000, 0))
+        assert other_wire.pending == 0
+        assert sim.components['sink0'].received == sim.components['sink1'].received == []
+        with pytest.raises(RuntimeError):
+            sim.reset()
+
+
+@pytest.mark.parametrize('replacement', [False, True])
+def test_receiver_cannot_hide_other_network_failure_or_continue_fanout(replacement):
+    class Receiver(DEMO['Receiver']):
+        after_receive = None
+
+        def receive_edge(self, edge):
+            super().receive_edge(edge)
+            if self.after_receive is not None:
+                self.after_receive()
+
+    class ReceiverFactory(DEMO['ReceiverFactory']):
+        def create(self, _spec, context):
+            return Receiver(context)
+
+    base = DEMO['simulation']()
+    nodes = tuple(NodeSpec(f'{node.name}{i}', node.kind, node.options)
+                  for i in range(2) for node in base.topology.nodes) + (NodeSpec('last', 'sink'),)
+    links = tuple(link for i in range(2) for link in (
+        LinkSpec(f'source{i}.out', f'wire{i}.signal'),
+        LinkSpec(f'sink{i}.in', f'wire{i}.signal'))) + (LinkSpec('last.in', 'wire0.signal'),)
+    registry = {**base.registry, 'sink': ReceiverFactory()}
+    with Simulation(Topology(nodes, links), registry) as sim:
+        first, other = (sim.components[f'source{i}'] for i in range(2))
+        first.sent = other.sent = True
+        sim.components['wire1'].max_pending = 1
+        errors = []
+
+        def fail_other_network():
+            other.output.send(DigitalEdge(1, 5000, 0))
+            try:
+                other.output.send(DigitalEdge(0, 5000, 0))
+            except BufferError as error:
+                errors.append(error)
+            if replacement:
+                raise OSError('later receiver error')
+
+        sim.components['sink0'].after_receive = fail_other_network
+        first.output.send(DigitalEdge(1, 5000, 0))
+        # Direct owner execution while paused must report the global first
+        # error even when its own queue never failed.
+        with pytest.raises(BufferError) as caught:
+            sim.components['wire0'].dispatch(0, 1)
+        assert caught.value is errors[0] is sim.failure
+        assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 0
+        assert sim.components['sink0'].received == [(1, 5000, 0, 0)]
+        assert sim.components['last'].received == sim.components['sink1'].received == []
+        assert sim.components['wire1'].pending == 1
+        assert sim.events_total == 0
 
 
 def test_reset_reconstructs_owners_and_invalidates_old_output_handle():

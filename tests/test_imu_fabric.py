@@ -15,6 +15,14 @@ VALUE = ImuSample((1.0, -2.0, 3.0), (0.0, 0.0, 9.80665))
 class Context:
     def __init__(self):
         self.events = []
+        self.failures = []
+
+    def fail(self, error):
+        self.failures.append(error)
+        return error
+
+    def check_io(self):
+        pass
 
     def emit(self, port, kind, payload, **metadata):
         self.events.append((port, kind, payload, metadata))
@@ -215,7 +223,7 @@ def test_partial_sink_failure_preserves_effects_and_never_replays():
     net.sample(0)
     with pytest.raises(OSError) as caught:
         net.dispatch(0, 1)
-    assert caught.value is error
+    assert caught.value is error and context.failures == [error]
     assert any('source.imu to sink1.imu at 0 ns' in note for note in error.__notes__)
     assert order == [('sink0', source.value)] and net.pending == 0
     assert [event[2]['destination'] for event in context.events

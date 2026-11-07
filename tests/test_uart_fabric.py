@@ -14,9 +14,14 @@ class Context:
     def __init__(self):
         self.t_sim_ns = self.not_before_ns = 0
         self.events = []
+        self.failures = []
 
     def check_io(self):
         pass
+
+    def fail(self, error):
+        self.failures.append(error)
+        return error
 
     def emit(self, port, kind, payload, **stamp):
         self.events.append((port, kind, payload, stamp))
@@ -225,6 +230,71 @@ def test_python_echo_runs_at_same_cut_through_generic_settle_and_resets():
         old = sim.components['source']
         sim.reset()
         assert old.closed and sim.components['source'].received == [b'\x00\xffbinary']
+
+
+def test_paused_send_admission_stays_healthy_but_capacity_freezes_all_networks():
+    def create(_spec, context):
+        peer = Peer()
+        peer.connection = context.attach('uart', peer)
+        return peer
+
+    nodes = tuple(node for i in range(2) for node in (
+        NodeSpec(f'wire{i}', 'net.uart', {'max_pending': 1}),
+        NodeSpec(f'left{i}', 'peer'), NodeSpec(f'right{i}', 'peer')))
+    links = tuple(LinkSpec(f'{side}{i}.uart', f'wire{i}.uart')
+                  for i in range(2) for side in ('left', 'right'))
+    registry = {'net.uart': UartNetFactory(), 'peer': SimpleNamespace(
+        describe=lambda _: NodeDescription((PortSpec('uart', 'uart'),)), create=create)}
+    with Simulation(Topology(nodes, links), registry) as sim:
+        first = sim.components['left0'].connection
+        other = sim.components['left1'].connection
+        with pytest.raises(TypeError):
+            first.send(bytearray(b'wrong type'))
+        first.send(b'')
+        assert sim.state == SimulationState.PAUSED and sim.failure is None
+        assert sim.components['wire0'].pending == 0 and sim.events_total == 0
+        first.send(b'accepted')
+        with pytest.raises(BufferError) as caught:
+            first.send(b'rejected')
+        assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+        assert sim.components['wire0'].pending_bytes == len(b'accepted')
+        with pytest.raises(RuntimeError):
+            other.send(b'must not enqueue')
+        assert sim.components['wire1'].pending == 0
+        assert sim.components['right0'].received == sim.components['right1'].received == []
+        assert sim.t_sim_ns == 0
+
+
+@pytest.mark.parametrize('transition', ['reset', 'close'])
+def test_observer_lifecycle_transition_keeps_original_send_error(transition):
+    graph, registry = topology()
+
+    def create(_spec, context):
+        peer = Peer()
+        peer.connection = context.attach('uart', peer)
+        return peer
+
+    registry['fixture.peer'].create = create
+    primary = OSError('old UART observer failed')
+    with Simulation(graph, registry) as sim:
+        old = sim.components['peer0']
+
+        def observe(event):
+            getattr(sim, transition)()
+            raise primary
+
+        sim.on_event = observe
+        with pytest.raises(OSError) as caught:
+            old.connection.send(b'old')
+        assert caught.value is primary and old.closed
+        assert sim.failure is None
+        assert sim.state == (SimulationState.PAUSED if transition == 'reset'
+                             else SimulationState.CLOSED)
+        if transition == 'reset':
+            sim.on_event = None
+            sim.components['peer0'].connection.send(b'new')
+            sim.run_until(0)
+            assert sim.components['peer1'].received == [b'new']
 
 
 def test_two_echoes_cannot_exceed_generic_settle_budget():

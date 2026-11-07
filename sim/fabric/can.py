@@ -108,6 +108,11 @@ class CanBus:
             raise self._failed
 
     @property
+    def failure(self) -> BaseException | None:
+        """First terminal queue/delivery error, cleared only by reset."""
+        return self._failed
+
+    @property
     def delay_ns(self) -> int:
         """Delay for subsequent sends; pending due times remain unchanged."""
         return self._delay_ns
