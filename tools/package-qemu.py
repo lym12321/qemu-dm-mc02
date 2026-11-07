@@ -2,6 +2,7 @@
 """Stage a native QEMU release with licenses and its committed source trees."""
 
 import argparse
+import configparser
 import hashlib
 import importlib.util
 import json
@@ -45,6 +46,29 @@ def archive_source(repository, commit, name, directory):
     subprocess.run(["git", "archive", "--format=tar.gz", f"--prefix={name}-{commit}/",
                     "--output", str(path), commit], cwd=repository, check=True)
     return {"path": f"sources/{path.name}", "commit": commit, "sha256": digest(path)}
+
+
+def archive_subproject(name, sources, licenses):
+    wrap = configparser.ConfigParser()
+    wrap.read(NATIVE / "subprojects" / f"{name}.wrap", encoding="utf-8")
+    identity = wrap["wrap-git"]
+    repository = NATIVE / "subprojects" / name
+    revision = identity["revision"]
+    if command("git", "rev-parse", "HEAD", cwd=repository) != revision:
+        raise ValueError(f"{name} HEAD must match its pinned wrap revision")
+    subprocess.run(["git", "diff", "--quiet", "--ignore-submodules=all", "HEAD"],
+                   cwd=repository, check=True)
+    result = archive_source(repository, revision, name, sources)
+    result.update(url=identity["url"], restore_path=f"qemu/upstream/subprojects/{name}")
+    license_names = {
+        "dtc": ("BSD-2-Clause", "GPL", "README.license"),
+        "keycodemapdb": ("LICENSE.GPL2", "LICENSE.BSD"),
+    }
+    destination = licenses / name
+    destination.mkdir()
+    for filename in license_names[name]:
+        shutil.copy2(repository / filename, destination / filename)
+    return result
 
 
 def windows_dependencies(binary, dll_directory):
@@ -121,6 +145,12 @@ def package(binary, output, dll_directory=None):
 
     sources = output / "sources"
     sources.mkdir()
+    source_archives = [archive_source(ROOT, root_commit, "dm-mc02-qemu", sources),
+                       archive_source(NATIVE, native_commit, "qemu", sources)]
+    # libfdt is linked statically; generated keycode tables are linked into QEMU.
+    # Berkeley softfloat/testfloat subprojects are only used by unpublished tests.
+    source_archives.extend(archive_subproject(name, sources, licenses)
+                           for name in ("dtc", "keycodemapdb"))
     provenance = {
         "schema": 1,
         "root_commit": root_commit,
@@ -130,8 +160,7 @@ def package(binary, output, dll_directory=None):
         "root_license": "licenses/LICENSE" if root_license.is_file() else None,
         "dlls": dlls,
         "msys2_packages": owners,
-        "sources": [archive_source(ROOT, root_commit, "dm-mc02-qemu", sources),
-                    archive_source(NATIVE, native_commit, "qemu", sources)],
+        "sources": source_archives,
         "source_submodules": "Git archives omit submodule checkouts, including ROM repositories.",
     }
     (output / "provenance.json").write_text(
