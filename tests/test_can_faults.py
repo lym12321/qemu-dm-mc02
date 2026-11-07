@@ -17,18 +17,15 @@ class Context:
     def __init__(self):
         self.t_sim_ns = 0
         self.events = []
-        self.failures = []
         self.on_emit = None
-        self.io_checks = 0
 
     def check_io(self):
-        self.io_checks += 1
+        pass
 
     def check_deadline(self):
         pass
 
     def fail(self, error):
-        self.failures.append(error)
         return error
 
     def emit(self, port, kind, payload, **times):
@@ -110,11 +107,11 @@ def test_unconfigured_bus_has_no_external_fault_capability(options):
         description.port("fault")
 
 
-@pytest.mark.parametrize("payload", [None, True, {}, ["broken"], "unknown"])
-def test_profile_input_is_pure_and_only_accepts_declared_names(payload):
+def test_profile_input_is_pure_and_only_accepts_declared_names():
     node = spec({"broken": {}})
-    with pytest.raises(ValueError, match="profile name"):
-        CanBusFactory.validate_input(node, "fault", payload, connected_ports=())
+    for payload in (None, True, {}, ["broken"], "unknown"):
+        with pytest.raises(ValueError, match="profile name"):
+            CanBusFactory.validate_input(node, "fault", payload, connected_ports=())
     assert CanBusFactory.validate_input(node, "fault", "normal", connected_ports=()) == "normal"
     assert CanBusFactory.validate_input(node, "fault", "broken", connected_ports=()) == "broken"
     with pytest.raises(ValueError, match="external input only"):
@@ -146,15 +143,15 @@ def test_fault_port_cannot_claim_a_connection_owner():
 
 def test_resolved_event_is_immutable_and_follows_effects_and_actual_cut():
     rules = [{"destination": "first.can", "can_id": 0x201}]
-    owner, context, _ = network({"broken": {"drop": rules}}, delay_ns=7)
+    owner, context, _ = network({"broken": {"delay_ns": 9, "drop": rules}}, delay_ns=7)
     rules[0]["can_id"] = 0x202
     observed = []
-    context.on_emit = lambda _kind: observed.append((owner.bus.delay_ns, owner._profile))
+    context.on_emit = lambda _kind: observed.append(owner.bus.delay_ns)
     context.t_sim_ns = 13
     owner.input("fault", "broken")
-    assert observed == [(7, "broken")]
+    assert observed == [9]
     assert context.events == [("fault", "can.fault.applied", {
-        "previous_profile": "normal", "profile": "broken", "delay_ns": 7,
+        "previous_profile": "normal", "profile": "broken", "delay_ns": 9,
         "drop": ({"destination": "first.can", "can_id": 0x201},), "cut_ns": 13,
     }, {"source_time_ns": 13, "mapped_time_ns": 13, "delivery_time_ns": 13})]
     with pytest.raises(TypeError):
@@ -227,45 +224,21 @@ def test_inherited_callback_runs_once_per_destination_even_if_declared_drop_matc
     owner.close()
 
 
-def test_callback_error_is_primary_and_failed_frame_is_never_replayed():
+@pytest.mark.parametrize("boundary", ["drop", "event", "delivery_callback"])
+def test_callback_failure_preserves_primary_and_partial_queue_until_successful_reset(boundary):
     failure = OSError("borrowed callback failed")
-    calls = []
-
-    def drop(*args):
-        calls.append(args)
-        raise failure
-
-    owner, _, (source, first, second) = network(
-        {"broken": {"drop": [{"can_id": 1}]}}, drop=drop)
-    owner.input("fault", "broken")
-    owner.bus.send(source, CanFrame(1))
-    owner.bus.send(source, CanFrame(2))
-    with pytest.raises(OSError) as caught:
-        owner.dispatch(0, 10)
-    assert caught.value is failure
-    assert len(calls) == 1 and owner.pending == 1
-    with pytest.raises(OSError) as caught:
-        owner.input("fault", "normal")
-    assert caught.value is failure
-    with pytest.raises(OSError) as caught:
-        owner.dispatch(1, 10)
-    assert caught.value is failure and len(calls) == 1
-    assert first.frames == second.frames == []
-    owner.close()
-    assert owner.pending == 0 and source.closed == first.closed == second.closed == 0
-
-
-@pytest.mark.parametrize("boundary", ["event", "delivery_callback"])
-def test_delivery_observer_failure_freezes_before_receive_until_successful_reset(boundary):
-    failure = OSError("delivery observation failed")
     observed = []
+    rejecting = True
 
-    def reject(_value):
+    def reject(*_args):
         observed.append(boundary)
-        raise failure
+        if rejecting:
+            raise failure
+        return False
 
     owner, context, (source, first, second) = network(
-        {"broken": {"delay_ns": 3}}, delay_ns=1,
+        {"broken": {"delay_ns": 3, "drop": [{"can_id": 1}]}}, delay_ns=1,
+        drop=reject if boundary == "drop" else None,
         on_delivery=reject if boundary == "delivery_callback" else None)
     owner.input("fault", "broken")
     if boundary == "event":
@@ -276,11 +249,12 @@ def test_delivery_observer_failure_freezes_before_receive_until_successful_reset
         owner.dispatch(3, 10)
     assert caught.value is failure and observed == [boundary]
     assert owner.pending == 1 and first.frames == second.frames == []
-    with pytest.raises(OSError) as caught:
-        owner.input("fault", "normal")
-    assert caught.value is failure
+    for operation in (lambda: owner.input("fault", "normal"), lambda: owner.dispatch(4, 10)):
+        with pytest.raises(OSError) as caught:
+            operation()
+        assert caught.value is failure and observed == [boundary]
     context.on_emit = None
-    owner._on_delivery = None
+    rejecting = False
     owner.reset(Session(2, 10))
     assert owner.pending == 0 and owner.bus.delay_ns == 1
     assert owner.dispatch(10, 10) == 0
@@ -288,6 +262,7 @@ def test_delivery_observer_failure_freezes_before_receive_until_successful_reset
     assert owner.dispatch(11, 10) == 1
     assert first.frames == second.frames == [CanFrame(3, timestamp_ns=11)]
     owner.close()
+    assert owner.pending == 0 and source.closed == first.closed == second.closed == 0
 
 
 @pytest.mark.parametrize("operation", ["input", "reset", "close", "dispatch"])

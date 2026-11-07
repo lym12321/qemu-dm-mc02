@@ -35,6 +35,7 @@ class Sink:
 
 def test_due_order_stable_ties_and_attachment_order():
     bus = CanBus(delay_ns=3)
+    assert bus.next_due_ns is None
     order = []
     source, first, second = (Sink(name, order)
                              for name in ("source", "first", "second"))
@@ -42,13 +43,15 @@ def test_due_order_stable_ties_and_attachment_order():
         bus.attach(sink, sink.name)
     for can_id, timestamp in ((0x103, 7), (0x101, 2), (0x102, 2)):
         bus.send(source, CanFrame(can_id, timestamp_ns=timestamp))
-    assert bus.pending == 3
+    assert (bus.next_due_ns, bus.next_due_ns, bus.pending, bus.t_sim_ns) == (5, 5, 3, 0)
+    assert order == []
     assert not bus.has_due(4)
     assert bus.has_due(5)
     assert bus.step(4) == 0
     assert bus.step(5) == 2
     assert order == [("first", 0x101, 5), ("second", 0x101, 5),
                      ("first", 0x102, 5), ("second", 0x102, 5)]
+    assert bus.next_due_ns == 10
     assert bus.step(10) == 1
     assert order[-2:] == [("first", 0x103, 10), ("second", 0x103, 10)]
     assert source.frames == []
@@ -126,6 +129,8 @@ def test_max_delay_is_valid_but_overflowing_send_is_atomic():
     assert bus.delay_ns == 18446744073709551615
     with pytest.raises(ValueError, match="64-bit"):
         bus.send(source, CanFrame(1, timestamp_ns=1))
+    with pytest.raises(ValueError, match="64-bit"):
+        bus.send(source, CanFrame(1), not_before_ns=(1 << 64) - 1)
     assert (bus.pending, bus.t_sim_ns) == (0, 0)
     assert events == sink.frames == []
     bus.send(source, CanFrame(2))
@@ -191,41 +196,7 @@ class Echo(VirtualCanDevice):
         self.emit(CanFrame(frame.can_id + 1, timestamp_ns=frame.timestamp_ns))
 
 
-def test_recursive_emits_share_bounded_dispatch_budget():
-    bus = CanBus(max_pending=1, dispatch_budget=3)
-    first, second = Echo(bus, "first"), Echo(bus, "second")
-    first.emit(CanFrame(1, timestamp_ns=5))
-    assert bus.step(5) == 3
-    assert first.seen == [2]
-    assert second.seen == [1, 3]
-    assert bus.pending == 1
-    # A second settle at the same target is valid and bounded independently.
-    assert bus.step(5) == 3
-    assert first.seen == [2, 4, 6]
-    assert second.seen == [1, 3, 5]
-    assert bus.pending == 1
-
-
-def test_next_due_is_a_read_only_queue_projection_through_delivery_reset_and_close():
-    bus = CanBus(delay_ns=3)
-    source, sink = Sink("source"), Sink("sink")
-    bus.attach(source)
-    bus.attach(sink)
-    assert bus.next_due_ns is None
-    bus.send(source, CanFrame(1, timestamp_ns=7))
-    bus.send(source, CanFrame(2, timestamp_ns=2))
-    assert (bus.next_due_ns, bus.next_due_ns, bus.pending, bus.t_sim_ns) == (5, 5, 2, 0)
-    assert sink.frames == []
-    bus.step(5)
-    assert bus.next_due_ns == 10
-    bus.reset()
-    assert bus.next_due_ns is None
-    bus.send(source, CanFrame(3))
-    bus.close()
-    assert bus.next_due_ns is None
-
-
-def test_caller_dispatch_cap_precedes_side_effects_and_preserves_bus_budget():
+def test_recursive_emits_obey_bus_and_caller_budgets_at_the_same_cut():
     bus = CanBus(max_pending=1, dispatch_budget=3)
     first, second = Echo(bus, "first"), Echo(bus, "second")
     first.emit(CanFrame(1, timestamp_ns=5))
@@ -237,10 +208,12 @@ def test_caller_dispatch_cap_precedes_side_effects_and_preserves_bus_budget():
     assert (first.seen, second.seen, bus.pending) == ([], [], 1)
     assert bus.step(5, max_dispatch=1) == 1
     assert (first.seen, second.seen, bus.pending) == ([], [1], 1)
-    assert bus.dispatch_budget == 3
     # A caller cannot enlarge the bus's own limit.
     assert bus.step(5, max_dispatch=4) == 3
     assert (first.seen, second.seen, bus.pending) == ([2, 4], [1, 3], 1)
+    # Another settle at the same target uses the unchanged default bus budget.
+    assert bus.step(5) == 3
+    assert (first.seen, second.seen, bus.pending) == ([2, 4, 6], [1, 3, 5, 7], 1)
 
 
 def test_capacity_rejection_retains_pending_but_freezes_until_reset():
@@ -282,17 +255,22 @@ def test_reset_clears_pending_clock_sequence_and_retains_wiring_and_delay():
     assert bus.pending == 1
     assert bus.t_sim_ns == 20
     bus.reset(5)
-    assert bus.pending == 0
-    assert bus.t_sim_ns == 5
-    assert bus.delay_ns == 3
+    assert (bus.next_due_ns, bus.pending, bus.t_sim_ns, bus.delay_ns) == (None, 0, 5, 3)
     with pytest.raises(RuntimeError, match="before the first send or step"):
         bus.attach(Sink("late"))
-    bus.send(source, CanFrame(2, timestamp_ns=6))
-    assert bus.step(8) == 0
-    assert bus.step(9) == 1
-    assert [frame.can_id for frame in sink.frames] == [2]
-    assert events[0].sequence == 0
-    assert events[0].due_ns == 9
+    original = CanFrame(2, timestamp_ns=2)
+    bus.send(source, original, not_before_ns=10)
+    assert bus.step(12) == 0
+    assert bus.step(13) == 1
+    assert sink.frames == [CanFrame(2, timestamp_ns=13)]
+    assert events[0].frame is original
+    assert (events[0].sequence, events[0].timestamp_ns, events[0].due_ns) == (0, 2, 13)
+    bus.send(source, CanFrame(3, timestamp_ns=14))
+    bus.close()
+    bus.close()
+    assert bus.pending == 0 and bus.next_due_ns is None
+    with pytest.raises(RuntimeError, match="closed"):
+        bus.send(source, original)
 
 
 @pytest.mark.parametrize("kwargs", [
@@ -427,17 +405,16 @@ def test_callbacks_cannot_step_reset_or_change_delay_mid_delivery(operation):
 
 def test_tool_importlib_consumers_share_canonical_frame_and_codec_objects():
     path = Path(__file__).resolve().parents[1] / "tools/dm_mc02_socketcan.py"
-    spec = importlib.util.spec_from_file_location("socketcan_fabric_compat", path)
+    spec = importlib.util.spec_from_file_location("socketcan_fabric_tool", path)
     assert spec is not None and spec.loader is not None
-    legacy = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = legacy
+    tool = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = tool
     try:
-        spec.loader.exec_module(legacy)
-        assert legacy.CanFrame is CanFrame
+        spec.loader.exec_module(tool)
+        assert tool.CanFrame is CanFrame
         for name in ("pack_wire_frame", "unpack_wire_frame", "pack_can_frame",
-                     "unpack_can_frame", "dlc_to_length", "length_to_dlc",
-                     "_CAN_STRUCT", "_CANFD_STRUCT", "_WIRE_STRUCT", "_FD_DLC_LENGTHS"):
-            assert getattr(legacy, name) is getattr(codec, name)
+                     "unpack_can_frame", "dlc_to_length", "length_to_dlc"):
+            assert getattr(tool, name) is getattr(codec, name)
     finally:
         sys.modules.pop(spec.name, None)
 

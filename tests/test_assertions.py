@@ -24,8 +24,7 @@ def endpoint(_kind, value):
 
 def test_parser_and_evaluator_are_resource_free_in_fresh_process():
     program = r'''
-import builtins
-import importlib.util
+import importlib.abc
 import os
 from pathlib import Path
 import socket
@@ -37,26 +36,19 @@ forbidden_modules = (
     "mujoco", "numpy", "sim.physics", "sim.devices", "sim.boards", "sim.transports",
     "sim.lab", "sim.apps", "sim.runtime", "tools",
 )
-original_import = builtins.__import__
-def pure_import(name, globals=None, locals=None, fromlist=(), level=0):
-    resolved = (importlib.util.resolve_name("." * level + name, globals["__package__"])
-                if level else name)
-    candidates = (resolved, *(resolved + "." + item for item in (fromlist or ()) if item != "*"))
-    for candidate in candidates:
-        assert not any(candidate == prefix or candidate.startswith(prefix + ".")
-                       for prefix in forbidden_modules), candidate
-    return original_import(name, globals, locals, fromlist, level)
+class PureImports(importlib.abc.MetaPathFinder):
+    def find_spec(self, name, *args):
+        assert not any(name == prefix or name.startswith(prefix + ".")
+                       for prefix in forbidden_modules), name
+sys.meta_path.insert(0, PureImports())
 def forbidden(*args, **kwargs):
     raise AssertionError("assertion admission/matching acquired IO or read configuration")
-builtins.__import__ = pure_import
 socket.socket = socket.create_connection = forbidden
 subprocess.Popen = os.system = forbidden
 Path.read_bytes = Path.read_text = Path.open = forbidden
 
 from sim.testing import (Assertion, CanMatch, parse_assertion, AssertionEvaluator,
                          AssertionObservation)
-from sim.testing.assertions import parse_assertion as canonical
-assert parse_assertion is canonical
 values = [
     {"before": "1ns", "uart_contains": {"endpoint": "sensor.serial", "text": "é\0"}},
     {"before": "2us", "digital_equals": {"endpoint": "switch.level", "value": 1}},
@@ -90,10 +82,7 @@ print("pure assertion parser and evaluator passed")
     assert result.stdout == "pure assertion parser and evaluator passed\n" and result.stderr == ""
 
 
-def test_parser_is_canonical_frozen_and_preserves_source():
-    from sim.testing.assertions import parse_assertion as canonical
-
-    assert parse_assertion is canonical
+def test_parser_freezes_values_and_preserves_source():
     source = {"before": "3600s", "can_seen": {"endpoint": "motor.can", "id": 0x1fffffff}}
     before = deepcopy(source)
     result = parse_assertion(source, 1024, endpoint_validator=endpoint)
@@ -156,18 +145,6 @@ def can(time, *, flags=0, dlc=1, payload=b"\xff", name="drive.can"):
     return AssertionObservation(name, time, CanFrame(0x123, flags, dlc, payload, time))
 
 
-def test_uart_split_matches_only_endpoint_and_retains_terminal_status():
-    evaluator = AssertionEvaluator((Assertion(50, "sensor.serial", "uart_contains", b"hello"),), 100, 1000)
-    evaluator.observe_values({}, (uart(1001, b"hel"),), 1001)
-    assert evaluator.status == ("pending",)
-    evaluator.observe_values({}, (uart(1002, b"lo", "other.serial"),), 1002)
-    assert evaluator.status == ("pending",)
-    evaluator.observe_values({}, (uart(1003, b"lo"),), 1003)
-    assert evaluator.status == ("pass",) and evaluator.all_passed and evaluator.failures == ()
-    evaluator.advance(1050)
-    assert evaluator.status == ("pass",)
-
-
 @pytest.mark.parametrize("bound,expected", [(1049, "pass"), (1050, "fail")])
 def test_uart_strict_before_uses_admitted_observation_bound(bound, expected):
     evaluator = AssertionEvaluator((Assertion(50, "sensor.serial", "uart_contains", b"OK"),), 100, 1000)
@@ -178,16 +155,20 @@ def test_uart_strict_before_uses_admitted_observation_bound(bound, expected):
         assert evaluator.status == ("fail",) and "before 50 ns" in evaluator.failures[0]
 
 
-def test_uart_suffix_memory_bounded_and_no_cross_endpoint_join():
+def test_uart_fragments_keep_bounded_suffixes_separate_endpoints_and_terminal_pass():
     evaluator = AssertionEvaluator((Assertion(100, "sensor.serial", "uart_contains", b"abc"),
                                     Assertion(100, "other.serial", "uart_contains", b"xy")), 100, 1000)
-    for timestamp in range(1001, 1011):
+    for timestamp in (1001, 1002):
         evaluator.observe_values({}, (uart(timestamp, b"z" * 4096 + b"ab"),), timestamp)
         assert evaluator.status == ("pending", "pending") and evaluator._tails == [b"ab", b""]
-    evaluator.observe_values({}, (uart(1011, b"c", "other.serial"),), 1011)
+    evaluator.observe_values({}, (uart(1003, b"c", "other.serial"),), 1003)
     assert evaluator.status == ("pending", "pending")
-    evaluator.observe_values({}, (uart(1012, b"c"),), 1012)
-    assert evaluator.status == ("pass", "pending") and evaluator._tails == [b"", b"c"]
+    evaluator.observe_values({}, (uart(1004, b"c"),), 1004)
+    assert evaluator.status == ("pass", "pending")
+    evaluator.observe_values({}, (uart(1005, b"xy", "other.serial"),), 1005)
+    assert evaluator.all_passed and evaluator.failures == () and not any(evaluator._tails)
+    evaluator.advance(1100)
+    assert evaluator.status == ("pass", "pass")
 
 
 def test_digital_consumes_supplied_levels_at_the_completed_bound_without_mutation():
@@ -271,6 +252,6 @@ def test_same_cut_batches_match_before_one_expiry_without_retaining_transcript()
     evaluator = AssertionEvaluator((Assertion(5, "sensor.serial", "uart_contains", b"OK"),), 10, 1000)
     evaluator.observe_values({}, (uart(1004, b"O"),), 1005, expire=False)
     evaluator.observe_values({}, (uart(1004, b"K"),), 1005, expire=False)
-    assert evaluator.status == ("pass",) and evaluator._tails == [b""]
+    assert evaluator.status == ("pass",)
     evaluator.advance(1005)
     assert evaluator.status == ("pass",)

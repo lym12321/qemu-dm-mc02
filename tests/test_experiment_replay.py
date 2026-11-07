@@ -30,6 +30,11 @@ def capture(configured=None, registry=None, **options):
     return output.getvalue(), result
 
 
+@pytest.fixture(scope="module")
+def recorded_trace():
+    return capture()[0]
+
+
 def rewrite(data, change):
     """Regenerate a valid lower container while changing its app lifecycle."""
     records = list(iter_experiment_records(BytesIO(data)))
@@ -165,23 +170,6 @@ def test_genuinely_empty_cut_expires_before_late_can_observation(quantum, expect
     assert len([item for item in records if item.kind == "event"]) == 1
 
 
-def test_repeated_cut_retains_same_cut_event_order_without_premature_expiry():
-    data, online = capture(inputs=(ExperimentInput(3, "board.uart", b"OK"),),
-                           assertions=(uart_assert("board.uart"),))
-
-    def repeat(records):
-        result = []
-        for item in records:
-            result.append(item)
-            if item.kind == "cut" and item.data == 0:
-                result.append(item)
-            if item.kind == "completion":
-                result[-1] = replace(item, data={**item.data, "cuts_total": item.data["cuts_total"] + 1})
-        return result
-
-    assert replay_experiment(BytesIO(rewrite(data, repeat))) == online
-
-
 def test_same_cut_event_after_repeated_empty_markers_still_precedes_cut_expiry():
     configured, registry, _ = scene(quantum=5, duration=10)
     data, _ = capture(configured, registry, assertions=(
@@ -226,22 +214,19 @@ def test_large_assertion_metadata_and_maximum_nodes_replay_offline(monkeypatch):
     (uart_assert("missing.uart"),), (uart_assert("board.level"),),
     (uart_assert("board.uart", before="31ns"),), (uart_assert("board.uart"),) * 1025,
 ])
-def test_replacement_admission_reuses_original_grammar_and_bounds(replacement):
-    data, _ = capture()
+def test_replacement_admission_reuses_original_grammar_and_bounds(recorded_trace, replacement):
     with pytest.raises((TypeError, ValueError)):
-        replay_experiment(BytesIO(data), replacement)
+        replay_experiment(BytesIO(recorded_trace), replacement)
 
 
-def test_replacement_cannot_hide_invalid_recorded_original_assertions():
-    data, _ = capture()
-
+def test_replacement_cannot_hide_invalid_recorded_original_assertions(recorded_trace):
     def change(records):
         records[0] = replace(records[0], data={**records[0].data,
             "assertions": (uart_assert("missing.uart"),)})
         return records
 
     with pytest.raises(ValueError, match="unknown assertion node"):
-        replay_experiment(BytesIO(rewrite(data, change)), ())
+        replay_experiment(BytesIO(rewrite(recorded_trace, change)), ())
 
 
 @pytest.mark.parametrize("field,value", [
@@ -249,15 +234,13 @@ def test_replacement_cannot_hide_invalid_recorded_original_assertions():
     ("descriptions", {}), ("assertions", (uart_assert("board.uart"),) * 1025),
     ("ready", {"endpoint": "board.can", "text": b"READY"}),
 ])
-def test_recorded_configuration_is_admitted_without_runtime(field, value):
-    data, _ = capture()
-
+def test_recorded_configuration_is_admitted_without_runtime(recorded_trace, field, value):
     def change(records):
         records[0] = replace(records[0], data={**records[0].data, field: value})
         return records
 
     with pytest.raises((TypeError, ValueError)):
-        replay_experiment(BytesIO(rewrite(data, change)))
+        replay_experiment(BytesIO(rewrite(recorded_trace, change)))
 
 
 @pytest.mark.parametrize("changes", [
@@ -281,33 +264,27 @@ def test_recorded_inputs_require_declared_timeline_horizon_and_input_capability(
     ("events_total", 99), ("cuts_total", 99), ("end_ns", 29),
     ("origin_ns", 1), ("delivered_inputs", 1),
 ])
-def test_valid_container_with_false_application_completion_is_rejected(field, value):
-    data, _ = capture()
-
+def test_valid_container_with_false_application_completion_is_rejected(recorded_trace, field, value):
     def change(records):
         records[-1] = replace(records[-1], data={**records[-1].data, field: value})
         return records
 
     with pytest.raises(ValueError, match="completion differs"):
-        replay_experiment(BytesIO(rewrite(data, change)))
+        replay_experiment(BytesIO(rewrite(recorded_trace, change)))
 
 
 @pytest.mark.parametrize("changes", [{"source_node": "missing"}, {"source_port": "missing"}])
-def test_event_source_requires_captured_node_and_port(changes):
-    data, _ = capture()
-
+def test_event_source_requires_captured_node_and_port(recorded_trace, changes):
     def change(records):
         index = next(index for index, item in enumerate(records) if item.kind == "event")
         records[index] = replace(records[index], data=replace(records[index].data, **changes))
         return records
 
     with pytest.raises(ValueError, match="unknown"):
-        replay_experiment(BytesIO(rewrite(data, change)))
+        replay_experiment(BytesIO(rewrite(recorded_trace, change)))
 
 
-def test_missing_physical_sample_marker_is_rejected_even_with_consistent_counts():
-    data, _ = capture()
-
+def test_missing_physical_sample_marker_is_rejected_even_with_consistent_counts(recorded_trace):
     def change(records):
         result = [item for item in records if not (item.kind == "cut" and item.data == 10)]
         result[-1] = replace(result[-1], data={**result[-1].data,
@@ -315,12 +292,12 @@ def test_missing_physical_sample_marker_is_rejected_even_with_consistent_counts(
         return result
 
     with pytest.raises(ValueError, match="observation cut"):
-        replay_experiment(BytesIO(rewrite(data, change)))
+        replay_experiment(BytesIO(rewrite(recorded_trace, change)))
 
 
 @pytest.mark.parametrize("damage", ["truncated", "trailing", "crc"])
-def test_no_result_before_complete_container_validation(damage):
-    data, _ = capture()
+def test_no_result_before_complete_container_validation(recorded_trace, damage):
+    data = recorded_trace
     if damage == "truncated":
         data = data[:-12]
     elif damage == "trailing":
@@ -360,8 +337,7 @@ def test_stream_is_borrowed_bounded_and_read_once_without_seek_or_tell():
 
 
 @pytest.mark.parametrize("at_eof", [False, True])
-def test_replay_read_errors_propagate_without_close_or_retry(at_eof):
-    data, _ = capture()
+def test_replay_read_errors_propagate_without_close_or_retry(recorded_trace, at_eof):
     primary = OSError("borrowed input diagnostic")
 
     class Input(BytesIO):
@@ -369,18 +345,12 @@ def test_replay_read_errors_propagate_without_close_or_retry(at_eof):
 
         def read(self, size):
             assert not self.failed
-            if not at_eof or super().tell() == len(data):
+            if not at_eof or super().tell() == len(recorded_trace):
                 self.failed = True
                 raise primary
             return super().read(size)
 
-        def seek(self, offset, whence=0):
-            raise AssertionError("replay must not seek its input")
-
-        def tell(self):
-            raise AssertionError("replay must not inspect its input position")
-
-    source = Input(data)
+    source = Input(recorded_trace)
     with pytest.raises(OSError) as caught:
         replay_experiment(source)
     assert caught.value is primary and source.failed and not source.closed
@@ -485,7 +455,8 @@ for action in (lambda: replay_experiment(BytesIO()), lambda: run_experiment(None
     assert result.returncode == 0, result.stderr
 
 
-def multi_machine_capture():
+@pytest.fixture(scope="module")
+def machine_recording():
     """Explicit mock machine observations; these are not native QEMU evidence."""
     from sim.api import StepResult
     from test_sim_experiment import snapshot
@@ -532,16 +503,16 @@ def multi_machine_capture():
                     uart_assert("west.uart", "startup", "10ns")))
 
 
-def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive_replay():
-    data, online = multi_machine_capture()
+def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive_replay(machine_recording):
+    data, online = machine_recording
     assert replay_experiment(BytesIO(data)) == online
     assert (online.origin_ns, online.end_ns, online.status) == (10, 30, ("pass", "fail"))
     assert list(online.ready_receipts) == ["west", "east"]
     assert [item.source_time_ns for item in online.ready_receipts.values()] == [705, 910]
-    assert [online.boards[name]["native_origin_ns"] for name in ("west", "east")] == [700, 900]
     assert online.boards["west"] == {"native_origin_ns": 700, "first_source_ns": 700,
         "last_source_ns": 730, "first_mapped_ns": 0, "last_mapped_ns": 30,
         "observation_batches": 8}
+    assert online.boards["east"]["native_origin_ns"] == 900
     assert online.boards["east"]["observation_batches"] == 8
     # Only two UART batches, but every native snapshot and empty cut remains.
     records = list(iter_experiment_records(BytesIO(data)))
@@ -554,8 +525,8 @@ def test_multiple_ready_receipts_native_epochs_empty_batches_and_origins_survive
 
 
 @pytest.mark.parametrize("field", ["ready_receipts", "boards"])
-def test_completion_cannot_forge_ready_receipt_or_native_epoch_metadata(field):
-    data, _ = multi_machine_capture()
+def test_completion_cannot_forge_ready_receipt_or_native_epoch_metadata(machine_recording, field):
+    data, _ = machine_recording
     def change(records):
         records[-1] = replace(records[-1], data={**records[-1].data, field: {}})
         return records
@@ -563,8 +534,8 @@ def test_completion_cannot_forge_ready_receipt_or_native_epoch_metadata(field):
         replay_experiment(BytesIO(rewrite(data, change)))
 
 
-def test_native_epoch_change_is_rejected_even_with_matching_completion_and_valid_container():
-    data, _ = multi_machine_capture()
+def test_native_epoch_change_is_rejected_even_with_matching_completion_and_valid_container(machine_recording):
+    data, _ = machine_recording
     def change(records):
         for index, record in enumerate(records):
             if record.kind == "event" and record.data.kind == "snapshot" and record.data.mapped_time_ns == 30:

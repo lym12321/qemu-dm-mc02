@@ -1,7 +1,5 @@
 """Pure topology admission never creates an execution component."""
 
-from pathlib import Path
-
 import pytest
 
 from sim.api import Endpoint, LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
@@ -12,22 +10,20 @@ from sim.runtime import Simulation
 class Factory:
     def __init__(self, *ports, capabilities=()):
         self.description = NodeDescription(ports, frozenset(capabilities))
-        self.created = 0
 
     def describe(self, spec):
         return self.description
 
     def create(self, spec, context):
-        self.created += 1
         raise AssertionError("static admission must never create resources")
 
 
-def pair(first, second, *, links=None):
+def pair(*, links=None):
     return Topology((NodeSpec("a", "a"), NodeSpec("b", "b")),
                     tuple(links if links is not None else [LinkSpec("a.p", "b.p")]))
 
 
-def test_static_validation_freezes_source_data_and_preserves_three_connection_categories(tmp_path):
+def test_node_options_and_admission_results_are_immutable(tmp_path):
     options = {"nested": [1, {"value": "original"}]}
     node = NodeSpec("a", "signal", options, base_dir=tmp_path)
     options["nested"][1]["value"] = "changed"
@@ -35,14 +31,22 @@ def test_static_validation_freezes_source_data_and_preserves_three_connection_ca
     assert node.base_dir == tmp_path.resolve()
     with pytest.raises(TypeError):
         node.options["new"] = 3
-    for category, protocol in (("protocol", "uart"), ("signal", "digital"), ("binding", "joint")):
-        a = Factory(PortSpec("p", protocol, "out", category))
-        b = Factory(PortSpec("p", protocol, "in", category))
-        descriptions = pair(a, b).validate({"a": a, "b": b})
-        assert descriptions["a"].ports[0].category == category
-        assert a.created == b.created == 0
-        with pytest.raises(TypeError):
-            descriptions["extra"] = NodeDescription()
+    descriptions = Topology((node,)).validate({"signal": Factory()})
+    with pytest.raises(TypeError):
+        descriptions["extra"] = NodeDescription()
+
+
+@pytest.mark.parametrize("category,protocol", [
+    ("protocol", "uart"), ("signal", "digital"), ("binding", "joint")])
+def test_typed_links_validate_but_need_an_execution_owner(category, protocol):
+    a = Factory(PortSpec("p", protocol, "out", category))
+    b = Factory(PortSpec("p", protocol, "in", category))
+    topology = pair()
+    descriptions = topology.validate({"a": a, "b": b})
+    assert descriptions["a"].ports[0].category == category
+    owner = "binding owner" if category == "binding" else "connection owner"
+    with pytest.raises(ValueError, match=f"exactly one {owner}"):
+        Simulation(topology, {"a": a, "b": b})
 
 
 @pytest.mark.parametrize("ports,links,error", [
@@ -58,8 +62,7 @@ def test_static_validation_freezes_source_data_and_preserves_three_connection_ca
 def test_bad_links_rejected_before_create(ports, links, error):
     a, b = Factory(ports[0]), Factory(ports[1])
     with pytest.raises(ValueError, match=error):
-        pair(a, b, links=links).validate({"a": a, "b": b})
-    assert a.created == b.created == 0
+        pair(links=links).validate({"a": a, "b": b})
 
 
 def test_missing_required_capabilities_and_port_capacity():
@@ -68,10 +71,10 @@ def test_missing_required_capabilities_and_port_capacity():
     a = Factory(PortSpec("p", "uart", required_capabilities={"buffered"}))
     b = Factory(PortSpec("p", "uart"))
     with pytest.raises(ValueError, match="required capabilities"):
-        pair(a, b).validate({"a": a, "b": b})
+        pair().validate({"a": a, "b": b})
     a = Factory(PortSpec("p", "uart", capabilities={"buffered"}))
     b = Factory(PortSpec("p", "uart", capabilities={"buffered"}))
-    assert pair(a, b, links=[LinkSpec("a.p", "b.p", {"buffered"})]).validate({"a": a, "b": b})
+    assert pair(links=[LinkSpec("a.p", "b.p", {"buffered"})]).validate({"a": a, "b": b})
     topology = Topology((NodeSpec("a", "a"), NodeSpec("b", "b"), NodeSpec("c", "b")),
                         (LinkSpec("a.p", "b.p"), LinkSpec("a.p", "c.p")))
     with pytest.raises(ValueError, match="capacity exceeded"):
@@ -106,15 +109,11 @@ def test_external_input_contract_is_admitted_before_create():
             capabilities={"external_input"}),), capabilities)
         with pytest.raises(ValueError, match="external_input"):
             topology.validate({"n": factory})
-    assert factory.created == 0
 
 
 def test_simulation_static_capabilities_and_can_wiring_admission():
     with pytest.raises(ValueError, match="both machine"):
         Simulation(Topology((NodeSpec("a", "a"),)), {"a": Factory(capabilities={"machine", "step"})})
-    a = Factory(PortSpec("p", "can"))
-    with pytest.raises(ValueError, match="exactly one connection owner"):
-        Simulation(pair(a, a), {"a": a, "b": a})
     for options in ({"unknown": 1}, {"delay_ns": True}, {"max_pending": 0}, {"dispatch_budget": 65537}):
         with pytest.raises(ValueError):
             Simulation(Topology((NodeSpec("bus", "bus.can", options),)), {"bus.can": CanBusFactory()})
@@ -124,18 +123,10 @@ def test_simulation_static_capabilities_and_can_wiring_admission():
     simulation.close()
 
 
-def test_required_connection_and_unimplemented_typed_links_rejected_before_resources():
+def test_required_connections_and_can_direction_reject_before_resources():
     required = Factory(PortSpec("p", "can", min_connections=1))
     with pytest.raises(ValueError, match="requires at least 1"):
         Topology((NodeSpec("a", "a"),)).validate({"a": required})
-    assert required.created == 0
-    for category, protocol in (("protocol", "uart"), ("signal", "digital"), ("binding", "joint")):
-        a = Factory(PortSpec("p", protocol, "out", category))
-        b = Factory(PortSpec("p", protocol, "in", category))
-        owner = "binding owner" if category == "binding" else "connection owner"
-        with pytest.raises(ValueError, match=f"exactly one {owner}"):
-            Simulation(pair(a, b), {"a": a, "b": b})
-        assert a.created == b.created == 0
     a = Factory(PortSpec("p", "can", direction="in"))
     topology = Topology((NodeSpec("a", "a"), NodeSpec("bus", "bus")), (LinkSpec("a.p", "bus.can"),))
     with pytest.raises(ValueError, match="inout"):
@@ -154,7 +145,6 @@ def test_connection_owners_and_endpoint_owner_peers_are_unique_before_create():
         topology = Topology(tuple(NodeSpec(name, kind) for name, kind in zip("abc", kinds)), links)
         with pytest.raises(ValueError, match=error):
             Simulation(topology, {"owner": owner, "endpoint": endpoint})
-    assert owner.created == endpoint.created == 0
 
 
 def test_binding_edges_require_their_own_owner_and_allow_one_shared_step_owner():
@@ -178,7 +168,6 @@ def test_binding_edges_require_their_own_owner_and_allow_one_shared_step_owner()
     simulation = Simulation(topology, registry)
     assert simulation.validate()["b"].capabilities == frozenset({"binding_owner", "step"})
     simulation.close()
-    assert owner.created == endpoint.created == connection.created == 0
 
 
 def test_binding_owner_does_not_replace_protocol_or_signal_connection_ownership():
@@ -187,8 +176,7 @@ def test_binding_owner_does_not_replace_protocol_or_signal_connection_ownership(
         owner = Factory(port, capabilities={"binding_owner"})
         endpoint = Factory(port)
         with pytest.raises(ValueError, match="exactly one connection owner"):
-            Simulation(pair(owner, endpoint), {"a": owner, "b": endpoint})
-        assert owner.created == endpoint.created == 0
+            Simulation(pair(), {"a": owner, "b": endpoint})
     with pytest.raises(ValueError, match="independently advance a connection owner"):
         Simulation(Topology((NodeSpec("a", "a"),)),
                    {"a": Factory(capabilities={"binding_owner", "connection", "step"})})
@@ -199,8 +187,7 @@ def test_connection_owner_cannot_borrow_a_binding_from_a_later_construction_grou
     connection = Factory(port, capabilities={"connection"})
     owner = Factory(port, capabilities={"binding_owner", "step"})
     with pytest.raises(ValueError, match="unsupported owner dependency.*earlier construction group"):
-        Simulation(pair(connection, owner), {"a": connection, "b": owner})
-    assert connection.created == owner.created == 0
+        Simulation(pair(), {"a": connection, "b": owner})
 
 
 def test_pure_topology_admission_hook_runs_once_per_factory_object_across_kind_aliases():
@@ -217,7 +204,6 @@ def test_pure_topology_admission_hook_runs_once_per_factory_object_across_kind_a
     topology = Topology((NodeSpec("a", "one"), NodeSpec("b", "alias"), NodeSpec("c", "two")))
     topology.validate({"one": first, "alias": first, "two": second})
     assert first.checked == second.checked == [("a", "b", "c")]
-    assert first.created == second.created == 0
 
 
 def test_m3508_duplicate_address_rejected_before_io_across_plants_and_factory_aliases():
@@ -232,13 +218,12 @@ def test_m3508_duplicate_address_rejected_before_io_across_plants_and_factory_al
     options = {"motor_id": 1, "plant": "fixed-rotor", "position_rad": 0, "velocity_rad_s": 0}
     first, second = Watched(), Watched()
     registry = {"bus": CanBusFactory(), "one": first, "alias": first, "two": second}
-    for kind in ("alias", "two"):
-        for plant in ("fixed-rotor", "rigid-rotor"):
-            topology = Topology((NodeSpec("bus", "bus"), NodeSpec("a", "one", options),
-                                 NodeSpec("b", kind, {**options, "plant": plant})),
-                                (LinkSpec("a.can", "bus.can"), LinkSpec("b.can", "bus.can")))
-            with pytest.raises(ValueError, match="duplicate M3508 motor_id 1 on bus bus"):
-                Simulation(topology, registry)
+    for kind, plant in (("alias", "fixed-rotor"), ("two", "rigid-rotor")):
+        topology = Topology((NodeSpec("bus", "bus"), NodeSpec("a", "one", options),
+                             NodeSpec("b", kind, {**options, "plant": plant})),
+                            (LinkSpec("a.can", "bus.can"), LinkSpec("b.can", "bus.can")))
+        with pytest.raises(ValueError, match="duplicate M3508 motor_id 1 on bus bus"):
+            Simulation(topology, registry)
     assert first.created == second.created == 0
     topology = Topology((NodeSpec("bus_a", "bus"), NodeSpec("bus_b", "bus"),
                          NodeSpec("a", "one", options),

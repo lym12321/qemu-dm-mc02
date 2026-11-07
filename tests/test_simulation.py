@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import pytest
 
 from sim.api import Event, LinkSpec, NodeDescription, NodeSpec, PortSpec, StepResult, Topology
-from sim.fabric import CanBus, CanBusFactory, CanFrame
+from sim.fabric import CanBusFactory, CanFrame
 from sim.runtime import Simulation, SimulationState
 import sim.runtime.simulation as runtime
 
@@ -581,7 +581,7 @@ def test_initial_sample_and_delivery_reject_close_reentry_and_preserve_cleanup(o
                 raise ValueError("initial cleanup also failed")
 
     events = Factory(InitialEvents, {"sample", "dispatch"})
-    probe = Factory(lambda spec, context: Component(spec, context))
+    probe = Factory(Component)
     topology = Topology((NodeSpec("probe", "probe"), NodeSpec("events", "events")))
 
     def attempt_close(event):
@@ -817,8 +817,12 @@ def test_input_queue_exhaustion_freezes_without_delivering_or_replaying_queued_i
 
 
 def test_bounded_event_history_full_callback_and_immutable_payload():
+    @dataclass(frozen=True)
+    class BadRecord:
+        values: tuple
+
     events = []
-    factory = Factory(lambda spec, context: Component(spec, context))
+    factory = Factory(Component)
     simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory}, event_history=2, on_event=events.append)
     with simulation:
         context = factory.instances[0].context
@@ -833,6 +837,9 @@ def test_bounded_event_history_full_callback_and_immutable_payload():
         with pytest.raises(TypeError):
             events[0].payload["new"] = 1
         assert (events[0].source_time_ns, events[0].mapped_time_ns, events[0].delivery_time_ns) == (4, 7, 9)
+        with pytest.raises(TypeError, match="immutable fields"):
+            context.emit(None, "bad", BadRecord(([1],)))
+        assert simulation.events_total == 3
 
 
 def test_context_failure_immediately_freezes_only_its_simulation_and_keeps_primary():
@@ -1115,34 +1122,8 @@ def test_can_self_excitation_and_queue_capacity_are_bounded(failure):
         assert simulation.components["bus"].pending == 1
 
 
-def test_can_interval_admission_preserves_original_frame_and_atomic_overflow():
-    class Sink:
-        def __init__(self):
-            self.frames = []
-        def receive(self, frame):
-            self.frames.append(frame)
-    source, sink = Sink(), Sink()
-    events = []
-    bus = CanBus(delay_ns=3, log=events.append)
-    bus.attach(source)
-    bus.attach(sink)
-    frame = CanFrame(1, timestamp_ns=2)
-    bus.send(source, frame, not_before_ns=10)
-    assert bus.step(12) == 0
-    assert bus.step(13) == 1
-    assert events[0].frame is frame and events[0].timestamp_ns == 2
-    assert sink.frames == [CanFrame(1, timestamp_ns=13)]
-    with pytest.raises(ValueError, match="64-bit"):
-        bus.send(source, frame, not_before_ns=(1 << 64) - 1)
-    assert bus.pending == 0
-    bus.close()
-    bus.close()
-    with pytest.raises(RuntimeError, match="closed"):
-        bus.send(source, frame)
-
-
 def test_connected_endpoint_must_be_attached_by_its_factory_before_start_hooks():
-    factory = Factory(lambda spec, context: Component(spec, context), ports=(PortSpec("can", "can"),))
+    factory = Factory(Component, ports=(PortSpec("can", "can"),))
     topology = Topology((NodeSpec("bus", "bus"), NodeSpec("n", "n")), (LinkSpec("n.can", "bus.can"),))
     simulation = Simulation(topology, {"bus": CanBusFactory(), "n": factory})
     with pytest.raises(ValueError, match="did not attach"):
@@ -1153,7 +1134,7 @@ def test_connected_endpoint_must_be_attached_by_its_factory_before_start_hooks()
 
 
 def test_invalid_step_admission_is_reversible_and_uint64_overflow_rejected():
-    factory = Factory(lambda spec, context: Component(spec, context))
+    factory = Factory(Component)
     simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory},
                             quantum_ns=(1 << 64) - 1)
     with simulation:
@@ -1180,15 +1161,7 @@ def test_observer_exception_and_interrupt_remain_primary_and_close_is_idempotent
         simulation.close()
 
 
-def test_frozen_record_cannot_hide_mutable_observation_and_startup_reentry_fails_safely():
-    @dataclass(frozen=True)
-    class BadRecord:
-        values: tuple
-    factory = Factory(lambda spec, context: Component(spec, context))
-    simulation = Simulation(Topology((NodeSpec("n", "n"),)), {"n": factory})
-    with simulation:
-        with pytest.raises(TypeError, match="immutable fields"):
-            factory.instances[0].context.emit(None, "bad", BadRecord(([1],)))
+def test_start_hook_observer_cannot_reenter_start():
     class Starts(Component):
         def start(self):
             self.context.emit(None, "started", None)

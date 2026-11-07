@@ -67,7 +67,7 @@ def wired(*, value=None, max_pending=256, dispatch_budget=256, sinks=2):
     context, order = Context(), []
     net = DigitalNet(context, max_pending=max_pending, dispatch_budget=dispatch_budget)
     source = Source(value if value is not None else DigitalSample(None, 100, 0))
-    assert attach(net, source, 'source', 'out') is source
+    attach(net, source, 'source', 'out')
     receivers = [Sink(f'sink{index}', order) for index in range(sinks)]
     for receiver in receivers:
         attach(net, receiver, receiver.name, 'in')
@@ -240,7 +240,7 @@ def test_invalid_source_results_freeze_without_delivery(value, match):
     net.close()
 
 
-def test_endpoint_admission_is_atomic_and_wiring_locks_before_first_source_read():
+def test_endpoint_admission_is_atomic_bounded_and_locks_before_first_source_read():
     context, order = Context(), []
     net = DigitalNet(context)
     with pytest.raises(ValueError, match='input or output'):
@@ -248,32 +248,23 @@ def test_endpoint_admission_is_atomic_and_wiring_locks_before_first_source_read(
     with pytest.raises(TypeError, match='read_digital'):
         attach(net, object(), 'missing', 'out')
     source = Source(DigitalSample(0, 0, 0))
-    attach(net, source, 'source', 'out')
+    assert attach(net, source, 'source', 'out') is source
     with pytest.raises(ValueError, match='exactly one driver'):
         attach(net, Source(DigitalSample(1, 0, 0)), 'other', 'out')
     sink = Sink('sink', order)
     attach(net, sink, 'sink', 'in')
     with pytest.raises(ValueError, match='already attached'):
         attach(net, sink, 'duplicate', 'in')
+    # One source and 255 sinks fill the existing topology's 256-link bound.
+    for index in range(254):
+        attach(net, Sink(f'sink{index}', order), f'sink{index}', 'in')
+    with pytest.raises(BufferError, match='endpoint capacity'):
+        attach(net, Sink('extra', order), 'extra', 'in')
     net.reset(Session(1))
     with pytest.raises(RuntimeError, match='before reset'):
         attach(net, Sink('late', order), 'late', 'in')
     assert source.reads == 0 and order == context.events == []
     net.close()
-
-
-def test_fanout_is_bounded_before_callbacks_or_source_reads():
-    # The source plus 255 sinks exhaust the topology's 256-link upper bound.
-    order = []
-    source = Source(DigitalSample(None, 100, 0))
-    fresh = DigitalNet(Context())
-    attach(fresh, source, 'source', 'out')
-    for index in range(255):
-        attach(fresh, Sink(f'sink{index}', order), f'sink{index}', 'in')
-    with pytest.raises(BufferError, match='endpoint capacity'):
-        attach(fresh, Sink('extra', order), 'extra', 'in')
-    assert source.reads == 0 and order == []
-    fresh.close()
 
 
 def test_direct_paused_sample_failure_freezes_before_more_source_reads():
