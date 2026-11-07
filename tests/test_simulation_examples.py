@@ -1,7 +1,9 @@
 """Example manifest, real build and direct acceptance-verifier coverage."""
 
 import importlib.util
+from dataclasses import replace
 from fractions import Fraction
+import hashlib
 import json
 import math
 from pathlib import Path
@@ -47,10 +49,10 @@ def test_real_bare_metal_examples_build_and_link_without_vendor_or_firmware_sdk(
                                        3 if case in ("can-motor", "rotor-loop") else 1)
 
 
-def test_missing_build_dependency_is_explicitly_blocked(monkeypatch):
+def test_missing_build_dependency_is_explicitly_blocked(tmp_path, monkeypatch):
     monkeypatch.setattr(smoke.shutil, "which", lambda name: None)
     with pytest.raises(smoke.Blocked, match="cmake"):
-        smoke.build_example("minimal-board")
+        smoke.build_example("minimal-board", build_dir=tmp_path / "firmware")
 
 
 def test_motor_loop_variants_are_mutually_exclusive_at_cmake_admission(tmp_path):
@@ -225,6 +227,70 @@ def test_digital_scene_reuses_two_normal_minimal_board_elfs(tmp_path, monkeypatc
     assert [node.kind for node in scene.topology.nodes] == ["machine.qemu", "net.digital", "machine.qemu"]
     assert [(str(link.source), str(link.target)) for link in scene.topology.links] == [
         ("main.gpio.B0.out", "wire.signal"), ("wire.signal", "peer.key")]
+
+
+@pytest.mark.parametrize("case", (*smoke.NATIVE_CASES, "joint-loop", "dual-board",
+                                 "imu-readback", "uart-link", "hal-gpio"))
+def test_native_case_scene_uses_requested_elf_for_every_machine_without_acquisition(
+        tmp_path, monkeypatch, case):
+    from sim.composition import builtin_registry
+    from sim.config.scene import load_scene
+
+    registry = builtin_registry()
+    for factory in registry.values():
+        monkeypatch.setattr(factory, "create", lambda *_a, **_k: pytest.fail("resource acquisition"))
+    monkeypatch.setattr(smoke.subprocess, "Popen", lambda *_a, **_k: pytest.fail("native process"))
+    monkeypatch.chdir(tmp_path)
+    # Missing firmware is intentional: scene preparation is pure admission,
+    # and must not open an ELF or construct the native backend.
+    requested = Path("not-built-yet.elf")
+    scene = smoke._case_scene(case, registry=registry, firmware=requested)
+    machines = [node for node in scene.topology.nodes if node.kind == "machine.qemu"]
+    assert {node.name for node in machines} == (
+        {"main", "peer"} if case in ("digital-link", "dual-board") else {"main"})
+    assert all(node.options["firmware"] == str(requested.resolve()) for node in machines)
+    if case == "hal-gpio":
+        assert machines[0].options["uarts"] == ()
+        return
+    example = "digital-link" if case == "digital-link" else smoke.EXAMPLE_ALIASES.get(case, case)
+    manifest = ROOT / "examples" / example / (
+        case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml")
+    original = load_scene(manifest, registry)
+    for before, after in zip(original.topology.nodes, scene.topology.nodes, strict=case != "dual-board"):
+        assert (after.name, after.kind, after.base_dir, after.required_capabilities) == (
+            before.name, before.kind, before.base_dir, before.required_capabilities)
+        expected_options = dict(before.options)
+        if before.kind == "machine.qemu":
+            expected_options["firmware"] = str(requested.resolve())
+        assert dict(after.options) == expected_options
+    assert scene.mode == original.mode and scene.experiment == original.experiment
+    assert (scene.quantum_ns, scene.duration_ns) == (
+        (10_000_000, 20_000_000) if case == "pulse" else
+        (original.quantum_ns, original.duration_ns))
+    assert scene.topology.links[:len(original.topology.links)] == original.topology.links
+    if case == "dual-board":
+        assert str(scene.topology.links[-1].source) == "peer.fdcan1"
+        assert str(scene.topology.links[-1].target) == "can0.can"
+    else:
+        assert scene.topology.links == original.topology.links
+
+
+def test_case_scene_preserves_required_capabilities_and_experiment(tmp_path, monkeypatch):
+    from sim.api import NodeSpec, Topology
+    from sim.composition import builtin_registry
+    from sim.config import scene as scene_module
+
+    original = scene_module.Scene(Topology((NodeSpec("main", "machine.qemu",
+        {"firmware": "old.elf"}, base_dir=tmp_path / "source",
+        required_capabilities={"machine"}),), ()), quantum_ns=123, duration_ns=456,
+        experiment=scene_module.ExperimentSpec(inputs=(
+            scene_module.ExperimentInput(1, "main.key", True, "session"),)))
+    monkeypatch.setattr(scene_module, "load_scene", lambda *_a: original)
+    prepared = smoke._case_scene("minimal-board", registry=builtin_registry(),
+                                 firmware=tmp_path / "selected.elf")
+    node = original.topology.nodes[0]
+    assert prepared == replace(original, topology=Topology((replace(node,
+        options={**node.options, "firmware": str(tmp_path / "selected.elf")}),), ()))
 
 
 def test_motor_uart_pass_alone_cannot_replace_actual_can_and_native_receipts():
@@ -545,6 +611,178 @@ def test_blocked_native_gate_retains_new_report_and_returns_78(tmp_path):
     original = report.read_bytes()
     assert smoke.main(["--qemu", str(tmp_path / "not-a-qemu"), "--report", str(report)]) == 1
     assert report.read_bytes() == original
+
+
+@pytest.mark.parametrize("location", ["report", "assets"])
+@pytest.mark.parametrize("existing", ["file", "directory", "dangling-symlink"])
+def test_report_and_assets_collisions_reject_before_build_or_native_effects(
+        tmp_path, monkeypatch, location, existing):
+    report = tmp_path / "gate.json"
+    target = report if location == "report" else tmp_path / "gate-assets"
+    if existing == "file":
+        target.write_bytes(b"preserve previous evidence")
+    elif existing == "directory":
+        target.mkdir()
+        (target / "evidence").write_bytes(b"preserve previous evidence")
+    else:
+        target.symlink_to(tmp_path / "missing-target")
+    monkeypatch.setattr(smoke.subprocess, "run", lambda *_a, **_k: pytest.fail("subprocess"))
+    monkeypatch.setattr(smoke, "build_example", lambda *_a, **_k: pytest.fail("build"))
+    monkeypatch.setattr(smoke, "run_case", lambda *_a, **_k: pytest.fail("native run"))
+    assert smoke.main(["--report", str(report)]) == 1
+    if existing == "file":
+        assert target.read_bytes() == b"preserve previous evidence"
+    elif existing == "directory":
+        assert {item.name for item in target.iterdir()} == {"evidence"}
+        assert (target / "evidence").read_bytes() == b"preserve previous evidence"
+    else:
+        assert target.is_symlink() and target.readlink() == tmp_path / "missing-target"
+
+
+@pytest.fixture
+def host_gate(tmp_path, monkeypatch):
+    """Only exercise report orchestration; these bytes are never native evidence."""
+    qemu = tmp_path / "mock-qemu"
+    qemu.write_bytes(b"host-contract placeholder")
+    qemu.chmod(0o700)
+    monkeypatch.setattr(smoke.subprocess, "run", lambda *_a, **_k:
+        SimpleNamespace(stdout="host contract version\n", returncode=0))
+    builds, runs = [], []
+
+    def build(case, *, build_dir, build_type="Debug", **options):
+        directory = Path(build_dir)
+        directory.mkdir(parents=True, exist_ok=True)
+        elf = directory / "firmware.elf"
+        elf.write_bytes((case + build_type).encode())
+        builds.append((case, directory, elf))
+        return {"elf": str(elf), "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(),
+                "build_type": build_type, "build": []}
+
+    def run(case, *, firmware, **_options):
+        runs.append((case, Path(firmware)))
+        return {"host_orchestration_mock": True}
+
+    monkeypatch.setattr(smoke, "build_example", build)
+    monkeypatch.setattr(smoke, "run_case", run)
+    return SimpleNamespace(qemu=qemu, builds=builds, runs=runs)
+
+
+def test_report_owns_each_build_and_forwards_its_exact_elf(tmp_path, host_gate):
+    report = tmp_path / "all.json"
+    assert smoke.main(["--qemu", str(host_gate.qemu), "--report", str(report)]) == 0
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "passed"
+    assert [case for case, _, _ in host_gate.builds] == list(smoke.NATIVE_CASES)
+    assert host_gate.runs == [(case, elf) for case, _, elf in host_gate.builds]
+    for case, directory, elf in host_gate.builds:
+        assert directory == tmp_path / "all-assets" / case / "Debug"
+        assert payload["cases"][case]["elf"] == str(elf)
+        assert payload["cases"][case]["sha256"] == hashlib.sha256(elf.read_bytes()).hexdigest()
+
+
+def test_report_copies_hal_firmware_into_owned_assets(tmp_path, host_gate):
+    source = tmp_path / "external.elf"
+    source.write_bytes(b"host HAL copy contract")
+    report = tmp_path / "hal.json"
+    assert smoke.main(["--case", "hal-gpio", "--hal-elf", str(source),
+                       "--qemu", str(host_gate.qemu), "--report", str(report)]) == 0
+    payload = json.loads(report.read_text())
+    retained = Path(payload["cases"]["hal-gpio"]["elf"])
+    assert retained.parent == tmp_path / "hal-assets" / "hal-gpio" / "Debug"
+    assert retained != source and retained.read_bytes() == source.read_bytes()
+    assert host_gate.builds == [] and host_gate.runs == [("hal-gpio", retained)]
+    source.write_bytes(b"later external build")
+    assert retained.read_bytes() == b"host HAL copy contract"
+
+
+def test_report_checks_all_retained_elfs_again_before_publishing_pass(
+        tmp_path, host_gate, monkeypatch):
+    original = smoke.build_example
+
+    def build(case, **options):
+        result = original(case, **options)
+        if case == "can-motor":
+            host_gate.builds[0][2].write_bytes(b"changed after its own run completed")
+        return result
+
+    monkeypatch.setattr(smoke, "build_example", build)
+    report = tmp_path / "changed.json"
+    assert smoke.main(["--qemu", str(host_gate.qemu), "--report", str(report)]) == 1
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed" and "ELF changed" in payload["error"]
+    assert host_gate.builds[0][2].read_bytes() == b"changed after its own run completed"
+
+
+@pytest.mark.parametrize("interrupted", [False, True])
+def test_failed_or_interrupted_gate_retains_report_and_owned_elf(
+        tmp_path, host_gate, monkeypatch, interrupted):
+    def fail(*_a, **_k):
+        error = KeyboardInterrupt("bounded interrupt") if interrupted else RuntimeError("native failure")
+        error.simulation_observations = {"resources": [], "cleanup_completed": True,
+                                         "cleanup_failures": []}
+        raise error
+
+    monkeypatch.setattr(smoke, "run_case", fail)
+    report = tmp_path / "failed.json"
+    assert smoke.main(["--case", "minimal-board", "--qemu", str(host_gate.qemu),
+                       "--report", str(report)]) == (130 if interrupted else 1)
+    payload = json.loads(report.read_text())
+    assert payload["status"] == "failed"
+    assert payload["error_type"] == ("KeyboardInterrupt" if interrupted else "RuntimeError")
+    assert payload["partial_observations"]["cleanup_completed"] is True
+    retained = Path(payload["cases"]["minimal-board"]["elf"])
+    assert retained == tmp_path / "failed-assets" / "minimal-board" / "Debug" / "firmware.elf"
+    assert hashlib.sha256(retained.read_bytes()).hexdigest() == payload["cases"]["minimal-board"]["sha256"]
+
+
+def test_smoke_failure_preserves_primary_and_all_cleanup_notes(tmp_path, monkeypatch):
+    from sim import runtime
+
+    firmware = tmp_path / "host-contract.elf"
+    firmware.write_bytes(b"host-only failure contract")
+    primary = RuntimeError("start failed")
+    cleanup = RuntimeError("first owner cleanup failed")
+    cleanup.add_note("second owner cleanup failed")
+    closed = []
+
+    class FailedSimulation:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            raise primary
+
+        def close(self):
+            closed.append(True)
+            raise cleanup
+
+    monkeypatch.setattr(runtime, "Simulation", FailedSimulation)
+    with pytest.raises(RuntimeError, match="start failed") as caught:
+        smoke.run_case("minimal-board", qemu=tmp_path / "unused", firmware=firmware)
+    assert caught.value is primary and closed == [True]
+    assert primary.__notes__ == ["Simulation cleanup also failed: first owner cleanup failed",
+                                 "second owner cleanup failed"]
+    assert primary.simulation_observations["cleanup_completed"] is False
+    assert primary.simulation_observations["cleanup_failures"] == primary.__notes__
+
+
+def test_can_smoke_blocked_conversion_preserves_native_cleanup_notes(tmp_path, monkeypatch):
+    from sim.api import BackendUnavailable
+    from sim.apps import experiment
+
+    firmware = tmp_path / "host-contract.elf"
+    firmware.write_bytes(b"host-only unavailable contract")
+    unavailable = BackendUnavailable("native attachment failed")
+    unavailable.add_note("native cleanup also failed")
+
+    def fail(*_args, **_kwargs):
+        raise unavailable
+
+    monkeypatch.setattr(experiment, "run_experiment", fail)
+    with pytest.raises(smoke.Blocked, match="native attachment failed") as caught:
+        smoke.run_can_faults(qemu=tmp_path / "unused", firmware=firmware)
+    assert caught.value.__notes__ == ["native cleanup also failed"]
+    assert caught.value.simulation_observations["resources"] == []
 
 
 def _imu_observations():

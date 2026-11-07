@@ -27,6 +27,133 @@ MMIO_WRITE = (
 MMIO_RECOMPILE = "cpu_io_recompile: rewound execution of TB to 000000000800012c\n"
 
 
+def test_native_instrumentation_forwards_the_requested_elf(monkeypatch, tmp_path):
+    firmware, qemu = tmp_path / "requested.elf", tmp_path / "qemu"
+    calls = []
+
+    def run(case, **kwargs):
+        calls.append((case, kwargs))
+        return {"snapshots": [{"mapped_time_ns": cut, "source": "main"} for cut in (0, 1)],
+                "events": 2}
+
+    monkeypatch.setattr(benchmark, "run_case", run)
+    metrics = benchmark.native("minimal-board", qemu, firmware=firmware)
+    assert calls == [("minimal-board", {"qemu": qemu, "firmware": firmware})]
+    assert metrics["cuts"] == 1 and metrics["observations"]["events"] == 2
+
+
+@pytest.fixture
+def simple_native(monkeypatch, tmp_path):
+    """Build/execute stand-ins verify tool ownership, never native behavior."""
+    qemu = tmp_path / "qemu"
+    qemu.write_bytes(b"qemu fixture")
+    qemu.chmod(0o700)
+    state = SimpleNamespace(qemu=qemu, builds=[], runs=[], failure=None, after_run=None)
+
+    def build(case, *, build_dir):
+        state.builds.append((case, build_dir))
+        build_dir.mkdir(parents=True, exist_ok=False)
+        elf = build_dir / "firmware.elf"
+        elf.write_bytes(f"{case}:{len(state.builds)}".encode())
+        return {"elf": str(elf), "sha256": hashlib.sha256(elf.read_bytes()).hexdigest(),
+                "build_type": "Debug", "build": []}
+
+    def native(case, path, *, firmware):
+        state.runs.append((case, path, firmware))
+        if state.failure is not None:
+            raise state.failure
+        if state.after_run is not None:
+            state.after_run(case)
+        return {"observations": {"fixture": True}}
+
+    monkeypatch.setattr(benchmark.subprocess, "check_output", lambda *_, **__: "QEMU fixture")
+    monkeypatch.setattr(benchmark, "build_example", build)
+    monkeypatch.setattr(benchmark, "native", native)
+    monkeypatch.setattr(benchmark, "host", lambda: {"fixture": True})
+    return state
+
+
+@pytest.mark.parametrize("name,case", [("single", "minimal-board"), ("dual", "dual-board")])
+def test_native_benchmark_reports_own_distinct_builds_and_forward_exact_elf(
+        simple_native, tmp_path, name, case):
+    retained = []
+    for stem in ("first", "second"):
+        report = tmp_path / f"{stem}.json"
+        assert benchmark.main(["--case", name, "--qemu", str(simple_native.qemu),
+                               "--repeat", "2", "--report", str(report)]) == 0
+        item = json.loads(report.read_text())["cases"][name]
+        expected = tmp_path / f"{stem}-assets" / case / "Debug" / "firmware.elf"
+        assert item["status"] == "PASS" and Path(item["firmware"]["elf"]) == expected
+        assert simple_native.runs[-2:] == [(case, simple_native.qemu, expected)] * 2
+        retained.append((expected, expected.read_bytes()))
+    assert simple_native.builds == [(case, path.parent) for path, _ in retained]
+    assert all(path.read_bytes() == content for path, content in retained)
+
+
+@pytest.mark.parametrize("target,kind", [(target, kind) for target in ("report", "assets")
+                                        for kind in ("file", "directory", "symlink")])
+def test_existing_benchmark_outputs_are_rejected_before_acquisition(
+        monkeypatch, tmp_path, target, kind):
+    report, assets = tmp_path / "existing.json", tmp_path / "existing-assets"
+    path = report if target == "report" else assets
+    if kind == "file":
+        path.write_bytes(b"existing evidence")
+    elif kind == "directory":
+        path.mkdir()
+        (path / "keep").write_bytes(b"existing evidence")
+    else:
+        path.symlink_to(tmp_path / "missing-target")
+
+    def acquired(*_, **__):
+        pytest.fail("existing outputs must be rejected before acquisition")
+
+    for name in ("host", "native", "build_example", "attribution"):
+        monkeypatch.setattr(benchmark, name, acquired)
+    monkeypatch.setattr(benchmark.subprocess, "check_output", acquired)
+    with pytest.raises(FileExistsError):
+        benchmark.main(["--case", "all", "--report", str(report)])
+    if kind == "file":
+        assert path.read_bytes() == b"existing evidence"
+    elif kind == "directory":
+        assert list(path.iterdir()) == [path / "keep"]
+        assert (path / "keep").read_bytes() == b"existing evidence"
+    else:
+        assert path.is_symlink() and path.readlink() == tmp_path / "missing-target"
+    if target == "assets":
+        assert not report.exists()
+
+
+def test_final_benchmark_hash_check_catches_changes_to_an_earlier_case(simple_native, tmp_path):
+    def mutate(case):
+        if case == "dual-board":
+            first = simple_native.builds[0][1] / "firmware.elf"
+            first.write_bytes(b"changed by later work")
+
+    simple_native.after_run = mutate
+    report = tmp_path / "all.json"
+    assert benchmark.main(["--case", "all", "--qemu", str(simple_native.qemu),
+                           "--repeat", "1", "--report", str(report)]) == 1
+    payload = json.loads(report.read_text())
+    assert payload["status"] == payload["cases"]["single"]["status"] == "FAIL"
+    assert "firmware ELF changed after native execution" in payload["cases"]["single"]["error"]
+    assert payload["cases"]["dual"]["status"] == "PASS"
+    assert len(payload["cases"]["single"]["runs"]) == 1
+
+
+@pytest.mark.parametrize("error_type,exit_code", [(RuntimeError, 1), (KeyboardInterrupt, 130)])
+def test_native_benchmark_failure_retains_owned_firmware_and_raw_observations(
+        simple_native, tmp_path, error_type, exit_code):
+    error = error_type("firmware did not consume input")
+    error.simulation_observations = {"uart": "PASS", "causal_reply": None}
+    simple_native.failure = error
+    report = tmp_path / "failed.json"
+    assert benchmark.main(["--case", "single", "--qemu", str(simple_native.qemu),
+                           "--report", str(report)]) == exit_code
+    item = json.loads(report.read_text())["cases"]["single"]
+    assert item["status"] == "FAIL" and item["partial_observations"] == error.simulation_observations
+    assert Path(item["firmware"]["elf"]).is_file() and not item["runs"]
+
+
 @pytest.mark.parametrize("mode", ("count", "json", "file"))
 def test_output_modes_count_or_encode_once_and_measure_real_writes(monkeypatch, mode):
     from sim import cli

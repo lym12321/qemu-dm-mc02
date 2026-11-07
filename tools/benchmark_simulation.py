@@ -261,7 +261,7 @@ def host():
     return rows
 
 
-def native(case, qemu):
+def native(case, qemu, *, firmware):
     from sim.machines.qemu.machine import QemuMachine
     metrics = {"qmp_calls": Counter(command=0, command_many=0), "qmp_commands": Counter(), "qmp_s": 0,
                "event_json_bytes": 0, "qemu_rss_samples": 0, "qemu_rss_max_bytes": {}}
@@ -306,7 +306,7 @@ def native(case, qemu):
                 (QemuMachine, "command_many", grouped), (Simulation, "start", started),
                 (Observations, "__call__", observed)):
             stack.enter_context(patch.object(owner, name, replacement))
-        observations = run_case(case, qemu=qemu)
+        observations = run_case(case, qemu=qemu, firmware=firmware)
     metrics["elapsed_including_cleanup_s"] = perf_counter() - begun
     cuts = {row["mapped_time_ns"] for row in observations["snapshots"]}
     metrics.update(cuts=len(cuts - {0}), simulated_ns=max(cuts),
@@ -787,28 +787,37 @@ def main(argv=None):
         payload["limits"] = ("Fixed WFI/busy-MMIO single-machine/count workloads;200ms, "
             "200cuts without trace or204cuts with four10us trace windows. See cases.native-cost.conditions. "
             "Log capacity exhaustion/truncation fails. Trace/sampling times do not establish baseline performance.")
+    assets = args.report.parent / (args.report.stem + "-assets")
+    for path in ((args.report,) if args.case == "host" else (args.report, assets)):
+        if os.path.lexists(path):
+            raise FileExistsError(path)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     with args.report.open("x", encoding="utf-8") as output:
+        assets_reserved = False
         try:
             for name in (("host", "single", "dual") if args.case == "all" else (args.case,)):
                 item = payload["cases"][name] = {"status": "FAIL", "runs": []}
                 try:
                     if name in ("attribution", "native-cost"):
-                        attribution(item, args.qemu, args.report.parent / (args.report.stem + "-assets"),
+                        attribution(item, args.qemu, assets,
                                     args.repeat, native_cost=name == "native-cost", capture=args.capture or "none")
                         continue
                     if name != "host":
                         if not args.qemu.is_file() or not os.access(args.qemu, os.X_OK):
                             raise Blocked(f"project QEMU executable missing: {args.qemu}")
+                        if not assets_reserved:
+                            assets.mkdir(exist_ok=False)
+                            assets_reserved = True
                         item["qemu"] = {"path": str(args.qemu.resolve()),
                             "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
                             "version": subprocess.check_output([str(args.qemu), "--version"],
                                 text=True, timeout=3).strip()}
                         case = "minimal-board" if name == "single" else "dual-board"
-                        item["firmware"] = build_example(case)
+                        item["firmware"] = build_example(case, build_dir=(assets / case / "Debug").resolve())
                     for _ in range(args.repeat):
                         before = usage()
-                        row = host() if name == "host" else native(case, args.qemu)
+                        row = host() if name == "host" else native(case, args.qemu,
+                            firmware=Path(item["firmware"]["elf"]))
                         row["usage"] = usage()
                         for key in ("host_cpu_s", "children_cpu_s"):
                             if before[key] is not None:
@@ -824,10 +833,21 @@ def main(argv=None):
                                 notes=list(getattr(error, "__notes__", ())))
                     if hasattr(error, "simulation_observations"):
                         item["partial_observations"] = error.simulation_observations
+            for item in payload["cases"].values():
+                if item["status"] == "PASS" and "firmware" in item:
+                    try:
+                        if _identity(item["firmware"]["elf"])["sha256"] != item["firmware"]["sha256"]:
+                            raise RuntimeError("firmware ELF changed after native execution")
+                        if _identity(args.qemu)["sha256"] != item["qemu"]["sha256"]:
+                            raise RuntimeError("QEMU executable changed after native execution")
+                    except Exception as error:
+                        item.update(status="FAIL", error=f"{type(error).__name__}: {error}")
             statuses = {item["status"] for item in payload["cases"].values()}
             payload["status"] = "FAIL" if "FAIL" in statuses else "BLOCKED" if "BLOCKED" in statuses else "PASS"
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as error:
             payload.update(status="FAIL", error="KeyboardInterrupt", interrupted=True)
+            if hasattr(error, "simulation_observations"):
+                item["partial_observations"] = error.simulation_observations
         finally:
             json.dump(payload, output, indent=2)
             output.write("\n")

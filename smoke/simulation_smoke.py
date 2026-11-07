@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -991,7 +991,48 @@ def verify_can_faults(observations, experiment):
         "limits": "Computed replies prove actual RX data use; delivery/receipt and sampled GPIO/UART are not exact IRQ consumption timestamps."}
 
 
-def run_can_faults(*, qemu, firmware):
+def _firmware_identity(firmware):
+    path = Path(firmware).resolve(strict=True)
+    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+
+
+def _capture_machine(resources, name, info, firmware):
+    """Capture actual Linux process arguments, independently of the scene."""
+    pid = info["pid"]
+    resource = {"name": name, "pid": pid, "sockets": dict(info["sockets"])}
+    resources.append(resource)
+    proc = Path(f"/proc/{pid}")
+    # starttime distinguishes an unrelated reused PID during cleanup.
+    resource["starttime"] = proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
+    arguments = proc.joinpath("cmdline").read_bytes().removesuffix(b"\0").split(b"\0")
+    resource["argv"] = [os.fsdecode(arg) for arg in arguments]
+    argv = resource["argv"]
+    if argv.count("-kernel") != 1 or argv.index("-kernel") + 1 == len(argv):
+        raise AssertionError("actual native process lacks a unique -kernel ELF argument")
+    resource["firmware"] = _firmware_identity(argv[argv.index("-kernel") + 1])
+    if resource["firmware"] != firmware:
+        raise AssertionError("actual native -kernel ELF differs from the requested firmware")
+
+
+def _cleanup_failures(resources):
+    failures = []
+    for resource in resources:
+        try:
+            stat = Path(f"/proc/{resource['pid']}/stat")
+            try:
+                current = stat.read_text().rsplit(")", 1)[1].split()[19]
+            except FileNotFoundError:
+                current = None
+            if current is not None and ("starttime" not in resource or current == resource["starttime"]):
+                failures.append(f"owned QEMU identity remains after cleanup: {resource['pid']}")
+            if any(os.path.lexists(path) for path in resource["sockets"].values()):
+                failures.append("owned native socket path remains after cleanup")
+        except (OSError, ValueError, IndexError) as error:
+            failures.append(f"native cleanup verification failed: {error}")
+    return failures
+
+
+def run_can_faults(*, qemu, firmware, backend_root=ROOT):
     import yaml
     from sim.apps.experiment import run_experiment
     from sim.composition import builtin_registry
@@ -999,7 +1040,8 @@ def run_can_faults(*, qemu, firmware):
     from sim.machines.qemu import QemuFactory
     from sim.machines.qemu.errors import BackendUnavailable
 
-    firmware = Path(firmware).resolve()
+    identity = _firmware_identity(firmware)
+    firmware = Path(identity["path"])
     document = yaml.safe_load((ROOT / "examples/can-faults/scene.yaml").read_text())
     document["nodes"]["main"]["firmware"] = str(firmware)
     prepared = firmware.parent / "can-faults.yaml"
@@ -1018,32 +1060,25 @@ def run_can_faults(*, qemu, firmware):
         observations(event)
         for name, machine in machines.items():
             if machine.started and not any(row["name"] == name for row in resources):
-                info = machine.connection_info
-                pid = info["pid"]
-                resources.append({"name": name, "pid": pid,
-                    "starttime": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
-                    "sockets": dict(info["sockets"])})
+                _capture_machine(resources, name, machine.connection_info, identity)
 
-    registry = builtin_registry(qemu=qemu)
-    registry["machine.qemu"] = CaptureFactory(qemu=qemu)
+    registry = builtin_registry(qemu=qemu, backend_root=backend_root)
+    registry["machine.qemu"] = CaptureFactory(qemu=qemu, backend_root=backend_root)
     scene = load_scene(prepared, registry)
     primary = None
     try:
         experiment = run_experiment(scene, registry, on_event=observe)
     except BaseException as error:
         if isinstance(error, BackendUnavailable):
-            error = Blocked(str(error))
+            unavailable = error
+            error = Blocked(str(unavailable))
+            for note in getattr(unavailable, "__notes__", ()):
+                error.add_note(note)
         primary = error
         raise error
     finally:
         # run_experiment owns Simulation and independently closes its owners.
-        failures = []
-        for resource in resources:
-            stat = Path(f"/proc/{resource['pid']}/stat")
-            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[19] == resource["starttime"]:
-                failures.append("owned QEMU identity remains after cleanup")
-            if any(os.path.lexists(path) for path in resource["sockets"].values()):
-                failures.append("owned QEMU socket remains after cleanup")
+        failures = _cleanup_failures(resources)
         partial = {**observations.report(), "resources": resources,
                    "cleanup_completed": not failures, "cleanup_failures": failures}
         if primary is not None:
@@ -1057,6 +1092,8 @@ def run_can_faults(*, qemu, firmware):
     try:
         if {row["name"] for row in resources} != {"main"}:
             raise AssertionError("actual native QEMU identity was not observed")
+        if _firmware_identity(firmware) != identity:
+            raise AssertionError("firmware ELF changed during the native acceptance run")
         verified = verify_can_faults(observations, experiment)
     except BaseException as error:
         error.simulation_observations = partial
@@ -1064,17 +1101,13 @@ def run_can_faults(*, qemu, firmware):
     return {**partial, "state": "closed", "experiment": _plain(experiment), "can_faults": verified}
 
 
-def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=False,
+def build_example(case, *, build_dir, build_type="Debug", imu_skip_gyro=False,
                   uart_skip_rx=False, can_skip_rx=False):
     for program in ("cmake", "arm-none-eabi-gcc"):
         if shutil.which(program) is None:
             raise Blocked(f"{program} is required to build the real example ELF")
     source = ROOT / "examples" / EXAMPLE_ALIASES.get(case, case)
-    default_build = (ROOT / "build" / "simulation-examples" / "pulse" if case == "pulse"
-                     else source / "build" / (build_type + ("-skip-rx" if can_skip_rx else "")) if case == "can-faults"
-                     else source / "build-rotor-loop" if case == "rotor-loop"
-                     else source / "build-joint-loop" if case == "joint-loop" else source / "build")
-    build = default_build if build_dir is None else Path(build_dir)
+    build = Path(build_dir).resolve()
     variant = (["-DSIM_KEY_PULSE_TEST=ON"] if case == "pulse" else
                ["-DSIM_KEY_PULSE_TEST=OFF"] if source.name == "minimal-board" else [])
     if source.name == "can-motor":
@@ -1100,53 +1133,48 @@ def build_example(case, *, build_dir=None, build_type="Debug", imu_skip_gyro=Fal
             "build_type": build_type, "build": logs}
 
 
-def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
-    if case == "can-faults":
-        return run_can_faults(qemu=qemu, firmware=firmware)
-    from sim.composition import builtin_registry
+def _case_scene(case, *, registry, firmware):
+    """Prepare fixed smoke scenes without acquiring execution resources."""
+    from sim.api import LinkSpec, NodeSpec
     from sim.config.scene import load_scene
-    from sim.runtime import Simulation
-    from sim.machines.qemu.errors import BackendUnavailable
 
-    observations = Observations()
-    registry = builtin_registry(qemu=qemu, backend_root=backend_root)
+    firmware = str(Path(firmware).resolve())
     if case == "hal-gpio":
-        from sim.api import NodeSpec, Topology
+        from sim.api import Topology
         from sim.config.scene import Scene
 
         scene = Scene(Topology((NodeSpec("main", "machine.qemu", {
-            "model": "dm-mc02", "firmware": str(firmware), "uarts": ()}),), ()))
+            "model": "dm-mc02", "firmware": firmware, "uarts": ()}),), ()))
     else:
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
         scene = load_scene(ROOT / "examples" / example /
                            (case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"), registry)
-        if case in ("imu-readback", "uart-link") and firmware is not None:
-            from sim.api import NodeSpec, Topology
-            from sim.config.scene import Scene
-
-            nodes = tuple(NodeSpec(node.name, node.kind,
-                {**node.options, "firmware": str(firmware)} if node.name == "main" else node.options,
-                base_dir=node.base_dir) for node in scene.topology.nodes)
-            scene = Scene(Topology(nodes, scene.topology.links), scene.mode,
-                          scene.quantum_ns, scene.duration_ns)
         if case == "pulse":
-            from sim.api import NodeSpec, Topology
-            from sim.config.scene import Scene
-
-            main = scene.topology.nodes[0]
-            node = NodeSpec(main.name, main.kind, {**main.options, "firmware": str(firmware)},
-                            base_dir=main.base_dir)
-            scene = Scene(Topology((node,), scene.topology.links), scene.mode,
-                          10_000_000, 20_000_000)
+            scene = replace(scene, quantum_ns=10_000_000, duration_ns=20_000_000)
         if case == "dual-board":
-            from sim.api import LinkSpec, NodeSpec, Topology
-            from sim.config.scene import Scene
-
             main = next(node for node in scene.topology.nodes if node.name == "main")
-            peer = NodeSpec("peer", main.kind, main.options, base_dir=main.base_dir)
-            scene = Scene(Topology((*scene.topology.nodes, peer),
-                (*scene.topology.links, LinkSpec("peer.fdcan1", "can0.can"))),
-                scene.mode, scene.quantum_ns, scene.duration_ns)
+            peer = replace(main, name="peer")
+            scene = replace(scene, topology=replace(scene.topology,
+                nodes=(*scene.topology.nodes, peer),
+                links=(*scene.topology.links, LinkSpec("peer.fdcan1", "can0.can"))))
+    nodes = tuple(replace(node, options={**node.options, "firmware": firmware})
+                  if node.kind == "machine.qemu" else node for node in scene.topology.nodes)
+    scene = replace(scene, topology=replace(scene.topology, nodes=nodes))
+    scene.topology.validate(registry)
+    return scene
+
+
+def run_case(case, *, qemu, firmware, backend_root=ROOT):
+    if case == "can-faults":
+        return run_can_faults(qemu=qemu, firmware=firmware, backend_root=backend_root)
+    from sim.composition import builtin_registry
+    from sim.runtime import Simulation
+    from sim.machines.qemu.errors import BackendUnavailable
+
+    identity = _firmware_identity(firmware)
+    observations = Observations()
+    registry = builtin_registry(qemu=qemu, backend_root=backend_root)
+    scene = _case_scene(case, registry=registry, firmware=identity["path"])
     simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
         mode=scene.mode, startup_timeout_s=10, host_timeout_s=30,
         on_event=observations)
@@ -1157,12 +1185,7 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
         for name, component in simulation.components.items():
             info = getattr(component, "connection_info", None)
             if info is not None:
-                pid = info["pid"]
-                stat = Path(f"/proc/{pid}/stat")
-                # Linux proc starttime distinguishes an unrelated reused PID.
-                starttime = stat.read_text().rsplit(")", 1)[1].split()[19]
-                resources.append({"name": name, "pid": pid, "starttime": starttime,
-                                  "sockets": dict(info["sockets"])})
+                _capture_machine(resources, name, info, identity)
         if {item["name"] for item in resources} != (
                 {"main", "peer"} if case in ("dual-board", "digital-link") else {"main"}):
             raise AssertionError("the real machine did not expose its native process identity")
@@ -1186,35 +1209,42 @@ def run_case(case, *, qemu, backend_root=ROOT, firmware=None):
             error = Blocked(str(unavailable))
             for note in getattr(unavailable, "__notes__", ()):
                 error.add_note(note)
-            error.simulation_observations = observations.report()
             primary = error
             raise error
         primary = error
-        error.simulation_observations = observations.report()
         raise
     finally:
+        close_error = None
         try:
             simulation.close()
         except BaseException as error:
-            if primary is None:
-                error.simulation_observations = observations.report()
-                raise
-            primary.add_note(f"Simulation cleanup also failed: {error}")
+            close_error = error
+        failures = _cleanup_failures(resources)
+        if close_error is not None:
+            failures.insert(0, f"Simulation cleanup also failed: {close_error}")
+            failures.extend(getattr(close_error, "__notes__", ()))
+        partial = {**observations.report(), "resources": resources,
+                   "cleanup_completed": not failures, "cleanup_failures": failures}
+        if primary is not None:
+            primary.simulation_observations = partial
+            for failure in failures:
+                primary.add_note(failure)
+        elif failures:
+            error = close_error if close_error is not None else AssertionError("; ".join(failures))
+            error.simulation_observations = partial
+            raise error
     # No success or verification is published before all resource owners close.
     try:
-        for resource in resources:
-            stat = Path(f"/proc/{resource['pid']}/stat")
-            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[19] == resource["starttime"]:
-                raise AssertionError(f"owned QEMU identity remains after cleanup: {resource['pid']}")
-            if any(Path(path).exists() for path in resource["sockets"].values()):
-                raise AssertionError("owned native socket path remains after cleanup")
+        if _firmware_identity(firmware) != identity:
+            raise AssertionError("firmware ELF changed during the native acceptance run")
         result = observations.verify(case)
         if str(simulation.state) != "closed":
             raise AssertionError("Simulation did not reach CLOSED after cleanup")
     except BaseException as error:
-        error.simulation_observations = observations.report()
+        error.simulation_observations = partial
         raise
     result["cleanup_completed"] = True
+    result["cleanup_failures"] = []
     result["resources"] = resources
     result["state"] = str(simulation.state)
     return result
@@ -1242,51 +1272,71 @@ def main(argv=None):
     report = args.report or ROOT / "build/test-results" / (
         "simulation-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S-%f") +
         f"-{os.getpid()}") / "report.json"
+    # Resolve the parent, not the report itself: a dangling report symlink is
+    # still an occupied output and must never redirect an acceptance run.
+    report = report.parent.resolve() / report.name
+    assets = report.parent / (report.stem + "-assets")
     payload = {"status": "failed", "cases": {}, "hardware_calibration": "SKIP",
                "limits": "Sampled stepped execution; no global IRQ/plant barrier or physical calibration."}
     code = 1
-    previous = signal.signal(signal.SIGTERM, _interrupted)
     try:
-        if not args.qemu.is_file() or not os.access(args.qemu, os.X_OK):
-            raise Blocked(f"project dm-mc02 QEMU executable is missing: {args.qemu}")
-        payload["qemu"] = {"path": str(args.qemu.resolve()),
-                           "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
-                           "version": subprocess.run([str(args.qemu), "--version"], check=True,
-                               capture_output=True, text=True, timeout=5).stdout.splitlines()[0]}
-        payload["python"] = {"executable": sys.executable, "version": sys.version}
-        for case in NATIVE_CASES if args.case == "all" else (args.case,):
-            if case == "hal-gpio":
-                if not args.hal_elf.is_file():
-                    raise Blocked(f"the existing HAL GPIO lesson ELF is missing: {args.hal_elf}")
-                elf = args.hal_elf.resolve()
-                payload["cases"][case] = {"elf": str(elf),
-                    "sha256": hashlib.sha256(elf.read_bytes()).hexdigest()}
-            else:
-                options = ({"can_skip_rx": args.can_skip_rx,
-                    "build_dir": report.resolve().parent / (report.stem + "-assets") /
-                        args.build_type} if case == "can-faults" else {})
-                payload["cases"][case] = build_example(case, build_type=args.build_type, **options)
-            payload["cases"][case]["observations"] = run_case(
-                case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
-            binary = Path(payload["cases"][case]["elf"])
-            if hashlib.sha256(binary.read_bytes()).hexdigest() != payload["cases"][case]["sha256"]:
-                raise AssertionError("firmware ELF changed during the native acceptance run")
-        payload["status"] = "passed"
-        code = 0
-    except (Exception, KeyboardInterrupt) as error:
-        payload.update(status="blocked" if isinstance(error, Blocked) else "failed",
-                       error=str(error), error_type=type(error).__name__,
-                       notes=list(getattr(error, "__notes__", ())))
-        if hasattr(error, "simulation_observations"):
-            payload["partial_observations"] = error.simulation_observations
-        code = 78 if isinstance(error, Blocked) else 130 if isinstance(error, KeyboardInterrupt) else 1
-    finally:
-        signal.signal(signal.SIGTERM, previous)
-    try:
+        if os.path.lexists(report) or os.path.lexists(assets):
+            raise FileExistsError(f"report or assets already exist: {report}, {assets}")
         report.parent.mkdir(parents=True, exist_ok=True)
+        # Reserve output before any compiler/native subprocess, retaining the
+        # original failure/interruption in this exclusively owned report.
         with report.open("x", encoding="utf-8") as output:
-            json.dump(payload, output, indent=2, ensure_ascii=True)
-            output.write("\n")
+            previous = signal.signal(signal.SIGTERM, _interrupted)
+            try:
+                assets.mkdir(exist_ok=False)
+                if not args.qemu.is_file() or not os.access(args.qemu, os.X_OK):
+                    raise Blocked(f"project dm-mc02 QEMU executable is missing: {args.qemu}")
+                payload["qemu"] = {"path": str(args.qemu.resolve()),
+                    "sha256": hashlib.sha256(args.qemu.read_bytes()).hexdigest(),
+                    "version": subprocess.run([str(args.qemu), "--version"], check=True,
+                        capture_output=True, text=True, timeout=5).stdout.splitlines()[0]}
+                payload["python"] = {"executable": sys.executable, "version": sys.version}
+                for case in NATIVE_CASES if args.case == "all" else (args.case,):
+                    build_dir = assets / case / args.build_type
+                    if case == "hal-gpio":
+                        if not args.hal_elf.is_file():
+                            raise Blocked(f"the existing HAL GPIO lesson ELF is missing: {args.hal_elf}")
+                        source = _firmware_identity(args.hal_elf)
+                        build_dir.mkdir(parents=True, exist_ok=False)
+                        elf = build_dir / "firmware.elf"
+                        shutil.copyfile(source["path"], elf)
+                        if _firmware_identity(elf)["sha256"] != source["sha256"]:
+                            raise AssertionError("HAL ELF changed while copying the acceptance input")
+                        payload["cases"][case] = {"elf": str(elf), "sha256": source["sha256"],
+                            "source_elf": source["path"], "build_type": args.build_type}
+                    else:
+                        payload["cases"][case] = build_example(case, build_dir=build_dir,
+                            build_type=args.build_type, can_skip_rx=args.can_skip_rx)
+                    payload["cases"][case]["observations"] = run_case(
+                        case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
+                    item = payload["cases"][case]
+                    if _firmware_identity(item["elf"])["sha256"] != item["sha256"]:
+                        raise AssertionError("firmware ELF changed during the native acceptance run")
+                # Later cases must not invalidate already verified, retained
+                # inputs. This check covers all assets after final cleanup.
+                for item in payload["cases"].values():
+                    if _firmware_identity(item["elf"])["sha256"] != item["sha256"]:
+                        raise AssertionError("retained firmware ELF changed during acceptance")
+                if hashlib.sha256(args.qemu.read_bytes()).hexdigest() != payload["qemu"]["sha256"]:
+                    raise AssertionError("QEMU executable changed during acceptance")
+                payload["status"] = "passed"
+                code = 0
+            except (Exception, KeyboardInterrupt) as error:
+                payload.update(status="blocked" if isinstance(error, Blocked) else "failed",
+                    error=str(error), error_type=type(error).__name__,
+                    notes=list(getattr(error, "__notes__", ())))
+                if hasattr(error, "simulation_observations"):
+                    payload["partial_observations"] = error.simulation_observations
+                code = 78 if isinstance(error, Blocked) else 130 if isinstance(error, KeyboardInterrupt) else 1
+            finally:
+                signal.signal(signal.SIGTERM, previous)
+                json.dump(payload, output, indent=2, ensure_ascii=True)
+                output.write("\n")
     except (OSError, KeyboardInterrupt) as error:
         print(f"error: report publication failed: {error}", file=sys.stderr)
         return 130 if isinstance(error, KeyboardInterrupt) else 1
