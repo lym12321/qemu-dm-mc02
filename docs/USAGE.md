@@ -4,7 +4,7 @@
 当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
 Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。
 原生下载包面向 Windows x86_64 的固件终端/GDB 监听，以及 Ubuntu 24.04+ x86_64；
-新增包的 CI 结果待实际运行记录确认。完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2。
+每包附有该平台的 `smoke.json`。完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2。
 
 下载包命令从解压目录执行；源码命令默认从仓库根目录执行。按需要阅读：
 
@@ -33,7 +33,7 @@ Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 M
 | `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64；完整场景、Lab 与外部通道使用 Linux/WSL2 |
 
 Artifacts 保留 30 天，下载需要 GitHub 登录。工作流仅在该平台门成功后上传，
-每包附 `smoke.json`；当前新增 CI 门的实际结果待运行记录确认。该门检查实际示例固件 UART、
+每包附 `smoke.json`，记录实际示例固件 UART、
 monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simulation/Lab 或实板校准。
 
 解压后包括：
@@ -81,7 +81,7 @@ Windows 使用 `.\.venv\Scripts\sim.exe` 调用同一命令；完整 Simulation�
 [Nix](#nix) 是可选的固定环境。
 
 ```bash
-git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+git clone --branch refactor/composable-platform https://github.com/lym12321/qemu-dm-mc02.git
 cd qemu-dm-mc02
 python3 -m venv .venv
 . .venv/bin/activate
@@ -870,7 +870,7 @@ uv sync --locked --group dev --python "$PYTHON"
 ## 获取固定原生源码
 
 ```bash
-git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+git clone --branch refactor/composable-platform https://github.com/lym12321/qemu-dm-mc02.git
 cd qemu-dm-mc02
 git submodule update --init --depth 1 qemu/upstream
 ```
@@ -878,10 +878,10 @@ git submodule update --init --depth 1 qemu/upstream
 也可以使用 SSH 地址：
 
 ```bash
-git clone --branch main git@github.com:lym12321/qemu-dm-mc02.git
+git clone --branch refactor/composable-platform git@github.com:lym12321/qemu-dm-mc02.git
 ```
 
-`main` 保存共享模型、工具和文档；同一仓库中的 `dm-mc02/v8.2.2` 分支保存 QEMU fork，外层子模块固定到一个确切提交。`qemu.lock` 记录上游 v8.2.2 身份、fork 基线和 fork 提交；子模块 gitlink 与 `fork_commit` 必须一致。不要使用 `git submodule update --remote` 替代锁定版本。
+当前用户入口与打包工作流位于 `refactor/composable-platform`；`main` 保存此前版本。同一仓库中的 `dm-mc02/v8.2.2` 分支保存 QEMU fork，外层子模块固定到一个确切提交。`qemu.lock` 记录上游 v8.2.2 身份、fork 基线和 fork 提交；子模块 gitlink 与 `fork_commit` 必须一致。不要使用 `git submodule update --remote` 替代锁定版本。
 
 首次构建不需要递归获取 ROM 子模块。**GitHub 的 main 源码 ZIP 不包含 QEMU 子模块源码，不能直接构建**；请使用 Git clone 并初始化子模块。通过本文快速命令获得的浅子模块足以构建和运行，源码打包时需要的完整历史见[源码包章节](#update-and-source-package)。
 
@@ -2267,13 +2267,7 @@ ninja -C build/qemu -v -j1 qemu-system-arm > /tmp/dm-mc02-build.log 2>&1
 
 系统 `/usr/bin/cc` 的探针与 QEMU 实际编译器是两个独立观测。保存日志中第一个 `FAILED:` 的完整命令与 include 栈，核对自定义 `CC`、`CFLAGS`、`LDFLAGS`、`PKG_CONFIG_PATH`、sysroot 和缓存 compiler。
 
-当 `cc` 指向 `~/.nix-profile/bin/cc`，而 GLib/zlib 来自 `/usr` 时，说明构建混用了两套依赖。推荐更新源码后使用完整 Nix 环境：
-
-```bash
-nix develop --command bash tools/build-qemu.sh
-```
-
-脚本会重新选择编译器和开发库。运行生成的 QEMU 也使用 `nix develop`。如果选择 Ubuntu 系统工具链，可保留旧目录后重建：
+当 `cc` 指向 `~/.nix-profile/bin/cc`，而 GLib/zlib 来自 `/usr` 时，说明构建混用了两套依赖。Ubuntu 用户安装上面的系统开发包后，可保留旧目录并用系统工具链重建：
 
 ```bash
 mv -T build/qemu "build/qemu.nix-backup-$(date +%Y%m%d-%H%M%S)"
@@ -2281,6 +2275,8 @@ PATH=/usr/bin:/bin CC=/usr/bin/cc CXX=/usr/bin/c++ \
   PKG_CONFIG=/usr/bin/pkg-config PYTHON=/usr/bin/python3 \
   bash tools/build-qemu.sh
 ```
+
+使用可选 Nix 环境的开发者，应在 `nix develop` 内构建并运行，保持编译器和开发库一致。
 
 更新后的脚本会自动迁移 configure 元数据；也可用 `QEMU_RECONFIGURE=1` 明确请求完整配置。仅执行 `meson setup --reconfigure` 不保证重新选择编译器。确认新构建可用后，再删除自己保留的旧备份。
 

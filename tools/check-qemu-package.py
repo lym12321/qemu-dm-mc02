@@ -160,6 +160,8 @@ def main():
     with args.report.open("x", encoding="utf-8") as stream:
         json.dump(report, stream, ensure_ascii=False, indent=2)
         stream.write("\n")
+    if not report["passed"]:
+        print(json.dumps(report, ensure_ascii=True, indent=2))
     print(f"Package smoke {'passed' if report['passed'] else 'FAILED'}: {args.report}")
     return 0 if report["passed"] else 1
 

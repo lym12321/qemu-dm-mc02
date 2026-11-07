@@ -217,6 +217,23 @@ def test_firmware_default_exec_preserves_native_terminal_and_environment_selecti
     assert fixture.launches[-1][1][-3:] == ['-S', '-gdb', 'tcp:127.0.0.1:1234']
 
 
+def test_windows_firmware_waits_for_native_console_and_forwards_exit(native_terminal, monkeypatch):
+    from sim.cli import main
+
+    fixture = native_terminal
+    calls = []
+    monkeypatch.setattr(fixture.module.sys, 'platform', 'win32')
+    monkeypatch.setattr(fixture.module.subprocess, 'call',
+                        lambda command: calls.append(command) or 17)
+    with pytest.raises(SystemExit) as error:
+        main(['firmware', str(fixture.elf), '--qemu', str(fixture.qemu)])
+    assert error.value.code == 17
+    assert calls == [[str(fixture.qemu), '-machine', 'dm-mc02', '-kernel', str(fixture.elf),
+                      '-nodefaults', '-display', 'none', '-monitor', 'none',
+                      '-serial', 'none', '-serial', 'mon:stdio', *(['-serial', 'none'] * 8)]]
+    assert not fixture.launches
+
+
 @pytest.mark.parametrize('uart,slot', [
     ('uart2', 2), ('uart3', 3), ('uart5', 4), ('uart7', 5), ('uart10', 6), ('none', None)])
 def test_firmware_uart_slots_and_native_debug_sockets(native_terminal, tmp_path, monkeypatch, uart, slot):

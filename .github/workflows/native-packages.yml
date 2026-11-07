@@ -91,6 +91,11 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 60
     steps:
+      - name: Use LF consistently in Git for Windows and MSYS2
+        shell: pwsh
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -114,6 +119,8 @@ jobs:
       - name: Build using upstream QEMU's MinGW support
         shell: msys2 {0}
         run: |
+          git diff --exit-code --stat --ignore-submodules=all HEAD
+          git -C qemu/upstream diff --exit-code --stat --ignore-submodules=all HEAD
           # QEMU 8.2's mkvenv generates a malformed file://D:/ wheel URL.
           # Install the same source-pinned wheel using pip's normal path input.
           python -m pip install --no-index --find-links qemu/upstream/python/wheels meson==1.2.3

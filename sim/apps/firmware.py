@@ -57,4 +57,8 @@ def run_firmware(firmware, *, qemu=None, uart='uart1', debug=False, gdb_port=Non
     if debug:
         print(f'Paused at reset. In GDB: target remote 127.0.0.1:{port}', file=sys.stderr)
     sys.stderr.flush()
+    if sys.platform == 'win32':
+        # Windows CRT exec ends this process without preserving its caller's
+        # wait handle. Keep the console caller waiting for native QEMU's exit.
+        raise SystemExit(subprocess.call(command))
     os.execv(str(binary), command)

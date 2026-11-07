@@ -22,7 +22,7 @@ Python 核心可独立安装；原生固件运行需要固定的项目 QEMU。�
 选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载
 `dm-mc02-windows-x86_64` 或 `dm-mc02-linux-x86_64` 并解压。下载需要登录 GitHub，包保留 30 天。
 每包包含 QEMU、Python wheel、`example.elf`、`smoke.json`、对应源码和许可证；
-工作流仅在该平台固件门成功后上传，当前新增 CI 门的实际结果待运行记录确认。
+工作流仅在该平台固件门成功后上传，验证结果保存在随包的 `smoke.json`。
 
 先安装 Python 3.11+。包不内置 Python、ARM 编译器或 GDB；pip 安装 Python 依赖需要联网。
 在解压目录执行：
@@ -81,7 +81,7 @@ continue
 源码开发默认使用 [Ubuntu 系统依赖](docs/USAGE.md#ubuntu)，Nix 是可选环境：
 
 ```bash
-git clone --branch main https://github.com/lym12321/qemu-dm-mc02.git
+git clone --branch refactor/composable-platform https://github.com/lym12321/qemu-dm-mc02.git
 cd qemu-dm-mc02
 git submodule update --init --depth 1 qemu/upstream
 bash tools/build-qemu.sh
