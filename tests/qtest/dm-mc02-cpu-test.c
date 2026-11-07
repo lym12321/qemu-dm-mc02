@@ -439,6 +439,88 @@ static void test_execution_busy_guest(void)
     check_execution_busy_guest("mps2-an500", 0, "-only-migratable");
 }
 
+static void test_execution_mmio_read_clear(void)
+{
+    static const struct {
+        int64_t target;
+        uint32_t result[3];
+    } cuts[] = {
+        { 990, { EXECUTION_SENTINEL, EXECUTION_SENTINEL,
+                 EXECUTION_SENTINEL } },
+        { 991, { EXECUTION_SENTINEL, EXECUTION_SENTINEL,
+                 EXECUTION_SENTINEL } },
+        { 992, { 7, EXECUTION_SENTINEL, EXECUTION_SENTINEL } },
+        { 1001, { 7, EXECUTION_SENTINEL, EXECUTION_SENTINEL } },
+        { 1002, { 7, EXECUTION_SENTINEL, EXECUTION_SENTINEL } },
+        { 1003, { 7, 0x10005, EXECUTION_SENTINEL } },
+        { 1004, { 7, 0x10005, EXECUTION_SENTINEL } },
+        { 1005, { 7, 0x10005, 5 } },
+    };
+    uint8_t image[0x834] = { 0 };
+    uint8_t *body = image + 0x60;
+
+    /*
+     * ARMv7-M ARM DDI 0403, SysTick SYST_CSR/SYST_RVR: COUNTFLAG is
+     * bit 16, set when the counter reaches zero and cleared by a CSR read;
+     * reading the reload value has no such side effect. CMSIS core_cm7.h
+     * supplies the register layout and control bits. TICKINT stays disabled.
+     *
+     * Independent Thumb literals load three addresses and branch over their
+     * pool. Instructions 4..1004 then occupy consecutive halfwords at 0x60.
+     * With shift=0, instruction N executes in [N, N+1) ns. NOP padding places
+     * the ordinary RVR read at 990 and read-clear CSR reads at 1001 and 1003;
+     * each following instruction stores the actual guest result into RAM.
+     * A duplicated first CSR read during MMIO replay would lose COUNTFLAG.
+     */
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    stw_le_p(image + 0x40, 0x4803); /* 0: ldr r0, [pc, #12] -> 0x50 */
+    stw_le_p(image + 0x42, 0x4904); /* 1: ldr r1, [pc, #16] -> 0x54 */
+    stw_le_p(image + 0x44, 0x4a04); /* 2: ldr r2, [pc, #16] -> 0x58 */
+    stw_le_p(image + 0x46, 0xe00b); /* 3: b 0x60 */
+    stl_le_p(image + 0x50, SYST_RVR);
+    stl_le_p(image + 0x54, SYST_CSR);
+    stl_le_p(image + 0x58, EXECUTION_COUNTER);
+    for (unsigned i = 4; i < 1005; i++) {
+        stw_le_p(body + (i - 4) * 2, 0xbf00); /* nop */
+    }
+    stw_le_p(body + (990 - 4) * 2, 0x6803);  /* ldr r3, [r0] */
+    stw_le_p(body + (991 - 4) * 2, 0x6013);  /* str r3, [r2] */
+    stw_le_p(body + (1001 - 4) * 2, 0x680b); /* ldr r3, [r1] */
+    stw_le_p(body + (1002 - 4) * 2, 0x6053); /* str r3, [r2, #4] */
+    stw_le_p(body + (1003 - 4) * 2, 0x680b); /* ldr r3, [r1] */
+    stw_le_p(body + (1004 - 4) * 2, 0x6093); /* str r3, [r2, #8] */
+    stw_le_p(body + (1005 - 4) * 2, 0xe7fe); /* b . (not executed) */
+
+    for (unsigned split = 0; split < 2; split++) {
+        QTestState *qts = execution_start_image("dm-mc02", image,
+                                                sizeof(image), NULL);
+
+        g_test_message("MMIO reads: %s execution",
+                       split ? "split" : "continuous");
+        for (unsigned word = 0; word < 3; word++) {
+            qtest_writel(qts, EXECUTION_COUNTER + word * 4,
+                         EXECUTION_SENTINEL);
+        }
+        /* Integer 125 ns period: the first COUNTFLAG is set at 1000 ns. */
+        qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8); /* D1CPRE /8. */
+        qtest_writel(qts, SYST_RVR, 7);
+        qtest_writel(qts, SYST_CVR, 0);
+        qtest_writel(qts, SYST_CSR, SYST_CSR_ENABLE | SYST_CSR_CLKSOURCE);
+        for (unsigned i = split ? 0 : G_N_ELEMENTS(cuts) - 1;
+             i < G_N_ELEMENTS(cuts); i++) {
+            execution_run_to(qts, cuts[i].target);
+            execution_assert_stable(qts, cuts[i].target, cuts[i].result[0]);
+            /* Never inspect CSR from the host: that would clear the flag. */
+            for (unsigned word = 1; word < 3; word++) {
+                g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER + word * 4),
+                                ==, cuts[i].result[word]);
+            }
+        }
+        qtest_quit(qts);
+    }
+}
+
 static void test_execution_can_snapshot_compat(void)
 {
     QTestState *qts = execution_guest("dm-mc02", 0x08000000, false,
@@ -2105,6 +2187,8 @@ int main(int argc, char **argv)
                     test_execution_reject_targets);
     g_test_add_func("/dm-mc02/virtual-execution/busy-guest",
                     test_execution_busy_guest);
+    g_test_add_func("/dm-mc02/virtual-execution/mmio-read-clear",
+                    test_execution_mmio_read_clear);
     g_test_add_func("/dm-mc02/virtual-execution/can-snapshot-compat",
                     test_execution_can_snapshot_compat);
     g_test_add_func("/dm-mc02/virtual-execution/wfi-systick",
