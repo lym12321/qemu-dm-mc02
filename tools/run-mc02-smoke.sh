@@ -25,7 +25,7 @@ command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is requi
 python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
     --socket qmp \
     --python-arg "{qmp}" -- \
-    bash "$script_dir/run-qemu.sh" --qemu "$qemu_bin" --elf "$elf" \
+    python3 "$script_dir/sim" firmware "$elf" --qemu "$qemu_bin" \
     --machine dm-mc02,board-profile=DM-MC02 --uart none --qmp "{qmp}" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re

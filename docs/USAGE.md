@@ -7,7 +7,7 @@ Linux x86_64 为交付环境；其它宿主的原生构建尚未验证。
 
 命令默认从仓库根目录执行。按需要阅读：
 
-- [安装](#installation)与[原生构建](#build)
+- [安装](#installation)、[原生构建](#build)与[直接运行 ELF](#native-debug)
 - [sim/v1 场景与唯一运行时](#simulation)
 - [互连与精度](#connections)
 - [有限实验、时间线与离线复核](#experiments)
@@ -45,9 +45,12 @@ python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
 
 ### 原生后端与可安装 QMP client
 
-原生固件运行先[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
-默认二进制为 `build/qemu/qemu-system-arm`，也可使用 `QEMU_SYSTEM_ARM` 或 `sim run --qemu BIN`。
-普通系统 QEMU 没有本项目板卡和执行能力，不能替代。后端要求固定的 QMP client、
+先[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
+直接终端/GDB 运行使用 `sim firmware app.elf`，不需要 YAML、Python QMP client 或 MuJoCo；
+完整参数见[原生固件入口](#native-debug)。QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、
+checkout 中的 `build/qemu/qemu-system-arm`。普通系统 QEMU 没有本项目板卡，不能替代。
+
+`sim run scene.yaml` 的原生场景后端另外要求固定的 QMP client、
 `x-run-to-virtual-time`、`x-query-virtual-execution` 及 CAN execution QOM 能力；不满足会明确报错。
 静态校验不会启动它们，也不证明 ELF 或二进制可运行。
 
@@ -674,7 +677,7 @@ ADC2、ADC网络互连及精确GPIO边沿未支持。
 原生自由运行、手动GDB与交互仍使用已有连接owner：
 
 ```bash
-uv run tools/sim-unmigrated board run --elf build/student.elf --debug --qmp /tmp/student-qmp.sock
+sim firmware build/student.elf --debug --qmp /tmp/student-qmp.sock
 ```
 
 交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
@@ -737,7 +740,7 @@ bash tools/build-qemu.sh
 nix develop --command bash tools/build-qemu.sh
 ```
 
-`flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包。
+`flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包或通用发行二进制。
 
 构建和运行都在 `nix develop` 内执行，包括 QEMU、测试、worker 和 Python 环境同步。`nix develop` 中的 `PYTHON` 指向固定的 Nix Python；同步项目测试环境使用：
 
@@ -862,7 +865,7 @@ bash tools/run-mc02-smoke.sh
 bash tools/run-ospi-smoke.sh
 ```
 
-smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后先重新构建。`tools/run-qemu.sh --smoke` 只探测通用空 machine，不会启动业务固件。
+smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后先重新构建。
 
 <a id="native-debug"></a>
 
@@ -870,28 +873,31 @@ smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后�
 
 ### 直接运行固件
 
-输入 ELF 必须面向 DM-MC02 地址空间。先记录用于复现的文件身份，再通过统一入口启动：
+输入 ELF 必须面向 DM-MC02 地址空间。安装核心命令行工具并构建项目 QEMU 后，
+直接传入已有 ELF；此入口不需要 YAML、Python QMP client 或 MuJoCo：
 
 ```bash
-export DM_MC02_ELF=/absolute/path/to/trobot.elf
-sha256sum "$DM_MC02_ELF"
-bash tools/run-qemu.sh
+sim firmware /absolute/path/to/app.elf
 ```
 
-也可传入 `--elf PATH`，它优先于 `DM_MC02_ELF`。入口默认使用 `build/qemu/qemu-system-arm` 和 `dm-mc02` machine；`--qemu PATH` 或 `QEMU_SYSTEM_ARM` 可以覆盖 QEMU。运行环境与构建时保持一致。
+ELF 是必填位置参数，不读取 `DM_MC02_ELF`。QEMU 选择顺序为 `--qemu PATH`、
+`QEMU_SYSTEM_ARM`、checkout 中的 `build/qemu/qemu-system-arm`；在 checkout 外运行时显式指定
+兼容二进制。默认 machine 是 `dm-mc02`，运行环境与构建时保持一致。
 
-默认 USART1 与 QEMU monitor 共用终端（原生 `mon:stdio`）。`Ctrl-a c` 切换 UART/monitor，`Ctrl-a h` 查看帮助。monitor 中可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`；`quit` 会走正常关闭路径。用 `--uart USART2` 等名称选择其它 UART，或用 `--uart none` 仅显示 monitor。当前 `trobot` Release 关闭了 logger/terminal，串口没有文本并不代表固件未运行。
+默认 UART1 与 QEMU monitor 共用终端（原生 `mon:stdio`）。`Ctrl-a c` 切换 UART/monitor，`Ctrl-a h` 查看帮助。monitor 中可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`；`quit` 会走正常关闭路径。用 `--uart uart2` 等名称选择其它 UART，或用 `--uart none` 仅显示 monitor。UART5 只接收，选择 `--uart uart5` 可输入字节但没有 TX 文本。当前 `trobot` Release 关闭了 logger/terminal，串口没有文本并不代表固件未运行。
 
-常用参数以 `bash tools/run-qemu.sh --help` 为准：
+常用参数以 `sim firmware --help` 为准：
 
 | 参数 | 用途 |
 | --- | --- |
-| `--elf PATH` | 固件 ELF；默认读取 `DM_MC02_ELF` |
-| `--debug`、`--gdb-port PORT` | 从复位暂停，启用原生 GDB；默认 `127.0.0.1:1234` |
-| `--uart NAME` | USART1（默认）、USART2、USART3、UART5、UART7、USART10 或 `none` |
+| `ELF` | 必填位置参数；面向 DM-MC02 的固件 ELF |
+| `--debug` | 从复位暂停，启用原生 GDB；默认 `127.0.0.1:1234` |
+| `--gdb-port PORT` | 配合 `--debug` 指定 GDB 端口，范围 1–65535 |
+| `--uart NAME` | `uart1`（默认）、`uart2`、`uart3`、`uart5`、`uart7`、`uart10` 或 `none` |
 | `--qmp PATH` | 创建 QMP Unix socket，`server=on,wait=off` |
 | `--cosim PATH` | 创建 co-sim Unix socket，`server=on,wait=off`；worker 单独启动 |
-| `--qemu PATH`、`--machine NAME` | 覆盖 QEMU 或 `dm-mc02` machine 属性 |
+| `--qemu PATH` | 指定兼容的项目 QEMU 二进制 |
+| `--machine NAME` | `dm-mc02`，可附加逗号分隔的原生 machine 属性 |
 
 查看 machine 属性：
 
@@ -933,13 +939,13 @@ build/qemu/qemu-system-arm -machine dm-mc02,help
 终端一启动 QEMU，CPU 在复位处暂停：
 
 ```bash
-bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --debug
+sim firmware /absolute/path/to/app.elf --debug
 ```
 
 终端二加载同一 ELF 并连接。Nix 的固定 ARM 工具链已提供 `arm-none-eabi-gdb`；Ubuntu 用户可使用自己的 ARM 工具链 GDB，或执行 `sudo apt-get install -y gdb-multiarch` 并将下面命令的程序名替换为它：
 
 ```bash
-arm-none-eabi-gdb /absolute/path/to/trobot.elf
+arm-none-eabi-gdb /absolute/path/to/app.elf
 ```
 
 ```gdb
@@ -960,12 +966,13 @@ continue
 | 1–6 | USART1、USART2、USART3、UART5、UART7、USART10 |
 | 7–9 | FDCAN1、FDCAN2、FDCAN3 |
 
-默认 DM-MC02 profile 的 UART5 仅接收；选择 `--uart UART5` 可输入数据，但不会输出文本。
+默认 DM-MC02 profile 的 UART5 仅接收；选择 `--uart uart5` 可输入数据，但不会输出文本。
 
 例如将 USART1 输出到文件，monitor 留在终端：
 
 ```bash
 mkdir -p build/runtime
+export DM_MC02_ELF=/absolute/path/to/trobot.elf
 build/qemu/qemu-system-arm -machine dm-mc02 -kernel "$DM_MC02_ELF" \
   -nodefaults -display none -monitor stdio \
   -serial none -serial file:build/runtime/usart1.log
@@ -979,12 +986,12 @@ FDCAN 使用固定 84 字节二进制帧，经项目 chardev/socket 连接；它
 
 ```bash
 dm_run_dir=$(mktemp -d /tmp/dm-qemu.qmp.XXXXXX)
-bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --qmp "$dm_run_dir/qmp.sock"
+sim firmware /absolute/path/to/app.elf --qmp "$dm_run_dir/qmp.sock"
 rm -f -- "$dm_run_dir/qmp.sock"
 rmdir -- "$dm_run_dir"
 ```
 
-项目 Python 工具通过 `tools/dm_mc02_qmp.py` 复用固定版本的 QEMU Python client。不要另开第二个 reader 读取同一 QMP 连接。深层临时目录可能超过 `sockaddr_un` 路径限制；Linux smoke 应使用脚本管理的 `/tmp/dm-qemu.*.XXXXXX` 私有临时目录。
+创建原生 QMP socket 不要求 Python QMP client。项目 Python 工具连接时通过 `tools/dm_mc02_qmp.py` 复用固定版本的 QEMU Python client。不要另开第二个 reader 读取同一 QMP 连接。深层临时目录可能超过 `sockaddr_un` 路径限制；Linux smoke 应使用脚本管理的 `/tmp/dm-qemu.*.XXXXXX` 私有临时目录。
 
 实验性原生 QMP 执行接口可让一个 CPU 在指定的绝对虚拟时间暂停。直接启动 QEMU 时使用
 `-accel tcg,thread=single -S -icount shift=0,align=off,sleep=off`，保留原生 QMP 连接。
@@ -1203,7 +1210,7 @@ bash tools/run-worker.sh --help
 export DM_MC02_ELF=/absolute/path/to/trobot.elf
 dm_run_dir=$(mktemp -d /tmp/dm-qemu.trobot.XXXXXX)
 printf '%s\n' "$dm_run_dir"
-bash tools/run-qemu.sh --elf "$DM_MC02_ELF" --debug \
+sim firmware "$DM_MC02_ELF" --debug \
   --cosim "$dm_run_dir/cosim.sock"
 rm -f -- "$dm_run_dir/cosim.sock"
 rmdir -- "$dm_run_dir"

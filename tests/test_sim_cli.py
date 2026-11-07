@@ -30,13 +30,10 @@ def test_isolated_entry_help_and_module_help(tmp_path):
     assert result.returncode == 0, result.stderr
     assert "--startup-timeout" in result.stdout
     assert "--gdb-port" in result.stdout and "--elf" in result.stdout
-    result = isolated(tmp_path, "board", "run", "--help")
-    assert result.returncode == 0, result.stderr
-    assert "Ctrl-a c" in result.stdout and "--elf" in result.stdout
     result = subprocess.run([sys.executable, "-m", "sim.apps.unmigrated_cli", "--help"], cwd=ROOT,
                             capture_output=True, text=True, timeout=5)
     assert result.returncode == 0, result.stderr
-    assert "board" in result.stdout and "lab" in result.stdout
+    assert "{lab}" in result.stdout.splitlines()[0]
     assert "robot" not in result.stdout and "arena" not in result.stdout and "scenario" not in result.stdout
 
 
@@ -47,16 +44,6 @@ def test_numeric_option_helpers_reject_boolean_values():
         cli._port(True)
 
 
-
-
-def test_board_run_forwards_native_options_without_reinterpreting(monkeypatch):
-    calls = []
-    monkeypatch.setattr(cli.os, "execv", lambda path, argv: calls.append((path, argv)))
-    options = ["--elf", "firmware path.elf", "--debug", "--gdb-port", "1235",
-               "--qmp", "native socket", "--uart", "USART3"]
-    assert cli.main(["board", "run", *options]) == 0
-    launcher = str(ROOT / "tools/run-qemu.sh")
-    assert calls == [(launcher, [launcher, *options])]
 
 
 def test_interactive_cli_forwards_configured_channels_and_deadlines(monkeypatch, tmp_path, capsys):

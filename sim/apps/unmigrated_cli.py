@@ -7,13 +7,9 @@ from __future__ import annotations
 
 import argparse
 import math
-import os
 from pathlib import Path
 import signal
 import sys
-
-
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _seconds(value) -> float:
@@ -58,12 +54,8 @@ def _runtime_options(parser, *, timeout: float, paused=True, debug=True) -> None
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="sim", description="Native firmware terminal and interactive Lab tools.")
+        prog="sim", description="Interactive Lab tools.")
     groups = parser.add_subparsers(dest="group", required=True)
-    board = groups.add_parser("board", help="native firmware terminal, QMP and GDB")
-    boards = board.add_subparsers(dest="action", required=True)
-    boards.add_parser("run", help="forward all options to tools/run-qemu.sh",
-                      add_help=False)
     lab = groups.add_parser("lab", help="native interactive public board IO")
     labs = lab.add_subparsers(dest="action", required=True)
     interactive = labs.add_parser("interactive", help="observe UART/CAN and enter GPIO/key/ADC commands",
@@ -126,16 +118,6 @@ def _run_interactive(args) -> int:
 
 def main(argv=None) -> int:
     arguments = list(sys.argv[1:] if argv is None else argv)
-    # The existing native launcher owns all board option admission. Preserve
-    # its exact argv, stdio mux, process identity and GDB/QMP semantics.
-    if arguments[:2] == ["board", "run"]:
-        launcher = str(PROJECT_ROOT / "tools/run-qemu.sh")
-        try:
-            os.execv(launcher, [launcher, *arguments[2:]])
-        except OSError as error:
-            _diagnose(error)
-            return 1
-        return 0  # Only reachable when execv is replaced by an embedding caller.
     args = _parser().parse_args(arguments)
     previous = signal.signal(signal.SIGTERM, _interrupted)
     try:

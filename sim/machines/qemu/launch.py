@@ -35,7 +35,10 @@ def qmp_socket_path(path) -> Path | None:
     if not isinstance(path, (str, Path)) or "\0" in str(path):
         raise ValueError("QMP socket must be a path without NUL")
     path = Path(path).absolute()
-    if len(os.fsencode(path)) > 100 or not path.parent.is_dir() or path.exists():
+    if path.exists() or path.is_symlink():
+        raise ValueError("QMP socket needs an existing parent, a new path, and at most 100 bytes")
+    path = path.parent.resolve() / path.name
+    if len(os.fsencode(path)) > 100 or not path.parent.is_dir():
         raise ValueError("QMP socket needs an existing parent, a new path, and at most 100 bytes")
     return path
 
@@ -56,4 +59,27 @@ def native_qemu_command(qemu, sockets, *, machine_arguments, serial_slots,
         command += ["-qmp", f"unix:{str(qmp_path).replace(',', ',,')},server=on,wait=off"]
     if gdb_port is not None:
         command += ["-gdb", f"tcp:127.0.0.1:{gdb_port}"]
+    return command
+
+
+def terminal_qemu_command(qemu, *, machine_arguments, serial_slots, uart,
+                          sockets, qmp_path=None, gdb_port=None):
+    """Compose a native console launch; QEMU owns execution and terminal IO."""
+    command = [str(qemu), *machine_arguments,
+               "-nodefaults", "-display", "none",
+               "-monitor", "stdio" if uart is None else "none"]
+    for port in serial_slots:
+        if port == uart:
+            command += ["-serial", "mon:stdio"]
+        elif port in sockets:
+            path = str(sockets[port]).replace(',', ',,')
+            command += ["-chardev", f"socket,id={port},path={path},server=on,wait=off",
+                        "-serial", f"chardev:{port}"]
+        else:
+            command += ["-serial", "none"]
+    if qmp_path is not None:
+        path = str(qmp_path).replace(',', ',,')
+        command += ["-qmp", f"unix:{path},server=on,wait=off"]
+    if gdb_port is not None:
+        command += ["-S", "-gdb", f"tcp:127.0.0.1:{gdb_port}"]
     return command

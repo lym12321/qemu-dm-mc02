@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -137,7 +138,7 @@ def test_help_and_validate_refuse_optional_imports_in_fresh_process(tmp_path):
     }
     path.write_text(yaml.safe_dump(document))
     program = '''
-import importlib.abc, sys
+import importlib.abc, json, subprocess, sys
 sys.path.insert(0, sys.argv[1])
 class Guard(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, *args):
@@ -145,6 +146,15 @@ class Guard(importlib.abc.MetaPathFinder):
             raise AssertionError('optional import: '+fullname)
 sys.meta_path.insert(0, Guard())
 from sim.cli import main
+if sys.argv[2] == 'native-fixture':
+    from sim.apps import firmware
+    firmware.subprocess.run = lambda argv, **kwargs: subprocess.CompletedProcess(
+        argv, 0, stdout='Supported machines:\\ndm-mc02 test profile\\n', stderr='')
+    def replace_process(executable, argv):
+        print(json.dumps({'executable': executable, 'argv': argv}))
+        raise SystemExit(37)
+    firmware.os.execv = replace_process
+    raise SystemExit(main(['firmware', *sys.argv[3:]]))
 raise SystemExit(main(sys.argv[2:]))
 '''
     result = subprocess.run([sys.executable, "-I", "-c", program, str(ROOT), "validate", str(path)],
@@ -156,6 +166,147 @@ raise SystemExit(main(sys.argv[2:]))
     assert result.returncode == 0, result.stderr
     assert "validate" in result.stdout and "run" in result.stdout
     assert "robot" not in result.stdout and "lab" not in result.stdout
+    result = subprocess.run([sys.executable, "-I", "-c", program, str(ROOT), "firmware", "--help"],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0 and "ELF" in result.stdout, result.stderr
+    qemu = tmp_path / "native-qemu"
+    qemu.write_bytes(b"exec is replaced; no native execution")
+    qemu.chmod(0o700)
+    result = subprocess.run([sys.executable, "-I", "-c", program, str(ROOT), "native-fixture",
+                             str(tmp_path / "firmware.elf"), "--qemu", str(qemu)],
+                            cwd=tmp_path, capture_output=True, text=True, timeout=10)
+    assert result.returncode == 37, result.stderr
+    assert json.loads(result.stdout)["executable"] == str(qemu)
+
+
+@pytest.fixture
+def native_terminal(tmp_path, monkeypatch):
+    from sim.apps import firmware
+
+    elf = tmp_path / 'firmware with spaces.elf'
+    elf.write_bytes(b'admission fixture, not executed')
+    qemu = tmp_path / 'qemu'
+    qemu.touch(mode=0o700)
+    probes, launches = [], []
+
+    def probe(argv, **options):
+        probes.append((argv, options))
+        return subprocess.CompletedProcess(argv, 0, stdout='dm-mc02 board\n', stderr='')
+
+    monkeypatch.setattr(firmware.subprocess, 'run', probe)
+    monkeypatch.setattr(firmware.os, 'execv', lambda path, argv: launches.append((path, argv)))
+    return SimpleNamespace(elf=elf, qemu=qemu, probes=probes, launches=launches, module=firmware)
+
+
+def test_firmware_default_exec_preserves_native_terminal_and_environment_selection(
+        native_terminal, monkeypatch, capsys):
+    from sim.cli import main
+
+    fixture = native_terminal
+    monkeypatch.setenv('QEMU_SYSTEM_ARM', str(fixture.qemu))
+    assert main(['firmware', str(fixture.elf)]) == 0
+    assert fixture.probes == [([str(fixture.qemu), '-machine', 'help'],
+                              {'capture_output': True, 'text': True, 'timeout': 5})]
+    assert fixture.launches == [(str(fixture.qemu), [str(fixture.qemu),
+        '-machine', 'dm-mc02', '-kernel', str(fixture.elf),
+        '-nodefaults', '-display', 'none', '-monitor', 'none',
+        '-serial', 'none', '-serial', 'mon:stdio', *(['-serial', 'none'] * 8)])]
+    diagnostics = capsys.readouterr().err
+    assert str(fixture.elf) in diagnostics and 'Ctrl-a c' in diagnostics
+    assert main(['firmware', str(fixture.elf), '--debug']) == 0
+    assert fixture.launches[-1][1][-3:] == ['-S', '-gdb', 'tcp:127.0.0.1:1234']
+
+
+@pytest.mark.parametrize('uart,slot', [
+    ('uart2', 2), ('uart3', 3), ('uart5', 4), ('uart7', 5), ('uart10', 6), ('none', None)])
+def test_firmware_uart_slots_and_native_debug_sockets(native_terminal, tmp_path, monkeypatch, uart, slot):
+    from sim.cli import main
+
+    fixture = native_terminal
+    monkeypatch.setenv('QEMU_SYSTEM_ARM', '/ignored/by/explicit/option')
+    qmp, cosim = tmp_path / 'qmp,sock', tmp_path / 'cosim,sock'
+    assert main(['firmware', str(fixture.elf), '--qemu', str(fixture.qemu),
+                 '--uart', uart, '--debug', '--gdb-port', '2345',
+                 '--machine', 'dm-mc02,board-profile=DM-MC02',
+                 '--qmp', str(qmp), '--cosim', str(cosim)]) == 0
+    command = fixture.launches[0][1]
+    serials = [command[i + 1] for i, word in enumerate(command) if word == '-serial']
+    expected = ['chardev:cosim', *(['none'] * 9)]
+    if slot is not None:
+        expected[slot] = 'mon:stdio'
+    assert serials == expected
+    assert command[command.index('-monitor') + 1] == ('stdio' if slot is None else 'none')
+    assert command[1:5] == ['-machine', 'dm-mc02,board-profile=DM-MC02', '-kernel', str(fixture.elf)]
+    assert command[command.index('-chardev') + 1] == (
+        f'socket,id=cosim,path={str(cosim).replace(",", ",,")},server=on,wait=off')
+    assert command[command.index('-qmp') + 1] == (
+        f'unix:{str(qmp).replace(",", ",,")},server=on,wait=off')
+    assert command[-3:] == ['-S', '-gdb', 'tcp:127.0.0.1:2345']
+
+
+@pytest.mark.parametrize('options', [[], ['app.elf', '--uart', 'USART1'], ['app.elf', '--gdb-port', '1234'],
+                                   ['app.elf', '--debug', '--gdb-port', '0']])
+def test_firmware_parser_rejects_before_native_probe(native_terminal, options):
+    from sim.cli import main
+
+    with pytest.raises(SystemExit) as error:
+        main(['firmware', *options])
+    assert error.value.code == 2
+    assert not native_terminal.probes and not native_terminal.launches
+
+
+@pytest.mark.parametrize('failure', ['missing-elf', 'machine', 'socket-alias', 'socket-symlink'])
+def test_firmware_admission_rejects_before_native_probe(native_terminal, tmp_path, failure, capsys):
+    from sim.cli import main
+
+    fixture = native_terminal
+    options = []
+    elf = fixture.elf
+    if failure == 'missing-elf':
+        elf = tmp_path / 'missing.elf'
+    elif failure == 'machine':
+        options = ['--machine', 'none']
+    elif failure == 'socket-alias':
+        alias = tmp_path / 'alias'
+        alias.symlink_to(tmp_path, target_is_directory=True)
+        options = ['--qmp', str(tmp_path / 'qmp'), '--cosim', str(alias / 'qmp')]
+    else:
+        occupied = tmp_path / 'qmp'
+        occupied.symlink_to(tmp_path / 'absent')
+        options = ['--qmp', str(occupied)]
+    assert main(['firmware', str(elf), '--qemu', str(fixture.qemu), *options]) == 1
+    assert 'error:' in capsys.readouterr().err
+    assert not fixture.probes and not fixture.launches
+    if failure == 'socket-symlink':
+        assert occupied.is_symlink()
+
+
+@pytest.mark.parametrize('failure', ['missing', 'unsupported', 'probe-error', 'timeout', 'exec'])
+def test_firmware_backend_diagnostics_and_exit_status(native_terminal, monkeypatch, capsys, failure):
+    from sim.cli import main
+
+    fixture = native_terminal
+    qemu = fixture.qemu
+    if failure == 'missing':
+        qemu.unlink()
+    elif failure == 'exec':
+        def reject(*args):
+            raise OSError('native exec diagnostic')
+        monkeypatch.setattr(fixture.module.os, 'execv', reject)
+    else:
+        def reject(argv, **options):
+            if failure == 'timeout':
+                raise subprocess.TimeoutExpired(argv, options['timeout'])
+            return subprocess.CompletedProcess(argv, 1 if failure == 'probe-error' else 0,
+                                               stdout='virt Generic ARM\n', stderr='native query diagnostic')
+        monkeypatch.setattr(fixture.module.subprocess, 'run', reject)
+    assert main(['firmware', str(fixture.elf), '--qemu', str(qemu)]) == (1 if failure == 'exec' else 78)
+    diagnostics = capsys.readouterr().err
+    expected = {'missing': '--qemu PATH', 'unsupported': 'does not provide the dm-mc02',
+                'probe-error': 'native query diagnostic', 'timeout': '5 seconds',
+                'exec': 'native exec diagnostic'}
+    assert expected[failure] in diagnostics
+    assert not fixture.launches
 
 
 def test_scene_experiment_pure_admission_canonicalizes_inputs_and_freezes_order(tmp_path, monkeypatch):
