@@ -1832,6 +1832,48 @@ TCG、外设及 I/O 线程；它不是纯指令执行成本。观察回调计时
 后者 QEMU 采样 CPU 为 103.42s，主 CLI 为 16.17s，输出约 47.1MB。
 两次使用同一 ELF，未改变 quantum、shift 或阈值；功能通过不代表原预算恢复。
 
+进一步定位单 Machine 的原生执行路径，可复用同一工具：
+
+```bash
+python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
+  --qemu /path/to/compatible/qemu-system-arm --report build/native-cost.json
+python tools/benchmark_simulation.py --case native-cost --capture mmio --repeat 3 \
+  --qemu /path/to/compatible/qemu-system-arm --report build/native-mmio.json
+```
+
+两种模式均运行上述 WFI、忙 MMIO 固件，各三次独立 Session，仅统计观察，不创建物理世界。
+`none` 完成 200ms／200 Cut；`mmio` 在 1、10、100、199ms 各记录 10µs，随后恢复整毫秒
+切点，合计 204 Cut。后者包含日志与额外查询开销，耗时只用于诊断，不能当成无插桩基线。
+两者都保持 shift0、1ms quantum、10s startup／30s host 期限。
+
+MMIO 模式需要 Linux `prlimit` 和 QEMU log trace 后端。每个日志最多 8MiB／65,536 行，
+单行最多 4KiB；达到文件字节上限、超限或截断均 FAIL。不会放宽继承的较低文件限制；
+缺失工具能力为 BLOCKED/78。输出路径不得包含控制字符或 QEMU 的 `%` 文件名模板。
+报告保留绝对 MMIO 地址、重执行 PC、窗口前后的原生暂停回执、JIT 原文、日志哈希及清理结果。
+日志的可选时间前缀是 Host wall time，不是 guest 时间；零次 MMIO 是合法的窗口结果。
+`TB count` 是驻留翻译块数，必须结合 flush／invalidation 理解，不能等同累计翻译次数。
+
+可选系统工具 `gprofng` 可以从现有 Python 入口跟踪 QEMU 子进程，采样与 trace 应分开运行：
+
+```bash
+gprofng collect app -o build/native-cpu.er -p 10 -F '=.*qemu-system-arm.*' -a off \
+  python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
+  --qemu /path/to/compatible/qemu-system-arm --report build/native-cpu.json
+gprofng display text -header -statistics -functions /path/to/qemu-child.er
+```
+
+先用报告中的 PID、QEMU 命令和子实验元数据选定对应的 QEMU 实验，避免合并 Python 或编译器
+数据。保留原始实验、采集器警告和 `<Unknown>`；包含时间不能相加，未知符号不能全部归为 TCG。
+`capture=none` 只表示工具未启用 trace，外部 profiler 仍会影响运行。
+本机 gprofng 2.42 能采到 vCPU，但报告 SIGPROF 屏蔽和退出附近计时器改变的警告；
+采集完成与定量精度是两回事，当前采样只辅助定位，不提供经校准的成本比例。
+
+2026-11-07 同一 Linux／QEMU 二进制下，无 trace 的三次 active wall 中位数为 WFI 0.596s、
+忙 MMIO 8.081s。忙固件三个稳态窗口各观察到 GPIO、UART、ADC、FDCAN 各 625 次读取及
+对应的 icount 重执行，驻留 TB 为 139，flush／invalidation 为零；1ms 启动尾部则主要是 UART
+等待。WFI 的稳态窗口各观察到一次 GPIO 读取。访问频率与 CPU 独占成本分开解释；
+这些结果没有证明新的加速效果，也没有恢复上述 Robot 10s 预算。
+
 日常修改优先运行受影响的原生测试，例如内部 Flash：
 
 ```bash
