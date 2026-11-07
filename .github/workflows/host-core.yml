@@ -163,6 +163,7 @@ jobs:
           tests/test_assertions.py
           tests/test_sim_experiment.py tests/test_application_presets.py
           tests/test_can_fault_experiment.py tests/test_can_fault_smoke.py
+          tests/test_simulation_examples.py
           tests/test_automatic_lab_smoke.py tests/test_referee_protocol.py
           tests/test_referee_messages.py tests/test_referee_engine.py
           tests/test_referee_endpoint.py tests/test_referee_factory.py

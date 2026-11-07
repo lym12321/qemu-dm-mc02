@@ -24,6 +24,124 @@ from sim.apps.experiment import ExperimentInput, run_experiment
 from sim.config.scene import Scene
 
 
+def _verify_smoke_native_identity_and_cleanup(observations, build):
+    assert observations["cleanup_completed"] is True
+    assert observations["cleanup_failures"] == []
+    assert len(observations["resources"]) == 1
+    resource = observations["resources"][0]
+    assert resource["firmware"] == {"path": build["elf"], "sha256": build["sha256"]}
+    argv = resource["argv"]
+    assert argv.count("-kernel") == 1 and argv[argv.index("-kernel") + 1] == build["elf"]
+    stat = Path(f"/proc/{resource['pid']}/stat")
+    assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[19] != resource["starttime"]
+    assert not any(Path(path).exists() for path in resource["sockets"].values())
+    assert hashlib.sha256(Path(build["elf"]).read_bytes()).hexdigest() == build["sha256"]
+
+
+def test_real_smoke_runs_requested_incompatible_elf_instead_of_valid_manifest_default(
+        tmp_path, monkeypatch):
+    """A valid default must not hide that the explicitly requested ELF is wrong."""
+    configured = os.environ.get("DM_MC02_EXPERIMENT_QEMU")
+    if configured is None:
+        pytest.skip("set DM_MC02_EXPERIMENT_QEMU for the separate actual firmware gate")
+    from smoke import simulation_smoke as smoke
+
+    report = tmp_path / "exact-elf-negative-evidence.json"
+    evidence = {"gate_status": "FAIL", "execution": {"status": "NOT RUN"},
+                "precision_limit": "completed GPIO samples and UART read upper bounds; no byte edge timing"}
+    try:
+        qemu = Path(configured).resolve(strict=True)
+        evidence["qemu"] = {"path": str(qemu),
+            "sha256": hashlib.sha256(qemu.read_bytes()).hexdigest(),
+            "version": subprocess.check_output([str(qemu), "--version"], text=True, timeout=3)}
+        default = smoke.build_example("minimal-board", build_dir=tmp_path / "default-firmware")
+        requested = smoke.build_example("can-motor", build_dir=tmp_path / "requested-firmware")
+        evidence["firmware"] = {"valid_default": default, "incompatible_requested": requested}
+        # Keep an actually valid default in a private manifest root. The old
+        # ignored-firmware path would execute it and incorrectly pass this run.
+        fixtures = tmp_path / "private-manifests"
+        manifest = fixtures / "examples/minimal-board/scene.yaml"
+        manifest.parent.mkdir(parents=True)
+        manifest.write_text((smoke.ROOT / "examples/minimal-board/scene.yaml").read_text().replace(
+            "./build/firmware.elf", default["elf"]))
+        evidence["manifest"] = {"path": str(manifest),
+            "sha256": hashlib.sha256(manifest.read_bytes()).hexdigest()}
+        monkeypatch.setattr(smoke, "ROOT", fixtures)
+        evidence["positive_default"] = smoke.run_case("minimal-board", qemu=qemu,
+                                                       firmware=Path(default["elf"]))
+        try:
+            result = smoke.run_case("minimal-board", qemu=qemu, firmware=Path(requested["elf"]))
+        except BaseException as error:
+            evidence["execution"] = {"status": "FAIL", "expected": True,
+                "error_type": type(error).__name__, "error": str(error),
+                "notes": list(getattr(error, "__notes__", ())),
+                "observations": getattr(error, "simulation_observations", {})}
+            if isinstance(error, smoke.Blocked):
+                raise
+            assert isinstance(error, AssertionError), evidence["execution"]
+        else:
+            evidence["execution"] = {"status": "PASS", "observations": result}
+            pytest.fail("incompatible requested ELF was accepted using the manifest default")
+        actual = evidence["execution"]["observations"]
+        assert "SIM_READY can-motor\n" in actual["uart"]
+        assert "SIM_READY minimal-board\n" not in actual["uart"]
+        for observations, build in ((evidence["positive_default"], default), (actual, requested)):
+            _verify_smoke_native_identity_and_cleanup(observations, build)
+        assert hashlib.sha256(qemu.read_bytes()).hexdigest() == evidence["qemu"]["sha256"]
+        assert hashlib.sha256(manifest.read_bytes()).hexdigest() == evidence["manifest"]["sha256"]
+        evidence["gate_status"] = "PASS"
+    except smoke.Blocked as error:
+        evidence.update(gate_status="BLOCKED", reason=str(error))
+        pytest.skip(f"BLOCKED: {error}")
+    finally:
+        if sys.exception() is not None:
+            error = sys.exception()
+            evidence["gate_error"] = {"error_type": type(error).__name__, "error": str(error)}
+        report.write_text(json.dumps(evidence, indent=2) + "\n")
+
+
+def test_real_uart_skip_rx_mutant_rejects_apparent_pass_and_keeps_native_evidence(tmp_path):
+    configured = os.environ.get("DM_MC02_EXPERIMENT_QEMU")
+    if configured is None:
+        pytest.skip("set DM_MC02_EXPERIMENT_QEMU for the separate actual firmware gate")
+    from smoke import simulation_smoke as smoke
+
+    evidence = {"gate_status": "FAIL", "execution": {"status": "NOT RUN"},
+                "precision_limit": "sampled GPIO proves RX-dependent response; no exact UART byte timing"}
+    try:
+        qemu = Path(configured).resolve(strict=True)
+        evidence["qemu"] = {"path": str(qemu), "sha256": hashlib.sha256(qemu.read_bytes()).hexdigest(),
+            "version": subprocess.check_output([str(qemu), "--version"], text=True, timeout=3)}
+        build = smoke.build_example("uart-link", build_dir=tmp_path / "firmware", uart_skip_rx=True)
+        evidence["firmware"] = build
+        try:
+            result = smoke.run_case("uart-link", qemu=qemu, firmware=Path(build["elf"]))
+        except BaseException as error:
+            evidence["execution"] = {"status": "FAIL", "expected": True,
+                "error_type": type(error).__name__, "error": str(error),
+                "notes": list(getattr(error, "__notes__", ())),
+                "observations": getattr(error, "simulation_observations", {})}
+            if isinstance(error, smoke.Blocked):
+                raise
+            assert isinstance(error, AssertionError) and "RX-dependent GPIO" in str(error)
+        else:
+            evidence["execution"] = {"status": "PASS", "observations": result}
+            pytest.fail("UART mutant's apparent PASS hid its missing receive-dependent response")
+        observations = evidence["execution"]["observations"]
+        assert "UART_RX sum=033c n=8\nUART_PASS\n" in observations["uart"]
+        _verify_smoke_native_identity_and_cleanup(observations, build)
+        assert hashlib.sha256(qemu.read_bytes()).hexdigest() == evidence["qemu"]["sha256"]
+        evidence["gate_status"] = "PASS"
+    except smoke.Blocked as error:
+        evidence.update(gate_status="BLOCKED", reason=str(error))
+        pytest.skip(f"BLOCKED: {error}")
+    finally:
+        if sys.exception() is not None:
+            error = sys.exception()
+            evidence["gate_error"] = {"error_type": type(error).__name__, "error": str(error)}
+        (tmp_path / "uart-mutant-evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
+
+
 @pytest.mark.parametrize("case", ["minimal-board", "pulse"])
 @pytest.mark.parametrize("build_type", ["Debug", "Release"])
 def test_real_qemu_experiment_reuses_firmware_smoke_and_cleans_before_result(tmp_path, case, build_type):

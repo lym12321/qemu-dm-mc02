@@ -1782,6 +1782,13 @@ done
 ```
 
 每次报告记录实际 ELF 哈希、QEMU 路径/哈希/版本、输入与观察时间及清理结果。
+`simulation_smoke.py` 为每份报告保留独立的
+`<报告名去扩展名>-assets/<case>/<Debug或Release>/` 构建目录；HAL GPIO 的
+`--hal-elf` 也先复制到该目录后运行。报告和资产目录必须都是新路径，已有路径
+（包括悬空符号链接）会在构建或启动 QEMU 前被拒绝。保留 JSON 时应同时保留旁边
+的资产目录；后续 Debug/Release 验收不会覆盖它。Linux 原生报告逐 Machine 记录
+实际进程的 `-kernel` 参数、ELF 路径/哈希和清理身份；双板使用本次指定的同一 ELF。
+失败或中断也保留本轮资产和已取得的观察证据，不自动重试。
 ADC 接受不等于 DR 读取；IMU ACK 不等于完整消费 DONE；UART 是字节流，读取批次不代表消息边界。
 GPIO 完成态快照不提供未记录的中间边沿。硬件和物理标定仍需独立证据。
 
@@ -1793,6 +1800,7 @@ python tools/benchmark_simulation.py --case all --qemu /path/to/compatible/qemu-
 ```
 
 默认三次固定工作量，报告排他创建，保留 Cut、CAN、QMP、事件数据量、启动/运行耗时和内存样本。
+single/dual 的固件同样构建到报告旁的独占资产目录，并将该 ELF 显式交给原生验收。
 Host 模式无需 QEMU 或物理引擎；原生模式复用真实验收断言。观察与 JSON 编码也有开销，短运行不能证明持续实时能力。
 
 需要区分固件执行、通信、物理与输出成本时，显式运行归因矩阵：
