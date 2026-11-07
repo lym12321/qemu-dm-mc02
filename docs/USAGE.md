@@ -1874,6 +1874,26 @@ gprofng display text -header -statistics -functions /path/to/qemu-child.er
 等待。WFI 的稳态窗口各观察到一次 GPIO 读取。访问频率与 CPU 独占成本分开解释；
 这些结果没有证明新的加速效果，也没有恢复上述 Robot 10s 预算。
 
+随后对 `cpu_io_recompile()` 复用 QEMU 已有的 `CPUState.cc`，消除每次 MMIO 重执行中的
+动态类型检查。新增原生 CPU 测试比较连续执行和多个指令边界切点下的 SysTick 普通读取与
+COUNTFLAG 读后清除；不改变 icount、MMIO 重放或完成态校验。
+
+同机以 GCC 14.3.0、Release/O3、关闭 LTO 构建基线与候选，所有编译选项一致；两者使用
+完全相同的 ELF 字节，按 AB/BA/AB/BA/AB 顺序各执行五次上述无 trace 负载。
+每次保持 200ms／200 Cut、shift0、1ms quantum 和原 host 期限，结果中位数如下：
+
+| 固件 | 基线 active wall | 候选 active wall | 基线 QEMU CPU | 候选 QEMU CPU |
+| --- | ---: | ---: | ---: | ---: |
+| WFI | 0.605s | 0.589s | 0.50s | 0.47s |
+| 忙 MMIO | 8.461s | 7.279s | 9.83s | 8.36s |
+
+忙 MMIO 的 wall 中位数减少约 14%，进程 CPU 约 15%，五对均同时下降；未排除首个较慢的
+基线样本。active wall 不含启动，CPU 是含启动的进程累计采样（10ms 分辨率），不是纯 guest
+成本；采样 RSS 中位数约 44MB，启动中位数约 25ms。独立 trace 运行的八组对应窗口中，
+归一化后的有序 MMIO/重执行记录、读值、原生切点回执和 JIT 计数一致。
+这些短样本只支持本负载下的改善。原 Robot 2s 场景在未放宽的 10s host 预算下仍 FAIL，
+本次完成 239ms 后超时并清理；不宣称恢复历史预算或达到持续实时能力。
+
 日常修改优先运行受影响的原生测试，例如内部 Flash：
 
 ```bash
