@@ -151,14 +151,24 @@ class QemuMachine:
         if self._closed:
             raise RuntimeError('QEMU machine is closed')
         self._ctx.check_deadline()
-        if self._owner is not None and self._owner.process.poll() is not None:
-            raise RuntimeError(f'QEMU exited ({self._owner.process.returncode})')
+        try:
+            if self._owner is not None and self._owner.process.poll() is not None:
+                raise RuntimeError(f'QEMU exited ({self._owner.process.returncode})')
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def _call(self, callback):
         self.check()
-        result = deadline_qmp_call(self._qmp, self.deadline_monotonic, 'QEMU machine', callback)
-        self.check()
-        return result
+        if self._qmp is None:
+            raise RuntimeError('QEMU machine has not connected QMP')
+        try:
+            # Serialization and native command errors can follow partial IO.
+            # Pure input admission belongs to the factory, before this boundary.
+            result = deadline_qmp_call(self._qmp, self.deadline_monotonic, 'QEMU machine', callback)
+            self.check()
+            return result
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def command(self, name, arguments=None):
         return self._call(lambda: self._qmp.command(name, arguments))
@@ -170,7 +180,7 @@ class QemuMachine:
         self.check()
         remaining = self.deadline_monotonic - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError('QEMU machine host deadline expired')
+            raise self._ctx.fail(TimeoutError('QEMU machine host deadline expired'))
         return remaining
 
     def to_native(self, value):
@@ -229,13 +239,20 @@ class QemuMachine:
 
     def require_paused(self, *, initial=False):
         status = self.command('query-status')
-        allowed = ('paused', 'prelaunch') if initial else ('paused',)
-        if not isinstance(status, dict) or status.get('running') is not False or status.get('status') not in allowed:
-            raise RuntimeError('QEMU must remain paused at each completed target')
+        try:
+            self._validate_status(status, initial=initial)
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def validate_cut(self):
+        self.check()
+        if self._owner is None:
+            raise RuntimeError('QEMU machine has not started')
         initial = self._last_time_ns == self._ctx.session.t_sim_ns
-        self._validate_completed_cut(self.to_native(self._last_time_ns), initial=initial)
+        try:
+            self._validate_completed_cut(self.to_native(self._last_time_ns), initial=initial)
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def _validate_completed_cut(self, expected, *, initial=False):
         execution, status = self._execution_observation()
@@ -260,16 +277,21 @@ class QemuMachine:
     def query_execution(self):
         """Read execution and run status together; this is not an atomic snapshot."""
         values = self.command_many((('x-query-virtual-execution', None), ('query-status', None)))
-        if type(values) is not tuple:
-            raise TypeError('QMP command_many result must be a plain tuple')
-        if len(values) != 2:
-            raise ValueError('QMP command_many result has wrong arity')
+        try:
+            if type(values) is not tuple:
+                raise TypeError('QMP command_many result must be a plain tuple')
+            if len(values) != 2:
+                raise ValueError('QMP command_many result has wrong arity')
+        except BaseException as error:
+            raise self._ctx.fail(error)
         return values
 
     def _execution_observation(self):
         observe = getattr(self._adapter, 'execution_observation', None)
         if callable(observe):
-            return observe()
+            result = observe()
+            self.check()
+            return result
         return self.query_execution()
 
     @property
@@ -300,8 +322,11 @@ class QemuMachine:
         if step is not self._prepared or self._pending is not None:
             raise ValueError('QEMU request requires the original prepared step')
         target = self.to_native(step.t_sim_ns)
-        self._adapter.service(self._last_time_ns)
-        self.command('x-run-to-virtual-time', {'target-ns': target})
+        try:
+            self._adapter.service(self._last_time_ns)
+            self.command('x-run-to-virtual-time', {'target-ns': target})
+        except BaseException as error:
+            raise self._ctx.fail(error)
         self._pending = step
         self._prepared = None
 
@@ -311,48 +336,61 @@ class QemuMachine:
             raise ValueError('QEMU completion requires the original pending step')
         target = self.to_native(step.t_sim_ns)
         previous = self.to_native(self._last_time_ns)
-        while True:
+        try:
+            while True:
+                self._adapter.service(step.t_sim_ns)
+                self.check()
+                execution, status = self._execution_observation()
+                if not isinstance(execution, dict):
+                    raise TypeError('invalid native execution observation')
+                current = _native_time(execution.get('current-ns'), 'native execution time')
+                if execution.get('target-ns') != target or not previous <= current <= target:
+                    raise RuntimeError('native execution target or time changed')
+                state = execution.get('state')
+                if state == 'reached':
+                    if current != target:
+                        raise RuntimeError('native execution reached an incorrect time')
+                    self._validate_status(status)
+                    break
+                if state != 'running':
+                    raise RuntimeError(f'native execution target was interrupted: {state}')
+                previous = current
+                select.select([], [], [], min(.001, self._remaining()))
             self._adapter.service(step.t_sim_ns)
-            execution, status = self._execution_observation()
-            if not isinstance(execution, dict):
-                raise TypeError('invalid native execution observation')
-            current = _native_time(execution.get('current-ns'), 'native execution time')
-            if execution.get('target-ns') != target or not previous <= current <= target:
-                raise RuntimeError('native execution target or time changed')
-            state = execution.get('state')
-            if state == 'reached':
-                if current != target:
-                    raise RuntimeError('native execution reached an incorrect time')
-                self._validate_status(status)
-                break
-            if state != 'running':
-                raise RuntimeError(f'native execution target was interrupted: {state}')
-            previous = current
-            select.select([], [], [], min(.001, self._remaining()))
-        self._adapter.service(step.t_sim_ns)
-        self._adapter.complete_cut(step.t_sim_ns, target)
-        # Completion emits synchronous observers. Recheck the pending identity
-        # after they return, before accepting this native interval as complete.
-        self._validate_completed_cut(target)
-        self.check()
+            self.check()
+            self._adapter.complete_cut(step.t_sim_ns, target)
+            # Completion emits synchronous observers. Recheck the pending identity
+            # after they return, before accepting this native interval as complete.
+            self.check()
+            self._validate_completed_cut(target)
+            self.check()
+        except BaseException as error:
+            raise self._ctx.fail(error)
         self._last_time_ns = step.t_sim_ns
         self._pending = None
         return StepResult('ok', step.t_sim_ns)
 
     def input(self, port, payload):
+        """Apply an admitted payload; adapter errors may follow partial IO."""
         self.check()
         if self._pending is not None or self._owner is None:
             raise RuntimeError('QEMU input requires a completed paused cut')
         self.validate_cut()
-        self._adapter.input(port, payload)
-        self.check()
+        try:
+            self._adapter.input(port, payload)
+            self.check()
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def commit_inputs(self, cut_ns):
         self.check()
         if self._pending is not None or self._owner is None:
             raise RuntimeError('QEMU input commit requires a completed paused cut')
-        self._adapter.commit_inputs(cut_ns)
-        self.check()
+        try:
+            self._adapter.commit_inputs(cut_ns)
+            self.check()
+        except BaseException as error:
+            raise self._ctx.fail(error)
 
     def observe(self):
         return self._adapter.observe()

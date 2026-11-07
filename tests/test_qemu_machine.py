@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, Topology
+from sim.api import LinkSpec, NodeDescription, NodeSpec, PortSpec, StepContext, Topology
 from sim.composition import builtin_registry
 from sim.fabric.digital import DigitalSample
 from sim.machines.qemu import BackendUnavailable, QemuFactory
@@ -983,6 +983,163 @@ class FakeProfile:
         return result
 
 
+@pytest.fixture
+def paused_machines(backend):
+    profiles = (FakeProfile('fixture-left'), FakeProfile('fixture-right'))
+    sim = Simulation(Topology((NodeSpec('left', 'left.qemu'), NodeSpec('right', 'right.qemu'))),
+        {f'{name}.qemu': QemuFactory(profile=profile, qemu='/explicit/qemu')
+         for name, profile in zip(('left', 'right'), profiles)})
+    sim.start()
+    sim.run_until(19)
+    try:
+        yield sim, profiles
+    finally:
+        sim.close()
+        sim.close()
+    assert all(profile.actions.count(('close',)) == 1 for profile in profiles)
+    assert backend.calls.count('QMP close') == backend.calls.count('process close') == 2
+    assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
+
+
+@pytest.mark.parametrize('fault', ['timeout', 'eof', 'serialization', 'process_exit'])
+def test_paused_direct_native_failure_immediately_freezes_other_machine(
+        backend, paused_machines, monkeypatch, fault):
+    sim, _ = paused_machines
+    left, right = sim.components['left'], sim.components['right']
+    errors = {'timeout': TimeoutError('native QMP stalled'),
+              'eof': EOFError('native QMP peer closed'),
+              'serialization': TypeError('native QMP argument cannot be encoded')}
+    if fault == 'process_exit':
+        backend.state.processes[0].returncode = 0
+    else:
+        def failed(name, arguments=None):
+            backend.commands.append((name, arguments))
+            raise errors[fault]
+        monkeypatch.setattr(backend.clients[0], 'command', failed)
+    expected = {'timeout': RuntimeError, 'eof': EOFError,
+                'serialization': TypeError, 'process_exit': RuntimeError}[fault]
+    with pytest.raises(expected) as caught:
+        left.command('query-status')
+    if fault == 'timeout':
+        assert caught.value.__cause__ is errors[fault]
+    elif fault != 'process_exit':
+        assert caught.value is errors[fault]
+    assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+    assert sim.t_sim_ns == left.t_sim_ns == right.t_sim_ns == 19
+    before = list(backend.commands)
+    with pytest.raises(type(caught.value)) as second:
+        right.command('query-status')
+    assert second.value is caught.value and backend.commands == before
+
+
+@pytest.mark.parametrize('fault', ['pair_type', 'pair_arity', 'status', 'cut'])
+def test_paused_direct_invalid_native_receipt_immediately_freezes(
+        backend, paused_machines, monkeypatch, fault):
+    sim, _ = paused_machines
+    left, right = sim.components['left'], sim.components['right']
+    operation = left.query_execution
+    if fault in ('pair_type', 'pair_arity'):
+        original = backend.clients[0].command_many
+        def malformed(commands):
+            result = original(commands)
+            return list(result) if fault == 'pair_type' else result[:1]
+        monkeypatch.setattr(backend.clients[0], 'command_many', malformed)
+    elif fault == 'status':
+        backend.state.read_status = lambda _: {'running': True, 'status': 'running'}
+        operation = left.require_paused
+    else:
+        backend.clients[0].current += 1
+        operation = left.validate_cut
+    expected = {'pair_type': TypeError, 'pair_arity': ValueError,
+                'status': RuntimeError, 'cut': RuntimeError}[fault]
+    with pytest.raises(expected) as caught:
+        operation()
+    assert sim.state == SimulationState.FAILED and sim.failure is caught.value
+    assert sim.t_sim_ns == left.t_sim_ns == 19 and left.pending is None
+    before = list(backend.commands)
+    with pytest.raises(type(caught.value)) as second:
+        right.command('query-status')
+    assert second.value is caught.value and backend.commands == before
+
+
+@pytest.mark.parametrize('operation', ['input', 'commit_inputs'])
+def test_paused_direct_adapter_failure_preserves_partial_effect_without_replay(
+        backend, paused_machines, monkeypatch, operation):
+    sim, profiles = paused_machines
+    machine = sim.components['left']
+    failure = OSError('adapter failed after writing')
+    effects = []
+    def failed(*args):
+        effects.append(args)
+        machine.streams['data'].send(b'partial')
+        raise failure
+    monkeypatch.setattr(profiles[0].adapters[0], operation, failed, raising=False)
+    args = ('feed', b'input') if operation == 'input' else (19,)
+    with pytest.raises(OSError) as caught:
+        getattr(machine, operation)(*args)
+    assert caught.value is failure
+    assert sim.state == SimulationState.FAILED and sim.failure is failure
+    assert backend.sockets[0][2].recv(4096) == b'partial'
+    before = list(backend.commands)
+    with pytest.raises(OSError) as second:
+        getattr(machine, operation)(*args)
+    assert second.value is failure and effects == [args] and backend.commands == before
+    assert sim.t_sim_ns == machine.t_sim_ns == 19
+
+
+def test_paused_adapter_cannot_swallow_native_failure_and_return_success(
+        backend, paused_machines, monkeypatch):
+    sim, profiles = paused_machines
+    machine = sim.components['left']
+    failure = EOFError('native QMP peer closed inside adapter')
+    original = backend.clients[0].command
+    def failed(name, arguments=None):
+        if name == 'query-commands':
+            raise failure
+        return original(name, arguments)
+    monkeypatch.setattr(backend.clients[0], 'command', failed)
+    def swallow(*_args):
+        try:
+            machine.command('query-commands')
+        except EOFError:
+            pass
+    monkeypatch.setattr(profiles[0].adapters[0], 'input', swallow)
+    with pytest.raises(EOFError) as caught:
+        machine.input('feed', b'input')
+    assert caught.value is failure and sim.failure is failure
+    assert sim.state == SimulationState.FAILED and sim.t_sim_ns == 19
+
+
+@pytest.mark.parametrize('operation', ['request_step', 'finish_step'])
+def test_machine_service_cannot_swallow_failure_before_next_execution_hook(
+        backend, paused_machines, monkeypatch, operation):
+    sim, profiles = paused_machines
+    machine = sim.components['left']
+    step = StepContext(sim.session.session_id, 2, 38, 19)
+    machine.prepare_step(step)
+    if operation == 'finish_step':
+        machine.request_step(step)
+    failure = EOFError('native QMP failed during service')
+    def failed(*_args):
+        raise failure
+    monkeypatch.setattr(backend.clients[0], 'command', failed)
+    def swallow(_cut):
+        try:
+            machine.command('query-commands')
+        except EOFError:
+            pass
+    monkeypatch.setattr(profiles[0].adapters[0], 'service', swallow)
+    monkeypatch.setattr(profiles[0].adapters[0], 'execution_observation',
+                        lambda: pytest.fail('service failure reached observation'), raising=False)
+    before = list(backend.commands)
+    with pytest.raises(EOFError) as caught:
+        getattr(machine, operation)(step)
+    assert caught.value is failure and sim.failure is failure
+    assert sim.state == SimulationState.FAILED and sim.t_sim_ns == machine.t_sim_ns == 19
+    assert machine.pending is (step if operation == 'finish_step' else None)
+    assert backend.commands == before
+
+
 def test_injected_profile_uses_same_native_target_lifecycle_without_dm_queries(backend, monkeypatch):
     profile = FakeProfile()
     monkeypatch.setattr(adapter, 'resolve_backend_root',
@@ -1007,6 +1164,18 @@ def test_injected_profile_uses_same_native_target_lifecycle_without_dm_queries(b
         sim.reset()
         assert previous is not sim.components['cpu']
         assert len(profile.adapters) == 2
+        before = list(backend.commands)
+        with pytest.raises(RuntimeError, match='closed'):
+            previous.command('query-status')
+        assert sim.state == SimulationState.PAUSED and sim.failure is None
+        assert backend.commands == before
+        current = sim.components['cpu']
+        assert current.command('query-status')['running'] is False
+    before = list(backend.commands)
+    with pytest.raises(RuntimeError, match='closed'):
+        current.command('query-status')
+    assert sim.state == SimulationState.CLOSED and sim.failure is None
+    assert backend.commands == before
     assert profile.actions.count(('close',)) == 2
     assert all(host.fileno() == -1 for _, host, _ in backend.sockets)
     assert backend.calls[-2:] == ['QMP close', 'process close']

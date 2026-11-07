@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import select
+import signal
 import subprocess
 import sys
 import tempfile
@@ -18,7 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sim.api import NodeDescription, NodeSpec, StepResult, Topology
+from sim.api import LinkSpec, NodeDescription, NodeSpec, StepResult, Topology
 from sim.apps.experiment import ExperimentInput, run_experiment
 from sim.config.scene import Scene
 
@@ -455,4 +456,164 @@ def test_real_qemu_cuts_and_reset_do_not_retain_internal_qmp_events(tmp_path, mo
             evidence["execution"]["notes"] = list(getattr(active_error, "__notes__", ()))
         (tmp_path / "event-retention-evidence.json").write_text(json.dumps(evidence, indent=2) + "\n")
         if failures and active_error is None:
+            raise failures[0][1]
+
+
+def test_real_paused_process_exit_immediately_freezes_independent_io(tmp_path):
+    """An exited real MCU freezes borrowed Host I/O before another run call."""
+    from smoke.simulation_smoke import Blocked, Observations, build_example
+    from sim.api import BackendUnavailable
+    from sim.composition import builtin_registry
+    from sim.machines.qemu.qmp import qmp_client_provenance
+    from sim.runtime import Simulation, SimulationState
+
+    report = tmp_path / "paused-exit-evidence.json"
+    evidence = {"gate_status": "NOT RUN", "python": sys.version,
+        "execution": {"status": "NOT RUN"}, "resources": [], "cleanup_errors": [],
+        "conditions": {"quantum_ns": 1_000_000, "completed_cut_ns": 10_000_000,
+            "startup_timeout_s": 10, "host_timeout_s": 20,
+            "process_exit_timeout_s": 3, "termination": "SIGTERM through pidfd",
+            "uart_timestamp_quality": "upper_bound",
+            "precision_limit": "UART read observation is not a guest byte-consumption timestamp"}}
+
+    def unavailable(status, reason):
+        evidence.update(gate_status=status, reason=reason)
+        report.write_text(json.dumps(evidence, indent=2) + "\n")
+        pytest.skip(f"{status}: {reason}")
+
+    configured = os.environ.get("DM_MC02_EXPERIMENT_QEMU")
+    if configured is None:
+        unavailable("NOT RUN", "set DM_MC02_EXPERIMENT_QEMU for the actual firmware gate")
+    if not hasattr(os, "pidfd_open") or not hasattr(signal, "pidfd_send_signal"):
+        unavailable("BLOCKED", "Linux pidfd support is required for bounded native exit evidence")
+    qemu = Path(configured).resolve()
+    if not qemu.is_file() or not os.access(qemu, os.X_OK):
+        unavailable("BLOCKED", f"project native QEMU executable is unavailable: {qemu}")
+    try:
+        build = build_example("minimal-board", build_dir=tmp_path / "firmware")
+        provenance = qmp_client_provenance()
+    except (Blocked, BackendUnavailable) as error:
+        unavailable("BLOCKED", str(error))
+    except BaseException as error:
+        evidence.update(gate_status="FAIL", build_error={
+            "type": type(error).__name__, "error": str(error)})
+        report.write_text(json.dumps(evidence, indent=2) + "\n")
+        raise
+    evidence.update(gate_status="FAIL", build=build,
+        qemu={"path": str(qemu), "sha256": hashlib.sha256(qemu.read_bytes()).hexdigest(),
+              "version": subprocess.check_output([str(qemu), "--version"], text=True, timeout=3)},
+        qmp_client=provenance)
+    observations = Observations()
+    # Real protocol-neutral fixtures borrow the actual UART fabric. Queued
+    # traffic is left pending so no echo feedback loop needs to be executed.
+    simulation = Simulation(Topology((
+        NodeSpec("main", "machine.qemu", {"firmware": build["elf"]}),
+        NodeSpec("left", "device.uart-echo"), NodeSpec("right", "device.uart-echo"),
+        NodeSpec("wire", "net.uart")), (
+        LinkSpec("left.uart", "wire.uart"), LinkSpec("right.uart", "wire.uart"))),
+        builtin_registry(qemu=str(qemu)), quantum_ns=1_000_000,
+        startup_timeout_s=10, host_timeout_s=20, on_event=observations)
+    primary = None
+    verified = False
+    try:
+        simulation.start()
+        machine, sender, wire = (simulation.components[name] for name in ("main", "left", "wire"))
+        info = machine.connection_info
+        pid = info["pid"]
+        sockets = dict(info["sockets"])
+        evidence["resources"].append({"pid": pid,
+            "starttime": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
+            "sockets": sockets, "socket_inodes": {
+                name: Path(path).stat().st_ino for name, path in sockets.items()},
+            "private_directories": sorted({str(Path(path).parent) for path in sockets.values()})})
+        simulation.run_until(10_000_000)
+        assert b"SIM_READY minimal-board\n" in observations.uart
+        assert simulation.state == SimulationState.PAUSED
+        assert simulation.t_sim_ns == machine.t_sim_ns == 10_000_000
+        assert simulation.step_id == 10
+        assert observations.uart_batches
+        assert all(row["quality"] == "upper_bound"
+                   and row["source_time_ns"] == info["native_origin_ns"] + row["mapped_time_ns"]
+                   and row["delivery_time_ns"] == row["mapped_time_ns"]
+                   for row in observations.uart_batches)
+        execution, status = machine.command_many(
+            (("x-query-virtual-execution", None), ("query-status", None)))
+        expected_native = info["native_origin_ns"] + simulation.t_sim_ns
+        assert execution == {"state": "reached", "current-ns": expected_native,
+                             "target-ns": expected_native}
+        assert status["running"] is False and status["status"] == "paused"
+        evidence["before_exit"] = {"execution": execution, "status": status,
+            "native_origin_ns": info["native_origin_ns"],
+            "time_ns": simulation.t_sim_ns, "step_id": simulation.step_id,
+            "uart_batches": observations.uart_batches}
+        sender.receive_uart(b"already queued")
+        pending = (wire.pending, wire.pending_bytes, len(simulation.events))
+        assert pending[:2] == (1, len(b"already queued"))
+        pidfd = os.pidfd_open(pid)
+        try:
+            signal.pidfd_send_signal(pidfd, signal.SIGTERM)
+            assert select.select([pidfd], [], [], 3)[0] == [pidfd], "native process did not exit"
+        finally:
+            os.close(pidfd)
+        # A direct public command must expose the failure now, without the
+        # Runtime entering another cut or a callback supplying a fake receipt.
+        with pytest.raises(RuntimeError, match="QEMU exited") as caught:
+            machine.command("query-status")
+        primary = caught.value
+        evidence["execution"] = {"status": "FAIL", "expected": True,
+            "error_type": type(primary).__name__, "error": str(primary)}
+        evidence["after_exit"] = {"state": str(simulation.state),
+            "time_ns": simulation.t_sim_ns, "step_id": simulation.step_id,
+            "failure_is_primary": simulation.failure is primary}
+        assert simulation.state == SimulationState.FAILED and simulation.failure is primary
+        with pytest.raises(RuntimeError):
+            sender.receive_uart(b"must not queue")
+        assert (wire.pending, wire.pending_bytes, len(simulation.events)) == pending
+        assert simulation.t_sim_ns == machine.t_sim_ns == 10_000_000
+        assert simulation.step_id == 10 and simulation.failure is primary
+        for operation in (lambda: simulation.run_until(11_000_000), simulation.reset):
+            with pytest.raises(RuntimeError, match="paused, healthy"):
+                operation()
+        evidence["independent_io"] = {"rejected": True, "pending_chunks": wire.pending,
+            "pending_bytes": wire.pending_bytes, "events_unchanged": True}
+        verified = True
+    except BackendUnavailable as error:
+        unavailable("BLOCKED", str(error))
+    finally:
+        active_error = sys.exception()
+        failures = []
+        try:
+            simulation.close()
+            simulation.close()
+        except BaseException as error:
+            failures.append(("Simulation cleanup", error))
+        try:
+            for resource in evidence["resources"]:
+                stat = Path(f"/proc/{resource['pid']}/stat")
+                assert not stat.exists() or stat.read_text().rsplit(")", 1)[1].split()[19] != resource["starttime"]
+                assert not any(Path(path).exists() for path in resource["sockets"].values())
+                assert not any(Path(path).exists() for path in resource["private_directories"])
+            assert simulation.state == SimulationState.CLOSED
+            assert hashlib.sha256(qemu.read_bytes()).hexdigest() == evidence["qemu"]["sha256"]
+            assert hashlib.sha256(Path(build["elf"]).read_bytes()).hexdigest() == build["sha256"]
+        except BaseException as error:
+            failures.append(("cleanup or input identity verification", error))
+        for label, failure in failures:
+            if active_error is not None and failure is not active_error:
+                active_error.add_note(f"{label}: {type(failure).__name__}: {failure}")
+            if primary is not None and failure is not primary:
+                primary.add_note(f"{label}: {type(failure).__name__}: {failure}")
+            evidence["cleanup_errors"].append(f"{label}: {type(failure).__name__}: {failure}")
+        evidence["cleanup_completed"] = not failures
+        evidence["expected_native_failure_verified"] = verified
+        if evidence["gate_status"] != "BLOCKED" or failures:
+            evidence["gate_status"] = "PASS" if verified and active_error is None and not failures else "FAIL"
+        if active_error is not None:
+            evidence["gate_error"] = {"type": type(active_error).__name__, "error": str(active_error),
+                "notes": list(getattr(active_error, "__notes__", ()))}
+        if primary is not None:
+            evidence["execution"]["notes"] = list(getattr(primary, "__notes__", ()))
+        evidence["partial_observations"] = observations.report()
+        report.write_text(json.dumps(evidence, indent=2) + "\n")
+        if failures and (active_error is None or isinstance(active_error, pytest.skip.Exception)):
             raise failures[0][1]
