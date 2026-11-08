@@ -50,7 +50,8 @@ monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simula
 
 运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
 可执行文件每次启动会解压内置内容到临时目录，临时目录需允许写入和执行；
-Linux 版本仍使用系统运行库，并非完全静态二进制。
+Linux 仍需系统 GLib/zlib；精简 Ubuntu 环境可用
+`sudo apt-get install -y libglib2.0-0t64 zlib1g` 安装。
 
 Windows PowerShell，在解压目录执行：
 

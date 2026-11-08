@@ -44,7 +44,7 @@ chmod +x sim bin/qemu-system-arm
 
 `chmod` 恢复 Actions ZIP 未保留的执行权限。将 `example.elf` 换为自己的 DM-MC02 ELF 即可。
 可执行文件内置 Python、基础依赖和 QEMU，每次启动会解压到临时目录，需允许写入和执行。
-Linux 包仍使用系统运行库，并非完全静态。下载包的验收范围是固件终端和 GDB 监听；
+Linux 仍需系统 GLib/zlib（Ubuntu 包 `libglib2.0-0t64 zlib1g`）。下载包的验收范围是固件终端和 GDB 监听；
 完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2 的[源码安装](docs/USAGE.md#installation)。
 
 默认 UART1 与原生 monitor 共用终端；`Ctrl-a c` 切换，`Ctrl-a h` 查看帮助。

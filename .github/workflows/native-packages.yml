@@ -51,7 +51,7 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config libglib2.0-dev zlib1g-dev python3 \
-            python3-venv python3-pip ninja-build git ca-certificates
+            python3-venv python3-pip libpython3.12t64 ninja-build git ca-certificates
       - uses: actions/checkout@v4
         with:
           submodules: true
