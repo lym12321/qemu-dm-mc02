@@ -26,6 +26,7 @@ def console_case(command, *, debug, cwd, env):
             port = reservation.getsockname()[1]
         command += ["--debug", "--gdb-port", str(port)]
     result = {"command": command, "passed": False}
+    started = time.monotonic()
     process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     tail = bytearray()
@@ -47,7 +48,7 @@ def console_case(command, *, debug, cwd, env):
 
     reader = threading.Thread(target=read_output, daemon=True)
     reader.start()
-    deadline = time.monotonic() + 20
+    deadline = started + 20
 
     def output():
         with lock:
@@ -89,6 +90,7 @@ def console_case(command, *, debug, cwd, env):
             send(b"cont\n\x01c")
         wait_for(READY)
         result["firmware_uart_ready"] = True
+        result["uart_ready_elapsed_s"] = time.monotonic() - started
         send(b"\x01cquit\n")
         process.stdin.close()
         result["exit_code"] = process.wait(timeout=max(0.1, deadline - time.monotonic()))
@@ -126,8 +128,8 @@ def console_case(command, *, debug, cwd, env):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--sim", type=Path,
-                        help="standalone executable; exercises bundled QEMU discovery")
+    parser.add_argument("--sim", type=Path, required=True,
+                        help="firmware executable; exercises adjacent QEMU discovery")
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -137,20 +139,17 @@ def main():
     qemu, firmware = args.qemu.resolve(), args.firmware.resolve()
     if not qemu.is_file() or not firmware.is_file():
         parser.error("--qemu and --firmware must be existing files")
-    sim = args.sim.resolve() if args.sim is not None else None
-    if sim is not None and not sim.is_file():
+    sim = args.sim.resolve()
+    if not sim.is_file():
         parser.error("--sim must be an existing executable")
-    command = ([str(sim), "firmware", str(firmware)] if sim is not None else
-               [sys.executable, "-I", "-m", "sim", "firmware", str(firmware),
-                "--qemu", str(qemu)])
+    command = [str(sim), "firmware", str(firmware)]
     report = {"schema": "dm-mc02/package-smoke/1", "platform": platform.platform(),
               "python": sys.executable, "qemu": str(qemu), "firmware": str(firmware),
-              "sim": str(sim) if sim is not None else None,
+              "sim": str(sim),
               "passed": False}
     try:
         # The standalone must find its own QEMU without a checkout, Python
-        # installation or executable from the caller's PATH. The fallback -I
-        # invocation still exercises a separately installed wheel.
+        # installation or executable from the caller's PATH.
         with tempfile.TemporaryDirectory(prefix="dm-mc02 package 验证-") as directory:
             empty_path = Path(directory) / "empty-path"
             empty_path.mkdir()

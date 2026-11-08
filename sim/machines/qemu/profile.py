@@ -157,14 +157,6 @@ class DmMc02Profile:
     """Fixed board admission and wire adapters, independent of process ownership."""
 
     serial_slots = ('cosim', *UARTS, 'can1', 'can2', 'can3')
-    terminal_uarts = UARTS
-
-    @staticmethod
-    def terminal_machine_arguments(firmware, machine):
-        if (not isinstance(machine, str) or '\0' in machine
-                or not (machine == 'dm-mc02' or machine.startswith('dm-mc02,'))):
-            raise ValueError('firmware requires --machine dm-mc02, optionally followed by machine properties')
-        return ('-machine', machine, '-kernel', str(firmware))
 
     @staticmethod
     def machine_arguments(firmware):

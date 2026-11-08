@@ -21,7 +21,7 @@ Python 核心可独立安装；原生固件运行需要固定的项目 QEMU。�
 无需安装 Python、Nix、pip 或本地编译。打开 [Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
 选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载
 `dm-mc02-windows-x86_64` 或 `dm-mc02-linux-x86_64` 并解压。下载需要登录 GitHub，包保留 30 天。
-每包包含独立的 `sim.exe` 或 `sim`、`example.elf`、QEMU、来源清单、对应源码和许可证。
+每包包含 Rust 编译的 `sim.exe` 或 `sim`、`example.elf`、QEMU、来源清单、对应源码和许可证。
 CI 要求该平台的真实固件 UART、monitor 退出及从复位暂停的 GDB 监听门成功后才上传，
 平台可用性以所下载运行记录及随包的 `smoke.json` 为准。在解压目录执行：
 
@@ -43,7 +43,7 @@ chmod +x sim bin/qemu-system-arm
 ```
 
 `chmod` 恢复 Actions ZIP 未保留的执行权限。将 `example.elf` 换为自己的 DM-MC02 ELF 即可。
-可执行文件内置 Python、基础依赖和 QEMU，每次启动会解压到临时目录，需允许写入和执行。
+Rust 可执行文件直接使用相邻 `bin/` 中的 QEMU，无 Python 运行时，也不解包临时可执行文件。
 Linux 仍需系统 GLib/zlib（Ubuntu 包 `libglib2.0-0t64 zlib1g`）。下载包的验收范围是固件终端和 GDB 监听；
 完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2 的[源码安装](docs/USAGE.md#installation)。
 
@@ -62,12 +62,20 @@ continue
 ```
 
 直接运行不需要 YAML、Python QMP client 或 MuJoCo。QEMU 选择顺序为 `--qemu`、
-`QEMU_SYSTEM_ARM`、下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的
-`build/qemu/qemu-system-arm`。包中的 `bin/` 保留原生诊断接口。
+`QEMU_SYSTEM_ARM`、发行目录 `bin/` 中的 QEMU。包中的 `bin/` 也可用于原生诊断。
 系统 QEMU 不含本项目板卡；GitHub 源码 ZIP 不含子模块，请使用 Git clone。
 其它 UART、machine 属性、QMP 和外部输入见[原生接口](docs/USAGE.md#native-debug)。
 
 ## 源码构建与自动场景
+
+Rust 固件入口使用固定工具链与 Cargo.lock：
+
+```bash
+cargo build --release --locked -p sim-host
+target/release/sim firmware path/to/app.elf --qemu build/qemu/qemu-system-arm
+```
+
+当前 Rust 入口支持 `firmware`；自动场景和其它宿主功能按边界继续迁移，以下安装仍使用 Python。
 
 源码开发默认使用 [Ubuntu 系统依赖](docs/USAGE.md#ubuntu)，Nix 是可选环境：
 

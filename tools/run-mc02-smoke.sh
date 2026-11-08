@@ -5,6 +5,7 @@ script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
 export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
+sim_bin=${SIM_EXECUTABLE:-"$root_dir/target/release/sim"}
 elf="$root_dir/build/smoke/dm_mc02_smoke.elf"
 
 if [[ ${1:-} == --qemu ]]; then
@@ -16,6 +17,7 @@ if (($# != 0)); then
     printf 'usage: %s [--qemu <path>]\n' "$0" >&2
     exit 2
 fi
+[[ -x "$sim_bin" ]] || { printf 'blocked: Rust sim not found: %s (run cargo build --release --locked)\n' "$sim_bin" >&2; exit 1; }
 [[ -x "$qemu_bin" ]] || { printf 'blocked: custom QEMU binary not found: %s\n' "$qemu_bin" >&2; exit 1; }
 if [[ ! -x "$elf" ]]; then
     "$script_dir/build-smoke.sh" >/dev/null
@@ -25,7 +27,7 @@ command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is requi
 python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
     --socket qmp \
     --python-arg "{qmp}" -- \
-    python3 "$script_dir/sim" firmware "$elf" --qemu "$qemu_bin" \
+    "$sim_bin" firmware "$elf" --qemu "$qemu_bin" \
     --machine dm-mc02,board-profile=DM-MC02 --uart none --qmp "{qmp}" <<'PY'
 from dm_mc02_qmp import QmpSession
 import re

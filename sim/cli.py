@@ -1,4 +1,4 @@
-"""Installed entry point for native firmware and composed Simulation scenes."""
+"""Temporary Python entry for Simulation scenes during the Rust migration."""
 from __future__ import annotations
 
 import argparse
@@ -35,17 +35,6 @@ def _port(value):
 def _parser():
     parser = argparse.ArgumentParser(prog='sim', description='Compose and run embedded simulations.')
     commands = parser.add_subparsers(dest='command', required=True)
-    firmware = commands.add_parser('firmware', help='run an ELF in the native QEMU terminal',
-        description='Run firmware directly; Ctrl-a c switches UART/monitor, Ctrl-a x quits.')
-    firmware.add_argument('elf', type=Path, help='DM-MC02 firmware ELF')
-    firmware.add_argument('--qemu', help='project QEMU executable (or QEMU_SYSTEM_ARM)')
-    firmware.add_argument('--uart', choices=('uart1', 'uart2', 'uart3', 'uart5', 'uart7', 'uart10', 'none'),
-                          default='uart1', help='terminal UART (default: uart1); UART5 is RX only')
-    firmware.add_argument('--debug', action='store_true', help='pause at reset and enable native GDB')
-    firmware.add_argument('--gdb-port', type=_port, help='GDB port with --debug (default: 1234)')
-    firmware.add_argument('--machine', default='dm-mc02', help='dm-mc02, optionally with machine properties')
-    firmware.add_argument('--qmp', type=Path, help='additional native QMP Unix socket')
-    firmware.add_argument('--cosim', type=Path, help='co-sim Unix socket for a separately launched worker')
     validate = commands.add_parser('validate', help='validate sim/v1 without starting native resources')
     validate.add_argument('scene', type=Path)
     run = commands.add_parser('run', help='run a sim/v1 scene through Simulation')
@@ -230,19 +219,6 @@ def _error_code(error):
 def main(argv=None):
     parser = _parser()
     args = parser.parse_args(argv)
-    if args.command == 'firmware':
-        if args.gdb_port is not None and not args.debug:
-            parser.error('--gdb-port requires --debug')
-        try:
-            from sim.apps.firmware import run_firmware
-
-            run_firmware(args.elf, qemu=args.qemu, uart=args.uart, debug=args.debug,
-                         gdb_port=args.gdb_port, machine=args.machine,
-                         qmp_path=args.qmp, cosim_path=args.cosim)
-        except (Exception, KeyboardInterrupt) as error:
-            print(f'error: {error}', file=sys.stderr)
-            return _error_code(error)
-        return 0
     simulation = None
     error = None
     code = 0

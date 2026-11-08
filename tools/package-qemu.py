@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stage a native QEMU release with licenses and its committed source trees."""
+"""Stage the Rust firmware CLI, native QEMU, licenses and corresponding sources."""
 
 import argparse
 import configparser
@@ -105,11 +105,56 @@ def msys2_license(owner, destination):
             "package_url": f"https://packages.msys2.org/package/{owner}"}
 
 
-def package(binary, output, dll_directory=None):
+def rust_provenance(sim, sources, licenses):
+    """Use Cargo's own vendoring format, including upstream license files."""
+    metadata = json.loads(command("cargo", "metadata", "--locked", "--format-version=1",
+                                  cwd=ROOT))
+    (sources / "rust-crates").mkdir()
+    vendor_config = command("cargo", "vendor", "--locked", "--versioned-dirs",
+                            "--respect-source-config",
+                            "--manifest-path", str(ROOT / "Cargo.toml"), "rust-crates",
+                            cwd=sources)
+    (sources / "cargo-config.toml").write_text(vendor_config + "\n", encoding="utf-8")
+    shutil.copy2(ROOT / "Cargo.lock", sources / "Cargo.lock")
+    dependencies = [{key: package[key] for key in
+                     ("name", "version", "license", "license_file", "repository", "source")}
+                    for package in metadata["packages"] if package["source"] is not None]
+
+    # rustc ships the notices for the statically linked standard library even
+    # when the optional rust-docs component is absent.
+    sysroot = Path(command("rustc", "--print", "sysroot"))
+    rust_docs = sysroot / "share/doc/rust"
+    rust_licenses = licenses / "rust"
+    rust_licenses.mkdir()
+    shutil.copy2(rust_docs / "COPYRIGHT-library.html", rust_licenses / "COPYRIGHT-library.html")
+    shutil.copytree(rust_docs / "licenses", rust_licenses / "licenses")
+    return {
+        "file": sim.name,
+        "sha256": digest(sim),
+        "scope": "firmware terminal and reset-paused GDB listener",
+        "rustc": command("rustc", "--version", "--verbose"),
+        "cargo": command("cargo", "--version"),
+        "cargo_lock_sha256": digest(ROOT / "Cargo.lock"),
+        "licenses": "licenses/rust",
+        "source_dependencies": dependencies,
+        "vendored_sources": "sources/rust-crates",
+        "vendor_restore_path": "rust-crates",
+        "vendor_config": "sources/cargo-config.toml",
+        "vendor_config_restore_path": ".cargo/config.toml",
+    }
+
+
+def package(binary, sim, output, dll_directory=None):
     binary = binary.resolve(strict=True)
+    sim = sim.resolve(strict=True)
     if not binary.is_file():
         raise ValueError(f"QEMU must be a regular file: {binary}")
-    if binary.suffix.lower() == ".exe" and dll_directory is None:
+    if not sim.is_file():
+        raise ValueError(f"sim must be a regular file: {sim}")
+    windows = binary.suffix.lower() == ".exe"
+    if windows != (sim.suffix.lower() == ".exe"):
+        raise ValueError("sim and QEMU must target the same platform")
+    if windows and dll_directory is None:
         raise ValueError("Windows QEMU requires --dll-dir for its runtime dependencies")
     if dll_directory is not None:
         dll_directory = dll_directory.resolve(strict=True)
@@ -120,6 +165,8 @@ def package(binary, output, dll_directory=None):
     output.mkdir(parents=True)
     (output / "bin").mkdir()
     shutil.copy2(binary, output / "bin" / binary.name)
+    launcher = output / ("sim.exe" if windows else "sim")
+    shutil.copy2(sim, launcher)
     (output / "docs").mkdir()
     shutil.copy2(ROOT / "README.md", output / "README.md")
     shutil.copy2(ROOT / "docs/USAGE.md", output / "docs/USAGE.md")
@@ -162,6 +209,7 @@ def package(binary, output, dll_directory=None):
         "msys2_packages": owners,
         "sources": source_archives,
         "source_submodules": "Git archives omit submodule checkouts, including ROM repositories.",
+        "rust": rust_provenance(launcher, sources, licenses),
     }
     (output / "provenance.json").write_text(
         json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -171,10 +219,12 @@ def package(binary, output, dll_directory=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu", required=True, type=Path, help="built native QEMU executable")
+    parser.add_argument("--sim", required=True, type=Path,
+                        help="Rust CLI built with cargo build --release --locked -p sim-host")
     parser.add_argument("--output", required=True, type=Path, help="new release directory")
     parser.add_argument("--dll-dir", type=Path, help="MSYS2 MinGW bin directory, for Windows")
     arguments = parser.parse_args()
-    destination = package(arguments.qemu, arguments.output, arguments.dll_dir)
+    destination = package(arguments.qemu, arguments.sim, arguments.output, arguments.dll_dir)
     print(f"Release staged: {destination}")
 
 

@@ -41,15 +41,15 @@ monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simula
 
 | 路径 | 内容 |
 | --- | --- |
-| `sim` 或 `sim.exe` | 独立 CLI，内置 Python、基础依赖及项目 QEMU/所需 DLL |
-| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | 保留的原生诊断接口；Windows 同目录带所需 DLL |
+| `sim` 或 `sim.exe` | Rust 原生固件 CLI，不携带 Python |
+| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | CLI 使用的唯一 QEMU；Windows 同目录带所需 DLL，也可直接诊断 |
 | `example.elf` | 已编译的 minimal-board 固件 |
 | `smoke.json` | 该包的固件运行与清理报告 |
 | `provenance.json` | 构建来源、版本和文件哈希 |
 | `sources/`、`licenses/` | 对应源码归档、QEMU 及运行库许可证 |
 
 运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
-可执行文件每次启动会解压内置内容到临时目录，临时目录需允许写入和执行；
+启动直接使用发行目录中的文件，不解包临时可执行文件。
 Linux 仍需系统 GLib/zlib；精简 Ubuntu 环境可用
 `sudo apt-get install -y libglib2.0-0t64 zlib1g` 安装。
 
@@ -75,6 +75,15 @@ Actions ZIP 不保留 Linux 执行权限，因此解压后需运行 `chmod`。
 请在 Linux 或 WSL2 中使用下述源码安装。
 
 ### 从源码安装
+
+Rust 固件入口使用 `rust-toolchain.toml` 固定的工具链，依赖由 Cargo.lock 锁定：
+
+```bash
+cargo build --release --locked -p sim-host
+target/release/sim firmware path/to/app.elf --qemu build/qemu/qemu-system-arm
+```
+
+当前 Rust CLI 只提供 `firmware`。自动场景、Lab 与物理后端继续按边界迁移；下面的源码安装供这些功能使用。
 
 开发、构建新固件和自动场景使用源码 checkout；默认按 [Ubuntu 系统依赖](#ubuntu)准备，
 [Nix](#nix) 是可选的固定环境。
@@ -107,7 +116,7 @@ python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
 可使用上面的原生包，或[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
 直接终端/GDB 运行使用 `sim firmware app.elf`，不需要 YAML、Python QMP client 或 MuJoCo；
 完整参数见[原生固件入口](#native-debug)。QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、
-下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的 `build/qemu/qemu-system-arm`。
+Rust 发行目录 `bin/` 中的 QEMU；Python 源码入口默认使用 checkout 中的 `build/qemu/qemu-system-arm`。
 普通系统 QEMU 没有本项目板卡，不能替代。
 
 `sim run scene.yaml` 的原生场景后端另外要求固定的 QMP client、

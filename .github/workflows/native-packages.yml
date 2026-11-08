@@ -13,11 +13,10 @@ on:
       - 'tools/qemu-build-env.sh'
       - 'tools/package-qemu.py'
       - 'tools/check-qemu-package.py'
-      - 'tools/standalone.spec'
-      - 'tools/sim'
-      - 'sim/cli.py'
-      - 'sim/apps/firmware.py'
-      - 'sim/machines/qemu/launch.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - 'crates/**'
 
 permissions:
   contents: read
@@ -51,10 +50,14 @@ jobs:
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config libglib2.0-dev zlib1g-dev python3 \
-            python3-venv python3-pip libpython3.12t64 ninja-build git ca-certificates
+            python3-venv python3-pip ninja-build git ca-certificates curl
       - uses: actions/checkout@v4
         with:
           submodules: true
+      - name: Install the pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91.1'
       - uses: actions/download-artifact@v4
         with:
           name: package-test-firmware
@@ -66,19 +69,17 @@ jobs:
           bash tools/build-qemu.sh
       - name: Package binary, licenses and corresponding sources
         run: |
-          python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm --output dist/dm-mc02-linux-x86_64
-          python3 -m venv build/cli-env
-          build/cli-env/bin/python -m pip install PyInstaller==6.16.0 .
-          build/cli-env/bin/python -m PyInstaller --noconfirm \
-            --distpath dist/dm-mc02-linux-x86_64 --workpath build/freeze \
-            tools/standalone.spec -- --package dist/dm-mc02-linux-x86_64
+          cargo build --release --locked -p sim-host
+          python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm \
+            --sim target/release/sim --output dist/dm-mc02-linux-x86_64
           cp build/guest/firmware.elf dist/dm-mc02-linux-x86_64/example.elf
       - name: Run the standalone executable without Python in PATH
         run: |
-          ldd dist/dm-mc02-linux-x86_64/bin/qemu-system-arm | tee dist/dm-mc02-linux-x86_64/runtime-libraries.txt
-          ! grep -E '/nix/|not found' dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          ldd dist/dm-mc02-linux-x86_64/sim | tee dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          ldd dist/dm-mc02-linux-x86_64/bin/qemu-system-arm | tee -a dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          ! grep -E '/nix/|not found|libpython' dist/dm-mc02-linux-x86_64/runtime-libraries.txt
           cd /tmp
-          "$GITHUB_WORKSPACE/build/cli-env/bin/python" "$GITHUB_WORKSPACE/tools/check-qemu-package.py" \
+          python3 "$GITHUB_WORKSPACE/tools/check-qemu-package.py" \
             --sim "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/sim" \
             --qemu "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/bin/qemu-system-arm" \
             --firmware "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/example.elf" \
@@ -90,7 +91,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Record verification
-        run: echo 'Ubuntu 24.04 x86_64 standalone executable — real firmware UART, monitor exit and reset-paused GDB port passed without Python in PATH.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Ubuntu 24.04 x86_64 Rust firmware entry — real firmware UART, monitor exit and reset-paused GDB port passed without Python in PATH. QEMU is stored once beside the launcher.' >> "$GITHUB_STEP_SUMMARY"
 
   windows:
     needs: firmware
@@ -108,6 +109,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install the pinned native MSVC Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.91.1'
+          targets: x86_64-pc-windows-msvc
       - uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
@@ -139,19 +145,24 @@ jobs:
             --disable-sdl --disable-gtk --disable-plugins --enable-fdt=internal \
             --enable-download -Dbuildtype=release -Dqom_cast_debug=false
           ninja qemu-system-arm.exe
-      - name: Package binary and recursive MinGW DLL dependencies
+      - name: Build the native Rust firmware entry
+        shell: pwsh
+        env:
+          # Keep the launcher independent of a separate Visual C++ runtime.
+          RUSTFLAGS: '-C target-feature=+crt-static'
+        run: |
+          cargo build --release --locked -p sim-host --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package Rust entry and recursive MinGW QEMU DLL dependencies
         shell: msys2 {0}
         run: |
+          export PATH="$(cygpath -u "$USERPROFILE")/.cargo/bin:$PATH"
           python tools/package-qemu.py --qemu build/qemu/qemu-system-arm.exe \
+            --sim target/x86_64-pc-windows-msvc/release/sim.exe \
             --dll-dir "$(cygpath -m /mingw64/bin)" --output dist/dm-mc02-windows-x86_64
-      - name: Freeze the existing CLI with Python and the packaged QEMU
+      - name: Include the actual firmware used by the package smoke
         shell: pwsh
         run: |
-          python -m pip install PyInstaller==6.16.0 .
-          python -m PyInstaller --noconfirm `
-            --distpath dist/dm-mc02-windows-x86_64 --workpath build/freeze `
-            tools/standalone.spec -- --package dist/dm-mc02-windows-x86_64
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item build/guest/firmware.elf dist/dm-mc02-windows-x86_64/example.elf
       - name: Run on native Windows without MSYS2 in PATH
         shell: pwsh
@@ -174,4 +185,4 @@ jobs:
           retention-days: 30
       - name: Record verification boundary
         shell: pwsh
-        run: Add-Content $env:GITHUB_STEP_SUMMARY 'Windows x86_64 standalone executable — real firmware UART, monitor exit and reset-paused GDB port passed without Python or MSYS2 in PATH. Full Simulation/Lab runtime requires Linux or WSL2.'
+        run: Add-Content $env:GITHUB_STEP_SUMMARY 'Windows x86_64 Rust firmware entry — real firmware UART, monitor exit and reset-paused GDB port passed without Python or MSYS2 in PATH. QEMU/DLLs are stored once beside the launcher. Full Simulation/Lab migration remains separate.'

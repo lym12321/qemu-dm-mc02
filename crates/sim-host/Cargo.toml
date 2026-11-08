@@ -1,0 +1,18 @@
+[package]
+name = "sim-host"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Native DM-MC02 firmware launcher"
+
+[[bin]]
+name = "sim"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5.53", features = ["derive"] }
+dunce = "1.0.5"
+tempfile = "3.23.0"
+wait-timeout = "0.2.1"
+which = "8.0.0"
