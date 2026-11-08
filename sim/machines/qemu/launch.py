@@ -4,6 +4,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parents[3]
 
@@ -23,7 +24,11 @@ def regular_file(path, label: str, *, executable=False) -> Path:
 
 
 def resolve_qemu(value) -> Path:
-    value = value or os.environ.get("QEMU_SYSTEM_ARM") or PROJECT_ROOT / "build/qemu/qemu-system-arm"
+    if getattr(sys, 'frozen', False):
+        default = Path(sys._MEIPASS) / 'bin' / ('qemu-system-arm.exe' if sys.platform == 'win32' else 'qemu-system-arm')
+    else:
+        default = PROJECT_ROOT / 'build/qemu/qemu-system-arm'
+    value = value or os.environ.get("QEMU_SYSTEM_ARM") or default
     if isinstance(value, str) and "/" not in value:
         value = shutil.which(value) or value
     return regular_file(value, "QEMU", executable=True)

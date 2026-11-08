@@ -206,7 +206,7 @@ def test_firmware_default_exec_preserves_native_terminal_and_environment_selecti
     monkeypatch.setenv('QEMU_SYSTEM_ARM', str(fixture.qemu))
     assert main(['firmware', str(fixture.elf)]) == 0
     assert fixture.probes == [([str(fixture.qemu), '-machine', 'help'],
-                              {'capture_output': True, 'text': True, 'timeout': 5})]
+                              {'capture_output': True, 'text': True, 'timeout': 5, 'env': None})]
     assert fixture.launches == [(str(fixture.qemu), [str(fixture.qemu),
         '-machine', 'dm-mc02', '-kernel', str(fixture.elf),
         '-nodefaults', '-display', 'none', '-monitor', 'none',
@@ -215,6 +215,43 @@ def test_firmware_default_exec_preserves_native_terminal_and_environment_selecti
     assert str(fixture.elf) in diagnostics and 'Ctrl-a c' in diagnostics
     assert main(['firmware', str(fixture.elf), '--debug']) == 0
     assert fixture.launches[-1][1][-3:] == ['-S', '-gdb', 'tcp:127.0.0.1:1234']
+
+
+@pytest.mark.parametrize('original', [None, '/caller/libraries'])
+def test_frozen_firmware_uses_embedded_qemu_and_restores_native_library_environment(
+        native_terminal, tmp_path, monkeypatch, original):
+    from sim.cli import main
+
+    fixture = native_terminal
+    bundle = tmp_path / 'extracted bundle'
+    (bundle / 'bin').mkdir(parents=True)
+    embedded = bundle / 'bin/qemu-system-arm'
+    embedded.touch(mode=0o700)
+    monkeypatch.setattr(sys, 'frozen', True, raising=False)
+    monkeypatch.setattr(sys, '_MEIPASS', str(bundle), raising=False)
+    monkeypatch.delenv('QEMU_SYSTEM_ARM', raising=False)
+    monkeypatch.setenv('LD_LIBRARY_PATH', str(bundle))
+    if original is None:
+        monkeypatch.delenv('LD_LIBRARY_PATH_ORIG', raising=False)
+    else:
+        monkeypatch.setenv('LD_LIBRARY_PATH_ORIG', original)
+    launches = []
+    monkeypatch.setattr(fixture.module.os, 'execve',
+                        lambda path, argv, env: launches.append((path, argv, env)))
+    assert main(['firmware', str(fixture.elf)]) == 0
+    assert launches[0][0] == str(embedded)
+    environment = launches[0][2]
+    assert environment.get('LD_LIBRARY_PATH') == original
+    assert 'LD_LIBRARY_PATH_ORIG' not in environment
+    assert fixture.probes[0][1]['env'] == environment
+    assert not fixture.launches
+    # Explicit and environment-selected native binaries still override the bundle.
+    monkeypatch.setenv('QEMU_SYSTEM_ARM', str(fixture.qemu))
+    assert main(['firmware', str(fixture.elf)]) == 0
+    assert launches[-1][0] == str(fixture.qemu)
+    monkeypatch.setenv('QEMU_SYSTEM_ARM', '/ignored/by/explicit/selection')
+    assert main(['firmware', str(fixture.elf), '--qemu', str(embedded)]) == 0
+    assert launches[-1][0] == str(embedded)
 
 
 def test_windows_firmware_waits_for_native_console_and_forwards_exit(native_terminal, monkeypatch):

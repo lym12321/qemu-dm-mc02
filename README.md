@@ -18,48 +18,38 @@ Python 核心可独立安装；原生固件运行需要固定的项目 QEMU。�
 
 ## 下载并运行固件
 
-无需 Nix。打开 [Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
+无需安装 Python、Nix、pip 或本地编译。打开 [Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
 选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载
 `dm-mc02-windows-x86_64` 或 `dm-mc02-linux-x86_64` 并解压。下载需要登录 GitHub，包保留 30 天。
-每包包含 QEMU、Python wheel、`example.elf`、`smoke.json`、对应源码和许可证；
-工作流仅在该平台固件门成功后上传，验证结果保存在随包的 `smoke.json`。
-
-先安装 Python 3.11+。包不内置 Python、ARM 编译器或 GDB；pip 安装 Python 依赖需要联网。
-在解压目录执行：
+每包包含独立的 `sim.exe` 或 `sim`、`example.elf`、QEMU、来源清单、对应源码和许可证。
+CI 要求该平台的真实固件 UART、monitor 退出及从复位暂停的 GDB 监听门成功后才上传，
+平台可用性以所下载运行记录及随包的 `smoke.json` 为准。在解压目录执行：
 
 Windows x86_64，PowerShell：
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install (Get-ChildItem .\wheels\*.whl).FullName
-$env:QEMU_SYSTEM_ARM = (Resolve-Path .\bin\qemu-system-arm.exe).Path
-.\.venv\Scripts\sim.exe firmware .\example.elf
+.\sim.exe firmware .\example.elf
+# 从复位暂停并打开 GDB 监听：
+.\sim.exe firmware .\example.elf --debug
 ```
 
 Ubuntu 24.04+ x86_64：
 
 ```bash
-sudo apt-get install -y python3-venv libglib2.0-0t64 zlib1g
-chmod +x bin/qemu-system-arm
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install wheels/*.whl
-export QEMU_SYSTEM_ARM="$PWD/bin/qemu-system-arm"
-sim firmware example.elf
+chmod +x sim bin/qemu-system-arm
+./sim firmware example.elf
+# 从复位暂停并打开 GDB 监听：
+./sim firmware example.elf --debug
 ```
 
 `chmod` 恢复 Actions ZIP 未保留的执行权限。将 `example.elf` 换为自己的 DM-MC02 ELF 即可。
-Windows 原生包面向固件终端和从复位暂停的 GDB 监听；完整 Simulation、Lab 和 SocketCAN
-使用 Linux 或 WSL2。
+可执行文件内置 Python、基础依赖和 QEMU，每次启动会解压到临时目录，需允许写入和执行。
+Linux 包仍使用系统运行库，并非完全静态。下载包的验收范围是固件终端和 GDB 监听；
+完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2 的[源码安装](docs/USAGE.md#installation)。
 
 默认 UART1 与原生 monitor 共用终端；`Ctrl-a c` 切换，`Ctrl-a h` 查看帮助。
-在 monitor 输入 `quit` 退出。调试时从复位暂停并打开 `127.0.0.1:1234`：
-
-```bash
-sim firmware example.elf --debug
-```
-
-另一个终端用同一 ELF 连接 GDB：
+在 monitor 输入 `quit` 退出。`--debug` 从复位暂停并打开 `127.0.0.1:1234`；
+另一个终端用另行安装的 ARM GDB 加载同一 ELF：
 
 ```bash
 arm-none-eabi-gdb example.elf
@@ -72,7 +62,8 @@ continue
 ```
 
 直接运行不需要 YAML、Python QMP client 或 MuJoCo。QEMU 选择顺序为 `--qemu`、
-`QEMU_SYSTEM_ARM`、checkout 中的 `build/qemu/qemu-system-arm`。
+`QEMU_SYSTEM_ARM`、下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的
+`build/qemu/qemu-system-arm`。包中的 `bin/` 保留原生诊断接口。
 系统 QEMU 不含本项目板卡；GitHub 源码 ZIP 不含子模块，请使用 Git clone。
 其它 UART、machine 属性、QMP 和外部输入见[原生接口](docs/USAGE.md#native-debug)。
 

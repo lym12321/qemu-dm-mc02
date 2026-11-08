@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Exercise an installed firmware CLI against an extracted native QEMU package."""
+"""Exercise a packaged firmware CLI and its native QEMU."""
 
 import argparse
 import json
+import os
 import platform
 from pathlib import Path
 import socket
@@ -17,16 +18,15 @@ READY = b"SIM_READY minimal-board\n"
 TAIL_BYTES = 12000
 
 
-def console_case(qemu, firmware, *, debug, cwd):
-    command = [sys.executable, "-I", "-m", "sim", "firmware", str(firmware),
-               "--qemu", str(qemu)]
+def console_case(command, *, debug, cwd, env):
+    command = list(command)
     if debug:
         with socket.socket() as reservation:
             reservation.bind(("127.0.0.1", 0))
             port = reservation.getsockname()[1]
         command += ["--debug", "--gdb-port", str(port)]
     result = {"command": command, "passed": False}
-    process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE,
+    process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.PIPE,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
     tail = bytearray()
     changed = threading.Event()
@@ -126,6 +126,8 @@ def console_case(qemu, firmware, *, debug, cwd):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--sim", type=Path,
+                        help="standalone executable; exercises bundled QEMU discovery")
     parser.add_argument("--qemu", type=Path, required=True)
     parser.add_argument("--firmware", type=Path, required=True)
     parser.add_argument("--report", type=Path, required=True)
@@ -135,24 +137,46 @@ def main():
     qemu, firmware = args.qemu.resolve(), args.firmware.resolve()
     if not qemu.is_file() or not firmware.is_file():
         parser.error("--qemu and --firmware must be existing files")
+    sim = args.sim.resolve() if args.sim is not None else None
+    if sim is not None and not sim.is_file():
+        parser.error("--sim must be an existing executable")
+    command = ([str(sim), "firmware", str(firmware)] if sim is not None else
+               [sys.executable, "-I", "-m", "sim", "firmware", str(firmware),
+                "--qemu", str(qemu)])
     report = {"schema": "dm-mc02/package-smoke/1", "platform": platform.platform(),
               "python": sys.executable, "qemu": str(qemu), "firmware": str(firmware),
+              "sim": str(sim) if sim is not None else None,
               "passed": False}
     try:
-        probe = subprocess.run([str(qemu), "-machine", "help"],
-                               capture_output=True, timeout=10)
-        report["machine_help"] = {
-            "exit_code": probe.returncode,
-            "stdout_tail": probe.stdout[-TAIL_BYTES:].decode("utf-8", errors="replace"),
-            "stderr_tail": probe.stderr[-TAIL_BYTES:].decode("utf-8", errors="replace"),
-        }
-        if probe.returncode or not any(line.split()[:1] == [b"dm-mc02"]
-                                      for line in probe.stdout.splitlines()):
-            raise RuntimeError("packaged QEMU does not expose the dm-mc02 machine")
-        # Run outside the source tree; -I requires the wheel to be installed.
-        with tempfile.TemporaryDirectory(prefix="dm-mc02-package-") as directory:
-            report["console"] = console_case(qemu, firmware, debug=False, cwd=directory)
-            report["debug"] = console_case(qemu, firmware, debug=True, cwd=directory)
+        # The standalone must find its own QEMU without a checkout, Python
+        # installation or executable from the caller's PATH. The fallback -I
+        # invocation still exercises a separately installed wheel.
+        with tempfile.TemporaryDirectory(prefix="dm-mc02 package 验证-") as directory:
+            empty_path = Path(directory) / "empty-path"
+            empty_path.mkdir()
+            env = os.environ.copy()
+            removed = ["QEMU_SYSTEM_ARM", "PYTHONHOME", "PYTHONPATH"]
+            for name in removed:
+                env.pop(name, None)
+            paths = [str(empty_path)]
+            if os.name == "nt":
+                system_root = Path(os.environ["SystemRoot"])
+                paths += [str(system_root / "System32"), str(system_root)]
+            env["PATH"] = os.pathsep.join(paths)
+            report["environment"] = {"cwd": directory, "PATH": env["PATH"],
+                                     "removed_variables": removed}
+            probe = subprocess.run([str(qemu), "-machine", "help"], cwd=directory,
+                                   env=env, capture_output=True, timeout=10)
+            report["machine_help"] = {
+                "exit_code": probe.returncode,
+                "stdout_tail": probe.stdout[-TAIL_BYTES:].decode("utf-8", errors="replace"),
+                "stderr_tail": probe.stderr[-TAIL_BYTES:].decode("utf-8", errors="replace"),
+            }
+            if probe.returncode or not any(line.split()[:1] == [b"dm-mc02"]
+                                          for line in probe.stdout.splitlines()):
+                raise RuntimeError("packaged QEMU does not expose the dm-mc02 machine")
+            report["console"] = console_case(command, debug=False, cwd=directory, env=env)
+            report["debug"] = console_case(command, debug=True, cwd=directory, env=env)
         report["passed"] = report["console"]["passed"] and report["debug"]["passed"]
     except Exception as error:
         report["error"] = f"{type(error).__name__}: {error}"

@@ -3,8 +3,9 @@
 项目以真实 MCU ELF 为输入，用一个 `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
 当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
 Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。
-原生下载包面向 Windows x86_64 的固件终端/GDB 监听，以及 Ubuntu 24.04+ x86_64；
-每包附有该平台的 `smoke.json`。完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2。
+独立下载包面向 Windows x86_64 和 Ubuntu 24.04+ x86_64 的固件终端/GDB 监听，
+无需安装 Python；每包附有该平台的 `smoke.json`。
+完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2 的源码安装。
 
 下载包命令从解压目录执行；源码命令默认从仓库根目录执行。按需要阅读：
 
@@ -23,57 +24,54 @@ Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 M
 
 ### 下载原生包
 
-普通固件运行无需 Nix 或本地编译 QEMU。登录 GitHub，打开
+普通固件运行无需安装 Python、Nix、pip 或本地编译。登录 GitHub，打开
 [Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
 选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载对应包：
 
 | Artifact | 宿主与范围 |
 | --- | --- |
 | `dm-mc02-windows-x86_64` | Windows x86_64，固件终端和从复位暂停的原生 GDB 监听 |
-| `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64；完整场景、Lab 与外部通道使用 Linux/WSL2 |
+| `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64，固件终端和从复位暂停的原生 GDB 监听 |
 
-Artifacts 保留 30 天，下载需要 GitHub 登录。工作流仅在该平台门成功后上传，
-每包附 `smoke.json`，记录实际示例固件 UART、
+Artifacts 保留 30 天，下载需要 GitHub 登录。CI 要求该平台门成功后才上传；
+平台可用性以所下载运行记录及随包的 `smoke.json` 为准。报告记录实际示例固件 UART、
 monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simulation/Lab 或实板校准。
 
 解压后包括：
 
 | 路径 | 内容 |
 | --- | --- |
-| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | 项目 QEMU；Windows 同目录带所需 DLL |
-| `wheels/*.whl` | 可安装的 Python 命令行工具 |
+| `sim` 或 `sim.exe` | 独立 CLI，内置 Python、基础依赖及项目 QEMU/所需 DLL |
+| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | 保留的原生诊断接口；Windows 同目录带所需 DLL |
 | `example.elf` | 已编译的 minimal-board 固件 |
 | `smoke.json` | 该包的固件运行与清理报告 |
+| `provenance.json` | 构建来源、版本和文件哈希 |
 | `sources/`、`licenses/` | 对应源码归档、QEMU 及运行库许可证 |
 
-宿主需另装 Python 3.11+；包不内置 Python、ARM 编译器或 GDB。
-pip 会在线安装 Python 依赖。运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
+运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
+可执行文件每次启动会解压内置内容到临时目录，临时目录需允许写入和执行；
+Linux 版本仍使用系统运行库，并非完全静态二进制。
 
 Windows PowerShell，在解压目录执行：
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install (Get-ChildItem .\wheels\*.whl).FullName
-$env:QEMU_SYSTEM_ARM = (Resolve-Path .\bin\qemu-system-arm.exe).Path
-.\.venv\Scripts\sim.exe firmware .\example.elf
+.\sim.exe firmware .\example.elf
+# 从复位暂停，监听 127.0.0.1:1234：
+.\sim.exe firmware .\example.elf --debug
 ```
 
 Ubuntu 24.04+ x86_64：
 
 ```bash
-sudo apt-get install -y python3-venv libglib2.0-0t64 zlib1g
-chmod +x bin/qemu-system-arm
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install wheels/*.whl
-export QEMU_SYSTEM_ARM="$PWD/bin/qemu-system-arm"
-sim firmware example.elf
+chmod +x sim bin/qemu-system-arm
+./sim firmware example.elf
+# 从复位暂停，监听 127.0.0.1:1234：
+./sim firmware example.elf --debug
 ```
 
 Actions ZIP 不保留 Linux 执行权限，因此解压后需运行 `chmod`。
-把 `example.elf` 替换为自己的 DM-MC02 ELF，`--debug` 启用 `127.0.0.1:1234` 并从复位暂停。
-Windows 使用 `.\.venv\Scripts\sim.exe` 调用同一命令；完整 Simulation、Lab、SocketCAN
-请进入 Linux 或 WSL2，Windows 原生包不覆盖这些运行时。
+把 `example.elf` 替换为自己的 DM-MC02 ELF。完整 Simulation、Lab、SocketCAN
+请在 Linux 或 WSL2 中使用下述源码安装。
 
 ### 从源码安装
 
@@ -108,7 +106,8 @@ python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
 可使用上面的原生包，或[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
 直接终端/GDB 运行使用 `sim firmware app.elf`，不需要 YAML、Python QMP client 或 MuJoCo；
 完整参数见[原生固件入口](#native-debug)。QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、
-checkout 中的 `build/qemu/qemu-system-arm`。普通系统 QEMU 没有本项目板卡，不能替代。
+下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的 `build/qemu/qemu-system-arm`。
+普通系统 QEMU 没有本项目板卡，不能替代。
 
 `sim run scene.yaml` 的原生场景后端另外要求固定的 QMP client、
 `x-run-to-virtual-time`、`x-query-virtual-execution` 及 CAN execution QOM 能力；不满足会明确报错。
@@ -936,16 +935,18 @@ smoke 脚本会编译并运行仓库中的最小 guest。修改 QEMU 模型后�
 
 ### 直接运行固件
 
-输入 ELF 必须面向 DM-MC02 地址空间。安装核心命令行工具，并下载或构建项目 QEMU 后，
-直接传入已有 ELF；此入口不需要 YAML、Python QMP client 或 MuJoCo：
+输入 ELF 必须面向 DM-MC02 地址空间。下载独立包，或从源码安装 CLI 并构建项目 QEMU 后，
+直接传入已有 ELF；此入口不需要 YAML、Python QMP client 或 MuJoCo。
+下面使用源码安装的 `sim`；下载包使用 `./sim` 或 `.\sim.exe`：
 
 ```bash
 sim firmware /absolute/path/to/app.elf
 ```
 
 ELF 是必填位置参数，不读取 `DM_MC02_ELF`。QEMU 选择顺序为 `--qemu PATH`、
-`QEMU_SYSTEM_ARM`、checkout 中的 `build/qemu/qemu-system-arm`；在 checkout 外运行时显式指定
-兼容二进制。默认 machine 是 `dm-mc02`，运行环境与构建时保持一致。
+`QEMU_SYSTEM_ARM`、下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的
+`build/qemu/qemu-system-arm`，在 checkout 外运行时显式指定兼容二进制。
+默认 machine 是 `dm-mc02`；源码构建的运行环境与构建时保持一致。
 
 默认 UART1 与 QEMU monitor 共用终端（原生 `mon:stdio`）。`Ctrl-a c` 切换 UART/monitor，`Ctrl-a h` 查看帮助。monitor 中可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`；`quit` 会走正常关闭路径。用 `--uart uart2` 等名称选择其它 UART，或用 `--uart none` 仅显示 monitor。UART5 只接收，选择 `--uart uart5` 可输入字节但没有 TX 文本。当前 `trobot` Release 关闭了 logger/terminal，串口没有文本并不代表固件未运行。
 

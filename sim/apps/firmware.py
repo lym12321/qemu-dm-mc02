@@ -32,8 +32,23 @@ def run_firmware(firmware, *, qemu=None, uart='uart1', debug=False, gdb_port=Non
         raise BackendUnavailable(
             f'{error}\n{advice}select a compatible binary with --qemu PATH or QEMU_SYSTEM_ARM.') from error
     try:
+        native_environment = None
+        if getattr(sys, 'frozen', False):
+            if sys.platform == 'win32':
+                import ctypes
+
+                # QEMU resolves its own adjacent DLLs, not the Python bundle's.
+                ctypes.windll.kernel32.SetDllDirectoryW(None)
+            else:
+                native_environment = os.environ.copy()
+                original = native_environment.pop('LD_LIBRARY_PATH_ORIG', None)
+                if original is None:
+                    native_environment.pop('LD_LIBRARY_PATH', None)
+                else:
+                    native_environment['LD_LIBRARY_PATH'] = original
         probe = subprocess.run([str(binary), '-machine', 'help'],
-                               capture_output=True, text=True, timeout=5)
+                               capture_output=True, text=True, timeout=5,
+                               env=native_environment)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise BackendUnavailable(f'cannot query QEMU machine support: {binary}: {error}') from error
     if probe.returncode:
@@ -61,4 +76,7 @@ def run_firmware(firmware, *, qemu=None, uart='uart1', debug=False, gdb_port=Non
         # Windows CRT exec ends this process without preserving its caller's
         # wait handle. Keep the console caller waiting for native QEMU's exit.
         raise SystemExit(subprocess.call(command))
-    os.execv(str(binary), command)
+    if native_environment is None:
+        os.execv(str(binary), command)
+    else:
+        os.execve(str(binary), command, native_environment)
