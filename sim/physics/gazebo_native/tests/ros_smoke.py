@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import math
 import os
 from pathlib import Path
 import signal
@@ -41,96 +40,18 @@ def marker(path: Path, expected: bytes) -> bool:
     return True
 
 
-def produce(sdf: str, finish: Path) -> int:
-    """Exercise the public production owner in a separate bridge-visible process."""
-    sys.path.insert(0, str(ROOT))
-    import _dm_gazebo_native as native
-    from sim.physics import CameraFrame, GazeboPhysics, LidarScan
-
-    # PYTHONPATH admits a directory; verify the exact binary that Python selected.
-    actual_module = Path(native.__file__).resolve(strict=True)
-    expected_module = Path(os.environ["DM_GAZEBO_NATIVE_MODULE"]).resolve(strict=True)
-    if actual_module != expected_module:
-        raise RuntimeError(f"production imported unexpected native module: {actual_module}")
-    signal.signal(signal.SIGTERM, interrupted)
-    signal.signal(signal.SIGINT, interrupted)
-    deadline = time.monotonic() + 10
-    camera_stamps: list[int] = []
-    lidar_stamps: list[int] = []
-    ticks = 0
-    with GazeboPhysics(sdf, cameras={"front": ("sensors", "body", "camera")},
-                       lidars={"scan": ("sensors", "body", "lidar")}) as physics:
-        while True:
-            if time.monotonic() >= deadline:
-                raise TimeoutError("production rendering exceeded its 10-second host deadline")
-            if ticks < 900:
-                physics.step(1_000_000)
-                ticks += 1
-            frame, scan = physics.get_camera("front"), physics.get_lidar("scan")
-            if frame is not None and (not camera_stamps or frame.timestamp_ns > camera_stamps[-1]):
-                if not (isinstance(frame, CameraFrame) and
-                        (frame.width, frame.height, frame.step, len(frame.data)) ==
-                        (64, 48, 192, 9216) and frame.frame_id == "sensors::body::camera" and
-                        0 <= frame.timestamp_ns < 1_000_000_000):
-                    raise RuntimeError("invalid production camera snapshot")
-                centre = (24 * 64 + 32) * 3
-                red, green, blue = frame.data[centre:centre + 3]
-                if not (red > 100 and green < 30 and blue < 30 and max(frame.data[:3]) < 30):
-                    raise RuntimeError("production camera missed the fixed red-box scene")
-                if len(camera_stamps) < 2:
-                    camera_stamps.append(frame.timestamp_ns)
-            if scan is not None and (not lidar_stamps or scan.timestamp_ns > lidar_stamps[-1]):
-                if not (isinstance(scan, LidarScan) and scan.frame_id == "sensors::body::lidar" and
-                        len(scan.ranges_m) == len(scan.intensities) == 65 and
-                        scan.angle_min_rad == -.3 and scan.angle_max_rad == .3 and
-                        scan.angle_step_rad == .6 / 64 and
-                        (scan.range_min_m, scan.range_max_m) == (.1, 10) and
-                        scan.vertical_angle_min_rad == scan.vertical_angle_max_rad == 0 and
-                        math.isnan(scan.vertical_angle_step_rad) and
-                        0 <= scan.timestamp_ns < 1_000_000_000):
-                    raise RuntimeError("invalid production lidar snapshot")
-                # Primitive scene source: box centre x=3, width=1; outer rays miss.
-                if not (abs(scan.ranges_m[32] - 2.5) <= .02 and
-                        scan.ranges_m[0] == scan.ranges_m[-1] == math.inf):
-                    raise RuntimeError("production lidar missed the fixed box geometry")
-                if len(lidar_stamps) < 2:
-                    lidar_stamps.append(scan.timestamp_ns)
-            if (marker(finish, b"finish\n") and
-                    len(camera_stamps) == len(lidar_stamps) == 2):
-                if time.monotonic() >= deadline:
-                    raise TimeoutError("production rendering completed after the host deadline")
-                break
-            # Host polling gives native transport/render workers discovery time;
-            # it neither replaces native sensor scheduling nor barriers delivery.
-            time.sleep(.005)
-    if time.monotonic() >= deadline:
-        raise TimeoutError("production rendering closed after the host deadline")
-    print(json.dumps({"production": "passed", "ticks": ticks,
-                      "camera_stamps_ns": camera_stamps, "lidar_stamps_ns": lidar_stamps,
-                      "native_module": str(actual_module)}))
-    return 0
-
-
 def main() -> int:
-    if len(sys.argv) == 4 and sys.argv[1] == "--produce":
-        return produce(str(Path(sys.argv[2]).resolve(strict=True)), Path(sys.argv[3]).resolve())
-    if len(sys.argv) not in (5, 7) or (len(sys.argv) == 7 and sys.argv[5] not in ("--production", "--rust-producer")):
+    if len(sys.argv) not in (5, 7) or (len(sys.argv) == 7 and sys.argv[5] != "--rust-producer"):
         print("usage: ros_smoke.py bridge_node consumer rendering.sdf bridge.yaml "
-              "[--production native-module | --rust-producer executable]", file=sys.stderr)
+              "[--rust-producer executable]", file=sys.stderr)
         return 1
     bridge, consumer, sdf, config = [str(Path(arg).resolve(strict=True)) for arg in sys.argv[1:5]]
-    module = Path(sys.argv[6]).resolve(strict=True) if len(sys.argv) == 7 and sys.argv[5] == "--production" else None
     rust_producer = Path(sys.argv[6]).resolve(strict=True) if len(sys.argv) == 7 and sys.argv[5] == "--rust-producer" else None
-    production = module is not None or rust_producer is not None
+    production = rust_producer is not None
     sources = [Path(path) for path in (bridge, consumer, sdf, config)]
     sources += [Path(__file__).resolve(), ROOT / "tools/dm_mc02_test_harness.py",
                 Path(__file__).with_name("rendering_smoke.cc"),
                 Path(__file__).with_name("ros_observer.hh")]
-    if module is not None:
-        sources += [module, *sorted((ROOT / "sim").rglob("*.py")),
-                    *sorted((ROOT / "sim/physics/gazebo_native").rglob("*.cc")),
-                    *sorted((ROOT / "sim/physics/gazebo_native").rglob("*.hh")),
-                    ROOT / "sim/physics/gazebo_native/CMakeLists.txt"]
     if rust_producer is not None:
         sources += [rust_producer, ROOT / "crates/sim-host/examples/gazebo_render_producer.rs",
                     ROOT / "crates/sim-host/src/physics/gazebo.rs",
@@ -198,15 +119,7 @@ def main() -> int:
                     running("consumer", native)
                     break
                 time.sleep(min(.01, remaining()))
-            producer_env = dict(env)
-            if rust_producer is not None:
-                argv = [str(rust_producer), sdf, str(finish)]
-            else:
-                producer_env["DM_GAZEBO_NATIVE_MODULE"] = str(module)
-                producer_env["PYTHONPATH"] = str(module.parent) + (
-                    os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-                argv = [sys.executable, str(Path(__file__).resolve()), "--produce", sdf, str(finish)]
-            producer = launch("producer", argv, producer_env)
+            producer = launch("producer", [str(rust_producer), sdf, str(finish)])
         while True:
             running("bridge", bridge_process)
             if producer is not None:
@@ -291,7 +204,7 @@ def main() -> int:
                       "cleanup_errors": cleanup_errors, "input_sha256": inputs,
                       "gz_partition": env["GZ_PARTITION"], "ros_domain_id": env["ROS_DOMAIN_ID"],
                       "ros_topic_prefix": topic_prefix,
-                      "mode": "rust" if rust_producer is not None else "production" if module is not None else "native",
+                      "mode": "rust" if rust_producer is not None else "native",
                       "children": [{"name": name, "pid": process.pid, "starttime": start,
                                     "exit_code": process.returncode}
                                    for name, process, start in processes]}, indent=2))

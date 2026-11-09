@@ -33,7 +33,7 @@ def accept(name, listener):
     streams[name] = stream
     if name == 'cosim':
         sys.path.insert(0, str(Path(__file__).resolve().parents[4]))
-        from sim.transports import step_codec as wire
+        from smoke.support import step_codec as wire
         def receive(size):
             data = b''
             while len(data) < size:
