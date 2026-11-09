@@ -1,0 +1,159 @@
+{
+  "name": "mdui",
+  "version": "2.1.4",
+  "license": "MIT",
+  "upstream": "https://github.com/zdhxiong/mdui",
+  "tag": "v2.1.4",
+  "commit": "d6d465f1adc6852f40b1adced6dcd103d8c406db",
+  "source_archive": {
+    "url": "https://codeload.github.com/zdhxiong/mdui/tar.gz/d6d465f1adc6852f40b1adced6dcd103d8c406db",
+    "sha256": "e9739b324b1ad3523ed60094626607f545cc91779e3bf5af4fc56c7df4e1b74b"
+  },
+  "distribution_archive": {
+    "url": "https://registry.npmjs.org/mdui/-/mdui-2.1.4.tgz",
+    "sha256": "d5be896577955dcfc63fce39d0479abfd7f3e76c38156bd53833b760c1517d78",
+    "integrity": "sha512-QtK5xia5HXtVO7yH30QjwvvNruw5JdrJL1MEc1k6S/ZfsbHOj6BxxdYjrdv2HiN5ikkGqt5CIbZdFyq6shaZyw=="
+  },
+  "files": {
+    "mdui.js": {
+      "upstream_path": "package/mdui.global.js",
+      "sha256": "2d910579c315615a567251f894e81097d09e2d2471f957257ea52a86577eca87"
+    },
+    "mdui.css": {
+      "upstream_path": "package/mdui.css",
+      "sha256": "6ec44497a312b98164ba82fdbc445268f68e44147cb3a7730d53ac83e1ce20d6"
+    },
+    "LICENSE": {
+      "upstream_path": "package/LICENSE",
+      "sha256": "a0f97626c2fd0dbe659289693571b527c0b2363981478911babc38cc9b28c62e"
+    }
+  },
+  "local_changes": [
+    "None to the upstream JavaScript or CSS. mdui.global.js is stored as mdui.js.",
+    "Retain bundled dependency license texts separately in THIRD-PARTY-NOTICES.txt."
+  ],
+  "runtime": "Prebuilt self-contained classic browser bundle. No imports, external URLs, fonts, CDN or npm installation are required by Lab.",
+  "bundled_dependency_licenses": {
+    "classcat": {
+      "version": "5.0.5",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/classcat/-/classcat-5.0.5.tgz",
+      "archive_sha256": "e0968992357c1ce4d0ab183986debed34971aff8a440338f0ea8a5b5ed04ed24",
+      "notice_source": [
+        "package/LICENSE.md"
+      ]
+    },
+    "@floating-ui/utils": {
+      "version": "0.2.9",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/@floating-ui/utils/-/utils-0.2.9.tgz",
+      "archive_sha256": "1e1982fa12898ef1b840675af50f659585943dd35e559c55766d54bbc2c95af8",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "is-promise": {
+      "version": "4.0.0",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/is-promise/-/is-promise-4.0.0.tgz",
+      "archive_sha256": "853891173876fa03b8762cf63e7f0c0d60e524947f4e4d5852d94c22acb445a7",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "lit": {
+      "version": "3.3.0",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/lit/-/lit-3.3.0.tgz",
+      "archive_sha256": "0b091155f34e424e78faccf51dd42ee4fd7c7fbadd4b2310aaf52b46efd8b480",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "lit-element": {
+      "version": "4.2.0",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/lit-element/-/lit-element-4.2.0.tgz",
+      "archive_sha256": "c2bc3eb8de109ddf7eb15951d063a0983a215632c2be344613c0b9acd9028c06",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "lit-html": {
+      "version": "3.3.0",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/lit-html/-/lit-html-3.3.0.tgz",
+      "archive_sha256": "4d9094f9db0e261b28e469073c0a9b51bb942507fda326db2cb53ee10c306942",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "@lit-labs/ssr-dom-shim": {
+      "version": "1.2.0",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/@lit-labs/ssr-dom-shim/-/ssr-dom-shim-1.2.0.tgz",
+      "archive_sha256": "3d1c33630579bca363bcd4b1668b35ab6b6e08cdd6faf63dfeac72dc01434709",
+      "notice_source": [
+        "package/index.js copyright header",
+        "lit@3.3.0/package/LICENSE (same BSD-3-Clause terms)"
+      ]
+    },
+    "@lit/localize": {
+      "version": "0.12.2",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/@lit/localize/-/localize-0.12.2.tgz",
+      "archive_sha256": "5aed5ab26fa5f932c3a6c9b301185e52093e5ac14b8807062fc7dd2224d2fd86",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "@lit/reactive-element": {
+      "version": "2.1.0",
+      "license": "BSD-3-Clause",
+      "source": "https://registry.npmjs.org/@lit/reactive-element/-/reactive-element-2.1.0.tgz",
+      "archive_sha256": "8c94d8b3e466d8591123a517c9eb9428966ac74fed5e811e8b58d7ae174f9b8d",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "@material/material-color-utilities": {
+      "version": "0.3.0",
+      "license": "Apache-2.0",
+      "source": "https://registry.npmjs.org/@material/material-color-utilities/-/material-color-utilities-0.3.0.tgz",
+      "archive_sha256": "438fc5b3ae9beef804bf7cee8ce2c235dcf596c98f45490b77d97a20e0276b14",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "ssr-window": {
+      "version": "5.0.0",
+      "license": "MIT",
+      "source": "https://registry.npmjs.org/ssr-window/-/ssr-window-5.0.0.tgz",
+      "archive_sha256": "c9eb7313522efb024d02d63a1c949ca38d2eb81f0ce1ede1470413e89426513a",
+      "notice_source": [
+        "package/LICENSE"
+      ]
+    },
+    "tslib": {
+      "version": "2.8.1",
+      "license": "0BSD",
+      "source": "https://registry.npmjs.org/tslib/-/tslib-2.8.1.tgz",
+      "archive_sha256": "66f635d5eeabae44807534976913a102cf615b9a045368359c9f79ae6ee2119e",
+      "notice_source": [
+        "package/LICENSE.txt"
+      ]
+    },
+    "@mdui/jq": {
+      "version": "3.0.3",
+      "license": "MIT",
+      "source": "https://github.com/zdhxiong/mdui/tree/d6d465f1adc6852f40b1adced6dcd103d8c406db/packages/jq",
+      "notice_source": "packages/jq/LICENSE"
+    },
+    "@mdui/shared": {
+      "version": "1.0.8",
+      "license": "MIT",
+      "source": "https://github.com/zdhxiong/mdui/tree/d6d465f1adc6852f40b1adced6dcd103d8c406db/packages/shared",
+      "notice_source": "packages/shared/LICENSE"
+    }
+  }
+}

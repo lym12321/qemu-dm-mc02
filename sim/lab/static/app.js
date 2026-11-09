@@ -30,8 +30,9 @@
 
   function notice(message, error = false) {
     $("notice").textContent = message;
-    $("notice").classList.toggle("error", error);
-    $("notice").hidden = !message;
+    $("notice").setAttribute("role", error ? "alert" : "status");
+    $("notice").timeout = error ? 0 : 5000;
+    $("notice").open = Boolean(message);
   }
 
   function ns(value) {
@@ -151,7 +152,7 @@
     const transitioning = ["starting", "stopping"].includes(state.status);
     const lifecyclePending = Array.from(pending.values()).some((item) => ["load", "run", "pause", "stop", "restart"].includes(item.action));
     $("firmware-input").disabled = uploading || !inactive.has(state.status) || lifecyclePending;
-    document.querySelector(".upload-button").classList.toggle("disabled", $("firmware-input").disabled);
+    $("upload-button").disabled = $("firmware-input").disabled;
     $("load-button").disabled = !connected || uploading || !state.firmware || !inactive.has(state.status) || lifecyclePending;
     $("run-button").disabled = !connected || state.status !== "paused" || lifecyclePending;
     $("pause-button").disabled = !connected || state.status !== "running" || lifecyclePending;
@@ -165,7 +166,10 @@
   function selectPin(pin) {
     $("gpio-pin").value = pin;
     $("selected-pin").textContent = pin;
-    for (const [name, button] of pinButtons) button.dataset.selected = String(pin === name);
+    for (const [name, button] of pinButtons) {
+      button.dataset.selected = String(pin === name);
+      button.variant = pin === name ? "tonal" : button.dataset.level === "1" ? "filled" : "outlined";
+    }
     const observed = (state.pins || []).find((item) => item.pin === pin);
     $("pin-summary").textContent = observed ? `${modes[observed.mode]} · 采样 ${observed.level} · ODR ${observed.odr} · ${observed.output ? "输出掩码有效" : "输出掩码无效"}` : "等待板卡快照";
   }
@@ -203,8 +207,13 @@
     $("led-value").textContent = board ? `#${board.led.rgb.toString(16).padStart(6, "0").toUpperCase()}` : "—";
     $("led-pin").textContent = board?.led.pin || "A7";
     $("led-source").textContent = board ? `${board.led.source === "ws2812-dma" ? "WS2812 DMA 波形" : "GPIO latch 近似"} · 亮度 ${board.led.brightness}` : "等待原生观察";
-    $("board-led").setAttribute("fill", board?.led.rgb ? `#${board.led.rgb.toString(16).padStart(6, "0")}` : "#526a5c");
-    $("vin-value").textContent = board ? `${board.vin_mv} mV` : "—";
+    // RGB already contains the encoded channel intensities. Zero is a known
+    // black sample; only a missing observation uses the unknown pattern.
+    const ledColor = board ? `#${board.led.rgb.toString(16).padStart(6, "0")}` : null;
+    $("board-led").setAttribute("fill", ledColor ?? "url(#unknown-led)");
+    $("board-led").closest("svg").setAttribute("aria-label", board ? `状态灯 ${ledColor}` : "状态灯，尚无观察数据");
+    $("led-rgb").textContent = board ? `R ${(board.led.rgb >>> 16) & 255} · G ${(board.led.rgb >>> 8) & 255} · B ${board.led.rgb & 255}` : "尚无颜色数据";
+    $("vin-input").helper = board ? `当前 ${board.vin_mv} mV` : "当前 —";
     for (const button of pinButtons.values()) { button.dataset.unknown = "true"; button.dataset.level = ""; button.textContent = "·"; }
     for (const pin of value.pins || []) {
       const button = pinButtons.get(pin.pin);
@@ -212,7 +221,7 @@
       button.dataset.unknown = "false";
       button.dataset.level = String(pin.level);
       button.dataset.mode = String(pin.mode);
-      button.textContent = modeTags[pin.mode] || "?";
+      button.textContent = `${pin.level}${modeTags[pin.mode] || "?"}`;
       button.title = `${pin.pin} · ${modes[pin.mode]} · 采样 ${pin.level} · ODR ${pin.odr}`;
       button.setAttribute("aria-label", button.title);
     }
@@ -256,7 +265,6 @@
     socket.addEventListener("open", () => {
       connected = true;
       $("connection-status").textContent = "已连接";
-      $("connection-dot").classList.add("connected");
       updateControls();
     });
     socket.addEventListener("message", (message) => {
@@ -273,7 +281,6 @@
       if (pending.size) systemLog(`${pending.size} 个请求的结果尚未收到；重连后不会重发。`);
       pending.clear();
       $("connection-status").textContent = "连接中断 · 正在重连";
-      $("connection-dot").classList.remove("connected");
       updateControls();
       reconnectTimer = setTimeout(connect, 1500);
     });
@@ -317,8 +324,8 @@
       grid.append(label);
       for (let bit = 0; bit < 16; bit += 1) {
         const pin = `${port}${bit}`;
-        const button = document.createElement("button");
-        button.type = "button";
+        const button = document.createElement("mdui-button-icon");
+        button.variant = "outlined";
         button.className = "gpio-pin";
         button.dataset.pin = pin;
         button.dataset.unknown = "true";
@@ -328,21 +335,21 @@
         button.addEventListener("click", () => selectPin(pin));
         pinButtons.set(pin, button);
         grid.append(button);
-        $("gpio-pin").add(new Option(pin, pin));
+        const option = document.createElement("mdui-menu-item");
+        option.value = pin;
+        option.textContent = pin;
+        $("gpio-pin").append(option);
       }
     }
-    for (let channel = 0; channel < 32; channel += 1) $("adc-channel").add(new Option(`CH${channel}`, channel));
+    for (let channel = 0; channel < 32; channel += 1) {
+      const option = document.createElement("mdui-menu-item");
+      option.value = String(channel);
+      option.textContent = `CH${channel}`;
+      $("adc-channel").append(option);
+    }
     selectPin("B0");
     for (const button of document.querySelectorAll("[data-action]")) button.addEventListener("click", () => send(button.dataset.action));
-    for (const button of document.querySelectorAll("[data-tab]")) {
-      button.addEventListener("click", () => {
-        for (const tab of document.querySelectorAll("[data-tab]")) {
-          const selected = tab === button;
-          tab.setAttribute("aria-selected", String(selected));
-          $(tab.getAttribute("aria-controls")).hidden = !selected;
-        }
-      });
-    }
+    $("upload-button").addEventListener("click", () => $("firmware-input").click());
     $("gpio-pin").addEventListener("change", () => selectPin($("gpio-pin").value));
     $("key-button").addEventListener("pointerdown", pressKey);
     $("key-button").addEventListener("pointerup", releaseKey);

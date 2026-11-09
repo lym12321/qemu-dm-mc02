@@ -6,6 +6,7 @@ No guest memory, private simulator state or test-only browser hook is used.
 """
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -259,26 +260,79 @@ def log_text(page, kind="uart"):
     return "".join(page.locator(f".log-row[data-kind='{kind}'] .log-data").all_text_contents())
 
 
+def button(page, identifier):
+    """Operate MDUI's visible native button through its open shadow root."""
+    return page.locator(f"#{identifier}").locator("button")
+
+
+def fill(page, identifier, value):
+    page.locator(f"#{identifier}").locator("input, textarea").fill(value)
+
+
+def choose(page, identifier, value):
+    control = page.locator(f"#{identifier}")
+    control.click()
+    control.locator(f'mdui-menu-item[value="{value}"]').click()
+    assert control.evaluate("element => element.value") == value
+
+
+def led_presentation(page, expected):
+    """Read the public snapshot and rendered SVG in one browser turn."""
+    actual = page.evaluate("""() => {
+      const node = document.getElementById('board-led');
+      const style = getComputedStyle(node);
+      let opacity = 1;
+      for (let current = node; current; current = current.parentElement) {
+        opacity *= Number(getComputedStyle(current).opacity);
+      }
+      return {led: JSON.parse(document.getElementById('raw-state').textContent)?.led,
+        fill: style.fill, fill_opacity: Number(style.fillOpacity), opacity,
+        label: document.getElementById('led-value').textContent};
+    }""")
+    channels = ((expected >> 16) & 255, (expected >> 8) & 255, expected & 255)
+    assert actual["led"]["rgb"] == expected, actual
+    assert actual["fill"] == f"rgb({channels[0]}, {channels[1]}, {channels[2]})", actual
+    assert actual["fill_opacity"] == actual["opacity"] == 1, actual
+    assert actual["label"] == f"#{expected:06X}", actual
+    return actual
+
+
+def led_pixel(page, expected):
+    """Decode the actual raster screenshot with Chromium's standard PNG reader."""
+    image = base64.b64encode(page.locator("#board-led").screenshot()).decode()
+    pixel = page.evaluate("""async encoded => {
+      const image = new Image(); image.src = `data:image/png;base64,${encoded}`;
+      await image.decode();
+      const canvas = document.createElement('canvas');
+      canvas.width = image.width; canvas.height = image.height;
+      const context = canvas.getContext('2d'); context.drawImage(image, 0, 0);
+      return [...context.getImageData(Math.floor(image.width / 2),
+        Math.floor(image.height / 2), 1, 1).data];
+    }""", image)
+    assert pixel == [(expected >> 16) & 255, (expected >> 8) & 255, expected & 255, 255], pixel
+    return pixel
+
+
 def load(page, server, elf):
     page.locator("#firmware-input").set_input_files(str(elf))
     wait_for(page, server, lambda: page.locator("#firmware-name").text_content() == elf.name
-             and page.locator("#load-button").is_enabled(), "uploaded firmware")
-    page.locator("#load-button").click()
+             and button(page, "load-button").is_enabled(), "uploaded firmware")
+    button(page, "load-button").click()
     wait_for(page, server, lambda: status(page) == "paused", "paused native session")
-    assert page.locator("#adc-send").is_disabled()
-    page.locator("#run-button").click()
+    assert button(page, "adc-send").is_disabled()
+    button(page, "run-button").click()
     wait_for(page, server, lambda: status(page) == "running", "running native session")
 
 
 def stop_board(page, server):
-    page.locator("#stop-button").click()
+    button(page, "stop-button").click()
     wait_for(page, server, lambda: status(page) == "stopped", "completed native cleanup")
     assert page.locator("#observation-status").get_attribute("data-stale") == "true"
 
 
 def gpio_lesson(page, server, elf, record, screenshot):
     load(page, server, elf)
-    button = page.locator("#key-button")
+    key = button(page, "key-button")
 
     def snapshot():
         server.check()
@@ -288,8 +342,8 @@ def gpio_lesson(page, server, elf, record, screenshot):
         return value
 
     def press():
-        button.scroll_into_view_if_needed()
-        box = button.bounding_box()
+        key.scroll_into_view_if_needed()
+        box = key.bounding_box()
         page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
         page.mouse.down()
 
@@ -305,45 +359,65 @@ def gpio_lesson(page, server, elf, record, screenshot):
 
 
 def channels(page, server, elf, record, screenshot):
-    page.locator("#clear-log").click()
+    button(page, "clear-log").click()
     load(page, server, elf)
     wait_for(page, server, lambda: all(text in log_text(page) for text in
              ("LAB_READY\\n", "KEY=1\\n", "ADC=43329\\n")), "actual fixture UART readiness")
-    page.locator("#uart-data").fill("q")
-    page.locator("#uart-send").click()
+    fill(page, "uart-data", "q")
+    button(page, "uart-send").click()
     wait_for(page, server, lambda: "UART=q\\n" in log_text(page), "UART echo")
-    page.locator("#key-button").focus()
+    button(page, "key-button").focus()
     page.keyboard.down("Space")
     wait_for(page, server, lambda: board(page)["key"]["pressed"] and
              board(page)["led"]["rgb"] == 0xffffff, "key-driven A7 output")
+    record["latch_white"] = led_presentation(page, 0xffffff)
+    record["latch_white"]["pixel"] = led_pixel(page, 0xffffff)
     page.keyboard.up("Space")
     wait_for(page, server, lambda: not board(page)["key"]["pressed"] and
              board(page)["led"]["rgb"] == 0, "key release")
+    record["latch_off"] = led_presentation(page, 0)
+    record["latch_off"]["pixel"] = led_pixel(page, 0)
     page.locator("#tab-adc").click()
-    page.locator("#adc-channel").select_option("4")
-    page.locator("#adc-mode").select_option("voltage_uv")
-    page.locator("#adc-value").fill("1650000")
-    page.locator("#adc-send").click()
+    choose(page, "adc-channel", "4")
+    choose(page, "adc-mode", "voltage_uv")
+    fill(page, "adc-value", "1650000")
+    button(page, "adc-send").click()
     wait_for(page, server, lambda: "ADC=32768\\n" in log_text(page), "ADC midpoint")
-    page.locator("#adc-mode").select_option("raw")
-    page.locator("#adc-value").fill("12345")
-    page.locator("#adc-send").click()
+    choose(page, "adc-mode", "raw")
+    fill(page, "adc-value", "12345")
+    button(page, "adc-send").click()
     wait_for(page, server, lambda: "ADC=12345\\n" in log_text(page), "ADC raw input")
     page.locator("#tab-can").click()
-    page.locator("#can-send").click()  # Existing fixture example defaults.
+    button(page, "can-send").click()  # Existing fixture example defaults.
     wait_for(page, server, lambda: "ID 0x322  flags=0  DLC=8  41 42 43 44 45 46 47 48"
              in log_text(page, "can"), "actual CAN echo")
     assert "CAN_BAD" not in log_text(page)
     record.update(uart=log_text(page), can=log_text(page, "can"), board=board(page))
-    page.locator("#pause-button").click()
+    button(page, "pause-button").click()
     wait_for(page, server, lambda: status(page) == "paused", "native pause")
     page.locator("#tab-adc").click()
-    assert page.locator("#adc-send").is_disabled()
+    assert button(page, "adc-send").is_disabled()
     assert "先运行" in page.locator("#adc-hint").text_content()
     page.screenshot(path=str(screenshot), full_page=True)
     record["screenshot"] = str(screenshot)
     # Leave one actual MCU active for the server SIGTERM cleanup consumer.
     record["shutdown_state"] = status(page)
+
+
+def ws2812(page, server, elf, record, screenshot):
+    load(page, server, elf)
+    record["colors"] = []
+    for rgb, brightness in ((0x12a43c, 0xa4), (0xe70591, 0xe7)):
+        wait_for(page, server, lambda: board(page)["led"]["rgb"] == rgb,
+                 f"native WS2812 #{rgb:06X}")
+        actual = led_presentation(page, rgb)
+        assert actual["led"]["source"] == "ws2812-dma", actual
+        assert actual["led"]["brightness"] == brightness, actual
+        record["colors"].append(actual)
+    record["colors"][-1]["pixel"] = led_pixel(page, 0xe70591)
+    page.screenshot(path=str(screenshot), full_page=True)
+    record["screenshot"] = str(screenshot)
+    stop_board(page, server)
 
 
 def main():
@@ -352,12 +426,16 @@ def main():
     parser.add_argument("--release-elf", required=True, type=Path)
     parser.add_argument("--lab-elf", required=True, type=Path,
                         help="existing smoke/dm_mc02_lab_smoke.c fixture ELF")
+    parser.add_argument("--ws2812-elf", type=Path,
+                        help="existing smoke/dm_mc02_ws2812_smoke.c fixture ELF")
     parser.add_argument("--qemu", type=Path)
     parser.add_argument("--sim", required=True, type=Path, help="compiled Rust sim executable with web enabled")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     elfs = {name: regular_file(path, name + " ELF") for name, path in
             (("Debug", args.debug_elf), ("Release", args.release_elf), ("channels", args.lab_elf))}
+    if args.ws2812_elf:
+        elfs["WS2812"] = regular_file(args.ws2812_elf, "WS2812 ELF")
     qemu = resolve_qemu(args.qemu)
     executable = regular_file(args.sim, "Rust sim", executable=True)
     args.output.mkdir(parents=True, exist_ok=False)
@@ -378,25 +456,41 @@ def main():
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(headless=True)
         report["browser"] = browser.version
-        for profile, width in (("Debug", 1440), ("Release", 390), ("channels", 1440)):
+        profiles = [("Debug", 1440), ("Release", 390)]
+        if "WS2812" in elfs:
+            profiles.append(("WS2812", 1440))
+        profiles.append(("channels", 1440))
+        for profile, width in profiles:
             record = {"profile": profile, "status": "failed", "stages": []}
             report["cases"].append(record)
             page = browser.new_page(viewport={"width": width, "height": 960})
             errors = []
+            requests = []
             page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on("request", lambda request: requests.append(request.url))
             page.set_default_timeout(3000)
             try:
                 page.goto(url, wait_until="networkidle")
                 wait_for(page, server, lambda: page.locator("#connection-status").text_content() == "已连接", "WebSocket controller")
+                if profile == "Debug":
+                    assert board(page) is None
+                    unknown = page.locator("#board-led").evaluate("node => getComputedStyle(node).fill")
+                    assert unknown != "rgb(0, 0, 0)", unknown
+                    record["unknown_led_fill"] = unknown
                 screenshot = args.output / (profile + ".png")
                 if profile == "channels":
                     channels(page, server, elfs[profile], record, screenshot)
+                elif profile == "WS2812":
+                    ws2812(page, server, elfs[profile], record, screenshot)
                 else:
                     gpio_lesson(page, server, elfs[profile], record, screenshot)
                 if errors:
                     raise AssertionError(f"browser JavaScript errors: {errors}")
+                assert not [request for request in requests if not request.startswith(url + "/")], requests
+                assert all(url + path in requests for path in ("/vendor/mdui.js", "/vendor/mdui.css")), requests
             finally:
                 record["page_errors"] = errors
+                record["requests"] = requests
                 page.close()
             record["status"] = "passed"
     except (Exception, KeyboardInterrupt) as error:
@@ -419,8 +513,8 @@ def main():
             if {path: sha(path) for path in protected} != protected:
                 raise AssertionError("Web smoke firmware/QEMU inputs changed")
             if primary is None:
-                if len(report["server"].get("native_identities", ())) != 3:
-                    raise AssertionError("browser gate did not record all three native QEMU identities")
+                if len(report["server"].get("native_identities", ())) != len(elfs):
+                    raise AssertionError("browser gate did not record every native QEMU identity")
                 report["status"] = "passed"
                 code = 0
         except BaseException as error:

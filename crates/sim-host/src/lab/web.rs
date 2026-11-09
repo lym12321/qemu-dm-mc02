@@ -127,6 +127,18 @@ async fn stylesheet() -> impl IntoResponse {
         include_bytes!("../../../../sim/lab/static/style.css").as_slice(),
     )
 }
+async fn material_javascript() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
+        include_bytes!("../../../../third_party/material/mdui/mdui.js").as_slice(),
+    )
+}
+async fn material_stylesheet() -> impl IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        include_bytes!("../../../../third_party/material/mdui/mdui.css").as_slice(),
+    )
+}
 
 async fn upload(
     State(state): State<Arc<WebState>>,
@@ -461,6 +473,8 @@ pub fn run_web(
         .route("/", get(index))
         .route("/app.js", get(javascript))
         .route("/style.css", get(stylesheet))
+        .route("/vendor/mdui.js", get(material_javascript))
+        .route("/vendor/mdui.css", get(material_stylesheet))
         .route("/api/state", get(self::state))
         .route("/api/firmware", post(upload))
         .route("/api/ws", get(websocket))

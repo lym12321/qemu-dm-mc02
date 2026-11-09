@@ -251,6 +251,19 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
                                 ["windows-lab"] if windows_lab else []),
         "development_worktree": development,
     }
+    if windows_lab or linux_full:
+        material = ROOT / "third_party/material/mdui"
+        notices = licenses / "mdui"
+        notices.mkdir()
+        for name in ("LICENSE", "THIRD-PARTY-NOTICES.txt", "PROVENANCE.json"):
+            shutil.copy2(material / name, notices / name)
+        identity = json.loads((material / "PROVENANCE.json").read_text(encoding="utf-8"))
+        provenance["web_ui"] = {
+            **{key: identity[key] for key in ("name", "version", "upstream", "commit")},
+            "licenses": "licenses/mdui",
+            "provenance": "licenses/mdui/PROVENANCE.json",
+            "vendored_sources": "third_party/material/mdui",
+        }
     if windows_lab:
         provenance["rust"]["scope"] = "native Windows interactive/Web Lab and ARM GDB debugging"
     if linux_full:
