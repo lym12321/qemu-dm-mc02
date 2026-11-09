@@ -1669,6 +1669,11 @@ void dm_mc02_dma_reset(DmMc02Dma *s)
     dm_mc02_dma_update_irqs(s);
 }
 
+uint32_t dm_mc02_dma_transfer_length(const DmMc02Dma *state, unsigned stream)
+{
+    return stream < DMA_STREAM_COUNT ? state->reload_ndtr[stream] : 0;
+}
+
 bool dm_mc02_dma_state_valid(const DmMc02Dma *state)
 {
     if (!state) {

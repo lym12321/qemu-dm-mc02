@@ -163,6 +163,10 @@ bool dm_mc02_dma_request_batch_coalesced(DmMc02Dma *state,
 bool dm_mc02_dma_advance_stream(DmMc02Dma *state, unsigned stream,
                                 unsigned items);
 
+/* Configured transfer length, retained while the live NDTR counts down and
+ * across circular reloads. Zero denotes an unconfigured or invalid stream. */
+uint32_t dm_mc02_dma_transfer_length(const DmMc02Dma *state, unsigned stream);
+
 void dm_mc02_dma_set_stream_enabled_callback(DmMc02Dma *state,
                                               DmMc02DmaStreamEnabled *callback,
                                               void *opaque);

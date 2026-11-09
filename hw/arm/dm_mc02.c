@@ -2552,7 +2552,7 @@ static bool dm_mc02_ws2812_decode(const DmMc02MachineState *s,
                           devices->ws2812_dma_stream *
                           DM_MC02_DMA_STREAM_STRIDE;
     uint32_t cr;
-    uint32_t ndtr;
+    uint32_t transfers;
     dma_addr_t m0ar;
     uint8_t waveform[DM_MC02_WS2812_TOTAL_BITS * 2] = { 0 };
     uint8_t green, red, blue;
@@ -2563,22 +2563,24 @@ static bool dm_mc02_ws2812_decode(const DmMc02MachineState *s,
         return false;
     }
     cr = dm_mc02_dma_reg(ws_dma, stream + DM_MC02_DMA_SxCR);
-    ndtr = dm_mc02_dma_reg(ws_dma, stream + DM_MC02_DMA_SxNDTR);
+    transfers = dm_mc02_dma_transfer_length(ws_dma,
+                                           devices->ws2812_dma_stream);
     m0ar = dm_mc02_dma_reg(ws_dma, stream + DM_MC02_DMA_SxM0AR);
 
     /* The current board buffer is exactly 72 half-word transfers.  Permit a
      * shorter transfer only when it still contains one complete LED, which
-     * is useful while firmware is bringing the stream up. */
+     * is useful while firmware is bringing the stream up. NDTR counts down
+     * during transmission; it does not change the configured buffer span. */
     if (!(cr & DM_MC02_DMA_CR_EN) || !(cr & DM_MC02_DMA_CR_MINC) ||
         ((cr >> DM_MC02_DMA_CR_PSIZE_SHIFT) & 3u) != DM_MC02_DMA_SIZE_16 ||
         ((cr >> DM_MC02_DMA_CR_MSIZE_SHIFT) & 3u) != DM_MC02_DMA_SIZE_16 ||
-        ndtr < DM_MC02_WS2812_FIRST_BITS ||
-        ndtr > DM_MC02_WS2812_TOTAL_BITS ||
+        transfers < DM_MC02_WS2812_FIRST_BITS ||
+        transfers > DM_MC02_WS2812_TOTAL_BITS ||
         (m0ar & 1u)) {
         return false;
     }
 
-    transfer_bytes = (size_t)ndtr * sizeof(uint16_t);
+    transfer_bytes = (size_t)transfers * sizeof(uint16_t);
     if (!dm_mc02_soc_dma_sram_range_valid(s->board->soc, m0ar,
                                          transfer_bytes)) {
         return false;

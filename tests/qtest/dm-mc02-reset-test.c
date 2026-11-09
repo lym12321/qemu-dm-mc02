@@ -334,6 +334,7 @@ static void test_board_state_ws2812_observation(void)
     uint8_t before[sizeof(red)];
     uint8_t after[sizeof(red)];
     int64_t time;
+    uint32_t remaining;
 
     for (unsigned i = 0; i < ARRAY_SIZE(red); ++i) {
         qtest_writew(qts, AXI_WAVEFORM + 2 * i, red[i]);
@@ -369,6 +370,35 @@ static void test_board_state_ws2812_observation(void)
     g_assert_cmpmem(before, sizeof(before), after, sizeof(after));
     g_assert_cmphex(qtest_readl(qts, DMA2_S6NDTR), ==, 24);
     g_assert_cmphex(qtest_readl(qts, DMA2_S6CR), ==, 0x2c41);
+
+    /* RM0468 DMA_SxNDTR is the remaining count, not the buffer length.
+     * Run the real TIM8/DMAMUX circular request path into the reset tail;
+     * the same first LED must still be observable with fewer than 24 left. */
+    qtest_writel(qts, DMA2_S6CR, 0);
+    for (unsigned i = 24; i < 72; ++i) {
+        qtest_writew(qts, AXI_WAVEFORM + 2 * i, 0);
+    }
+    qtest_writel(qts, DMA2_S6PAR, 0x40010434); /* TIM8_CCR1 */
+    qtest_writel(qts, DMA2_S6NDTR, 72);
+    qtest_writel(qts, 0x40020838, 47); /* DMAMUX1 channel 14: TIM8_CH1 */
+    qtest_writel(qts, DMA2_S6CR, 0x2d41); /* CIRC */
+    qtest_writel(qts, 0x40010428, 63); /* TIM8_PSC: 1 MHz */
+    qtest_writel(qts, 0x4001042c, 999); /* TIM8_ARR */
+    qtest_writel(qts, 0x40010434, 84); /* TIM8_CCR1 */
+    qtest_writel(qts, 0x4001040c, 1u << 9); /* CC1DE */
+    qtest_writel(qts, 0x40010400, 1); /* CEN */
+    remaining = 72;
+    for (unsigned step = 0; remaining >= 24 && step < 100; ++step) {
+        qtest_clock_step(qts, 1000000);
+        remaining = qtest_readl(qts, DMA2_S6NDTR);
+    }
+    g_assert_cmpuint(remaining, >, 0);
+    g_assert_cmpuint(remaining, <, 24);
+    g_test_message("circular WS2812 remaining=%u", remaining);
+    state = board_state(qts);
+    assert_led(state, "A7", 0x00ff00, 255, "ws2812-dma");
+    qobject_unref(state);
+    g_assert_cmphex(qtest_readl(qts, DMA2_S6NDTR), ==, remaining);
     qtest_quit(qts);
 }
 
