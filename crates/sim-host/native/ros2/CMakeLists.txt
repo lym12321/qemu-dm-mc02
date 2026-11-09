@@ -1,5 +1,7 @@
 cmake_minimum_required(VERSION 3.22)
 project(dm_ros2_native LANGUAGES CXX)
+# Cargo consumes the probe's link command, not CMake's output dependency file.
+set(CMAKE_LINK_DEPENDS_USE_LINKER FALSE)
 find_package(rclcpp 28.1.22 EXACT REQUIRED)
 find_package(sensor_msgs 5.3.8 EXACT REQUIRED)
 find_package(std_msgs 5.3.8 EXACT REQUIRED)
