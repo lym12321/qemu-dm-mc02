@@ -285,16 +285,36 @@ impl NativeProcess {
 
     fn stop(&mut self) -> Vec<String> {
         let mut errors = Vec::new();
+        let mut processes = job::Processes::default();
+        let graceful_deadline = Instant::now() + STOP_LIMIT;
+        if let Some(job) = &self.job {
+            if let Err(error) = job.capture(&mut processes, graceful_deadline) {
+                errors.push(format!("native job process capture: {error}"));
+            }
+        }
         if let Some(child) = &mut self.child {
             // Targeted CTRL_BREAK requires an attached console. Services/GUI
             // parents may have none; job termination is the unconditional path.
             // SAFETY: CREATE_NEW_PROCESS_GROUP made this child's PID its group.
             if unsafe { GenerateConsoleCtrlEvent(CTRL_BREAK_EVENT, child.id()) } != 0 {
-                if let Err(error) = child.wait_timeout(STOP_LIMIT) {
+                if let Err(error) =
+                    child.wait_timeout(graceful_deadline.saturating_duration_since(Instant::now()))
+                {
                     errors.push(format!("native CTRL_BREAK wait: {error}"));
                 }
             }
         }
+        let deadline = Instant::now() + STOP_LIMIT;
+        let mut captured_total = match &self.job {
+            Some(job) => match job.capture(&mut processes, deadline) {
+                Ok(total) => Some(total),
+                Err(error) => {
+                    errors.push(format!("native job process capture: {error}"));
+                    None
+                }
+            },
+            None => None,
+        };
         let job_terminated = if let Some(job) = &self.job {
             match job.terminate() {
                 Ok(()) => true,
@@ -324,7 +344,6 @@ impl NativeProcess {
                 Err(error) => errors.push(format!("native exit observation: {error}")),
             }
         }
-        let deadline = Instant::now() + STOP_LIMIT;
         loop {
             let reaped = match self.child.as_mut().map(Child::try_wait).transpose() {
                 Ok(status) => status.is_none_or(|value| value.is_some()),
@@ -333,14 +352,30 @@ impl NativeProcess {
                     break;
                 }
             };
-            let empty = match self.job.as_ref().map(job::Job::empty).transpose() {
-                Ok(empty) => empty.unwrap_or(true),
+            let empty = match self.job.as_ref().map(job::Job::accounting).transpose() {
+                Ok(Some(accounting)) => {
+                    if captured_total.is_some_and(|total| total != accounting.TotalProcesses) {
+                        errors.push("native job gained a process during termination; complete tree exit could not be verified".into());
+                        captured_total = None;
+                    }
+                    accounting.ActiveProcesses == 0
+                }
+                Ok(None) => true,
                 Err(error) => {
                     errors.push(format!("native job accounting: {error}"));
                     break;
                 }
             };
-            if reaped && empty {
+            let signaled = match processes.exited() {
+                Ok(exited) => exited,
+                Err(error) => {
+                    errors.push(format!("native job process wait: {error}"));
+                    break;
+                }
+            };
+            // TerminateJobObject initiates asynchronous TerminateProcess calls.
+            // ActiveProcesses can reach zero before descendant handles signal.
+            if reaped && empty && signaled {
                 break;
             }
             if Instant::now() >= deadline {
