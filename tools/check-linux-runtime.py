@@ -137,6 +137,8 @@ def main():
     with args.report.open("x") as target:
         json.dump(report, target, ensure_ascii=False, indent=2)
         target.write("\n")
+    if not report["passed"]:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
     print(f"Linux full package {'PASS' if report['passed'] else 'FAILED'}: {args.report}")
     return 0 if report["passed"] else 1
 

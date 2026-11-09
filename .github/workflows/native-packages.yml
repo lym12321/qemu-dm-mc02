@@ -128,7 +128,7 @@ jobs:
             -v "$GITHUB_WORKSPACE/dist:/dist" -w /tmp ubuntu:24.04 bash -euc '
               apt-get update
               DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-                python3 patchelf strace libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri
+                python3 patchelf strace libegl1 libgl1 libopengl0 libglx-mesa0 libgl1-mesa-dri
               python3 /checkout/tools/check-linux-runtime.py \
                 --package /dist/dm-mc02-linux-x86_64 \
                 --native-probe /checkout/target/release/examples/package_native_probe \
@@ -140,6 +140,17 @@ jobs:
                 --report /dist/dm-mc02-linux-x86_64/smoke.json
             '
           tar -C dist -czf dist/dm-mc02-linux-x86_64.tar.gz dm-mc02-linux-x86_64
+      - name: Preserve Linux package failure reports
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dm-mc02-linux-package-diagnostics
+          path: |
+            dist/dm-mc02-linux-x86_64/native-smoke.json
+            dist/dm-mc02-linux-x86_64/smoke.json
+            dist/dm-mc02-linux-x86_64/runtime-libraries.txt
+          if-no-files-found: ignore
+          retention-days: 30
       - uses: actions/upload-artifact@v4
         with:
           name: dm-mc02-linux-x86_64
