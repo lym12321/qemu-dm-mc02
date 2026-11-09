@@ -1,6 +1,7 @@
 # Local environments and build products
 /.venv/
 /build/
+/dist/
 /target/
 /.pytest_cache/
 /.mypy_cache/
