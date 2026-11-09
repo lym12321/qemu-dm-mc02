@@ -67,9 +67,12 @@ sudo apt-get install -y --no-install-recommends \
 本地完整包已在干净 Ubuntu 24.04.3 容器、checkout 外和空应用 PATH 下，通过 367 个 ELF 的
 依赖闭包、实际 MuJoCo 转子、Ogre2 相机/LiDAR、ROS context、固件 UART/monitor/reset-paused
 GDB 监听，以及场景/完整 MCAP 重放验收；原生探针未访问外部 SDK 或 Python。
-本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)。
-平台可用性以运行和随包报告为准；Windows Lab 包的 `lab-smoke.json` 记录真实交互/Web 通道、
-外部 QMP、GDB 断点/继续/单步/复位/寄存器与内存读写及退出清理。Windows 原生门运行于 Windows Server 2022。
+Linux 构建见 [Actions 42631611379](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42631611379) 的 Linux job。
+Windows Lab 当前为本地交叉构建候选；该轮 Windows 原生进程测试发现清理提前结束，
+修复已通过交叉编译和 Clippy，完整交互/Web/GDB 验收尚待原生复验。
+平台状态以随包 `validation.json` 为准；Windows 原生验收使用 Windows Server 2022，
+覆盖交互/Web 通道、外部 QMP、GDB 断点/继续/单步/复位/寄存器与内存读写及退出清理。
+本地运行包与对应源码单独提供；源码包不参与运行，许可证仍保留在运行包中。
 实板校准仍未完成。
 
 ### 从源码构建

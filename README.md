@@ -35,8 +35,10 @@ Linux 下载后解开 Artifact 外层，再用 `tar -xzf` 解开其中的 tar.gz
 
 本地完整包已在干净 Ubuntu 24.04.3 容器、checkout 外和空应用 PATH 下，通过原生依赖、
 MuJoCo/Ogre2/ROS、固件 UART/GDB、场景及完整 MCAP 重放验收。
-本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)；
-下载时以该运行的平台结果和随包报告为准；新 Windows Lab 包以 `lab-smoke.json` 中的原生验收结果为准。
+Linux 构建见 [Actions 42631611379](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42631611379) 的 Linux job。
+Windows Lab 当前提供交叉构建候选；该轮原生进程测试发现清理提前结束，修复已通过编译检查，
+完整 Windows Lab/GDB 尚待原生复验。下载时核对随包 `validation.json`。
+本地交付将运行包与对应源码分开；运行程序只需运行包，许可证保留在其中。
 
 Windows PowerShell：
 
