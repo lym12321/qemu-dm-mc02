@@ -471,7 +471,9 @@ pub fn with_lab<T>(
         };
         while !lab
             .channels
-            .consume_opening()
+            // Windows QEMU connects before its initial machine reset; Unix
+            // peers connect after startup. Both use the same wire parser.
+            .consume_opening(cfg!(windows))
             .map_err(|error| error as Failure)?
         {
             lab.wait(None, Duration::from_millis(5))?;

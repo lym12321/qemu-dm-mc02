@@ -86,6 +86,7 @@ pub struct LabChannels<'a, T: Read + Write> {
     cans: Vec<CanPort<'a, T>>,
     cosim: Option<&'a mut StreamTransport<T>>,
     opening_seen: bool,
+    opening_reset_seen: bool,
     time_ns: u64,
     adc_sequence: Option<u64>,
     adc_time_ns: Option<u64>,
@@ -128,14 +129,17 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
             cans: ports,
             cosim,
             opening_seen: false,
+            opening_reset_seen: false,
             time_ns: 0,
             adc_sequence: None,
             adc_time_ns: None,
         })
     }
-    /// Consume the actual opening telemetry before submitting the initial RESET.
+    /// Consume actual opening telemetry before submitting the host RESET. An
+    /// early-connected QEMU client also emits its initial machine RESET; wait
+    /// for telemetry after that RESET, even across separate reads.
     /// Each call reads at most once; waiting and deadlines belong to the caller.
-    pub fn consume_opening(&mut self) -> Result<bool> {
+    pub fn consume_opening(&mut self, wait_for_machine_reset: bool) -> Result<bool> {
         if self.opening_seen {
             return Ok(true);
         }
@@ -145,10 +149,14 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
         stream.read_once()?;
         while let Some(bytes) = stream.next_length_prefixed(V1_HEADER, V1_MAX_BODY)? {
             let frame = V1Frame::decode_body(&bytes)?;
-            if frame.kind != 3 || frame.payload.len() != 12 {
-                return Err(state("unexpected Lab co-sim opening frame"));
+            match frame.kind {
+                1 => {
+                    self.opening_reset_seen = true;
+                    self.opening_seen = false;
+                }
+                3 => self.opening_seen = !wait_for_machine_reset || self.opening_reset_seen,
+                _ => return Err(state("unexpected Lab co-sim opening frame")),
             }
-            self.opening_seen = true;
         }
         Ok(self.opening_seen)
     }

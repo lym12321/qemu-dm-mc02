@@ -1,24 +1,30 @@
-#![cfg(all(target_os = "linux", feature = "lab"))]
+#![cfg(feature = "lab")]
+#[cfg(unix)]
 use sim_host::{
     can::CanFrame,
-    lab::channels::{AdcValue, ChannelData, ChannelEvent, LabChannels},
-    step_wire::V1Frame,
-    transports::{
-        fixed84::{self, CanStream},
-        stream::StreamTransport,
-    },
+    lab::channels::{ChannelData, ChannelEvent},
+    transports::fixed84::{self, CanStream},
 };
+use sim_host::{
+    lab::channels::{AdcValue, LabChannels},
+    step_wire::V1Frame,
+    transports::stream::StreamTransport,
+};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::{
+    collections::VecDeque,
     io::{self, Read, Write},
-    os::unix::net::UnixStream,
 };
 
+#[cfg(unix)]
 fn pair() -> (UnixStream, UnixStream) {
     let (host, peer) = UnixStream::pair().unwrap();
     host.set_nonblocking(true).unwrap();
     peer.set_nonblocking(true).unwrap();
     (host, peer)
 }
+#[cfg(unix)]
 fn drain(peer: &mut UnixStream) -> Vec<u8> {
     let mut bytes = Vec::new();
     match peer.read_to_end(&mut bytes) {
@@ -27,9 +33,11 @@ fn drain(peer: &mut UnixStream) -> Vec<u8> {
     }
     bytes
 }
+#[cfg(unix)]
 fn frame(stamp: u64, byte: u8) -> CanFrame {
     CanFrame::new(0x321, 0, Some(1), vec![byte], stamp).unwrap()
 }
+#[cfg(unix)]
 fn send_v1(peer: &mut UnixStream, kind: u16) {
     let body = V1Frame {
         kind,
@@ -54,6 +62,7 @@ fn decode_v1(bytes: &[u8]) -> Vec<V1Frame> {
 }
 
 #[test]
+#[cfg(unix)]
 fn channels_keep_uart_poll_time_can_wire_time_and_physical_tail_across_reset() {
     let (uart, mut uart_peer) = pair();
     let mut uart = StreamTransport::new(uart, 256).unwrap();
@@ -120,15 +129,16 @@ fn channels_keep_uart_poll_time_can_wire_time_and_physical_tail_across_reset() {
 }
 
 #[test]
+#[cfg(unix)]
 fn v1_adc_requires_opening_explicit_reset_and_real_increasing_timestamps() {
     let (cosim, mut peer) = pair();
     let mut cosim = StreamTransport::new(cosim, 256).unwrap();
     let mut channels = LabChannels::new(vec![], vec![], Some(&mut cosim)).unwrap();
     assert!(channels.reset(100).is_err());
     assert!(drain(&mut peer).is_empty());
-    assert!(!channels.consume_opening().unwrap());
+    assert!(!channels.consume_opening(false).unwrap());
     send_v1(&mut peer, 3);
-    assert!(channels.consume_opening().unwrap());
+    assert!(channels.consume_opening(false).unwrap());
     channels.reset(100).unwrap();
     assert!(channels.send_adc(4, AdcValue::Raw(12345), 100).is_err());
     channels.send_adc(4, AdcValue::Raw(12345), 101).unwrap();
@@ -170,4 +180,89 @@ fn v1_adc_requires_opening_explicit_reset_and_real_increasing_timestamps() {
         (frames[0].kind, frames[1].sequence, frames[1].time_ns),
         (1, 1, 201)
     );
+}
+
+// Captured from pinned QEMU's prebound TCP client at startup: OPENED telemetry,
+// initial machine RESET, then post-reset telemetry. Expected bytes come from
+// the native producer, independently of the Rust encoder under test.
+const EARLY_OPENING: &[u8] = include_bytes!("fixtures/cosim_early_opening.bin");
+
+struct ReadBatches {
+    pending: VecDeque<Vec<u8>>,
+    written: Vec<u8>,
+}
+impl Read for ReadBatches {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let Some(batch) = self.pending.pop_front() else {
+            return Err(io::ErrorKind::WouldBlock.into());
+        };
+        assert!(batch.len() <= output.len());
+        output[..batch.len()].copy_from_slice(&batch);
+        Ok(batch.len())
+    }
+}
+impl Write for ReadBatches {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.written.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn early_opening_waits_for_machine_reset_and_following_telemetry() {
+    // Separate before RESET, inside RESET, after RESET, and inside the final
+    // telemetry. Coalesced delivery is the originally reported load failure.
+    for split in [44, 47, 76, 119, 120] {
+        let mut batches = vec![EARLY_OPENING[..split].to_vec()];
+        if split < EARLY_OPENING.len() {
+            batches.push(EARLY_OPENING[split..].to_vec());
+        }
+        let io = ReadBatches {
+            pending: batches.into(),
+            written: Vec::new(),
+        };
+        let mut stream = StreamTransport::new(io, 8).unwrap();
+        let mut channels = LabChannels::new(vec![], vec![], Some(&mut stream)).unwrap();
+        assert_eq!(channels.consume_opening(true).unwrap(), split == 120);
+        if split < 120 {
+            assert!(channels.reset(1).is_err());
+            assert!(channels.consume_opening(true).unwrap());
+        }
+        channels.reset(1).unwrap();
+        channels.service(2, true).unwrap();
+        channels.send_adc(4, AdcValue::Raw(12345), 2).unwrap();
+        drop(channels);
+        let frames = decode_v1(&stream.io().written);
+        assert_eq!(
+            frames
+                .iter()
+                .map(|f| (f.kind, f.sequence, f.time_ns))
+                .collect::<Vec<_>>(),
+            [(1, 0, 1), (5, 1, 2)]
+        );
+    }
+}
+
+#[test]
+fn opening_rejects_non_startup_frames_and_invalid_telemetry() {
+    let mut ack = EARLY_OPENING[44..76].to_vec();
+    ack[10] = 4; // Valid v1 ACK, which cannot open the Lab ADC session.
+    let mut invalid_telemetry = EARLY_OPENING[..44].to_vec();
+    invalid_telemetry[42] = 1; // Canonical telemetry's reserved field.
+    for bytes in [ack, invalid_telemetry] {
+        let mut stream = StreamTransport::new(
+            ReadBatches {
+                pending: [bytes].into(),
+                written: Vec::new(),
+            },
+            8,
+        )
+        .unwrap();
+        let mut channels = LabChannels::new(vec![], vec![], Some(&mut stream)).unwrap();
+        assert!(channels.consume_opening(true).is_err());
+        assert!(channels.reset(1).is_err());
+    }
 }
