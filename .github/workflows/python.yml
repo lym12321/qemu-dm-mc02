@@ -16,6 +16,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Install native test prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config zlib1g-dev ninja-build gcc-arm-none-eabi
       - name: Install independent test dependencies
         run: |
           python -m venv .venv

@@ -78,6 +78,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.91.1'
+          components: clippy,rustfmt
       - uses: actions/download-artifact@v4
         with:
           name: package-test-firmware
@@ -169,6 +170,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: '1.91.1'
+          components: clippy,rustfmt
           targets: x86_64-pc-windows-msvc
       - uses: msys2/setup-msys2@v2
         with:
