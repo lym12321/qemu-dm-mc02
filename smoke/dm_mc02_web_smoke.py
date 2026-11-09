@@ -420,22 +420,63 @@ def ws2812(page, server, elf, record, screenshot):
     stop_board(page, server)
 
 
+def trobot_led(page, server, elf, record, screenshot):
+    # Ordinary app_entrance calls BSP RGB(0, 50, 0) before waiting for INS.
+    # This free-run Lab supplies no IMU producer, so the startup color remains.
+    load(page, server, elf)
+    wait_for(page, server, lambda: board(page)["led"]["rgb"] == 0x003200,
+             "ordinary firmware's green startup LED")
+    origin = board(page)["timestamp_ns"]
+    deadline = min(server.deadline, time.monotonic() + 5)
+    record["observations"] = []
+    while True:
+        server.check()
+        snapshot = board(page)
+        assert snapshot["led"] == {"pin":"A7", "rgb":0x003200, "brightness":50,
+                                  "source":"ws2812-dma"}, snapshot["led"]
+        if not record["observations"] or snapshot["timestamp_ns"] != record["observations"][-1]["timestamp_ns"]:
+            record["observations"].append({"timestamp_ns":snapshot["timestamp_ns"], "led":snapshot["led"]})
+        if snapshot["timestamp_ns"] >= origin + 2_000_000_000:
+            break
+        if time.monotonic() >= deadline:
+            raise AssertionError("ordinary firmware did not advance through the LED observation interval")
+        page.wait_for_function("() => true")
+        server.wait()
+    button(page, "pause-button").click()
+    wait_for(page, server, lambda: status(page) == "paused", "paused ordinary firmware")
+    record["color"] = led_presentation(page, 0x003200)
+    record["color"]["pixel"] = led_pixel(page, 0x003200)
+    page.screenshot(path=str(screenshot), full_page=True)
+    record["screenshot"] = str(screenshot)
+    stop_board(page, server)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--debug-elf", required=True, type=Path)
-    parser.add_argument("--release-elf", required=True, type=Path)
-    parser.add_argument("--lab-elf", required=True, type=Path,
+    parser.add_argument("--debug-elf", type=Path)
+    parser.add_argument("--release-elf", type=Path)
+    parser.add_argument("--lab-elf", type=Path,
                         help="existing smoke/dm_mc02_lab_smoke.c fixture ELF")
     parser.add_argument("--ws2812-elf", type=Path,
                         help="existing smoke/dm_mc02_ws2812_smoke.c fixture ELF")
+    parser.add_argument("--trobot-elf", type=Path,
+                        help="ordinary trobot ELF with green startup RGB(0,50,0); may run alone")
     parser.add_argument("--qemu", type=Path)
     parser.add_argument("--sim", required=True, type=Path, help="compiled Rust sim executable with web enabled")
     parser.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
+    fixtures = (args.debug_elf, args.release_elf, args.lab_elf)
+    if any(fixtures) and not all(fixtures):
+        parser.error("--debug-elf, --release-elf and --lab-elf must be supplied together")
+    if not any(fixtures) and not args.trobot_elf:
+        parser.error("provide the three fixture ELFs or --trobot-elf")
     elfs = {name: regular_file(path, name + " ELF") for name, path in
-            (("Debug", args.debug_elf), ("Release", args.release_elf), ("channels", args.lab_elf))}
+            (("Debug", args.debug_elf), ("Release", args.release_elf), ("channels", args.lab_elf))
+            if path is not None}
     if args.ws2812_elf:
         elfs["WS2812"] = regular_file(args.ws2812_elf, "WS2812 ELF")
+    if args.trobot_elf:
+        elfs["trobot"] = regular_file(args.trobot_elf, "ordinary trobot ELF")
     qemu = resolve_qemu(args.qemu)
     executable = regular_file(args.sim, "Rust sim", executable=True)
     args.output.mkdir(parents=True, exist_ok=False)
@@ -456,10 +497,13 @@ def main():
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(headless=True)
         report["browser"] = browser.version
-        profiles = [("Debug", 1440), ("Release", 390)]
+        profiles = [("Debug", 1440), ("Release", 390)] if "Debug" in elfs else []
         if "WS2812" in elfs:
             profiles.append(("WS2812", 1440))
-        profiles.append(("channels", 1440))
+        if "trobot" in elfs:
+            profiles.append(("trobot", 1440))
+        if "channels" in elfs:
+            profiles.append(("channels", 1440))
         for profile, width in profiles:
             record = {"profile": profile, "status": "failed", "stages": []}
             report["cases"].append(record)
@@ -472,7 +516,7 @@ def main():
             try:
                 page.goto(url, wait_until="networkidle")
                 wait_for(page, server, lambda: page.locator("#connection-status").text_content() == "已连接", "WebSocket controller")
-                if profile == "Debug":
+                if len(report["cases"]) == 1:
                     assert board(page) is None
                     unknown = page.locator("#board-led").evaluate("node => getComputedStyle(node).fill")
                     assert unknown != "rgb(0, 0, 0)", unknown
@@ -482,6 +526,8 @@ def main():
                     channels(page, server, elfs[profile], record, screenshot)
                 elif profile == "WS2812":
                     ws2812(page, server, elfs[profile], record, screenshot)
+                elif profile == "trobot":
+                    trobot_led(page, server, elfs[profile], record, screenshot)
                 else:
                     gpio_lesson(page, server, elfs[profile], record, screenshot)
                 if errors:

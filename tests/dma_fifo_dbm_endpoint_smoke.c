@@ -720,6 +720,7 @@ static void test_m2p(DmMc02Dma *dma, DmMc02Dmamux *dmamux)
         CHECK(probe.timestamps[i] == 1000 + i);
         CHECK(dma_read(dma, stream_register(0, DMA_SxNDTR)) ==
               (i == 7 ? 8 : 7 - i));
+        CHECK(dm_mc02_dma_transfer_length(dma, 0) == 8);
         if (i == 0) {
             /* Four 16-bit memory beats have been prefetched.  One byte has
              * been consumed by the endpoint, leaving seven FIFO bytes; the
