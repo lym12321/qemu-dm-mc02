@@ -52,12 +52,21 @@ CLI 直接使用相邻 `bin/` 中的 QEMU，不解包临时可执行文件。
 完整 Linux 包带 `lib/` 原生依赖、`plugins/` 相对符号链接、Gazebo/SDF/ament 资源、官方 ROS bridge、
 `runtime-env.json`、`native-runtime.json`、来源哈希、对应源码和许可证；宿主提供 glibc≥2.39、
 Linux pidfd 及 EGL/GLVND/Mesa 或显卡厂商驱动。运行不需要安装 Python 或物理 SDK。
-本地完整运行时约 351.8 MiB，源码另占约 141.4 MiB；这是完整原生功能的成本。
+完整 Linux 运行目录约 351.8 MiB，其中 Rust 入口为 8.64 MiB；对应源码另占约 141 MiB。
 
-Actions [42501982549](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42501982549)
-通过的是轻量固件产品。新的完整 Linux 工作流尚未执行；本地开发包已通过 SDK 路径隐藏、
-checkout 外和空应用 PATH 下的原生 MuJoCo/Ogre2/ROS、实际固件/GDB、场景/MCAP 重放验收。
-平台可用性以所选 Actions 记录和随包报告为准；这些门不证明 Windows 完整宿主功能或实板校准。
+Ubuntu 24.04 的无桌面环境可安装以下宿主图形库，使用 Mesa 软件渲染：
+
+```bash
+sudo apt-get update
+sudo apt-get install -y --no-install-recommends \
+  libegl1 libgl1 libopengl0 libglx-mesa0 libgl1-mesa-dri
+```
+
+本地完整包已在干净 Ubuntu 24.04.3 容器、checkout 外和空应用 PATH 下，通过 367 个 ELF 的
+依赖闭包、实际 MuJoCo 转子、Ogre2 相机/LiDAR、ROS context、固件 UART/monitor/reset-paused
+GDB 监听，以及场景/完整 MCAP 重放验收；原生探针未访问外部 SDK 或 Python。
+本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)。
+平台可用性以该运行和随包报告为准；Windows 仅覆盖固件终端/GDB 监听，实板校准仍未完成。
 
 ### 从源码构建
 
@@ -1435,9 +1444,18 @@ plant 推进 RTF 须在 `0.999–1.001x`，相对测量起点的 plant/host 时�
 watchdog、最终暂停计数及输入哈希。CPU 以一个核心为 100%，可能超过 100%；RSS 为
 采样最大值。三轮全部通过才返回零；中断保留失败，未执行的轮次明确标为跳过。
 
+Rust 迁移后在同一 i5-12400 宿主完成三轮 72 秒运行，每轮实际测量至少 60 秒，均通过上述原阈值：
+
+| 测量 | 三轮范围 |
+| --- | --- |
+| plant 轨迹推进 RTF | 0.999999793–1.000000680 |
+| firmware tick RTF | 0.999933121–0.999953588 |
+| worker 采样 CPU / 最大 RSS | 14.26–15.60% / 13.46–13.63 MiB |
+| QEMU 采样 CPU / 最大 RSS | 119.38–119.83% / 41.89–42.18 MiB |
+
 该门测量当前固定业务场景的 wall-clock pacing。plant 时间戳在 ACK 和 pacing sleep
 之前记录，表示轨迹推进；无节流容量、完整 loop 完成延迟、CPU/plant 全局锁步及任意机构
-性能仍需独立验证。
+性能仍需独立验证。原 Robot 10 秒及 DJI 20 秒预算失败仍保留；本节业务 pacing 结果不覆盖它们。
 
 ### worker 的后端边界
 
@@ -1461,7 +1479,7 @@ worker 支持的常用选择：
 MuJoCo adapter 在初始化、reset 和每次 `mj_step` 后调用原生 `mj_forward`，使姿态和
 IMU derived state 对应当前关节状态；这一步不会增加 plant 时间。gyro/accelerometer
 来自 MuJoCo site-local 传感器，worker 再转换成 deg/s 和 g。该观察边界仍不改变旧 worker
-的 step-start wire 时间约定，也不建立 QEMU/plant 全局锁步；当前变更后的性能尚需重测。
+的 step-start wire 时间约定，也不建立 QEMU/plant 全局锁步；固定业务 pacing 结果见上节。
 
 MuJoCo worker smoke 验证 adapter 和测试模型；下文的 MotorTest 另验证实际固件电机组件的数据边界。普通 Release 的固定单转子业务使用上面的 [business fixture](#trobot-release-business-fixture) 入口。ROS 2 默认 topic 为 `/dm_mc02/imu`、`/dm_mc02/joint_states` 和 `/dm_mc02/motor_cmd`；adapter smoke 不等同于 Gazebo world/model 联调。运行时完整参数以 `bash tools/run-worker.sh --help` 为准。
 

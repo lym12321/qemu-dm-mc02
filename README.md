@@ -30,12 +30,12 @@ QEMU、MuJoCo、Gazebo 与 ROS 2 继续使用各自的原生实现。
 
 Linux 下载后解开 Artifact 外层，再用 `tar -xzf` 解开其中的 tar.gz，保留执行权限和插件符号链接。
 轻量 Linux 包需要系统 GLib/zlib；完整包保留宿主 glibc≥2.39、Linux pidfd 与 EGL/OpenGL 驱动边界。
-完整运行时本地候选约 351.8 MiB，另附源码与许可证；不能将其与轻量固件包的体积混为一谈。
+完整 Linux 运行目录约 351.8 MiB，其中 Rust 入口为 8.64 MiB；另附约 141 MiB 对应源码与许可证。
 
-已通过的 Actions 运行 [42501982549](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42501982549)
-验证的是轻量固件产品。新的完整 Linux 打包工作流尚未执行；本地开发包已在隐藏 SDK、
-checkout 外和空应用 PATH 条件下验证原生依赖、固件/GDB、场景及 MCAP 重放。
-下载时以所选运行记录和随包报告为准。
+本地完整包已在干净 Ubuntu 24.04.3 容器、checkout 外和空应用 PATH 下，通过原生依赖、
+MuJoCo/Ogre2/ROS、固件 UART/GDB、场景及完整 MCAP 重放验收。
+本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)；
+下载时以该运行的平台结果和随包报告为准。Windows 范围为固件终端与 GDB 监听。
 
 Windows PowerShell：
 
