@@ -25,27 +25,22 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from sim.boards import QemuBoard, digital_level
-from sim.machines.qemu.launch import regular_file, resolve_qemu
-from sim.lab.runtime import open_lab
-from sim.processes import ChildProcess
-from tools.dm_mc02_firmware_rtf import deadline_qmp_call
-from tools.dm_mc02_qmp import QmpSession
-from tools.dm_mc02_test_harness import stop
+from smoke.support.native_cli import NativeCommand, regular_file, resolve_sim
+from smoke.support.process import identity, stop
+from smoke.support.processes import ChildProcess
+
+
+def resolve_qemu(value):
+    value = value or os.environ.get("QEMU_SYSTEM_ARM") or ROOT / "build/qemu/qemu-system-arm"
+    if isinstance(value, str) and "/" not in value:
+        value = shutil.which(value) or value
+    return regular_file(value, "QEMU", executable=True)
 
 
 class StageFailure(AssertionError):
     def __init__(self, stage, last):
         self.stage = stage
         super().__init__(f"GPIO lesson stage {stage!r} did not match; last={last!r}")
-
-
-def identity(pid):
-    try:
-        return {"pid": pid, "starttime": Path(f"/proc/{pid}/stat").read_text()
-                .rsplit(")", 1)[1].split()[19]}
-    except FileNotFoundError:
-        return None
 
 
 def sha(path):
@@ -62,9 +57,9 @@ def remaining(deadline):
 def levels(state):
     a, b = state["gpio"]["A"], state["gpio"]["B"]
     return {"timestamp_ns": state["timestamp_ns"],
-            "a15": digital_level("gpio.A15", state),
+            "a15": (a["sampled"] >> 15) & 1,
             "a15_mode": (a["moder"] >> 30) & 3,
-            "b0": digital_level("gpio.B0", state), "b0_odr": b["odr"] & 1,
+            "b0": b["sampled"] & 1, "b0_odr": b["odr"] & 1,
             "b0_mode": b["moder"] & 3,
             "b0_output_mask": b["output_mask"] & 1}
 
@@ -163,48 +158,11 @@ def free_gdb_port():
         return reserved.getsockname()[1]
 
 
-def direct(elf, qemu, gdb, record):
-    port = free_gdb_port() if gdb is not None else None
-    owner = None
-    paths = ()
-    primary = None
-    try:
-        with open_lab(elf, qemu=qemu, uarts=(), gdb_port=port,
-                      startup_timeout=10.0, timeout=15.0) as lab:
-            owner = lab.owner
-            record["qemu_identity"] = identity(owner.process.pid)
-            paths = tuple(owner.sockets.values())
-            if gdb is not None:
-                debug = command([str(gdb), "-q", "--batch", str(elf),
-                    "-ex", "set pagination off", "-ex", "set confirm off",
-                    "-ex", f"target remote 127.0.0.1:{port}",
-                    "-ex", "hbreak lesson_step", "-ex", "continue",
-                    "-ex", "info symbol $pc", "-ex", "detach"],
-                    min(lab.deadline, time.monotonic() + 5.0), record.setdefault("gdb", {}))
-                if (debug["returncode"] != 0 or not re.search(
-                        r"Breakpoint [0-9]+,\s+lesson_step\b", debug["stdout"])):
-                    raise AssertionError(f"native GDB did not hit lesson_step: {debug!r}")
-            lab.call(lab.board.resume)
-            ordered_sequence(lab.snapshot,
-                             lambda: lab.call(lambda: lab.board.set_key(True)),
-                             lambda: lab.call(lambda: lab.board.set_key(False)),
-                             lab.wait, lab.deadline, record)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        if owner is not None:
-            record["qemu_reaped"] = owner.process.returncode is not None
-            record["qemu_identity_gone"] = identity(owner.process.pid) != record["qemu_identity"]
-            record["socket_paths_removed"] = all(not path.exists() for path in paths)
-            if not all(record[key] for key in ("qemu_reaped", "qemu_identity_gone", "socket_paths_removed")):
-                error = AssertionError("direct Lab owner cleanup incomplete")
-                if primary is None:
-                    raise error
-                BaseException.add_note(primary, str(error))
+def direct(elf, qemu, gdb, record, executable):
+    return interactive(elf, qemu, record, executable, gdb=gdb)
 
 
-def simulation_cli(elf, qemu, manifest_path, directory, record, *, expect_failure=False):
+def simulation_cli(elf, qemu, manifest_path, directory, record, executable, *, expect_failure=False):
     import yaml
 
     document = yaml.safe_load(manifest_path.read_text())
@@ -212,7 +170,7 @@ def simulation_cli(elf, qemu, manifest_path, directory, record, *, expect_failur
     manifest = directory / "lesson.yaml"
     manifest.write_text(yaml.safe_dump(document, sort_keys=False))
     report = directory / "simulation-result.json"
-    result = command([sys.executable, str(ROOT / "tools/sim"), "run", str(manifest),
+    result = command([str(executable), "run", str(manifest),
                       "--qemu", str(qemu), "--startup-timeout", "10", "--timeout", "15",
                       "--report", str(report)], time.monotonic() + 20.0, record)
     record["report"] = json.loads(report.read_text())
@@ -235,105 +193,56 @@ def simulation_cli(elf, qemu, manifest_path, directory, record, *, expect_failur
     # This entrypoint gate does not claim its `before` assertions prove order.
 
 
-def interactive(elf, qemu, record):
-    process = child = qmp = None
+def interactive(elf, qemu, record, executable, *, gdb=None):
     primary = None
-    observed_children = {}
     deadline = time.monotonic() + 20.0
+    consumer = None
     with tempfile.TemporaryDirectory(prefix="dm-qemu.teaching.", dir="/tmp") as temporary:
         qmp_path = Path(temporary) / "user-qmp.sock"
-
-        def pump():
-            remaining(deadline)
-            child.pump()
-            if process.poll() is not None:
-                raise RuntimeError(f"interactive CLI exited early: {process.returncode}")
-            try:
-                pids = Path(f"/proc/{process.pid}/task/{process.pid}/children").read_text().split()
-            except FileNotFoundError:
-                pids = []
-            for pid in pids:
-                current = identity(int(pid))
-                if current is not None:
-                    observed_children[current["pid"]] = current
-
-        def wait():
-            pump()
-            select.select(child.readers(), [], [], min(.01, remaining(deadline)))
-
-        def send(text):
-            pump()
-            process.stdin.write((text + "\n").encode())
-            process.stdin.flush()
-
-        def snapshot():
-            pump()
-            state = deadline_qmp_call(qmp, deadline, "Teaching", board.snapshot)
-            pump()
-            return state
-
+        argv = [str(executable), "lab", "interactive", "--elf", str(elf),
+                "--qemu", str(qemu), "--qmp", str(qmp_path),
+                "--startup-timeout", "10", "--timeout", "15"]
+        if gdb is not None:
+            port = free_gdb_port()
+            argv.extend(("--gdb-port", str(port), "--paused"))
         try:
-            process = subprocess.Popen([sys.executable, str(ROOT / "tools/sim-unmigrated"), "lab", "interactive",
-                "--elf", str(elf), "--qemu", str(qemu), "--qmp", str(qmp_path),
-                "--startup-timeout", "10", "--timeout", "15"],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                start_new_session=True)
-            child = ChildProcess("teaching interactive", process)
-            record["identity"] = identity(process.pid)
-            if record["identity"] is None:
-                raise AssertionError("interactive CLI exited before identity recording")
-            child.prepare()
-            while (not qmp_path.exists() or b"Lab connected;" not in child.tails["stdout"]):
-                wait()
-            qmp = QmpSession(str(qmp_path), timeout=min(2.0, remaining(deadline)),
-                             connect_timeout=min(2.0, remaining(deadline)), close_timeout=2.0)
-            board = QemuBoard(qmp)
-            ordered_sequence(snapshot, lambda: send("key press"), lambda: send("key release"),
-                             wait, deadline, record)
-            send("state")
-            while True:
-                pump()
-                states = [json.loads(line) for line in child.tails["stdout"].splitlines()
-                          if line.startswith(b'{"') and line.endswith(b"}")]
-                if states:
-                    if not matches(states[-1], 1, 0):
-                        raise AssertionError("interactive state differs from the released observation")
-                    record["published_state"] = levels(states[-1])
-                    break
-                wait()
-            qmp.close()
-            qmp = None
-            send("quit")
-            while process.poll() is None:
-                child.pump()
-                select.select(child.readers(), [], [], min(.01, remaining(deadline)))
-            remaining(deadline)
-            child.pump()
-            if process.returncode != 0:
-                raise AssertionError(f"interactive CLI failed: {child.diagnostics()!r}")
+            consumer = NativeCommand(argv, deadline, record, stdin=True)
+            consumer.ready()
+            if gdb is not None:
+                debug = command([str(gdb), "-q", "--batch", str(elf),
+                    "-ex", "set pagination off", "-ex", "set confirm off",
+                    "-ex", f"target remote 127.0.0.1:{port}",
+                    "-ex", "hbreak lesson_step", "-ex", "continue",
+                    "-ex", "info symbol $pc", "-ex", "detach"],
+                    min(deadline, time.monotonic() + 5.0), record.setdefault("gdb", {}))
+                if (debug["returncode"] != 0 or not re.search(
+                        r"Breakpoint [0-9]+,\s+lesson_step\b", debug["stdout"])):
+                    raise AssertionError(f"native GDB did not hit lesson_step: {debug!r}")
+                consumer.send("cont")
+            ordered_sequence(consumer.snapshot, lambda: consumer.send("key press"),
+                             lambda: consumer.send("key release"), consumer.wait, deadline, record)
+            state = consumer.snapshot()
+            if not matches(state, 1, 0):
+                raise AssertionError("interactive state differs from the released observation")
+            record["published_state"] = levels(state)
+            consumer.send("quit")
+            if consumer.finish() != 0:
+                raise AssertionError(f"interactive CLI failed: {consumer.child.diagnostics()!r}")
         except BaseException as error:
             primary = error
             raise
         finally:
-            resources = []
-            if qmp is not None:
-                resources.append(("interactive QMP", qmp.close))
-            if process is not None:
-                resources.extend((("interactive CLI stop", lambda: stop(process)),
-                                  ("interactive stdin", process.stdin.close),
-                                  ("interactive stdout", process.stdout.close),
-                                  ("interactive stderr", process.stderr.close)))
-            cleanup(primary, resources)
-            if child is not None:
-                record.update(child.diagnostics())
-                cleanup(primary, [("interactive reap", lambda: reap_record(process, record))])
-            record["qemu_children"] = list(observed_children.values())
-            record["qemu_identities_gone"] = all(identity(pid) != item
-                for pid, item in observed_children.items())
-            record["external_qmp_removed"] = not qmp_path.exists()
-            if primary is None and (not observed_children or not record["qemu_identities_gone"]
-                                    or not record["external_qmp_removed"]):
-                raise AssertionError("interactive QEMU cleanup incomplete")
+            if consumer is not None:
+                consumer.close(primary)
+                resources = record["resources"]
+                record["qemu_children"] = [{key: row[key] for key in ("pid", "starttime")}
+                                            for row in resources]
+                record["qemu_reaped"] = record["qemu_identity_gone"] = record["cleanup_completed"]
+                record["socket_paths_removed"] = record["cleanup_completed"]
+                record["external_qmp_removed"] = not qmp_path.exists()
+                if primary is None and (len(resources) != 1 or not record["external_qmp_removed"]
+                        or resources[0]["firmware"] != {"path": str(elf), "sha256": sha(elf)}):
+                    raise AssertionError("interactive native ELF/identity/cleanup evidence incomplete")
 
 
 def main():
@@ -345,41 +254,43 @@ def main():
     parser.add_argument("--qemu", type=Path)
     parser.add_argument("--gdb", default=os.environ.get("GDB_ARM"))
     parser.add_argument("--output", required=True, type=Path)
+    parser.add_argument("--sim", type=Path, help="compiled Rust sim executable (or SIM_EXECUTABLE)")
     args = parser.parse_args()
     elfs = {name: regular_file(path, f"{name} lesson ELF") for name, path in (
         ("Debug", args.debug_elf), ("Release", args.release_elf), ("constant-low", args.bad_elf))}
     manifest = regular_file(args.manifest, "teaching scene")
     qemu = resolve_qemu(args.qemu)
+    executable = resolve_sim(args.sim)
     selected = args.gdb or shutil.which("arm-none-eabi-gdb") or shutil.which("gdb-multiarch")
     if selected is None:
         raise ValueError("native ARM GDB is required; use --gdb or GDB_ARM")
     gdb = regular_file(shutil.which(selected) or selected, "ARM GDB", executable=True)
     args.output.mkdir(parents=True, exist_ok=False)
-    protected = {str(path): sha(path) for path in (*elfs.values(), manifest, qemu, gdb)}
+    protected = {str(path): sha(path) for path in (*elfs.values(), manifest, qemu, gdb, executable)}
     report = {"status": "failed", "inputs": protected, "cases": [],
               "limits": ["Digital GPIO/HAL teaching consumer only; no physical calibration.",
                          "Sequential public observations are not a global CPU/peripheral barrier."]}
     code = 1
     try:
         for profile in ("Debug", "Release"):
-            for name, function in (("direct-and-native-gdb", direct), ("simulation-cli", simulation_cli),
+            for name, function in (("interactive-and-native-gdb", direct), ("simulation-cli", simulation_cli),
                                    ("interactive-cli", interactive)):
                 record = {"profile": profile, "case": name, "status": "failed", "stages": []}
                 report["cases"].append(record)
                 if function is direct:
-                    function(elfs[profile], qemu, gdb, record)
+                    function(elfs[profile], qemu, gdb, record, executable)
                 elif function is simulation_cli:
                     directory = args.output / profile
                     directory.mkdir()
-                    function(elfs[profile], qemu, manifest, directory, record)
+                    function(elfs[profile], qemu, manifest, directory, record, executable)
                 else:
-                    function(elfs[profile], qemu, record)
+                    function(elfs[profile], qemu, record, executable)
                 record["status"] = "passed"
         record = {"profile": "constant-low", "case": "same-direct-acceptance",
                   "status": "failed", "stages": []}
         report["cases"].append(record)
         try:
-            direct(elfs["constant-low"], qemu, None, record)
+            direct(elfs["constant-low"], qemu, None, record, executable)
         except StageFailure as error:
             if (error.stage != "pressed" or [item["name"] for item in record["stages"]] != ["initial"]
                     or any(not note.startswith("QEMU stderr tail:\n")
@@ -396,7 +307,7 @@ def main():
         report["cases"].append(record)
         directory = args.output / "constant-low"
         directory.mkdir()
-        simulation_cli(elfs["constant-low"], qemu, manifest, directory, record, expect_failure=True)
+        simulation_cli(elfs["constant-low"], qemu, manifest, directory, record, executable, expect_failure=True)
         record["status"] = "expected-failure"
         if {path: sha(path) for path in protected} != protected:
             raise AssertionError("teaching consumer inputs changed during the gate")

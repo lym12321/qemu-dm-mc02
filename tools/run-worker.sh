@@ -3,28 +3,9 @@ set -Eeuo pipefail
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 root_dir=$(CDPATH= cd -- "$script_dir/.." && pwd)
-engine=null
-
-for ((index = 1; index <= $#; index++)); do
-    argument=${!index}
-    if [[ "$argument" == "--engine" && $((index + 1)) -le $# ]]; then
-        next=$((index + 1))
-        engine=${!next}
-    elif [[ "$argument" == --engine=* ]]; then
-        engine=${argument#--engine=}
-    fi
-done
-
-if [[ "$engine" == "ros2" ]]; then
-    # ROS2 Python packages are supplied by the sourced ROS installation, not
-    # by the uv project environment. The caller should source /opt/ros/... .
-    exec python3 "$root_dir/tools/dm_mc02_sim_worker.py" "$@"
-fi
-
-uv_args=(run --project "$root_dir")
-if [[ "$engine" == "mujoco" ]]; then
-    uv_args+=(--extra mujoco)
-fi
-
-exec uv "${uv_args[@]}" python \
-    "$root_dir/tools/dm_mc02_sim_worker.py" "$@"
+sim_bin=${SIM_EXECUTABLE:-"$root_dir/target/release/sim"}
+[[ -x "$sim_bin" ]] || {
+    printf 'blocked: Rust sim not found: %s (build sim-host with the worker feature)\n' "$sim_bin" >&2
+    exit 1
+}
+exec "$sim_bin" worker "$@"

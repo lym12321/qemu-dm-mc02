@@ -466,6 +466,23 @@ def _run_host_tests(root: Path, jobs: int, report: Path) -> CollectionResult:
     return _result_from_junit(result, junit, required=True)
 
 
+def _run_cargo(root: Path, report: Path) -> CollectionResult:
+    """Cargo owns discovery and execution; total counts this contract command."""
+    result = _run_logged(
+        ["cargo", "test", "--locked", "--workspace", "--features", "sim-host/host-runtime"],
+        cwd=root, log_path=report / "cargo.log", report_root=report,
+    )
+    status = Status.PASS if result.raw_exit == 0 else (
+        Status.BLOCKED if result.raw_exit in (77, 78, 127) else Status.FAIL
+    )
+    return CollectionResult(
+        status=status, required=True, total=1,
+        passed=int(status is Status.PASS), failed=int(status is Status.FAIL),
+        blocked=int(status is Status.BLOCKED), raw_exit=result.raw_exit,
+        duration_seconds=result.duration_seconds, log=result.log, command=result.command,
+    )
+
+
 def _run_pytest(root: Path, report: Path) -> CollectionResult:
     junit = report / "pytest-junit.xml"
     python = root / ".venv" / "bin" / "python"
@@ -711,6 +728,14 @@ def _runner_versions(root: Path, smoke_only: bool) -> dict[str, Any]:
                     "path": shutil.which("ctest"),
                     "version": _command_version(["ctest", "--version"], root),
                 },
+                "cargo": {
+                    "path": shutil.which("cargo"),
+                    "version": _command_version(["cargo", "--version"], root),
+                },
+                "rustc": {
+                    "path": shutil.which("rustc"),
+                    "version": _command_version(["rustc", "--version"], root),
+                },
                 "pytest": {
                     "path": str((root / ".venv" / "bin" / "python").resolve()),
                     "version": _command_version(
@@ -755,7 +780,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--no-build",
         action="store_true",
-        help="consume existing build products without configuring or compiling",
+        help="consume existing native C build products; Cargo checks its Rust test artifacts",
     )
     parser.add_argument(
         "--smoke-only",
@@ -797,7 +822,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     required_commands = ["bash", "python3", "arm-none-eabi-gcc"]
     required_paths = [qemu_binary] if args.no_build or args.smoke_only else []
     if not args.smoke_only:
-        required_commands.extend(["cmake", "ctest"])
+        required_commands.extend(["cmake", "ctest", "cargo", "rustc"])
         required_paths.extend(
             [
                 root / ".venv" / "bin" / "python",
@@ -888,12 +913,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 root, meson_tests, args.jobs, report
             )
             collections["host_ctest"] = _run_host_tests(root, args.jobs, report)
+            collections["cargo"] = _run_cargo(root, report)
             collections["pytest"] = _run_pytest(root, report)
             collections["smoke"] = _run_smokes(root, report)
     else:
         names = ["smoke"] if args.smoke_only else [
             "meson",
             "host_ctest",
+            "cargo",
             "pytest",
             "smoke",
         ]

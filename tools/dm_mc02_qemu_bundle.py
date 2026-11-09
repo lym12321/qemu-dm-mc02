@@ -30,7 +30,7 @@ LICENSE_HASHES = {
 }
 if __package__ in (None, ''):
     sys.path.insert(0, str(ROOT))
-from sim.machines.qemu.qmp import (
+from smoke.support.qmp import (
     CLIENT_COMMIT, CLIENT_SOURCE_FILES, CLIENT_SOURCE_SHA256, CLIENT_VERSION,
 )
 

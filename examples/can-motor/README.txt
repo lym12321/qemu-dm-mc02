@@ -2,12 +2,13 @@ Build and run from the repository root:
 
   cmake -S examples/can-motor -B examples/can-motor/build -DCMAKE_BUILD_TYPE=Debug
   cmake --build examples/can-motor/build
-  sim validate examples/can-motor/scene.yaml
-  sim run examples/can-motor/scene.yaml
+  tools/sim validate examples/can-motor/scene.yaml
+  tools/sim run examples/can-motor/scene.yaml
   bash tools/run-simulation-smoke.sh --case can-motor
 
-Dependencies: Python core installation, CMake, arm-none-eabi-gcc, and the
-project's dm-mc02 QEMU build plus its pinned QMP client. This is one virtual
+Dependencies: the Rust sim CLI built with scene,machine,devices, CMake,
+arm-none-eabi-gcc, and the project's dm-mc02 QEMU build. The optional smoke
+runner uses the Python black-box test dependencies. This is one virtual
 M3508/C620 on one CAN bus. No Robot, four-wheel XML, IMU, trobot or physics
 engine is required. The explicit fixed-rotor plant has position and speed zero.
 
@@ -29,8 +30,8 @@ Feedback-driven rotor variant (the default build above is unchanged):
 
   cmake -S examples/can-motor -B examples/can-motor/build-rotor-loop -DCMAKE_BUILD_TYPE=Debug -DSIM_ROTOR_LOOP_TEST=ON
   cmake --build examples/can-motor/build-rotor-loop
-  sim validate examples/can-motor/rotor-loop.yaml
-  sim run examples/can-motor/rotor-loop.yaml
+  tools/sim validate examples/can-motor/rotor-loop.yaml
+  tools/sim run examples/can-motor/rotor-loop.yaml
   bash tools/run-simulation-smoke.sh --case rotor-loop
 
 SIM_ROTOR_LOOP_TEST defaults to OFF. The variant uses the same board startup,

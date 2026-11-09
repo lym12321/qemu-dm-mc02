@@ -1,0 +1,259 @@
+{
+  "schema": "sim/v1",
+  "runtime": {
+    "quantum": "1000000ns",
+    "duration": "50000000ns"
+  },
+  "nodes": {
+    "east": {
+      "kind": "machine.qemu",
+      "firmware": "/admission/east.elf",
+      "uarts": [
+        "uart1"
+      ]
+    },
+    "east_can": {
+      "kind": "bus.can",
+      "fault_profiles": {
+        "policy0": {
+          "delay_ns": 5000000,
+          "drop": []
+        },
+        "policy1": {
+          "delay_ns": 0,
+          "drop": []
+        },
+        "policy2": {
+          "delay_ns": 0,
+          "drop": [
+            {
+              "source": "east_motor_fl.can",
+              "destination": "east.fdcan1",
+              "can_id": 513
+            }
+          ]
+        }
+      }
+    },
+    "east_motor_fl": {
+      "kind": "device.dji-m3508",
+      "motor_id": 1,
+      "plant": "joint",
+      "joint": "alpha/wheel_fl"
+    },
+    "east_motor_fr": {
+      "kind": "device.dji-m3508",
+      "motor_id": 2,
+      "plant": "joint",
+      "joint": "alpha/wheel_fr"
+    },
+    "east_motor_rl": {
+      "kind": "device.dji-m3508",
+      "motor_id": 3,
+      "plant": "joint",
+      "joint": "alpha/wheel_rl"
+    },
+    "east_motor_rr": {
+      "kind": "device.dji-m3508",
+      "motor_id": 4,
+      "plant": "joint",
+      "joint": "alpha/wheel_rr"
+    },
+    "east_imu": {
+      "kind": "net.imu"
+    },
+    "west": {
+      "kind": "machine.qemu",
+      "firmware": "/admission/west.elf",
+      "uarts": [
+        "uart1"
+      ]
+    },
+    "west_can": {
+      "kind": "bus.can"
+    },
+    "west_motor_fl": {
+      "kind": "device.dji-m3508",
+      "motor_id": 1,
+      "plant": "joint",
+      "joint": "bravo/wheel_fl"
+    },
+    "west_motor_fr": {
+      "kind": "device.dji-m3508",
+      "motor_id": 2,
+      "plant": "joint",
+      "joint": "bravo/wheel_fr"
+    },
+    "west_motor_rl": {
+      "kind": "device.dji-m3508",
+      "motor_id": 3,
+      "plant": "joint",
+      "joint": "bravo/wheel_rl"
+    },
+    "west_motor_rr": {
+      "kind": "device.dji-m3508",
+      "motor_id": 4,
+      "plant": "joint",
+      "joint": "bravo/wheel_rr"
+    },
+    "west_imu": {
+      "kind": "net.imu"
+    },
+    "world": {
+      "kind": "physics.mujoco",
+      "model": "/admission/world.xml",
+      "control": "bound",
+      "joints": {
+        "alpha/wheel_fl": "alpha/drive_fl",
+        "alpha/wheel_fr": "alpha/drive_fr",
+        "alpha/wheel_rl": "alpha/drive_rl",
+        "alpha/wheel_rr": "alpha/drive_rr",
+        "bravo/wheel_fl": "bravo/drive_fl",
+        "bravo/wheel_fr": "bravo/drive_fr",
+        "bravo/wheel_rl": "bravo/drive_rl",
+        "bravo/wheel_rr": "bravo/drive_rr"
+      },
+      "imus": {
+        "east": [
+          "alpha/imu_gyro",
+          "alpha/imu_accel"
+        ],
+        "west": [
+          "bravo/imu_gyro",
+          "bravo/imu_accel"
+        ]
+      }
+    }
+  },
+  "links": [
+    [
+      "east.fdcan1",
+      "east_can.can"
+    ],
+    [
+      "east_motor_fl.can",
+      "east_can.can"
+    ],
+    [
+      "east_motor_fl.joint",
+      "world.drives"
+    ],
+    [
+      "east_motor_fr.can",
+      "east_can.can"
+    ],
+    [
+      "east_motor_fr.joint",
+      "world.drives"
+    ],
+    [
+      "east_motor_rl.can",
+      "east_can.can"
+    ],
+    [
+      "east_motor_rl.joint",
+      "world.drives"
+    ],
+    [
+      "east_motor_rr.can",
+      "east_can.can"
+    ],
+    [
+      "east_motor_rr.joint",
+      "world.drives"
+    ],
+    [
+      "world.imu.east",
+      "east_imu.signal"
+    ],
+    [
+      "east.imu",
+      "east_imu.signal"
+    ],
+    [
+      "west.fdcan1",
+      "west_can.can"
+    ],
+    [
+      "west_motor_fl.can",
+      "west_can.can"
+    ],
+    [
+      "west_motor_fl.joint",
+      "world.drives"
+    ],
+    [
+      "west_motor_fr.can",
+      "west_can.can"
+    ],
+    [
+      "west_motor_fr.joint",
+      "world.drives"
+    ],
+    [
+      "west_motor_rl.can",
+      "west_can.can"
+    ],
+    [
+      "west_motor_rl.joint",
+      "world.drives"
+    ],
+    [
+      "west_motor_rr.can",
+      "west_can.can"
+    ],
+    [
+      "west_motor_rr.joint",
+      "world.drives"
+    ],
+    [
+      "world.imu.west",
+      "west_imu.signal"
+    ],
+    [
+      "west.imu",
+      "west_imu.signal"
+    ]
+  ],
+  "experiment": {
+    "ready": [
+      {
+        "name": "east",
+        "endpoint": "east.uart1",
+        "text": "FIRST"
+      },
+      {
+        "name": "west",
+        "endpoint": "west.uart1",
+        "text": "SECOND"
+      }
+    ],
+    "inputs": [
+      {
+        "at": "0ns",
+        "endpoint": "east_can.fault",
+        "value": "policy0",
+        "origin": "session"
+      },
+      {
+        "at": "25000000ns",
+        "endpoint": "east_can.fault",
+        "value": "policy1",
+        "origin": "session"
+      },
+      {
+        "at": "25000000ns",
+        "endpoint": "east_can.fault",
+        "value": "policy2",
+        "origin": "session"
+      },
+      {
+        "at": "35000000ns",
+        "endpoint": "east_can.fault",
+        "value": "policy1",
+        "origin": "session"
+      }
+    ],
+    "assertions": []
+  }
+}

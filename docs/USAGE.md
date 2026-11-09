@@ -1,21 +1,17 @@
 # DM-MC02 QEMU 使用手册
 
-项目以真实 MCU ELF 为输入，用一个 `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
+项目以真实 MCU ELF 为输入，用一个 Rust `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
 当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
-Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 MuJoCo。
-独立下载包面向 Windows x86_64 和 Ubuntu 24.04+ x86_64 的固件终端/GDB 监听，
-无需安装 Python；每包附有该平台的 `smoke.json`。
-完整 Simulation、Lab 和 SocketCAN 使用 Linux 或 WSL2 的源码安装。
+产品运行不需要 Python。QEMU、MuJoCo、Gazebo 和 ROS 2 保留原生实现；Python 仅用于构建和独立测试驱动。
+Windows 产品提供固件终端/GDB；完整场景、Lab/Web、worker 和 SocketCAN 面向 Linux 或 WSL2。
 
 下载包命令从解压目录执行；源码命令默认从仓库根目录执行。按需要阅读：
 
 - [安装](#installation)、[原生构建](#build)与[直接运行 ELF](#native-debug)
-- [sim/v1 场景与唯一运行时](#simulation)
-- [互连与精度](#connections)
-- [有限实验、时间线与离线复核](#experiments)
-- [四轮与多板应用预设](#application-presets)
-- [HAL 教学](#hal-teaching)与[保留的交互 Lab](#virtual-lab)
-- [原生调试与接口](#native-debug)、[外部 worker](#external-simulation-worker)
+- [sim/v1 场景与 Rust API](#simulation)、[互连与精度](#connections)
+- [有限实验与离线复核](#experiments)、[应用预设](#application-presets)
+- [HAL 教学](#hal-teaching)、[交互 Lab](#virtual-lab)与[Web Lab](#web-lab)
+- [原生接口](#native-debug)、[外部 worker](#external-simulation-worker)
 - [验证与性能](#testing-and-performance)、[故障排查](#troubleshooting)
 
 <a id="installation"></a>
@@ -24,123 +20,106 @@ Python 3.11+ 核心、静态场景校验和纯 Python 设备不要求 QEMU 或 M
 
 ### 下载原生包
 
-普通固件运行无需安装 Python、Nix、pip 或本地编译。登录 GitHub，打开
-[Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
-选择 `refactor/composable-platform` 分支的运行记录，在页面底部 **Artifacts** 下载对应包：
+登录 GitHub，打开 [Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
+在所选运行记录底部的 **Artifacts** 下载。包保留 30 天。
 
-| Artifact | 宿主与范围 |
+| Artifact | 平台与范围 |
 | --- | --- |
-| `dm-mc02-windows-x86_64` | Windows x86_64，固件终端和从复位暂停的原生 GDB 监听 |
-| `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64，固件终端和从复位暂停的原生 GDB 监听 |
+| `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端及从复位暂停的原生 GDB 监听 |
+| `dm-mc02-linux-firmware-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，轻量固件入口 |
+| `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，完整场景、Lab/Web、worker、MuJoCo/Gazebo/ROS 2 |
 
-Artifacts 保留 30 天，下载需要 GitHub 登录。CI 要求该平台门成功后才上传；
-平台可用性以所下载运行记录及随包的 `smoke.json` 为准。报告记录实际示例固件 UART、
-monitor 退出及从复位暂停的 GDB 端口，不代表 Windows 完整 Simulation/Lab 或实板校准。
+Linux Artifact 外层解开后，使用 `tar -xzf` 解开内层 tar.gz；它保留可执行权限和插件符号链接。
+Windows ZIP 直接解压。运行已有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
 
-解压后包括：
-
-| 路径 | 内容 |
-| --- | --- |
-| `sim` 或 `sim.exe` | Rust 原生固件 CLI，不携带 Python |
-| `bin/qemu-system-arm` 或 `bin/qemu-system-arm.exe` | CLI 使用的唯一 QEMU；Windows 同目录带所需 DLL，也可直接诊断 |
-| `example.elf` | 已编译的 minimal-board 固件 |
-| `smoke.json` | 该包的固件运行与清理报告 |
-| `provenance.json` | 构建来源、版本和文件哈希 |
-| `sources/`、`licenses/` | 对应源码归档、QEMU 及运行库许可证 |
-
-运行现有 ELF 不需要 ARM 编译器，源码断点调试另装 ARM GDB。
-启动直接使用发行目录中的文件，不解包临时可执行文件。
-Linux 仍需系统 GLib/zlib；精简 Ubuntu 环境可用
-`sudo apt-get install -y libglib2.0-0t64 zlib1g` 安装。
-
-Windows PowerShell，在解压目录执行：
+Windows PowerShell：
 
 ```powershell
 .\sim.exe firmware .\example.elf
-# 从复位暂停，监听 127.0.0.1:1234：
 .\sim.exe firmware .\example.elf --debug
 ```
 
-Ubuntu 24.04+ x86_64：
+Linux，在解压目录执行：
 
 ```bash
-chmod +x sim bin/qemu-system-arm
 ./sim firmware example.elf
-# 从复位暂停，监听 127.0.0.1:1234：
 ./sim firmware example.elf --debug
 ```
 
-Actions ZIP 不保留 Linux 执行权限，因此解压后需运行 `chmod`。
-把 `example.elf` 替换为自己的 DM-MC02 ELF。完整 Simulation、Lab、SocketCAN
-请在 Linux 或 WSL2 中使用下述源码安装。
+将 `example.elf` 替换为自己的 DM-MC02 ELF。`--debug` 从复位暂停并监听 `127.0.0.1:1234`。
+CLI 直接使用相邻 `bin/` 中的 QEMU，不解包临时可执行文件。
+轻量 Linux 包需要系统 `libglib2.0-0t64 zlib1g`。
+完整 Linux 包带 `lib/` 原生依赖、`plugins/` 相对符号链接、Gazebo/SDF/ament 资源、官方 ROS bridge、
+`runtime-env.json`、`native-runtime.json`、来源哈希、对应源码和许可证；宿主提供 glibc≥2.39、
+Linux pidfd 及 EGL/GLVND/Mesa 或显卡厂商驱动。运行不需要安装 Python 或物理 SDK。
+本地完整运行时约 351.8 MiB，源码另占约 141.4 MiB；这是完整原生功能的成本。
 
-### 从源码安装
+Actions [42501982549](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42501982549)
+通过的是轻量固件产品。新的完整 Linux 工作流尚未执行；本地开发包已通过 SDK 路径隐藏、
+checkout 外和空应用 PATH 下的原生 MuJoCo/Ogre2/ROS、实际固件/GDB、场景/MCAP 重放验收。
+平台可用性以所选 Actions 记录和随包报告为准；这些门不证明 Windows 完整宿主功能或实板校准。
 
-Rust 固件入口使用 `rust-toolchain.toml` 固定的工具链，依赖由 Cargo.lock 锁定：
+### 从源码构建
+
+工具链由 `rust-toolchain.toml` 固定，Rust 依赖由 Cargo.lock 锁定：
+
+```bash
+git clone --branch refactor/composable-platform https://github.com/lym12321/qemu-dm-mc02.git
+cd qemu-dm-mc02
+git submodule update --init --depth 1 qemu/upstream
+cargo build --release --locked -p sim-host --features host-runtime
+export PATH="$PWD/target/release:$PATH"
+sim --help
+sim validate examples/can-faults/host-only.yaml
+sim run examples/can-faults/host-only.yaml --report build/host-only.json
+```
+
+该三端点 CAN 实验无固件或求解器，验证延迟、定向丢帧及恢复。真实固件另按
+[Ubuntu](#ubuntu)或可选 [Nix](#nix) 环境构建 QEMU 与 ARM ELF。
+源码构建后，`firmware` 与 Lab 需显式 `--qemu` 或设置
+`export QEMU_SYSTEM_ARM="$PWD/build/qemu/qemu-system-arm"`；打包产品自动使用相邻 `bin/`。
+Cargo 的产品选择如下：
+
+| features | 用途 |
+| --- | --- |
+| 默认 | 轻量 `sim firmware`，支持 Linux/Windows |
+| `scene` | YAML 准入、Host 场景与唯一 Simulation |
+| `host-runtime` | 场景、trace、machine、Lab/Web、worker、设备、裁判、SocketCAN、显式上位机进程 |
+| `mujoco` | MuJoCo 3.12.0，使用成熟的 mujoco-rs 绑定 |
+| `gazebo` / `gazebo-rendering` | 原生 Gazebo CXX 接口 / Ogre2 相机与 LiDAR |
+| `ros2` | 原生 ROS 2 CXX transport |
+| `linux-runtime` | `host-runtime` 加全部上述原生物理/ROS 功能 |
+
+仅固件入口：
 
 ```bash
 cargo build --release --locked -p sim-host
 target/release/sim firmware path/to/app.elf --qemu build/qemu/qemu-system-arm
 ```
 
-当前 Rust CLI 只提供 `firmware`。自动场景、Lab 与物理后端继续按边界迁移；下面的源码安装供这些功能使用。
-
-开发、构建新固件和自动场景使用源码 checkout；默认按 [Ubuntu 系统依赖](#ubuntu)准备，
-[Nix](#nix) 是可选的固定环境。
+完整 Linux 构建需先安装 `.github/workflows/native-packages.yml` 列出的 Ubuntu/ROS Jazzy SDK 依赖：
 
 ```bash
-git clone --branch refactor/composable-platform https://github.com/lym12321/qemu-dm-mc02.git
-cd qemu-dm-mc02
-python3 -m venv .venv
-. .venv/bin/activate
-python -m pip install -e .
-sim --help
-sim validate examples/can-faults/host-only.yaml
-sim run examples/can-faults/host-only.yaml --report build/host-only.json
+bash tools/build-linux-sdk.sh
+bash tools/build-linux-runtime.sh
 ```
 
-这个三端点 CAN 实验没有固件或物理求解器，验证延迟、定向丢帧及恢复；不能作为原生后端证据。
-基础安装只依赖锁定的 PyYAML。可选依赖分别安装：
+SDK 脚本固定 Gazebo Sim 8.15.0、禁用其 Python 绑定，并固定 MuJoCo 3.12.0。
+`DM_GAZEBO_PREFIX`、`DM_ROS_PREFIX`、`DM_MUJOCO_PREFIX` 可选择原生 SDK 位置；
+构建 helper 设置 Cargo/C++ 所需路径，产物仍是 Rust 可执行文件。
+Python 开发依赖只安装到[独立测试环境](#test-environment)，不再使用项目 pip 安装或运行时 extras。
 
-```bash
-python -m pip install '.[mujoco]'       # 原生 MuJoCo 世界
-python -m pip install '.[trace]'        # MCAP 记录与离线复核
-python -m pip install '.[referee]'      # 固定版本裁判协议 fixture
-```
+### 原生后端与 QMP
 
-开发测试使用 `uv sync --locked --group dev`；需要哪种可选后端，再添加对应 `--extra`。
-`sim --help`、`sim validate` 不加载 QMP client、物理求解器、MCAP 或裁判 CRC 库。
+可使用下载包，或[初始化固定子模块并构建](#get-the-source)项目 QEMU。
+QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、发行目录 `bin/`；源码场景还能通过
+`--backend-root` 定位 checkout 的 `build/qemu/qemu-system-arm`。普通系统 QEMU 没有本项目板卡。
 
-### 原生后端与可安装 QMP client
-
-可使用上面的原生包，或[初始化子模块并构建](#get-the-source)项目 QEMU，再构建所需 ELF。
-直接终端/GDB 运行使用 `sim firmware app.elf`，不需要 YAML、Python QMP client 或 MuJoCo；
-完整参数见[原生固件入口](#native-debug)。QEMU 选择顺序为 `--qemu`、`QEMU_SYSTEM_ARM`、
-Rust 发行目录 `bin/` 中的 QEMU；Python 源码入口默认使用 checkout 中的 `build/qemu/qemu-system-arm`。
-普通系统 QEMU 没有本项目板卡，不能替代。
-
-`sim run scene.yaml` 的原生场景后端另外要求固定的 QMP client、
-`x-run-to-virtual-time`、`x-query-virtual-execution` 及 CAN execution QOM 能力；不满足会明确报错。
-静态校验不会启动它们，也不证明 ELF 或二进制可运行。
-
-从当前固定子模块构建完整的上游 Python distribution 与许可证：
-
-```bash
-uv venv build/qmp-package-env --python 3.11
-uv pip install --python build/qmp-package-env/bin/python setuptools==75.8.0 wheel==0.45.1
-python tools/dm_mc02_qemu_bundle.py build --python build/qmp-package-env/bin/python --output build/qemu-bundle
-python tools/dm_mc02_qemu_bundle.py verify build/qemu-bundle
-uv pip install --python .venv/bin/python build/qemu-bundle/python/qemu-*.whl
-```
-
-输出目录必须不存在。运行时使用安装包的版本和源码指纹，不从 checkout 偷加载 QMP，
-不复制私有 client，也不接受任意同名 PyPI 包。显式给出兼容二进制后可在 checkout 外运行；
-`--backend-root` 只帮助寻找默认二进制。fork 升级须同步 client 来源并重跑原生合同。
-
-可用 `--qemu BIN --binary-provenance FILE` 把二进制装入 bundle；provenance 要求
-`schema: dm-mc02/qemu-binary/1`、固定 `source_commit` 和实际 `sha256`。
-bundle 保存调用者提供的来源、字节哈希、命令和许可证；动态运行库由部署环境提供，
-来源清单不代替原生验收。
+`sim run scene.yaml` 的原生后端通过 Rust QAPI client 使用固定 QMP schema，要求
+`x-run-to-virtual-time`、`x-query-virtual-execution` 与 CAN execution QOM 能力；缺失会报错。
+`sim validate` 不启动进程或求解器，也不证明 ELF 可运行。生产运行不需要安装 Python QMP client。
+保留的 Python QMP client 仅供独立原生测试，从固定的 `qemu/upstream/python` 安装，
+不接受任意同名 PyPI client，也不从测试结果推导新的原生能力。
 
 <a id="simulation"></a>
 
@@ -186,28 +165,39 @@ links:
 实验因增加一个无资源观察节点，最多接收 63 个用户节点。`validate` 不创建进程、socket 或求解器。
 机器描述只检查固件路径形式；文件存在且可读的检查在执行准入时完成，早于端口附着和原生进程启动。
 
-Python API 与 CLI 共用 Factory admission 和执行路径：
+Rust API 与 CLI 共用 `config::scene::load_scene` 和 `Scene::simulation`：
 
-```python
-from sim.composition import builtin_registry
-from sim.config.scene import load_scene
-from sim.runtime import Simulation
+```rust
+use sim_core::SimulationOptions;
+use sim_host::config::scene::load_scene;
 
-registry = builtin_registry()
-scene = load_scene("examples/minimal-board/scene.yaml", registry)
-with Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
-                on_event=lambda event: print(event.kind, event.mapped_time_ns)) as simulation:
-    simulation.schedule_input("main.key", True, at_ns=40_000_000)
-    simulation.schedule_input("main.key", False, at_ns=90_000_000)
-    simulation.run_until(scene.duration_ns)
+fn main() -> sim_core::Result<()> {
+    let scene = load_scene("examples/minimal-board/scene.yaml")
+        .map_err(|error| std::sync::Arc::new(error) as sim_core::Failure)?;
+    let mut simulation = scene.simulation(SimulationOptions::default())?;
+    let execution: sim_core::Result<()> = (|| {
+        simulation.start(None)?;
+        simulation.run_until(scene.duration_ns, None)?;
+        Ok(())
+    })();
+    let cleanup = simulation.close();
+    for note in simulation.failure_notes() {
+        eprintln!("{note}");
+    }
+    execution.and(cleanup)
+}
 ```
 
-显式 Registry 注册 Factory；不自动发现或导入配置里的 Python 路径。
-`describe(spec)` 返回纯 `NodeDescription`/`PortSpec`，`create(spec, context)` 才取得资源。
-`context.attach(port, endpoint)` 借用连接 Owner 的协议句柄；设备不拥有总线、机器或其它节点。
-连接、binding owner、其它组件按组构建，组内保留声明顺序，循环资源依赖提前拒绝。
-`QemuFactory(profile=...)` 注入板级端口、输入规则和外设 adapter；Backend 独占进程、QMP、
-socket 和 CPU request/finish，Profile 不能推进 CPU。Fake Profile 只证明接口合同，不代表第二颗 MCU。
+无原生依赖的完整 API 示例可直接编译运行：
+
+```bash
+cargo run --locked -p sim-host --features simulation --example host_can
+```
+
+通用调度合同由 `sim-core` 拥有，具体配置和 adapter 由 `sim-host` 提供。
+配置不动态导入代码；Factory 的纯描述先于资源创建，设备借用连接 owner 的协议句柄。
+QEMU Backend 独占进程、QMP、socket 和 CPU request/finish，板级 Profile 不推进 CPU。
+Fake Profile 只证明接口合同，不代表第二颗 MCU。
 
 Machine 完成采样及同步观察回调后，Backend 重新核验本次目标、原生时间、执行状态与暂停状态，
 通过后才提交 Machine 完成时间。回调期间原生目标发生变化会使当前 Simulation 失败，已产生的输出保留。
@@ -244,9 +234,9 @@ UART 使用读取后的完成态上界；`can-input-processed` 仅表示原生 t
 健康暂停态 `reset()` 重建 owned 组件并递增 session，host 总期限不重新计时；失败态应关闭并新建。
 `close()` 独立清理资源并保留主错误与辅助诊断；只有清理完成才发布成功。
 
-嵌入已有会话可传 `initial_session=Session(id, origin_ns)`。借用有限绝对 host deadline 时，
-`start` 和后续每次 `step/run_until/reset` 都须显式传 `deadline_monotonic`。
-同步第三方调用无法由 Python 抢占，组件必须遵守借用期限。
+嵌入已有会话可通过 `SimulationOptions::initial_session` 提供 `Session`。借用有限绝对 host deadline 时，
+`start` 和后续每次 `step/run_until/reset` 都须显式传入同一期限。
+同步原生第三方调用没有抢占保证，组件必须遵守借用期限。
 
 `runtime.mode: interactive` 使用同一切点，支持 `run`、`pause`、`step 1ms`、`state`、
 `inject main.key true`、`inject main.uart1 "text"`、`reset`、`quit`。
@@ -296,11 +286,11 @@ DM-MC02 的 UART5 只引出遥控器 RX。机器配置 `remote: true` 暴露专�
 不重放部分交付。close 不关闭借用的源和接收端。
 
 ```bash
-python examples/edge-events/main.py
-python -m pytest -q tests/test_edge_fabric.py
+cargo run --release --locked -p sim-host --features simulation --example edge_events
+cargo test --locked -p sim-host --features simulation --test edge
 ```
 
-示例的纯 Python 源在同一1ms区间产生四次翻转（含相邻及同时间事件），全部在完成切点有序交付。
+示例的 Rust 事件源在同一1ms区间产生四次翻转（含相邻及同时间事件），全部在完成切点有序交付。
 当前 QEMU 仅公开完成态 GPIO 快照，没有可信原生边沿通道，因此不提供 GPIO `event-output`；
 原生边沿验收为 BLOCKED，需先增加并独立验证 QEMU 观察 hook。
 电气网络、开漏争用、PWM 负载和 GPIO bit-banging 均不在此能力内。
@@ -309,8 +299,8 @@ python -m pytest -q tests/test_edge_fabric.py
 
 `physics.mujoco` 将具名原生世界作为独立 step 节点接入同一 Simulation。
 `model` 路径相对场景目录解析，`joints` 将关节名映射到执行器名。
-配置校验无需加载原生包；执行需要锁定的 `mujoco` extra。
-[双关节示例](../examples/shared-world/README.md)提供 CLI 和 Python 使用命令。
+配置校验无需加载原生包；执行需要编译 `mujoco` feature 并提供 MuJoCo 3.12.0 原生库。
+[双关节示例](../examples/shared-world/README.md)提供 CLI 和 Rust example 命令。
 
 `world.effort` 接收非空的 `{关节名: 转矩Nm}` 映射，整批校验后才写入控制量。
 部分更新保留其他关节的控制，reset 重建世界并清零。
@@ -323,7 +313,7 @@ python -m pytest -q tests/test_edge_fabric.py
 并禁用外部 effort 输入。公共 `JointDriveBinding`/`JointDrivePlan` 使用 joint SI 转矩与
 有效截止时间；世界收齐全部计划后按所有 expiry 分段，每段写齐控制并只推进一次原生求解器。
 全部目标状态通过校验后才完成反馈。设备 adapter 负责协议、齿轮换算与命令时效，不能推进世界。
-`python examples/shared-world/mixed_drivers.py` 演示同一双关节世界中的 M3508 与独立理想转矩驱动器，
+`cargo run --release --locked -p sim-host --features simulation,mujoco,devices --example mixed_drivers` 演示同一双关节世界中的 M3508 与独立理想转矩驱动器，
 分别在3ms、7ms到期；扩展驱动器只需显式注册 Factory，不修改世界的类型分支。
 M3508 默认理想减速比为3591/187，可用正数 `gear_ratio` 显式替换，不模拟效率、背隙或转子惯量。
 
@@ -387,12 +377,12 @@ experiment:
 每条总线最多声明 16 个策略，所有策略合计最多 64 条丢弃规则。策略名遵循节点名的 ASCII
 identifier 规则，`normal` 是保留的恢复名称。策略可省略 `delay_ns` 或 `drop`，分别使用
 总线初始延迟和空规则；每次切换都完整替换声明式策略。健康 Simulation reset 后也恢复初始状态。
-Python 中同样使用 `simulation.schedule_input("can0.fault", "receive_loss", at_ns=...)`。
+Rust API 使用 `HostInput::FaultProfile`，通过同一 `schedule_input` 队列调度。
 
 规则只接受 `source`、`destination` 和 `can_id`，至少指定一项；同一规则内取“且”，多条规则取“或”。
 端点必须实际连接在该总线上，未知或跨总线端点在静态校验时拒绝。`can_id` 精确比较数值 ID，
 不区分相同数值的标准帧和扩展帧，也不改写 flags、DLC 或数据。`fault` 是外部控制端口，不能接内部连线。
-原有 Python drop callback 继续逐目标执行一次，与声明式规则取“或”；`normal` 不撤销该 callback。
+显式 CAN drop callback 继续逐目标执行一次，与声明式规则取“或”；`normal` 不撤销该 callback。
 
 时间语义沿用总线合同：延迟只影响切换之后入队的帧，已经排队的 due time 不变；后发帧可能先到。
 丢弃在 dispatch 时判断，所以切换也会影响尚未交付的旧 pending。相同时刻外部输入按声明/入队顺序执行，
@@ -426,8 +416,8 @@ bash tools/run-simulation-smoke.sh --case can-faults --build-type Release --qemu
 
 ## 有限实验与观察
 
-`sim.apps.experiment.run_experiment` 使用同一个 Simulation 的输入队列、公开 Event 和纯断言 evaluator。
-公共解析和求值由 `sim.testing` 唯一拥有；调用者提供端口准入，在线运行与离线复核使用相同匹配规则。
+`sim_host::apps::experiment::run_experiment` 使用同一个 Simulation 的输入队列、公开 Event 和纯断言 evaluator。
+公共解析和求值由 `sim_host::config` / `sim_host::assertions` 拥有；调用者提供端口准入，在线运行与离线复核使用相同匹配规则。
 单板、外设、多机器均可使用 `experiment`，输入与断言各最多 1024 项：
 
 ```yaml
@@ -464,15 +454,12 @@ UART 跨块匹配只保留必要后缀；仅下界质量不能证明严格截止
 完整时间质量，以及各 Machine 的 native epoch、首末 source/mapped 时间和 snapshot 批次数。
 这些字段描述真实捕获，不把 CPU 暂停、传输交付或输入接受合并为固件消费保证。
 
-Python 可传 `ExperimentInput(at_ns, endpoint, payload, origin="ready")` 和
-`ready=(ExperimentReady(name, endpoint, text), ...)`；文件与 Python 值共用纯准入。
-`on_cut(cut_ns, simulation)` 借用源采样之后、目标交付之前的现有观察点，可向同一队列
-排定当前切点输入；不能重入 step/run/reset/close，也不能声称当前交付已完成。
-初始采样在 NEW 状态，不能从该回调注入。回调错误终止当前执行并清理。
+Rust 的 `ExperimentInput`、`ReadyMarker` 与 `Origin` 位于 `sim_host::config::scene`；
+CLI 与 Rust API 共用纯准入和实验消费者。运行现有编译示例：
 
 ```bash
-python examples/experiment/main.py --qemu build/qemu/qemu-system-arm \
-  --firmware examples/minimal-board/build/firmware.elf
+cargo run --release --locked -p sim-host --features scene,machine --example experiment -- \
+  --qemu build/qemu/qemu-system-arm --firmware examples/minimal-board/build/firmware.elf
 ```
 
 <a id="experiment-recording"></a>
@@ -485,7 +472,7 @@ sim replay observations.mcap --report offline.json
 sim replay observations.mcap --assertions assertions.yaml --report revised.json
 ```
 
-需要 `trace` extra。`sim/experiment/2` 记录原输入声明、命名 ready、断言时间线、时长、公开能力、
+需要构建 `trace` feature（`host-runtime` 已包含）。`sim/experiment/2` 记录原输入声明、命名 ready、断言时间线、时长、公开能力、
 每个 Event 原始 source/mapped/delivery/quality、空切点和 snapshot 批次；清理完成后写结束记录。
 无需 ELF、原场景、Factory、QEMU 或求解器即可复核。替换文件只有一个 `assertions` 列表，
 沿用相同 endpoint、origin、before 和断言语法，不能为未记录能力制造观察。
@@ -494,38 +481,42 @@ sim replay observations.mcap --assertions assertions.yaml --report revised.json
 并与结束记录核对；单遍读取完整校验 MCAP CRC/footer/EOF 和计数后才返回结果。
 离线只重新评估捕获观察，**不会重跑固件、输入或物理演化**，也不认证文件作者或硬件真实性。
 
-Python 使用借用的 binary stream：`run_experiment(..., trace=output)` 与
-`replay_experiment(source, assertions=None)` 返回同一 `ExperimentResult`。
-输入只需阻塞式 `read(size)`，从 MCAP 文件头读到 EOF；无需 seek/tell，函数不关闭借用流。
+Rust 使用 `sim_host::apps::recording::{run_recorded, replay_experiment}`，
+通过标准 `Read` / `Write` 接口记录或复核。复核从 MCAP 文件头读到 EOF，无需 seek；
 CLI 排他创建 trace/report，不覆盖已有文件。失败断言也可得到完整记录；执行、清理、
 写入或晚期 flush/close 错误均不发布成功，已发生 I/O 不回滚。
 
-MCAP 固定 1.5.0；typed 配置上限 8 MiB，按 32 KiB 分段，其它单记录上限 64 KiB；
+Rust MCAP reader/writer 使用锁定的 `mcap 0.26.0`，独立测试消费者使用 Python `mcap 1.5.0`；typed 配置上限 8 MiB，按 32 KiB 分段，其它单记录上限 64 KiB；
 嵌套最多 32 层、整数最多 256bit，时间遵循 uint64 ns。bytes、CAN/IMU/JointState 显式编码，
-不使用 pickle 或动态导入。首版只支持单 session 的有限 stepped 实验，不支持 reset/interactive 录制。
+不使用对象反序列化或动态导入。首版只支持单 session 的有限 stepped 实验，不支持 reset/interactive 录制。
 
 <a id="application-presets"></a>
 
 ## 四轮与多板应用预设
 
 Robot/Arena/Scenario 的有限运行已经表达为普通 sim/v1 图；不再提供独立 schema1、专用 CLI 或运行时。
-`sim.apps.presets` 只构造数据，不取得资源或推进时间：
+`sim_host::apps::presets` 只构造数据，不取得资源或推进时间：
 
-```python
-from pathlib import Path
-import yaml
-from sim.apps.presets import four_wheel_document, add_can_faults
+```rust
+use sim_host::apps::presets::{four_wheel_document, add_can_faults, CanFault, FourWheelOptions};
+use std::{collections::BTreeMap, path::PathBuf};
 
-scene = four_wheel_document(
-    {"west": Path("west.elf"), "east": Path("east.elf")},
-    Path("models/two_four_wheel.xml"),
-    ready={"west": "WEST_READY", "east": "EAST_READY"}, duration="1s",
-    assertions=[{"origin": "session", "before": "300ms",
-                 "uart_contains": {"endpoint": "west.uart1", "text": "WEST_READY"}}],
-)
-add_can_faults(scene, "west", delays=((0, 5_000_000), (250_000_000, 0)),
-               feedback=((300_000_000, 1, False), (400_000_000, 1, True)))
-Path("scene.yaml").write_text(yaml.safe_dump(scene, sort_keys=False))
+let mut document = four_wheel_document(FourWheelOptions {
+    firmwares: vec![("west".into(), PathBuf::from("west.elf")),
+                    ("east".into(), PathBuf::from("east.elf"))],
+    model: PathBuf::from("models/two_four_wheel.xml"),
+    ready: BTreeMap::from([("west".into(), "WEST_READY".into()),
+                          ("east".into(), "EAST_READY".into())]),
+    referees: BTreeMap::new(), duration_ns: 1_000_000_000, quantum_ns: 1_000_000,
+    imus: true, inputs: vec![], assertions: vec![],
+})?;
+add_can_faults(&mut document, "west", vec![
+    (0, CanFault::Delay(5_000_000)), (250_000_000, CanFault::Delay(0)),
+    (300_000_000, CanFault::Feedback { motor_id: 1, enabled: false }),
+    (400_000_000, CanFault::Feedback { motor_id: 1, enabled: true }),
+])?;
+// JSON 也是合法 YAML，直接写入普通 sim/v1 配置。
+std::fs::write("scene.yaml", serde_json::to_vec_pretty(&document)?)?;
 ```
 
 将 ELF 和 ready 文本替换为实际固件值，再运行 `sim validate scene.yaml`、`sim run scene.yaml`。
@@ -543,8 +534,9 @@ PYTHON=.venv/bin/python bash tools/run-qemu-shared-world-smoke.sh --cli
 PYTHON=.venv/bin/python bash tools/run-qemu-shared-world-smoke.sh --can-deadlines
 ```
 
-`--peer-exit`、`--reset`、`--upper-exit`、`--interrupt` 分别检查失败冻结和独立清理。
-缺依赖的这个可选 shell gate 返回 77 并输出 BLOCKED；不能按退出 0 的通过结果统计。
+`--multi-cut` 验证公开 400µs 切点；`--peer-exit`、`--reset`、`--upper-exit`、`--interrupt`
+原私有 Python 注入入口已移除，其失败冻结/清理由 Rust machine/process/physics 门验证。
+缺依赖须按脚本的非零 BLOCKED/SKIP 状态记录，不能统计为 PASS。
 真实裁判与 DJI consumer 使用后文专用固件门，普通共享世界门不能替代其消费证据。
 
 ### 显式可信的上位机程序
@@ -560,9 +552,9 @@ nodes:
 ```
 
 `sim validate` 只准入命令；运行必须显式 `sim run scene.yaml --allow-host-processes`。
-Python 同样需 `builtin_registry(allow_host_processes=True)`。配置可执行本机程序，
+Rust API 也必须显式设置该节点的 `allow_launch`。配置可执行本机程序，
 此选择只用于可信场景；不可信 ELF/manifest 的隔离属于外部沙箱系统。
-argv 使用 `shell=False`，不展开 shell；工作目录是场景目录，程序在准入时解析为绝对路径。
+argv 作为字面参数直接交给原生进程，不展开 shell；工作目录是场景目录，程序在准入时解析为绝对路径。
 最多 8 个子进程、每个 128 个参数、每参数 4096 UTF-8 bytes、总计 16 KiB（含终止符）。
 Simulation 检查子进程和 host deadline；任何提前退出，包括退出码 0，均失败。
 stdout/stderr 有界采样尾部各最多 12000 bytes，持续输出可能背压。
@@ -585,7 +577,7 @@ stdout/stderr 有界采样尾部各最多 12000 bytes，持续输出可能背压
 节点 `initial` 要求 `game/robot/power_heat/buff` 四组全部字段，`durations` 显式给出
 `countdown_s/battle_s`；可选 `events` 使用 `{offset_ns, hit|shot|game|robot|power_heat|buff}`。
 事件以 reset 相对时间非递减排列，同刻保持顺序；最多 1024 项。typed 编码与状态引擎位于
-`sim.devices.referee`，固定 RoboMaster 2026 V1.1.0 的 0001/0201/0202/0204，使用同一 CRC 封装。
+`sim_host::devices::referee`，固定 RoboMaster 2026 V1.1.0 的 0001/0201/0202/0204，使用同一 CRC 封装。
 当前 0206 固件结构不匹配而保持未支持，不填充字节掩盖差异；不支持官方各命令独立发送周期、
 自动命中裁决、增益叠加、过热扣血或功率惩罚。toy 世界与规则均不作实物标定声明。
 
@@ -597,17 +589,20 @@ stdout/stderr 有界采样尾部各最多 12000 bytes，持续输出可能背压
 
 #### 纯裁判编码
 
-```python
-from sim.devices.referee import encode_frame, decode_frame, encode_message, GameStatus
+```rust
+use sim_host::devices::referee::{encode_frame, decode_frame, encode_message, GameStatus};
 
-wire = encode_message(GameStatus(1, 4, 300, 0), sequence=7)
-assert decode_frame(wire).command_id == 0x0001
-wire = encode_frame(command_id=0x0201, payload=b"opaque", sequence=0)
+let message = GameStatus {
+    game_type: 1, game_progress: 4, stage_remain_time: 300, sync_timestamp: 0,
+};
+let wire = encode_message(message.into(), 7)?;
+assert_eq!(decode_frame(&wire)?.command_id, 0x0001);
+let opaque = encode_frame(0x0201, b"opaque", 0)?;
 ```
 
 完整帧最多 128 bytes，payload 最多 119；固定反射 CRC8(init FF)/CRC16(init FFFF,xor0)
-来自锁定的 MIT `crccheck 1.3.1`。opaque codec 不判断 command 支持、HP、ID、规则或时钟，
-不拥有 UART/sequence。typed 编码拒绝 bool、越界和未知字段；PowerHeat 保留 8 bytes 输出 0。
+由锁定的 Rust `crc 3.4.0` 实现。opaque codec 不判断 command 支持、HP、ID、规则或时钟，
+不拥有 UART/sequence。typed Rust 字段与配置准入拒绝类型错误、越界和未知字段；PowerHeat 保留 8 bytes 输出 0。
 Buff 按官方 8-byte packed struct 在 offset7 编码 remaining_energy；文档表格 offset6
 与结构/长度冲突，未静默借用其它版本。官方版本入口为 [RoboMaster 文档](https://bbs.robomaster.com/wiki/20204847/811363)。
 
@@ -624,10 +619,9 @@ B0 是本课观察的数字输出；板载 A7 是 WS2812 数据线，普通 GPIO
 `third_party/stm32h7/SOURCES.json`，构建时不下载 SDK，也不需要 CubeMX。
 
 ```bash
-uv sync --frozen
 cmake -S examples/teaching -B build/teaching/Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
 cmake --build build/teaching/Debug
-uv run tools/sim run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
+sim run examples/teaching/gpio-key.yaml --report build/teaching/gpio-key.json
 ```
 
 Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同命令，
@@ -641,7 +635,7 @@ Debug ELF 保存在 `build/teaching/Debug/gpio_key.elf`。Release 使用相同�
 可用同一个 ELF 交互观察：
 
 ```bash
-uv run tools/sim-unmigrated lab interactive --elf build/teaching/Debug/gpio_key.elf
+sim lab interactive --elf build/teaching/Debug/gpio_key.elf
 ```
 
 依次输入 `state`、`key press`、`state`、`key release`、`state`，最后输入 `quit`。
@@ -652,7 +646,7 @@ uv run tools/sim-unmigrated lab interactive --elf build/teaching/Debug/gpio_key.
 要调试同一份源码，在终端一启动：
 
 ```bash
-uv run tools/sim-unmigrated lab interactive --elf build/teaching/Debug/gpio_key.elf \
+sim lab interactive --elf build/teaching/Debug/gpio_key.elf \
   --gdb-port 1234 --paused --startup-timeout 120 --timeout 300
 ```
 
@@ -692,13 +686,13 @@ GDB 断点和恒低错误版本的拒绝检查。它验证教学固件与数字�
 
 <a id="virtual-lab"></a>
 
-## 保留的交互 Lab
+## 交互与 Web Lab
 
 有限自动实验使用同一 Simulation：
 
 ```bash
-uv run tools/sim validate path/to/scene.yaml
-uv run tools/sim run path/to/scene.yaml --report build/lab-result.json
+sim validate path/to/scene.yaml
+sim run path/to/scene.yaml --report build/lab-result.json
 # 自动编译真实专用固件，保留直接通道及原生交互/GDB验收：
 bash tools/run-lab-channels-smoke.sh
 ```
@@ -724,7 +718,7 @@ experiment:
       digital_equals: {endpoint: main.led, value: 1}
 ```
 
-输入端口使用 qualified `main.key`（布尔）、`main.gpio.B0`（0/1）、`main.uart1`（UTF-8或Python bytes）。
+输入端口使用 qualified `main.key`（布尔）、`main.gpio.B0`（0/1）、`main.uart1`（配置 UTF-8 文本或 Rust 字节输入）。
 UART5 只由 `remote: true` 暴露为 `main.remote` 遥控器 RX 原始字节输入；不提供 TX 或 SBUS/DR16解析。
 CAN 刺激使用 `device.can-host` 的 `tx`，其 `can` 与机器 `fdcan1/2/3` 连接同一 `bus.can`；
 值为 `{id: 0x321, flags: 0, dlc: 2, data_hex: '4142'}`。它复用总线队列，发送时间取实际交付切点。
@@ -752,7 +746,7 @@ sim firmware build/student.elf --debug --qmp /tmp/student-qmp.sock
 交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
 
 ```bash
-uv run tools/sim-unmigrated lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
+sim lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
 ```
 
 连接提示只说明 transport 已连接。输入 `help` 查看命令；`state` 显示原生只读 JSON：
@@ -780,7 +774,71 @@ quit
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
 
+<a id="web-lab"></a>
 
+## Web Lab
+
+构建项目 QEMU 后，在同一运行环境中启动本地网页实验台：
+
+```bash
+sim lab web
+# 或预选已编译的 HAL 第一课：
+sim lab web --elf build/teaching/Debug/gpio_key.elf
+# 启用原生 GDB，调试期限改为两小时：
+sim lab web --elf build/student.elf --gdb-port 1234 --timeout 7200
+```
+
+打开 `http://127.0.0.1:8765`，选择固件并点击“加载”，初始停在复位处；点击“运行”后
+固件开始执行。“暂停”使用原生 QMP；“停止”完成进程和通道清理后返回。
+“重新加载”清理旧实验，再从新进程的复位状态开始。上传文件最多 64 MiB，
+停止后可替换；文件保留到替换或服务关闭。加载沿用 QEMU 的 ARM ELF/raw BIN 语义，
+文件可读并不表示它适合本板或应用已经就绪。
+
+同一服务只允许一个控制页面。关闭页面后实验继续运行，重新打开接回原会话，
+按住的瞬时用户按键会在断开时释放；未收到结果的输入不会自动重发。
+默认每次实验的 host 总期限为一小时，包含启动和暂停；`--timeout` 可调整，
+`--startup-timeout` 默认 10 秒。`Ctrl-C` 或 TERM 关闭服务并清理实验。
+`--port` 改变本地 HTTP 端口；服务仅绑定回环地址。
+
+页面提供用户按键、LED、VIN、GPIO A–H 检查器，以及 UART1/2/3/5/7/10、CAN1/2/3
+和 ADC1 通道 0–31。UART 支持文本、HEX 和显式追加换行；CAN 使用既有 ID/flags/DLC
+准入；ADC 可输入 raw16 或 0–3300000 µV，暂停时明确拒绝。全部通道由同一 Lab owner
+连接。输入“已接受”表示提交给现有 transport/Fabric；实际固件反应要看后续输出。
+
+状态和原始 JSON 来自只读 native `board-state`，纳秒时间在浏览器中保留为十进制字符串。
+GPIO 采样电平、ODR、输出掩码分开展示，AF 仅显示复用模式；模型引脚不等同于全部可接线引脚。
+LED 明示 WS2812 DMA 波形或 GPIO latch 近似，ADC 输入值不是固件的转换读数。
+UART 时间是轮询样本，CAN 保留 wire 时间；页面刷新不驱动仿真，也不建立全局锁步。
+服务端历史最多保留 4096 条或 1 MiB，页面最多显示 600 条或 256 KiB，省略均可见。
+
+板卡图为原创逻辑示意。当前快照未公开的 IMU、Flash、蜂鸣器和 USB 等内部状态没有网页读数。
+当前固件若依赖 IMU 或电机环境，仍需使用已验证的对应 worker 入口；此板卡实验台尚未接入
+物理场景。源码断点与变量继续使用原生 GDB/VS Code；启用 `--gdb-port` 后网页显示连接地址。
+
+开发验证可安装测试专用 Chromium：
+
+```bash
+.venv/bin/python -m pip install aiohttp==3.14.3 playwright==1.56.0
+.venv/bin/python -m playwright install chromium --only-shell
+cargo test --locked -p sim-host --features host-runtime --test lab_session --test lab_command
+```
+
+真实浏览器门使用已构建的 HAL Debug/Release 和既有裸机通道夹具：
+
+```bash
+mkdir -p build/web-test
+arm-none-eabi-gcc -mcpu=cortex-m7 -mthumb -O2 -Wall -Wextra -Werror \
+  -ffreestanding -fno-builtin -fno-stack-protector -nostdlib -nostartfiles \
+  -Wl,--gc-sections -Wl,--build-id=none -Wl,-T,smoke/dm_mc02_uart_smoke.ld \
+  -o build/web-test/lab.elf smoke/dm_mc02_lab_smoke.c
+.venv/bin/python smoke/dm_mc02_web_smoke.py --sim target/release/sim \
+  --debug-elf build/teaching/Debug/gpio_key.elf \
+  --release-elf build/teaching/Release/gpio_key.elf --lab-elf build/web-test/lab.elf \
+  --output build/web-test/browser-run
+```
+
+当前 Rust Web 已通过这三个实际浏览器案例。输出目录必须是新路径；报告保存原始输入哈希、截图和清理结果。HAL GPIO 与裸机通道测试
+属于不同消费者证据，不代表实板校准或完整业务固件就绪。
 
 <a id="environment"></a>
 
@@ -788,6 +846,8 @@ Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `a
 
 源码构建默认使用 **Ubuntu 24.04 x86_64** 系统工具链，Nix 是可选的固定环境。
 Windows 下载包的范围与 CI 状态见[安装](#installation)；macOS 和 ARM 宿主原生构建尚未验证。
+
+<a id="ubuntu"></a>
 
 ### Ubuntu
 
@@ -816,7 +876,8 @@ sudo apt-get install -y \
 
 QEMU `configure` 会在 `build/qemu/pyvenv` 创建 Python 环境，并从源码携带的 wheel 安装固定的 Meson 1.2.3。Ubuntu 的 `python3-venv` 用于这一配置过程；Nix shell 已提供可用 Python，无需该 apt 包。项目级 Meson 命令通过 `tools/meson` 调用 QEMU 自己的版本。
 
-因此，**只构建并运行 QEMU 不需要 `uv`**。`uv` 管理的是项目 Python 测试环境和可选 worker 依赖；当前 dev group 安装 pytest 与纯 Python 协议/记录测试依赖，不重复安装 Meson 或 Ninja。需要运行完整回归门禁时，额外安装：
+**构建并运行 QEMU 不需要 `uv`**；Rust 产品使用 Cargo。Python 测试环境与产品分离，
+不重复安装 Meson 或 Ninja。需要运行完整回归门禁时，额外安装：
 
 ```bash
 sudo apt-get install -y \
@@ -827,11 +888,23 @@ sudo apt-get install -y \
   gdb-multiarch
 ```
 
-CMake/CTest 构建 Host 测试，ARM GCC/binutils 构建测试 guest，GDB 验证原生调试连接，ripgrep 是完整门禁检查项使用的命令。然后按 [uv 安装说明](https://docs.astral.sh/uv/getting-started/installation/) 安装 `uv`，在仓库根目录创建锁定的 Python 测试环境：
+CMake/CTest 构建原生 Host 测试，ARM GCC/binutils 构建 guest，GDB 验证原生调试连接，
+ripgrep 供完整门禁检查使用。Rust 构建还需安装 rustup，由仓库工具链文件选择 Rust 1.91.1。
+
+<a id="test-environment"></a>
+
+独立 Python 构建/测试环境使用与 CI 相同的安装方式：
 
 ```bash
-uv sync --locked --group dev --python /usr/bin/python3
+python3 -m venv .venv
+.venv/bin/python -m pip install 'pytest>=8,<9' PyYAML==6.0.3 mcap==1.5.0 crccheck==1.3.1 setuptools==80.10.2 wheel
+.venv/bin/python -m pip install --no-build-isolation qemu/upstream/python
 ```
+
+PyYAML/MCAP、独立裁判 CRC oracle 与固定上游 QMP client 是测试消费者，不进入 Rust 产品。
+`pyproject.toml` 的 `dev` group 也声明这些工具；QEMU 上游 Python distribution 的构建需
+setuptools/wheel 和 `--no-build-isolation`，单独 `uv sync --group dev` 不能替代此构建前提。
+浏览器门另装 `web-test` 所列工具；`native-test` 中的 Python MuJoCo 仅供确有独立数值对照需求的测试。
 
 当前 profile 使用内部 FDT，并关闭 Capstone、slirp、文档及 SDL/GTK 图形界面，因此不需要对应系统开发包或 Sphinx。Pixman 是可选依赖：没有 `libpixman-1-dev` 时，QEMU 会关闭依赖 pixman 的通用显示设备；DM-MC02 的默认 headless 使用不依赖它。如需这些通用显示设备，可额外安装：
 
@@ -839,7 +912,8 @@ uv sync --locked --group dev --python /usr/bin/python3
 sudo apt-get install -y libpixman-1-dev
 ```
 
-启用 MuJoCo 时再安装项目的可选 Python extra。首次同步 pytest/MuJoCo 或下载所需的 QEMU Meson wraps 需要网络，`/tmp` 必须可写。
+启用物理后端时按[安装](#installation)构建原生 SDK 与对应 Cargo feature。首次下载 Cargo crate、
+测试工具或 QEMU Meson wraps 需要网络，`/tmp` 必须可写。
 
 <a id="nix"></a>
 
@@ -866,13 +940,11 @@ nix develop --command bash tools/build-qemu.sh
 
 `flake.lock` 固定 nixpkgs 的确切提交。Nix 提供 C/C++ 编译器、GLib、zlib、Python 3.11、Ninja、CMake、ARM guest 工具链、ripgrep 和 uv；无需为它们再安装 apt 包。Nix 默认下载可用的二进制缓存，缺少缓存时自行构建依赖。构建目录仍是本地 `build/`，此入口是 Nix shell，项目暂未提供 `nix build` 包。
 
-选择 Nix 时，构建和运行都在 `nix develop` 内执行，包括 QEMU、测试、worker 和 Python 环境同步。`nix develop` 中的 `PYTHON` 指向固定的 Nix Python；同步项目测试环境使用：
-
-```bash
-uv sync --locked --group dev --python "$PYTHON"
-```
-
-退出 shell 用 `exit`。更换机器后使用同一 `flake.lock` 可恢复相同工具和依赖版本。普通 Nix profile 中只有编译器并不足以构建本项目；请使用这里的完整 shell，使编译器、GLib、zlib 与 pkg-config 保持一致。MuJoCo Python 包通过项目 extra 按需安装；Nix shell 提供其 C++ 运行库，并默认使用 `MUJOCO_GL=disable` 运行无渲染后端。ROS 2 需要另行安装和配置。
+选择 Nix 时，QEMU 和对应测试在 `nix develop` 内执行，使编译器、GLib、zlib 与 pkg-config 保持一致。
+`PYTHON` 指向固定的 Nix 构建解释器，独立测试环境仍按[测试环境](#test-environment)准备。
+Rust 由仓库 `rust-toolchain.toml` 固定；完整 Linux 分发包使用 Ubuntu 系统工具与原生 SDK 构建，
+打包会拒绝依赖 `/nix/store` 的可执行文件。MuJoCo、Gazebo、ROS 2 使用各自的原生 SDK，
+不安装 Python runtime extras。退出 shell 用 `exit`。
 
 <a id="get-the-source"></a>
 
@@ -902,12 +974,14 @@ git clone --branch refactor/composable-platform git@github.com:lym12321/qemu-dm-
 
 ```bash
 bash tools/build-qemu.sh
+export QEMU_SYSTEM_ARM="$PWD/build/qemu/qemu-system-arm"
 ```
+
+后续源码 CLI 示例使用此 `QEMU_SYSTEM_ARM`；`firmware` 与 Lab 的默认查找是发行目录的相邻 `bin/`。
 
 Ubuntu 用户请先安装[环境章节](#ubuntu)的额外依赖；可选 Nix shell 已包含 CMake、ARM 工具链、ripgrep 和 uv。构建 Host 测试程序：
 
 ```bash
-uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"
 cmake -S . -B build/host -DCMAKE_BUILD_TYPE=Release
 cmake --build build/host --parallel 4
 ```
@@ -921,7 +995,8 @@ cmake --build build/host --parallel 4
 | `build/qemu/qemu-system-arm` | 带 `dm-mc02` machine 的 QEMU |
 | `build/host/` | Host 协议与桥接测试程序 |
 | `build/qemu/pyvenv/` | QEMU configure 从源码 wheel 创建的锁定 Meson 环境 |
-| `.venv/` | 由 `uv` 管理的 pytest 和项目 Python 工具环境 |
+| `target/release/sim` | 所选 Cargo features 的 Rust CLI |
+| `.venv/` | 独立 Python 构建与测试驱动环境 |
 
 QEMU 默认构建为 Release、`arm-softmmu` 和 DM-MC02 设备 profile。调试构建可运行 `QEMU_BUILD_TYPE=debugoptimized bash tools/build-qemu.sh`；性能测量前应重建 Release。`tools/build-qemu-generic.sh` 用于检查通用 ARM 复用边界，不是运行 DM-MC02 固件的入口。
 
@@ -954,8 +1029,8 @@ sim firmware /absolute/path/to/app.elf
 ```
 
 ELF 是必填位置参数，不读取 `DM_MC02_ELF`。QEMU 选择顺序为 `--qemu PATH`、
-`QEMU_SYSTEM_ARM`、下载可执行文件内置的 QEMU；源码安装默认使用 checkout 中的
-`build/qemu/qemu-system-arm`，在 checkout 外运行时显式指定兼容二进制。
+`QEMU_SYSTEM_ARM`、可执行文件相邻 `bin/` 中的 QEMU；源码构建运行时
+显式指定兼容二进制，或先设置 `QEMU_SYSTEM_ARM="$PWD/build/qemu/qemu-system-arm"`。
 默认 machine 是 `dm-mc02`；源码构建的运行环境与构建时保持一致。
 
 默认 UART1 与 QEMU monitor 共用终端（原生 `mon:stdio`）。`Ctrl-a c` 切换 UART/monitor，`Ctrl-a h` 查看帮助。monitor 中可使用 `info status`、`stop`、`cont`、`system_reset` 和 `quit`；`quit` 会走正常关闭路径。用 `--uart uart2` 等名称选择其它 UART，或用 `--uart none` 仅显示 monitor。UART5 只接收，选择 `--uart uart5` 可输入字节但没有 TX 文本。当前 `trobot` Release 关闭了 logger/terminal，串口没有文本并不代表固件未运行。
@@ -1112,30 +1187,21 @@ LED 的 `ws2812-dma` 来源是既有 DMA 波形观察近似；`gpio-latch` 来�
 映射成白/黑，适合初期调试。它不表示实际引脚电气驱动，应结合 GPIO mode 和 output mask
 检查。AF/analog、电气波形和全局 CPU/plant 锁步仍未由这个接口验证。
 
-Python 自动化脚本可复用 `sim.boards.QemuBoard(qmp)`，其中 `qmp` 是现有
-`tools.dm_mc02_qmp.QmpSession`。`snapshot()` 校验原生对象；`digital("gpio.B0")`、
-`digital("key")` 读取采样值，`digital("led")` 判断 RGB 是否非零。`set_gpio("B0", 1)`、
-`set_key(True)`、`set_vin(24000)` 注入公开输入，`pause()`/`resume()`/`reset()` 使用
-原生 QMP。调用方负责 QMP 的期限和关闭；这些 API 不判断应用是否已启动。
+Rust 自动化复用 `sim_host::boards::{validate_snapshot, digital_level}` 校验并读取同一原生 JSON。
+`digital_level("gpio.B0", &state)` 等读取公开采样值，不从 guest 内存重建 GPIO。
+输入和 pause/resume/reset 仍走原生 QMP；连接、有限期限、关闭和应用 ready 由调用方拥有。
+生产 QMP 使用 `sim_host::qmp::QmpSession`，批量独立查询按输入顺序保留错误，
+不提供原子快照或跨 I/O/CPU/world 边界的缓存。失败后停止当前操作并关闭连接，不重发整组。
+独立 Python 原生测试仍复用 `tools.dm_mc02_test_harness.running_qemu()` 的启动和有界清理。
 
-`QmpSession.command_many(((name, arguments), ...))` 可在同一连接上查询 1–8 个
-互相独立的命令，按输入顺序返回结果元组；参数为 `dict` 或 `None`，整组须先通过
-JSON 序列化检查，并配置有限的正超时；组等待和取消清理分别使用该超时。
-它不是原子快照；错误按输入顺序选择首个异常，
-其余异常附入 notes。超时或中断会取消并等待本组请求清理，但已发送的命令仍可能执行。
-失败后应停止当前操作并关闭连接，不得重试整组或跨 I/O、CPU、world 边界复用结果。
-
-外部测试与工具共用 `tools.dm_mc02_test_harness.running_qemu()` 的进程、私有 `/tmp`
-socket 和有界清理。socket 出现只表示 transport 可连接；固件 ready 必须另取实际应用事件。
-
-`sim.boards.channels.LabChannels` 可借用既有 UART、CAN 和 co-sim 连接：UART 使用无帧
+`sim_host::lab::channels::LabChannels` 可借用既有 UART、CAN 和 co-sim 连接：UART 使用无帧
 `StreamTransport`，CAN 使用固定 84 字节 `CanStream` 与 CAN Fabric，ADC1 使用 v1
-`FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns)`
+`FramedSocket`。它不打开或关闭连接，也不推进 CPU 或 plant。`service(timestamp_ns, flush_uart)`
 每个连接只读一次有界数据；CAN 观察保留原始 QEMU 时间，UART 时间只是调用者的轮询样本。
 需要截止时间判断时，应在读取后再查询 QMP 虚拟时间作为观察上界。
-已有独立 UART TX owner 时可调用 `service(timestamp_ns, flush_uart=False)`，
+已有独立 UART TX owner 时可调用 `service(timestamp_ns, false)`，
 继续读取并报告 UART 字节，同时保留其发送队列和后缀；TX owner 负责发送与 flush。
-该参数必须为布尔值，默认仍服务 UART 发送；CAN 和 ADC 服务保持各自原语义。
+该布尔参数显式选择 UART flush；CAN 和 ADC 服务保持各自原语义。
 
 ADC1 支持 raw16 或 0–3.3 V；先读取连接开场帧，再显式 `reset(time)`，输入时间严格递增。
 收到 QEMU RESET 后必须重新显式 reset。逻辑 reset 保留物理流尾部，不提供 CAN/v1 历史输入隔离。
@@ -1209,56 +1275,28 @@ FDCAN host socket 收到关闭事件后，会丢弃旧连接尚未完成的发�
 调用者可从剩余后缀继续；若首次写入即阻塞或失败，则仍返回错误。正数返回值只报告已接受的
 字节数，不证明该次调用中未遇到后续错误，也不代表对端已消费。
 
-主机代码可调用 `sim.boards.drain_paused_can(qmp, stream, sink, *, target_ns,
-controller, chardev, tx_dropped, deadline, check)`，把已准入的 CAN 输出逐帧交给
-`sink(frame)`；frame 沿用 `CanStream.receive()` 的 tuple。此操作要求原生执行目标已
-`reached`、QEMU 保持 `paused`，并使用同一条普通非阻塞 AF_UNIX 连接、唯一 writer 和 reader，
-不使用 mux、TLS 或 FD passing。
-调用者必须在整个区间排除新发送、复位、断电、配置、重连和其它清队列事件，且在 producer
-区间开始前建立 `tx_dropped` 基线。CPU 暂停本身不能证明这些前提。
+Rust Machine 的 CAN adapter 通过同一 `can-execution-state` 边界完成输出 drain、输入 receipt 和初始基线观察。
+观察要求原连接唯一 reader/writer、普通非阻塞 AF_UNIX、有限绝对 host 期限，原生执行目标 reached 且 paused；
+初始基线则要求 idle、无目标、时间等于 RESET_ACK 原点且 prelaunch/paused。
+整个区间须排除额外发送、复位、断电、restore、配置、重连和清队列，CPU 暂停本身不能证明这些前提。
 
-`deadline` 是有限的 `time.monotonic()` 绝对期限；`check()` 检查进程存活，QMP 的单命令
-超时仍由调用者配置，可复用 `deadline_qmp_call`。操作先观察发送队列为零，再要求一次新的
-空读及空 framing tail，最后复核执行状态和队列。它每轮只读最多 4096 字节，不收集无限结果。
-EOF、解码、状态变化、sink 或超时错误直接失败，保留部分效果和借用连接；调用者须停止该次
-尝试。任意阻塞 callback 无法被此软期限抢占。此操作不推进 world，也不证明全局锁步、
-同一时刻所有 timer/IRQ 已处理、任意复位恢复或真实 CAN 时序。
+输出先确认 native TX 队列为空，再取得新的空读和空 framing tail，最后复核执行状态、连接身份和 drop 基线。
+输入 receipt 使用发送前的 completed_frames 基线与已知完整记录数，不能从当前队列长度推算；
+等待只 peek 原连接，未读输出、framing tail、EOF 或连接身份变化均失败并保留字节。
+达到目标时 native 部分记录和 host TX 队列也必须为空；rx_dropped 可以增加，因为处理完成包含被拒收的记录。
+这些观察只证明 transport 处理，不证明固件消费或存储，也不推进 world。
 
-`sim.boards.wait_paused_can_input(qmp, stream, *, target_ns, controller, chardev,
-completed_frames, deadline, check)` 使用相同的原连接、暂停目标及期限约束，刷新既有
-发送队列，并等待原生接收计数精确达到 `completed_frames`。调用者必须在发送前取得
-基线、知道本批完整记录数，并保证绝对目标严格小于 `UINT64_MAX`；不得用当前队列长度
-推算记录数。整个尝试中须排除额外输入、复位、restore、断电、配置、重连或清队列。
-
-先用既有 reader 排空 QEMU 输出。等待操作只对原 socket 做非消费 peek；存在未读输出、
-framing tail 或原连接 EOF 时直接失败并保留字节，即使原生属性显示另一个 peer 已连接。
-达到目标时还要求发送队列和原生部分记录均为空，再重新查询执行状态与接收计数。
-返回最后一次原生控制器字典；`rx_dropped` 可以增长，因为处理完成包含被拒收的记录。
-此返回值证明同步输入处理已返回，固件消费与存储成功仍须分别验证。错误保留已发生的
-效果、后缀和借用资源，调用者须停止该次尝试；操作不负责恢复或推进 CPU/world。
-
-尚未执行首个目标时，可用 `sim.boards.observe_initial_paused_can(qmp, stream, *,
-timestamp_ns, controller, chardev, deadline, check)` 建立初始 CAN 基线。
-它要求执行状态为 `idle`、没有目标且时间精确等于 RESET_ACK 的原点，QEMU 保持
-`prelaunch` 或 `paused`；原连接、主机队列及原生发送和部分接收记录均须为空。
-函数不读取或刷新字节，以非消费 peek 拒绝未读输出和 EOF，并复核两次完整状态，
-返回最后的 `{"tx": ..., "rx": ...}` 控制器字典。期限、唯一 reader/writer 和排除
-复位、断电、配置、重连等条件与上述函数相同。此操作只建立启动基线，不推进时间。
-
-这三个 CAN 函数在借用对象提供 `command_many` 时，每次观察只查询 `can-execution-state`。
-返回后依次校验执行状态、暂停状态、实际绑定的 chardev 路径与调用方身份一致、连接状态
-及本次所需的 TX/RX 统计，初始观察校验两个方向。它们要求 QEMU 提供包含
-`fdcan-transports` 的上述组合属性；另一个已连接的 socket 不能代替实际 CAN 连接。
-组调用前后检查存活和期限；读取、逐帧 sink、发送刷新及最终复核仍各自保留检查。
-结果只用于当前观察，不跨这些 I/O 边界复用，也不是原子快照。批量调用失败直接终止，
-不会退回逐命令重发。没有该方法或显式为 `None` 的借用对象继续使用原逐命令路径。
+每轮有界读取至多 4096 字节，读取、逐帧交付、flush 和最终查询均检查存活/期限。
+sink、解码、I/O、状态变化或期限错误冻结当前尝试，保留部分效果与借用流后缀；不重试整个区间。
+原生 QMP 查询不是原子快照，也不证明同刻所有 timer/IRQ、真实 CAN 时序或 CPU/plant 全局屏障。
 
 <a id="external-simulation-worker"></a>
 
-## 保留的外部 worker 与独立原生后端
+## 外部 worker 与原生后端
 
 这部分保留独特的 legacy v1/v2、MIT/达妙、电机、ROS 2 与 Gazebo 连接能力，
-不作为新 sim/v1 应用的第二个运行入口。新的 CAN/四轮 worker 已复用 Simulation，见下节。
+所有生产 worker 均为编译后的 `sim worker`。CAN/四轮 worker 借用同一 Simulation，
+MIT/达妙、ROS transport 与 v1/v2 保留各自的协议边界。
 配置中的 `--backend` / `--backend-registry` 是可信开发者手动选择的旧扩展入口，
 sim/v1 不从不可信 manifest 动态导入路径，也不提供任意主机命令执行。
 
@@ -1323,11 +1361,11 @@ continue
 在构建 QEMU 时所选的 Nix 或系统环境中同步项目 `.venv`，并确保有 `arm-none-eabi-nm`：
 
 ```bash
-uv sync --locked --group dev --extra mujoco --python "${PYTHON:-/usr/bin/python3}"
+bash tools/build-linux-runtime.sh --example trobot_bench
 bash tools/run-trobot-business.sh
 ```
 
-该场景需要实际 MuJoCo Python 包。常用参数如下；完整帮助可运行
+该场景调用编译后的 `trobot_bench` 与 MuJoCo 3.12.0 原生库，Python 只负责采集和报告。常用参数如下；完整帮助可运行
 `bash tools/run-trobot-business.sh --help`：
 
 | 参数 | 默认值与用途 |
@@ -1401,7 +1439,7 @@ watchdog、最终暂停计数及输入哈希。CPU 以一个核心为 100%，可
 之前记录，表示轨迹推进；无节流容量、完整 loop 完成延迟、CPU/plant 全局锁步及任意机构
 性能仍需独立验证。
 
-### Legacy worker 的后端边界
+### worker 的后端边界
 
 手动运行 stationary startup 示例只建立 co-sim 控制/采样通道。要交换电机总线数据，还需将 QEMU FDCAN chardev socket 配好并给 worker 传入 `--fdcan`；完整 wiring 示例见 `tools/run-dm-motor-smoke.sh`，上面的业务入口已自动连接该通道。通道联通不等于机构闭环已验证。
 
@@ -1415,10 +1453,10 @@ worker 支持的常用选择：
 | 场景 | 入口 |
 | --- | --- |
 | NullEngine fixture | 默认 `--engine null`；静止 IMU 输入和简化电机响应，用于功能/传输验证 |
-| MuJoCo adapter | `uv sync --locked --group dev --extra mujoco` 后运行 `bash tools/run-mujoco-worker-smoke.sh` |
+| MuJoCo adapter | 构建 `mujoco` feature 后运行 `bash tools/run-mujoco-worker-smoke.sh` |
 | ROS 2 adapter | 安装并 source 系统 ROS 环境（验收环境为 Jazzy），运行 `bash tools/run-ros2-worker-smoke.sh` |
 | 已有 Linux CAN 接口 | `--socketcan can0 --fdcan /path/to/fdcan.sock` |
-| 自定义 plant | `--backend package:create_backend` 或 `--backend-registry package:register --engine name` |
+| 自定义 plant | 在 Rust 中实现公开物理/worker 接口并显式编译，不动态导入插件 |
 
 MuJoCo adapter 在初始化、reset 和每次 `mj_step` 后调用原生 `mj_forward`，使姿态和
 IMU derived state 对应当前关节状态；这一步不会增加 plant 时间。gyro/accelerometer
@@ -1429,19 +1467,19 @@ MuJoCo worker smoke 验证 adapter 和测试模型；下文的 MotorTest 另验�
 
 具名物理接口使用锁定的 MuJoCo 3.12.0，可独立于 QEMU 和 CAN 调用：
 
-```python
-from sim.physics import MujocoPhysics
+```rust
+use sim_host::physics::{JointPhysics, mujoco::{MujocoBindings, MujocoPhysics}};
 
-plant = MujocoPhysics.from_xml_path(
-    "smoke/dm_mc02_mujoco_smoke.xml",
-    joints={"test_joint": "motor0"},
-    imus={"imu": ("imu_gyro", "imu_accel")},
-)
-plant.set_joint_effort("test_joint", 0.005)  # Nm
-plant.step(1_000_000)  # ns, one native solver step
-print(plant.get_joint_state("test_joint"))  # rad, rad/s
-print(plant.get_body_pose("test_body"))  # world metres, body quaternion wxyz
-print(plant.get_imu("imu"))  # site-local rad/s and proper acceleration m/s²
+let mut plant = MujocoPhysics::from_xml_path("smoke/dm_mc02_mujoco_smoke.xml", MujocoBindings {
+    joints: vec![("test_joint".into(), "motor0".into())],
+    imus: vec![("imu".into(), "imu_gyro".into(), "imu_accel".into())],
+})?;
+plant.set_joint_effort("test_joint", 0.005)?; // Nm
+plant.step(1_000_000)?; // ns
+println!("{:?}", plant.get_joint_state("test_joint")?);
+println!("{:?}", plant.get_body_pose("test_body")?);
+println!("{:?}", plant.get_imu("imu")?); // rad/s, proper m/s²
+plant.close()?;
 ```
 
 绑定只接受 hinge 与直接、单位 gear、即时且无隐式限幅的 motor；IMU 必须是同一 site 的
@@ -1453,12 +1491,12 @@ getter 读取最近一次初始化、reset 或完成 step 的状态；改变力�
 `time_s` 是原生浮点 plant 时间，`step_seconds` 为旧 worker 保留精确浮点步长，两者都
 不建立 QEMU 时间屏障。固件 IMU 闭环和物理标定仍需分别验证。
 `validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 只检查准入，不推进模型或
-改写力矩。`validate_steps((dt1_ns, dt2_ns, ...))` 按顺序检查未来 native 时间，提前
+改写力矩。`validate_steps(&[dt1_ns, dt2_ns, ...])` 按顺序检查未来 native 时间，提前
 拒绝浮点时间分辨率不足的后续区间。`close()` 释放此实例持有的原生 model/data；重复关闭无害，关闭后操作拒绝。
 
 ### CAN worker 会话
 
-`tools/run-can-worker.py` and `tools/run-chassis-worker.py` now use the same
+`sim worker --can-profile rotor` and `sim worker --can-profile four-wheel` use the same
 `Simulation`/Topology factories as `sim run`. The rotor worker requires the
 default stationary IMU fixture; combining it with an independent legacy engine
 is rejected before connection. The chassis worker preflights the complete
@@ -1484,8 +1522,8 @@ body state without advancing physics.
 `--connect-timeout` budget; each target advance and its IMU observation borrow a
 2-second host budget. ACK/DONE waits keep their existing separate deadlines.
 Any execution/queue/I/O failure terminates the worker with independent cleanup;
-failed effects are not retried or rolled back. `PYTHON=/path/to/python` selects
-the interpreter for the chassis firmware runner as well as the DJI runner.
+failed effects are not retried or rolled back. `SIM_EXECUTABLE` selects the compiled worker for shell smoke consumers;
+`PYTHON=/path/to/python` selects only the independent firmware test driver.
 
 The native RESET/suffix regression is included in:
 
@@ -1497,41 +1535,30 @@ QEMU_SYSTEM_ARM=/path/to/pinned/qemu-system-arm \
 该门补充真实 SPI readback 与 DJI/Chassis 固件消费者测试；它们不能证明全局 CPU/World 屏障、
 物理标定或持续实时性能。
 
-### Gazebo 原生关节接口（可选）
+### Gazebo 原生关节接口
 
-这个独立接口使用 Gazebo Harmonic `gz-sim8 8.15.0`，通过原生 Server
-读取完成的关节状态，验收使用默认 DART 求解器。当前 SDK profile 使用 ROS Jazzy 与 CPython 3.12；不要将模块
-放入默认 Python 3.11 环境。先安装匹配的 SDK、系统 C++ 编译器、Python 开发头文件
-和 pybind11 2.11.1、gz-sensors 8.2.2 IMU 组件，然后在仓库根目录运行标准构建：
+Rust 的 `sim_host::physics::gazebo` 使用 Gazebo Harmonic `gz-sim8 8.15.0` 与默认 DART 求解器。
+CXX 只传递值、错误和生命周期，原 `NativeWorld` 继续拥有 Server、solver、传感器和线程。
+生产 Python ABI 已移除；SDK 必须使用固定上游提交
+`446a44335a45b704b4d36dabcc5508ee34eeb3d8` 的 `SKIP_PYBIND11=ON` 构建。
+同版本但链接 libpython 的 ROS vendor gz-sim 不能作为无 Python 产品的替代品。
+构建见[安装](#installation)，Cargo feature `gazebo` 启用关节/body/IMU，
+`gazebo-rendering` 再启用原生相机/LiDAR。使用独立构建目录，避免 Conda 的 Protobuf 覆盖系统 SDK。
 
-```bash
-source /opt/ros/jazzy/setup.bash
-UV_PROJECT_ENVIRONMENT=build/venv-gazebo uv sync --frozen --python /usr/bin/python3
-cmake -S sim/physics/gazebo_native -B build/gazebo-native \
-  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
-  -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release
-cmake --build build/gazebo-native -j2
-ctest --test-dir build/gazebo-native --output-on-failure
-```
+```rust
+use sim_host::physics::{JointPhysics, gazebo::{GazeboBindings, GazeboPhysics}};
 
-使用新的构建目录，并避免 Conda 等环境的 Protobuf 覆盖系统 SDK 依赖。若本机 CMake
-仍搜索 `/opt/anaconda3`，可显式增加 `-DCMAKE_IGNORE_PREFIX_PATH=/opt/anaconda3`。
-专用 CTest 使用这个 Python 环境；缺少模块、依赖或测试失败会返回非零。默认 QEMU
-门使用原有环境，Gazebo SDK 门需要单独执行，不会将未执行的 Gazebo 测试记为通过。
-
-设置 `PYTHONPATH="$PWD/build/gazebo-native"` 后，在上述 Python 环境中调用：
-
-```python
-from sim.physics import GazeboPhysics
-
-with GazeboPhysics("models/gazebo_rotor.sdf",
-                   joints={"shaft": ("rotor", "shaft")},
-                   bodies={"rotor": ("rotor", "body")}) as plant:
-    plant.set_joint_effort("shaft", 0.4)  # Nm
-    plant.step(100_000_000)               # 100 native 1 ms ticks
-    print(plant.time_ns, plant.get_joint_state("shaft"))  # ns, rad, rad/s
-    print(plant.get_body_pose("rotor"))  # world/link frame: m, quaternion wxyz
-    plant.reset()                       # completed native reset at time 0
+let mut plant = GazeboPhysics::from_sdf_path("models/gazebo_rotor.sdf", GazeboBindings {
+    joints: vec![("shaft".into(), "rotor".into(), "shaft".into())],
+    bodies: vec![("body".into(), "rotor".into(), "body".into())],
+    ..Default::default()
+}, &[])?;
+plant.set_joint_effort("shaft", 0.4)?; // Nm
+plant.step(100_000_000)?; // 100 native 1ms ticks
+println!("{} {:?}", plant.time_ns()?, plant.get_joint_state("shaft")?);
+println!("{:?}", plant.get_body_pose("body")?); // m, quaternion wxyz
+plant.reset()?;
+plant.close()?;
 ```
 
 首版接受一个 world、一个 physics profile、顶层动态 model 中的 revolute 关节，
@@ -1549,10 +1576,26 @@ model 的 link，缺失、重复和静态绑定拒绝。未由 Physics 发布的
 `close()` 停止并销毁服务器，原生析构负责线程释放；阻塞插件调用不提供抢占保证。
 `validate_step(dt_ns)` 和 `validate_joint_effort(name, Nm)` 使用同一准入规则，只读检查
 当前 native 时间、绑定和范围；检查通过不保证后续求解成功。
-`validate_steps((dt1_ns, dt2_ns, ...))` 还检查每个后续区间及累计 native 时间范围。
+`validate_steps(&[dt1_ns, dt2_ns, ...])` 还检查每个后续区间及累计 native 时间范围。
 
-Gazebo 尚无 sim/v1 World Factory；独立 API 的调用者拥有其唯一 step/reset/close，
-不能与其它拥有相同 solver 的执行者并用。原生 sensor 交付与 CPU 同步仍是独立边界。
+`physics.gazebo` 与 `physics.mujoco` 共用同一个 NativeFactory，支持 direct effort、
+共享 joint driver 与完成态 IMU；绑定保持后端显式类型。示例片段中的路径相对 YAML：
+
+```yaml
+nodes:
+  world:
+    kind: physics.gazebo
+    model: gazebo_imu_rotor.sdf
+    joints: {shaft: [rotor, shaft]}
+    bodies: {body: [rotor, body]}
+    imus: {inertial: [rotor, body, imu]}
+experiment:
+  inputs:
+    - {at: 0ns, endpoint: world.effort, value: {shaft: 0.4}}
+```
+
+独立 API 调用者拥有其唯一 step/reset/close；使用场景时由唯一 Simulation world owner 执行。
+原生 sensor 消息交付、MCU 消费与 CPU 同步仍是各自独立的边界。
 
 可通过原生 SDFormat include 组合本地静态场景，并用 `resource_paths` 指定
 `model://` 的模型目录。目录以调用者当前路径解析，必须存在且不含冒号或 NUL；
@@ -1564,44 +1607,24 @@ SDF DOM，外部纹理、mesh 等文件仍需保留，不会随 DOM 保存其内
 
 仓库提供固定社区版本的 RMUA 2019 静态场地及两个落体测试立方体：
 
-```python
-from pathlib import Path
-from sim.physics import GazeboPhysics
-
-models = Path("models")
-with GazeboPhysics(models / "gazebo_rmua19.sdf",
-                   resource_paths=(models / "vendor/rmua19/resource/models",),
-                   bodies={"floor": ("floor_probe", "body"),
-                           "obstacle": ("obstacle_probe", "body")}) as world:
-    world.step(5_000_000_000)
-    print(world.get_body_pose("floor"))
-    print(world.get_body_pose("obstacle"))
-    world.reset()
-```
+`GazeboPhysics::from_sdf_path` 的第三个参数传入 `&[PathBuf]` 资源目录，
+`GazeboBindings::bodies` 可绑定 `floor_probe/body` 与 `obstacle_probe/body`。
+`models/gazebo_rmua19.sdf` 使用同一公共 API；调用 `step(5_000_000_000)` 后读取完成位姿，再 reset。
 
 模型配置、几何和木纹图片原样复用；固定来源、哈希和 Apache-2.0 许可见
 `models/vendor/rmua19/NOTICE`、`SOURCES.json` 和 `LICENSE`。场地仅作为历史社区
 夹具，未验证当前比赛尺寸、实物接触参数或图片实际渲染；原生平面的碰撞范围
 可能大于视觉尺寸。该组合只使用 Physics，不包含相机、LiDAR、机器人控制、
 裁判规则或 Arena 调度。SDK 的 `gazebo-native-resources` 测试独立验证资源准入，
-`gazebo-native-joints` 再验证实际接触、公共位姿和 reset。
+Rust `physics_gazebo` 与 `physics_gazebo_consumers` 再验证实际接触、公共位姿和 reset。
 
 IMU 使用原生 gz-sensors 的同步生成和公开 getter，配置为
 `imus={逻辑名称: (model, link, sensor)}`：
 
-```python
-from sim.physics import GazeboPhysics
-
-with GazeboPhysics("models/gazebo_imu_rotor.sdf",
-                   joints={"shaft": ("rotor", "shaft")},
-                   imus={"imu": ("rotor", "body", "imu")}) as plant:
-    print(plant.get_imu("imu"))  # time 0: gyro (0,0,0), proper accel (0,0,9.80665)
-    plant.set_joint_effort("shaft", 0.4)
-    plant.step(100_000_000)
-    print(plant.get_imu("imu"))  # sensor-local rad/s and proper acceleration m/s²
-    plant.reset()
-    print(plant.time_ns, plant.get_imu("imu"))  # fresh native time 0, torque cleared
-```
+`GazeboBindings::imus` 使用 `(alias, model, link, sensor)` 元组。
+`models/gazebo_imu_rotor.sdf` 的 `("imu", "rotor", "body", "imu")` 绑定可通过
+`get_imu("imu")` 读取完成态的 sensor-local rad/s 与 proper m/s²。
+初始与 reset 的静止样本为零角速度、`(0,0,9.80665)` 加速度。
 
 首版所有 link sensor 都须显式绑定，且为动态 model 的 IMU；只接受
 `update_rate=0`、无噪声、无 sensor 插件或 metrics 的配置。每个完成的 native tick
@@ -1619,11 +1642,11 @@ Imu plugin 的 paused 行为或任意 ODR 调度。原生 sensor 仍拥有 publi
 相机和 GPU LiDAR 的原生无窗口验证使用标准 Sensors plugin、Ogre2 EGL 和
 Gazebo transport，不需要 X server。需要额外安装匹配的 gz-rendering 8.2.3
 Ogre2、gz-transport 13.6.0、gz-msgs 10.4.0，以及可用的 EGL/OpenGL 驱动。
-在上述 SDK 环境中显式启用独立测试：
+CMake 只构建独立的原生资源、mailbox 与 ROS 观察器测试；生产代码由 Cargo/CXX 构建。
+在匹配的原生 SDK 环境中显式启用测试：
 
 ```bash
 cmake -S sim/physics/gazebo_native -B build/gazebo-native \
-  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
   -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release \
   -DDM_GAZEBO_RENDERING_TESTS=ON
 cmake --build build/gazebo-native -j2
@@ -1637,28 +1660,22 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering$' --output-on-
 这项测试验证固定场景的原生消息。公开相机/LiDAR 接口使用下面独立的构建选项；
 资产渲染、任意场景的 ROS 2 交付和 MCU 时间同步仍需各自验证。
 
-要在 `GazeboPhysics` 中读取相机和 LiDAR，启用默认关闭的生产接口选项：
+生产接口使用 Cargo feature `gazebo-rendering`，独立于 CMake 测试开关：
 
 ```bash
-cmake -S sim/physics/gazebo_native -B build/gazebo-native \
-  -DDM_GAZEBO_RENDERING=ON
-cmake --build build/gazebo-native -j2
-ctest --test-dir build/gazebo-native -R '^gazebo-native-rendering-(admission|mailbox|consumer)$' --output-on-failure
+bash tools/build-linux-runtime.sh --example gazebo_render_producer
 ```
 
-它独立于 `BUILD_TESTING` 和 ROS 测试选项。沿用上述 SDK/Python 配置和 `PYTHONPATH`，
-可用固定场景读取真实原生快照：
+准备同一 SDK 的 pkg-config、native library 和插件环境后，可用 Cargo 分层验证：
 
-```python
-from sim.physics import GazeboPhysics
-
-with GazeboPhysics("sim/physics/gazebo_native/tests/rendering.sdf",
-                   cameras={"front": ("sensors", "body", "camera")},
-                   lidars={"scan": ("sensors", "body", "lidar")}) as world:
-    world.step(50_000_000)
-    print(world.get_camera("front"))  # CameraFrame or None; RGB8 bytes
-    print(world.get_lidar("scan"))    # LidarScan or None; m/rad
+```bash
+cargo test --locked -p sim-host --features scene,devices,gazebo-rendering,trace \
+  --test physics_gazebo --test physics_gazebo_consumers --test physics_gazebo_rendering \
+  --test physics_gazebo_simulation --test scene_gazebo --test scene_gazebo_cli
 ```
+
+相机/LiDAR 使用 `GazeboBindings` 的四元组绑定与 `get_camera` / `get_lidar`。
+其实际 RGB8/米/弧度值由原生快照提供；getter 可能尚无消息。
 
 渲染由标准 Sensors/Ogre2 EGL 管理。SDF 必须显式配置 Physics 和
 `gz-sim-sensors-system` / `gz::sim::systems::Sensors`，后者只设置
@@ -1676,7 +1693,7 @@ LiDAR `/points`、`/set_rate` 与标准 marker 名称；`camera_info_topic` 可�
 保持 `GZ_PARTITION` 不变，并保持准入的配置，不调用原生 `set_rate` 服务。
 本模块每进程只允许一个渲染 owner；外部进程内渲染器共存未支持。
 
-getter 立即返回最新实际交付的不可变快照，未收到消息时返回 `None`，不等待或
+getter 立即返回最新实际交付的不可变快照，未收到消息时返回 `Ok(None)`，不等待或
 推进物理时间。`timestamp_ns` 保留原生 sensor 时间（零合法）；`frame_id` 原样保留。
 图像有 `width/height/step/data`，扫描保留完整 `ranges_m/intensities` 和角度/距离元数据；
 原生无穷距离与单行 `vertical_angle_step_rad=NaN` 保留，NaN 距离拒绝。
@@ -1688,34 +1705,23 @@ reset 重建 producer 和订阅，清空旧观察；close 完成 Server 线程�
 
 仓库提供带传感器的历史社区场地组合，使用同一接口和固定本地资源：
 
-```python
-from pathlib import Path
-from sim.physics import GazeboPhysics
-
-models = Path("models").resolve()
-with GazeboPhysics(models / "gazebo_rmua19_sensors.sdf",
-                   cameras={"front": ("sensors", "body", "camera")},
-                   lidars={"scan": ("sensors", "body", "lidar")},
-                   resource_paths=(models / "vendor/rmua19/resource/models",)) as world:
-    world.step(50_000_000)
-    print(world.get_camera("front"))
-    print(world.get_lidar("scan"))
-```
+`models/gazebo_rmua19_sensors.sdf` 使用同一 `GazeboBindings` 与
+`models/vendor/rmua19/resource/models` 资源目录；按上述 front/scan 绑定读取实际快照。
 
 相机与 LiDAR 位于 `(3, 0, 0.25)`，朝向原场地墙面；中心扫描距离为 1 米。
-`gazebo-native-rendering-consumer` 用真实快照验证木纹渲染，并与仅去掉贴图的临时
+Rust `physics_gazebo_rendering` 用真实快照验证木纹渲染，并与仅去掉贴图的临时
 资源对照比较色彩和空间变化，同时核验原资产哈希。此证据只覆盖固定场景，
-不代表精确像素、相机标定或当前官方赛场；读取仍可能返回 `None` 或较早帧。
+不代表精确像素、相机标定或当前官方赛场；读取仍可能返回 `Ok(None)` 或较早帧。
 
 要验证实际 ROS 2 消息交付，在同一构建目录额外启用 ROS 门；需要
 ROS Jazzy 的 `ros_gz_bridge 1.0.24`、rclcpp 和 sensor_msgs：
 
 ```bash
 cmake -S sim/physics/gazebo_native -B build/gazebo-native \
-  -DPython3_EXECUTABLE="$PWD/build/venv-gazebo/bin/python" \
   -DCMAKE_CXX_COMPILER=/usr/bin/c++ -DCMAKE_BUILD_TYPE=Release \
   -DDM_GAZEBO_RENDERING=ON \
-  -DDM_GAZEBO_RENDERING_TESTS=ON -DDM_GAZEBO_ROS_TESTS=ON
+  -DDM_GAZEBO_RENDERING_TESTS=ON -DDM_GAZEBO_ROS_TESTS=ON \
+  -DDM_GAZEBO_RUST_PRODUCER="$PWD/target/release/examples/gazebo_render_producer"
 cmake --build build/gazebo-native -j2
 ctest --test-dir build/gazebo-native -R '^gazebo-native-ros(-consumer)?$' --output-on-failure
 ```
@@ -1729,8 +1735,8 @@ ctest --test-dir build/gazebo-native -R '^gazebo-native-ros(-consumer)?$' --outp
 Gazebo 侧 subscriber 队列由 SDK 管理，配置中的 `subscriber_queue` 不建立
 该队列的容量保证。
 
-`gazebo-native-ros` 验证原生场景夹具；`gazebo-native-ros-consumer` 使用独立 Python
-进程中的实际 `GazeboPhysics`。后者在观察器建立两个原生订阅并匹配 ROS publisher
+`gazebo-native-ros` 验证原生场景夹具；`gazebo-native-ros-consumer` 使用编译后的 Rust
+`gazebo_render_producer` 中的实际 `GazeboPhysics` / `PhysicsParticipant`。后者在观察器建立两个原生订阅并匹配 ROS publisher
 后启动 producer，验证公开 getter 的两份递增样本及原生/ROS 配对，然后等待 producer
 正常关闭。ready 标记只证明订阅设置与 DDS 匹配；原生跨进程发现和图像交付仍为异步。
 producer 最多推进 900 个 1 ms tick，观察期限为 10 秒。该门沿用固定红色方块场景，
@@ -1741,8 +1747,8 @@ CTest 总超时为 30 秒。报告保留子进程退出码、输入哈希和清�
 SDK 的 bridge 使用了 KILL 清理，不能据此宣称组件可通过公开 API 正常析构。
 该门默认关闭，证明固定场景的真实 ROS 交付，不建立 ROS、渲染与 MCU 的全局时间屏障。
 
-这个转子是未标定的验证夹具。Gazebo 的 sim/v1 多设备组合尚未迁入；
-ROS consumer 仅覆盖上述固定场景；
+这个转子是未标定的验证夹具。Gazebo 的共享 factory、YAML/CLI、离线 MCAP 与
+实际 Rust producer → 官方 ROS bridge 门已分别通过；ROS consumer 仅覆盖上述固定场景；
 上述静态场地组合也不建立 CPU/plant 全局锁步或实时性能保证。
 
 ### MuJoCo 四轮底盘
@@ -1759,18 +1765,17 @@ ROS consumer 仅覆盖上述固定场景；
 同一四轮 plant 可通过专用 worker 同时产生 M3508 反馈和 BMI088 输入：
 
 ```bash
-uv run --frozen --extra mujoco python tools/run-chassis-worker.py \
+sim worker --can-profile four-wheel --mujoco-model models/four_wheel.xml \
   --cosim /path/to/cosim.sock --fdcan /path/to/can.sock \
   --protocol v2 --rate 1000 --realtime
-uv run --frozen --extra mujoco bash tools/run-qemu-worker-smoke.sh --chassis
+bash tools/run-qemu-worker-smoke.sh --chassis
 ```
 
-ID 1–4 固定为左前、右前、左后、右后；默认模型为 `models/four_wheel.xml`，可用
-`--chassis-model` 指定具有相同具名绑定的 XML。默认 command timeout 为 100 ms，
+ID 1–4 固定为左前、右前、左后、右后；模型必须通过 `--mujoco-model` 显式指定，并具有相同具名绑定。默认 command timeout 为 100 ms，
 `--torque-per-amp .02` 是未标定的转子 Nm/A 系数，`--can-delay-ns 0` 无额外交付延迟。
 每步先完成共享 plant 的推进和反馈交付，再读取该目标时刻的原生 IMU；RESET 只重置
 一次 plant，重试不重新推进或采样。此入口要求默认 engine，不组合旧 motor backend。
-原有 `run-worker.sh` 与 `run-can-worker.py` 保持原入口。
+`tools/run-worker.sh` 是同一 Rust CLI 的薄 shell 入口。
 可选 smoke 用实际 SPI guest 核对第一个 1 ms 目标的接触瞬态、六轴量化与 DONE 消费；
 它仍不证明真实四轮固件闭环、实物标定、CPU 锁步或持续实时性能。
 
@@ -1782,7 +1787,8 @@ cd ../trobot
 cmake --preset ChassisTestRelease
 cmake --build --preset ChassisTestRelease
 cd ../dm-mc02-qemu
-uv run --frozen --extra mujoco bash tools/run-trobot-chassis-test.sh \
+bash tools/build-linux-runtime.sh --example chassis_worker
+PYTHON=.venv/bin/python bash tools/run-trobot-chassis-test.sh \
   ../trobot/build/ChassisTestRelease/trobot.elf build/test-results/chassis-release
 ```
 
@@ -1799,10 +1805,10 @@ UART 阶段窗口按主机读取时间分段，ACK/DONE 和 CAN 时间戳不建�
 可单独运行物理门：
 
 ```bash
-uv run --frozen --extra mujoco python -m pytest -q tests/test_four_wheel_physics.py
+cargo test --locked -p sim-host --features simulation,mujoco,devices --test physics_mujoco --test physics_simulation --test m3508_joints
 ```
 
-`sim.devices.bmi088.imu_to_bmi088_units(plant.get_imu("imu"))` 将已完成的 native
+`sim_host::devices::bmi088::imu_to_bmi088_units(&plant.get_imu("imu")?)` 将已完成的 native
 site 采样转换为现有 BMI088 输入单位 `(gyro_deg_s, accel_g)`，其中 `1g=9.80665 m/s²`。
 它保持三轴方向，不推进 plant、减去重力、添加 bias 或分配样本身份；已有器件负责
 量程、ODR、filter 与 raw 字节，co-sim link 负责读取来源身份。
@@ -1810,8 +1816,8 @@ site 采样转换为现有 BMI088 输入单位 `(gyro_deg_s, accel_g)`，其中 
 用同一四轮模型验证单个静止或转向采样的 QEMU SPI 读回：
 
 ```bash
-uv run --frozen --extra mujoco bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source rest
-uv run --frozen --extra mujoco bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source turn
+PYTHON=.venv/bin/python bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source rest
+PYTHON=.venv/bin/python bash tools/run-qemu-v2-step-done-smoke.sh --mujoco-source turn
 ```
 
 该门先完成 500 ms 静止步进；`turn` 再通过四台 M3508 的实际 CAN 分组命令推进
@@ -1827,7 +1833,7 @@ v2 worker 对每个 STEP 的输入准入最多等待 2 秒。没有 ACK 时，�
 
 worker 每次从 co-sim/FDCAN stream 最多读取 4096 字节，返回完整帧并保留未完成帧；v2 暂存的已解码回复先处理，再读取新输入。因此持续可读输入期间仍有机会检查等待期限并服务其它就绪方向。此策略不保证各方向吞吐相同或固定的主机延迟；自定义 backend 的阻塞调用仍需自行限时。
 
-多 QEMU 的有限运行使用前述 sim/v1 图。底层 `sim.transports.cosim` 与唯一 STEP codec
+多 QEMU 的有限运行使用前述 sim/v1 图。底层 Rust co-sim transport 与唯一 C STEP codec
 继续承载旧 worker 协议，不给应用建立第二个 scheduler。RESET/ACK/DONE 和原始流尾部
 各自保留其语义；不能从握手元数据推断 MCU、传感器和物理世界的全局锁步。
 
@@ -1841,24 +1847,24 @@ pytest 的 optional skip 不是该层 PASS；没有 Actions 运行记录时不�
 
 | 层级 | 验证入口 | 证据与限制 |
 | --- | --- | --- |
-| Host core | `.github/workflows/host-core.yml` 的 `host-core` Job | 安装基础包、纯 Python 合同、checkout 外 CLI；不运行 MCU |
-| 协议与记录 | 同 workflow 的 `application-contracts` Job | 按需安装 trace/referee；实际字节/状态、MCAP 生命周期与离线复核 |
-| 原生 Board | 下方逐项手动验收命令 | ARM ELF + 固定 QEMU；缺依赖退出 78 |
-| 多板 | 同脚本 `--case dual-board` | 独立机器与时间映射，非全局硬件锁步 |
-| 物理 | `python -m pytest -q tests/test_simulation_joints.py tests/test_four_wheel_physics.py` | 需要 MuJoCo；单 solver、异构驱动器和数值状态 |
-| 固件直连 | 下文 HAL/BSP、Motor、DJI、Chassis、Referee runner | 消费行为与清理；不代表实板标定 |
+| Host core | `cargo test --locked --workspace --features sim-host/host-runtime` | Rust 生命周期、协议、互连、配置、实验与 checkout 外 CLI；不运行 MCU |
+| 独立工具 | `.venv/bin/python -m pytest -q` | 构建/打包与黑盒消费者；无旧 Python 生产模块 |
+| 原生 Board | 下方手动 smoke / Cargo native gates | ARM ELF + 固定 QEMU；缺依赖按实际 BLOCKED/SKIP 记录 |
+| 多板 | `tools/run-simulation-smoke.sh --case dual-board` | 独立机器与时间映射，非全局硬件锁步 |
+| 物理 | Cargo `physics_mujoco` / `physics_simulation` / `physics_gazebo*` | 匹配 native feature 和 SDK；单 solver、共享驱动与完成态 |
+| 固件直连 | 下文 HAL/BSP、Motor、DJI、Chassis、Referee runner | 编译后的 consumer 与清理；不代表实板标定 |
+| 浏览器 | `smoke/dm_mc02_web_smoke.py --sim ...` | 实际 Rust Web + 原生 HAL/裸机三案例 |
 
-轻量 PR gate 不构建 QEMU、不安装 MuJoCo/ROS/Gazebo，也不依赖未追踪的本地示例。
-原生门应在具备 ARM GCC、兼容二进制及对应系统依赖的 Linux 环境中单独执行，并保留构建缓存与产物身份。
-轻量工作流明确报告 Native NOT RUN；手动门的 PASS、FAIL、BLOCKED 和有依据的 SKIPPED 分开记录。
-`--case all` 当前只运行五个基础场景，完整外设验收需要显式逐项调用：
+`.github/workflows/host-core.yml` 使用 Rust host 合同、Clippy 和独立 CLI gate，明确报告 Native NOT RUN。
+原生门需 ARM GCC、兼容 QEMU 及对应 SDK，单独记录命令、产物身份、PASS/FAIL/BLOCKED/SKIP。
+`--case all` 只运行五个基础场景；完整外设观察需按影响选择对应门：
 
 ```bash
 for build_type in Debug Release; do
   for case in minimal-board pulse digital-link can-motor rotor-loop dual-board joint-loop imu-readback uart-link can-faults; do
-    python smoke/simulation_smoke.py --build-type "$build_type" --case "$case"
+    .venv/bin/python smoke/simulation_smoke.py --build-type "$build_type" --case "$case"
   done
-  python smoke/automatic_lab_smoke.py --build-type "$build_type" --case all
+  .venv/bin/python smoke/automatic_lab_smoke.py --build-type "$build_type" --case all
 done
 ```
 
@@ -1873,34 +1879,28 @@ done
 ADC 接受不等于 DR 读取；IMU ACK 不等于完整消费 DONE；UART 是字节流，读取批次不代表消息边界。
 GPIO 完成态快照不提供未记录的中间边沿。硬件和物理标定仍需独立证据。
 
-使用同一 Runtime 和上述最小固件测量短运行开销：
+性能工具也是编译后 CLI 的黑盒消费者，`--sim` 或 `SIM_EXECUTABLE` 指定实际 Rust 可执行文件：
 
 ```bash
-python tools/benchmark_simulation.py --case host --report build/host-benchmark.json
-python tools/benchmark_simulation.py --case all --qemu /path/to/compatible/qemu-system-arm --report build/platform-benchmark.json
-```
-
-默认三次固定工作量，报告排他创建，保留 Cut、CAN、QMP、事件数据量、启动/运行耗时和内存样本。
-single/dual 的固件同样构建到报告旁的独占资产目录，并将该 ELF 显式交给原生验收。
-Host 模式无需 QEMU 或物理引擎；原生模式复用真实验收断言。观察与 JSON 编码也有开销，短运行不能证明持续实时能力。
-
-需要区分固件执行、通信、物理与输出成本时，显式运行归因矩阵：
-
-```bash
-python tools/benchmark_simulation.py --case attribution --repeat 3 \
+.venv/bin/python tools/benchmark_simulation.py --case host --sim target/release/sim --report build/host-benchmark.json
+.venv/bin/python tools/benchmark_simulation.py --case all --sim target/release/sim \
+  --qemu /path/to/compatible/qemu-system-arm --report build/platform-benchmark.json
+.venv/bin/python tools/benchmark_simulation.py --case attribution --repeat 3 --sim target/release/sim \
   --qemu /path/to/compatible/qemu-system-arm --report build/execution-cost.json
 ```
 
-该矩阵使用未修改的 minimal-board WFI 固件和 Lab 忙 MMIO 固件，分别运行单 Machine 与
-四轮单 World 组合，并比较仅统计、JSON 编码、实际 CLI 文件输出三种观察方式。
-每个样本独立执行 200ms，quantum 为 1ms，固定 `icount shift=0`；默认每格三次，共 36 个样本。
-报告和旁边的资产目录保留真实固件、身份、原始测量及失败诊断；缺少原生依赖返回 BLOCKED/78。
-QMP、Machine 完成等待及观察回调的耗时存在嵌套，QMP 等待也包含 guest 执行等待，不能相加。
-CPU 时间、wall time 和采样 RSS 分别报告；文件输出包含真实编码、写入与 flush 成本。
-`shift=0` 是每条指令一纳秒的虚拟计时约定，不是 H723 周期模型。忙轮询与 WFI 负载不可互换，
-该短矩阵不证明恢复历史 Robot 10s 预算，也不证明电机/IMU 已被固件消费或持续实时能力。
+默认三次固定工作量，报告和相邻 assets 目录排他创建，保留实际 ELF、CLI/QEMU 身份、
+观察、输入哈希与清理。Host idle 使用10000 cuts，CAN 使用1024-input准入内的1000个有序帧。
+原生样本运行200ms、1ms quantum、shift0，比较WFI/忙MMIO、单Machine/四轮World，
+输出为discard/file/mcap，共12格。三种模式都经过CLI JSON序列化；discard排空、file落盘，
+mcap额外记录。报告采集CLI墙时和Linux进程CPU/RSS，不再声称分离私有QMP、World或encoder成本。
+构建时间不计入样本，启动、输出和清理分别按报告字段解释；短样本不证明持续实时能力。
 
-本地实测（Linux、i5-12400、Python 3.12.3、QEMU 8.2.2、MuJoCo 3.12.0），
+以下性能表及原生MMIO定位属于Rust迁移前的历史证据，不能当作Rust版新测值。
+旧Python私有观察钩子与 `--capture mmio` 已移除；需要新trace时使用QEMU原生日志或外部profiler。
+历史Robot10秒预算失败仍保留，当前迁移不宣称恢复该预算。
+
+历史本地实测（Linux、i5-12400、Python 3.12.3、QEMU 8.2.2、MuJoCo 3.12.0），
 每格三次独立运行的 active wall time 中位数如下，单位为秒；均完成 200 Cut：
 
 | 固件 / 组合 | 仅统计 | JSON 编码 | CLI 文件输出 |
@@ -1921,15 +1921,14 @@ TCG、外设及 I/O 线程；它不是纯指令执行成本。观察回调计时
 后者 QEMU 采样 CPU 为 103.42s，主 CLI 为 16.17s，输出约 47.1MB。
 两次使用同一 ELF，未改变 quantum、shift 或阈值；功能通过不代表原预算恢复。
 
-进一步定位单 Machine 的原生执行路径，可复用同一工具：
+当前单 Machine 黑盒测量入口为：
 
 ```bash
-python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
-  --qemu /path/to/compatible/qemu-system-arm --report build/native-cost.json
-python tools/benchmark_simulation.py --case native-cost --capture mmio --repeat 3 \
-  --qemu /path/to/compatible/qemu-system-arm --report build/native-mmio.json
+.venv/bin/python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
+  --sim target/release/sim --qemu /path/to/compatible/qemu-system-arm --report build/native-cost.json
 ```
 
+以下 `none/mmio` 窗口和日志配额记录历史诊断工具的条件；`mmio` 私有入口已退役。
 两种模式均运行上述 WFI、忙 MMIO 固件，各三次独立 Session，仅统计观察，不创建物理世界。
 `none` 完成 200ms／200 Cut；`mmio` 在 1、10、100、199ms 各记录 10µs，随后恢复整毫秒
 切点，合计 204 Cut。后者包含日志与额外查询开销，耗时只用于诊断，不能当成无插桩基线。
@@ -1942,16 +1941,16 @@ MMIO 模式需要 Linux `prlimit` 和 QEMU log trace 后端。每个日志最多
 日志的可选时间前缀是 Host wall time，不是 guest 时间；零次 MMIO 是合法的窗口结果。
 `TB count` 是驻留翻译块数，必须结合 flush／invalidation 理解，不能等同累计翻译次数。
 
-可选系统工具 `gprofng` 可以从现有 Python 入口跟踪 QEMU 子进程，采样与 trace 应分开运行：
+可选系统工具 `gprofng` 可以跟踪黑盒测量工具启动的 Rust CLI 与 QEMU 子进程，采样与 trace 应分开运行：
 
 ```bash
 gprofng collect app -o build/native-cpu.er -p 10 -F '=.*qemu-system-arm.*' -a off \
-  python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
-  --qemu /path/to/compatible/qemu-system-arm --report build/native-cpu.json
+  .venv/bin/python tools/benchmark_simulation.py --case native-cost --capture none --repeat 3 \
+  --sim target/release/sim --qemu /path/to/compatible/qemu-system-arm --report build/native-cpu.json
 gprofng display text -header -statistics -functions /path/to/qemu-child.er
 ```
 
-先用报告中的 PID、QEMU 命令和子实验元数据选定对应的 QEMU 实验，避免合并 Python 或编译器
+先用报告中的 PID、QEMU 命令和子实验元数据选定对应的 QEMU 实验，避免合并测试驱动、Rust CLI 或编译器
 数据。保留原始实验、采集器警告和 `<Unknown>`；包含时间不能相加，未知符号不能全部归为 TCG。
 `capture=none` 只表示工具未启用 trace，外部 profiler 仍会影响运行。
 本机 gprofng 2.42 能采到 vCPU，但报告 SIGPROF 屏蔽和退出附近计时器改变的警告；
@@ -2025,10 +2024,10 @@ consumer 回归，不能据此声明硅级精度、真实电气时序或整机 m
 
 ### trobot Motor/MuJoCo 测试
 
-在相同构建环境中同步项目 MuJoCo extra，再选择专用电机测试固件：
+先准备[独立测试环境](#test-environment)，构建 Rust consumer 和 MuJoCo 原生库，再选择专用固件：
 
 ```bash
-uv sync --locked --group dev --extra mujoco
+bash tools/build-linux-runtime.sh --example firmware_motor
 cd ../trobot
 cmake --preset MotorTestRelease
 cmake --build --preset MotorTestRelease
@@ -2052,15 +2051,16 @@ P/V/T=12.5/30/10 是测试 profile，状态 nibble=0 和温度=25°C 是固定�
 
 ### 完整回归门
 
-完整门禁中的 MuJoCo Python 行为测试需要安装 `mujoco` extra；仅同步 `dev` 时，该测试会跳过并使完整门禁返回 BLOCKED。基础 QEMU 构建和最小 guest smoke 不需要此 extra：
+先准备独立 Python 测试工具、Cargo、固定 QEMU 与原生依赖。生产后端由 Rust feature 选择，
+不再安装项目的 Python MuJoCo extra：
 
 ```bash
-uv sync --locked --group dev --extra mujoco --python "${PYTHON:-/usr/bin/python3}"
+bash tools/build-linux-runtime.sh
 export DM_MC02_ELF=/absolute/path/to/trobot.elf
-python3 tools/dm_mc02_test_gate.py --jobs 4
+.venv/bin/python tools/dm_mc02_test_gate.py --jobs 4
 ```
 
-统一门禁执行 QEMU/Meson 测试、原生 Host CTest、完整 pytest 和 shell integration。它会创建 `build/test-results/qemu-gate/<run>/summary.json`，并保存各阶段日志、退出码、动态测试分母及测试前后的关键二进制 SHA-256。可通过 `--report-dir /absolute/path` 指定报告根目录。
+统一门禁执行 QEMU/Meson、原生 Host CTest、Cargo host 合同、独立 pytest 和 shell integration。它会创建 `build/test-results/qemu-gate/<run>/summary.json`，并保存各阶段日志、退出码、动态测试分母及测试前后的关键二进制 SHA-256。可通过 `--report-dir /absolute/path` 指定报告根目录。
 
 这是回归门，不是硅级验证。寄存器、IRQ、时钟和虚拟时间用例优先使用 QEMU 原生 libqtest；外部进程测试共享 QEMU 启动、socket、超时和清理逻辑。关键硬件断言注明 ST CMSIS/HAL/LL 或 RM0468 来源；实板观测仍需独立核对。
 
@@ -2074,8 +2074,8 @@ python3 tools/dm_mc02_test_gate.py --jobs 4
 只有明确列出的 ROS 2 和 MuJoCo 可选 smoke 可以 SKIP。SKIP 不等于相应能力通过验收。`--no-build` 仅适用于源码与构建产物已同步的情况；`--smoke-only` 只运行 shell smoke，不代替完整门禁：
 
 ```bash
-python3 tools/dm_mc02_test_gate.py --no-build --jobs 4
-python3 tools/dm_mc02_test_gate.py --smoke-only --jobs 4
+.venv/bin/python tools/dm_mc02_test_gate.py --no-build --jobs 4
+.venv/bin/python tools/dm_mc02_test_gate.py --smoke-only --jobs 4
 ```
 
 ### 固件实时系数
@@ -2132,6 +2132,7 @@ cmake --build --preset DjiTestDebug --clean-first
 cmake --preset DjiTestRelease
 cmake --build --preset DjiTestRelease
 cd ../dm-mc02-qemu
+cargo build --release --locked -p sim-host --features host-runtime --example firmware_dji
 bash tools/run-trobot-dji-test.sh ../trobot/build/DjiTestRelease/trobot.elf \
   build/test-results/trobot-dji.json ../trobot
 ```
@@ -2148,60 +2149,10 @@ runner 通过 ID1/ID5 覆盖两个电流命令组，独立 literal 反馈检查�
 观测与追赶有界，FAIL、缺失项、清理失败或输入哈希变化均返回非零并保留报告；实物
 plant 校准显式 SKIP。此专用固件验证与普通 Release 业务、持续性能门分别执行。
 
-Scenario 的 CAN 延迟消费者使用默认关闭的 `DjiScenarioTestDebug/Release`：
-
-该固定场景曾有 Release 复测在原 20 秒 host 期限内只完成 1090 步，最终暂停
-watchdog 观察缺失，历史失败保留。逐切点交换收敛后，Debug/Release 在原期限下
-各复测通过一次；单次通过不证明期限稳定性，也不构成实时性能证据。
-
-```bash
-cd ../trobot
-cmake --preset DjiScenarioTestRelease
-cmake --build --preset DjiScenarioTestRelease --clean-first
-cd ../dm-mc02-qemu
-.venv/bin/python tools/dm_mc02_dji_test.py --scenario \
-  ../trobot/build/DjiScenarioTestRelease/trobot.elf \
-  build/test-results/dji-scenario-release ../trobot \
-  --qemu build/qemu/qemu-system-arm
-```
-
-夹具生成固定双板 sim/v1 场景，通过同一 Simulation 运行。两个 MCU
-使用相同 ELF，真实驱动 ID1/2 输出 `64/-64`；另外两个命令槽保持零。east 总线在
-RESET 相对 0ms 设置 5ms 入队延迟，在 250ms 恢复零延迟，west 保持零延迟。
-已排队帧保留原截止时间；报告分别记录来源、交付时间、原始 CAN 字节和固件复制的
-反馈字段及 BSP 时间戳。相同反馈字节只能证明来源匹配，不能识别唯一一次固件回调。
-两边第一次完整反馈报告必须早于 250ms，否则测试失败。
-命令观察逐条校验并计数；`transition_count` 保存实际切换总数，`transitions` 仅保留
-最初 8 次切换，`last` 始终记录最后一条命令。该诊断摘要不提供完整命令轨迹。
-
-恢复延迟后，既有 UART1 握手释放第二次应用观察；握手不改变事件时间或推进世界。
-结果目录必须不存在。缺失样本、FAIL、发送或清理失败、输入变化均保留失败报告。
-该门不证明动态延迟下的 50ms 超时、物理 CAN 时序、CPU/plant 全局锁步或实时性能；
-物理校准保持显式 SKIP。旧 ID1/ID5 独立掉线测试沿用上述入口。
-
-反馈丢失的固件消费者使用独立、默认关闭的 `DjiFeedbackTestDebug/Release`，
-与 `DjiScenarioTest` 互斥：
-
-```bash
-cd ../trobot
-cmake --preset DjiFeedbackTestRelease
-cmake --build --preset DjiFeedbackTestRelease --clean-first
-cd ../dm-mc02-qemu
-.venv/bin/python tools/dm_mc02_dji_test.py --feedback-scenario \
-  ../trobot/build/DjiFeedbackTestRelease/trobot.elf \
-  build/test-results/dji-feedback-release ../trobot \
-  --qemu build/qemu/qemu-system-arm
-```
-
-新结果目录必须不存在。固定场景在 RESET 后 200 ms 屏蔽两成员各自 ID1 的反馈，
-350 ms 恢复，实际 ready 后运行 400 ms；启动期限 10 秒、host 总期限 20 秒。
-固件持续请求 ID1/2 电流 `64/-64`，检查反馈时间戳冻结、年龄超过配置的 50 ms、
-应用非零命令仍新鲜时驱动任务清零输出，以及恢复后新反馈和非零输出。
-ID2 是各成员的持续在线对照。主机还检查真实 CAN 命令、器件来源、丢弃范围、
-物理发送完成及最终 watchdog，清理和输入哈希核验完成后才发布通过。
-
-这是反馈不可达测试；50 ms 是该驱动的应用配置，不能据此声明电机断电、精确中断
-时刻、全局锁步或实时性能。物理校准保留 SKIP；本门不替代上面的固定 Release 场景门。
+旧 `--scenario` / `--feedback-scenario` 专用 DJI runner 已退役；CAN延迟、反馈缺失与恢复通过普通
+sim/v1图表达，固定ID1/ID5固件消费者使用上面的Rust `firmware_dji`。
+原Scenario Release曾在20秒host期限内只完成1090步，最终watchdog观察缺失；
+后续Debug/Release在原期限下各通过一次。这些历史结果保留，不能证明期限稳定性或实时性能。
 
 <a id="update-and-source-package"></a>
 
@@ -2248,7 +2199,7 @@ git -C qemu/upstream fetch --unshallow origin dm-mc02/v8.2.2
 | QEMU 提示找不到 Ninja | Nix 使用本项目 shell；Ubuntu 安装 `ninja-build` |
 | `fatal error: zlib.h: No such file or directory` 或 zlib 探针失败 | 检查编译器、sysroot 和 pkg-config 是否属于同一环境；Nix 使用完整 shell，Ubuntu 缺开发包时安装 `zlib1g-dev` |
 | 已有 `/usr/include/zlib.h`，但 `cc` 来自 `.nix-profile/bin` | 编译器与 apt 开发库混用；使用完整 `nix develop` 环境，或改用 Ubuntu 系统工具链 |
-| pytest 或项目 Python 环境不可用 | 使用所选环境的 Python 运行 `uv sync --locked --group dev --python "${PYTHON:-/usr/bin/python3}"` |
+| pytest 或测试 QMP client 不可用 | 按[独立测试环境](#test-environment)安装工具及固定上游 client；QEMU client 构建需要 setuptools/wheel 和 `--no-build-isolation` |
 | 测试 guest 编译失败 | 检查 `arm-none-eabi-gcc`、`arm-none-eabi-objcopy` 与 `binutils-arm-none-eabi` |
 | 终端没有 UART 文本 | 核对 `--uart` 与固件日志配置；当前 `trobot` Release 关闭 logger/terminal。原生 `-serial` 槽位 0 是二进制 co-sim |
 | `trobot` 未进入 `example_task` | 用 GDB 找到首个阻塞位置；INS 初始化需要静止 IMU 输入，按 worker 示例复现 |
@@ -2318,17 +2269,19 @@ EXTI 与 GPIO/EXTI component 状态使用 v2；修正前的 v1 pending 布局被
 - UART5 是遥控器 RX 原始输入，不提供 SBUS-A/DR16 编码、反相电平真实性或 TX。
 - MuJoCo/四轮 toy 参数未标定；CAN 故障为主机交付策略，不模拟真实仲裁、bus-off 或电气错误。
 - 固定 shift0 是虚拟指令计时，不是 H723 周期模型；CPU 切点、FIFO 到达和固件应用消费分别验证。
-- 独立 Gazebo/ROS/MIT legacy worker 与原生自由运行 Lab 暂保留其独特能力，不给新场景复制运行时。
+- Gazebo/MuJoCo共用场景world factory；ROS/MIT worker与自由运行Lab/Web使用各自明确的原生边界，不建立第二个场景时钟。
 - 不提供完整硅级模型、整机 migration、硬实时保证、分布式仿真、OJ 服务或任意不可信 manifest 的主机沙箱。
 
 | 路径 | 职责 |
 | --- | --- |
-| `sim/api`, `sim/runtime` | 纯公共合同、唯一生命周期/时间/调度 |
-| `sim/config`, `sim/fabric` | 无资源场景准入、CAN/UART/数字/IMU 连接 Owner |
-| `sim/machines/qemu` | 进程/QMP Backend、DM-MC02 Profile 与外设 adapter |
-| `sim/devices`, `sim/physics` | 具体协议设备与单一 World / joint driver |
-| `sim/apps`, `sim/trace` | 可选预设、可信进程与实验消费者；记录/离线复核 |
-| `sim/lab` | 纯断言复用与保留的原生自由运行交互 |
-| `examples`, `smoke`, `tests` | 自包含场景、真实 ELF 门、Python 合同 |
+| `crates/sim-core` | 纯公共合同、唯一生命周期/时间/调度 |
+| `crates/sim-host/src/config`, `fabric` | 无资源场景准入、CAN/UART/数字/IMU连接owner |
+| `crates/sim-host/src/machine`, `profile`, `qmp` | 原生进程/QMP Backend、DM-MC02 profile与外设adapter |
+| `crates/sim-host/src/devices`, `physics` | 协议设备、原生world和joint driver |
+| `crates/sim-host/src/apps`, `trace`, `processes` | 预设、实验、记录/重放、可信上位机程序 |
+| `crates/sim-host/src/lab`, `worker` | Rust原生自由运行Lab/Web与co-sim worker |
+| `sim/physics/gazebo_native`, `crates/sim-host/native/ros2` | 复用的Gazebo C++ owner与ROS CXX transport |
+| `cosim` | 唯一C wire codec与原生协议测试 |
+| `crates/sim-host/examples`, `examples`, `smoke`, `tests` | 编译示例、自包含场景、真实ELF门与独立测试驱动 |
 | `qemu/upstream`, `qemu.lock` | 固定 fork 与独立的原生器件/板级测试 |
 | `models`, `third_party` | 固定物理/教学来源、许可证与来源声明 |

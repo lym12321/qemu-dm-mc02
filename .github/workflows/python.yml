@@ -1,0 +1,31 @@
+name: Independent build and test tools
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tools:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install independent test dependencies
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install 'pytest>=8,<9' PyYAML==6.0.3 mcap==1.5.0 crccheck==1.3.1 setuptools==80.10.2 wheel
+          .venv/bin/python -m pip install --no-build-isolation qemu/upstream/python
+      - name: Build tools, test oracles and native vectors
+        env:
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: '1'
+          PYTHONDONTWRITEBYTECODE: '1'
+        run: .venv/bin/python -m pytest -q
+      - name: Record runtime boundary
+        if: always()
+        run: echo 'Python runs independent tests and build tools. Production CLI and runtime are Rust; native firmware and physics integration are separate gates.' >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,6 @@
+error: cannot use attributes on fields inside a struct with a struct-level `map`
+ --> tests/ui/map_with_field_level_attr.rs:6:5
+  |
+6 | /     #[br(map(|x| x + 1))]
+7 | |     y: u64,
+  | |__________^

@@ -10,8 +10,8 @@ import zipfile
 
 import pytest
 
-from sim.api import BackendUnavailable
-from sim.machines.qemu import qmp
+from smoke.support.errors import BackendUnavailable
+from smoke.support import qmp
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location('qemu_bundle', ROOT / 'tools/dm_mc02_qemu_bundle.py')

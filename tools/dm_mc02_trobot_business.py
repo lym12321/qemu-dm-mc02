@@ -23,10 +23,11 @@ from dm_mc02_firmware_rtf import (
     forward_tick_delta, read_iwdg_timeouts, read_tick, require_stopped_status,
 )
 from dm_mc02_qmp import QmpSession
-from dm_mc02_socketcan import unpack_wire_frame
 from dm_mc02_test_harness import stop
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from smoke.support.can_codec import unpack_wire_frame
 GATES = ROOT / "smoke/dm_mc02_trobot_business_gates.json"
 ENABLE = bytes.fromhex("ff ff ff ff ff ff ff fc")
 PERFORMANCE_STEPS = 72_000
@@ -77,16 +78,25 @@ def _sample_process(identity: dict) -> dict:
     return sample
 
 
+def _bench_worker() -> Path:
+    path = Path(os.environ.get("DM_TROBOT_BENCH_WORKER",
+                              ROOT / "target/release/examples/trobot_bench")).resolve()
+    if not path.is_file() or not os.access(path, os.X_OK):
+        raise RuntimeError("Compiled business worker missing: build cargo example trobot_bench "
+                           "with worker,mujoco,devices,qmp,native-process, or set DM_TROBOT_BENCH_WORKER")
+    return path
+
+
 def _inputs(elf: Path, qemu: Path) -> dict:
-    paths = [elf, qemu, GATES, ROOT / "uv.lock", ROOT / "qemu.lock",
-             ROOT / "smoke/dm_mc02_trobot_bench.py",
+    paths = [elf, qemu, _bench_worker(), GATES, ROOT / "Cargo.lock", ROOT / "qemu.lock",
+             ROOT / "crates/sim-host/examples/trobot_bench.rs",
              ROOT / "smoke/dm_mc02_trobot_bench.xml", Path(__file__)]
     paths += [ROOT / "tools" / name for name in (
-        "dm_mc02_sim_worker.py", "dm_mc02_step_coordinator.py",
-        "dm_mc02_motor_adapter.py", "dm_mc02_step_protocol.py",
-        "dm_mc02_socketcan.py", "dm_mc02_qmp.py",
+        "dm_mc02_qmp.py",
         "dm_mc02_firmware_rtf.py", "dm_mc02_test_harness.py")]
-    paths += sorted((ROOT / "sim").rglob("*.py"))
+    paths += sorted((ROOT / "crates/sim-host/src").rglob("*.rs"))
+    paths += sorted((ROOT / "crates/sim-core/src").rglob("*.rs"))
+    paths += sorted((ROOT / "smoke/support").glob("*.py"))
     result = {}
     for path in paths:
         with path.open("rb") as stream:
@@ -319,19 +329,12 @@ def _run_inside(qmp_path: str, cosim: str, can: str, pid: str,
         def call(callback, deadline=started + run_seconds):
             return deadline_qmp_call(qmp, deadline, "business run", callback)
 
-        environment = dict(os.environ, DM_TROBOT_BENCH_TRACE=str(out / "plant.jsonl"))
-        environment["DM_TROBOT_BENCH_MAX_EVENTS"] = str(3 * frames if sustained else 50000)
-        environment["PYTHONPATH"] = os.pathsep.join([
-            str(ROOT / "tools"), str(ROOT / "smoke"),
-            environment.get("PYTHONPATH", "")])
         worker = subprocess.Popen([
-            sys.executable, str(ROOT / "tools/dm_mc02_sim_worker.py"),
-            "--cosim", cosim, "--fdcan", can, "--protocol", "v2",
-            "--engine", "mujoco", "--backend", "dm_mc02_trobot_bench:create_backend",
-            "--mujoco-model", str(ROOT / "smoke/dm_mc02_trobot_bench.xml"),
-            "--motor-count", "1", "--motor-protocol", "dm-mit",
-            "--rate", "1000", "--realtime", "--frames", str(frames),
-            "--connect-timeout", "2"], stdout=stdout, stderr=stderr, env=environment)
+            str(_bench_worker()), "--cosim", cosim, "--fdcan", can,
+            "--model", str(ROOT / "smoke/dm_mc02_trobot_bench.xml"),
+            "--trace", str(out / "plant.jsonl"), "--frames", str(frames),
+            "--max-events", str(3 * frames if sustained else 50000)],
+            stdout=stdout, stderr=stderr)
         candidate["processes"]["worker"] = _identity(worker.pid)
         initialization_deadline = min(started + 10, time.monotonic() + 3)
         while time.monotonic() < initialization_deadline:
@@ -424,8 +427,7 @@ def _run_report(args) -> dict:
     try:
         if not args.elf.is_file() or not os.access(args.qemu, os.X_OK):
             raise RuntimeError("firmware ELF or QEMU missing; build the ordinary Release and project QEMU first")
-        import mujoco
-        report["mujoco_version"] = mujoco.__version__
+        report["worker_executable"] = str(_bench_worker())
         if args.performance:
             report["host"] = dict(uname=list(os.uname()), cpu_count=os.cpu_count(),
                                   load_average_start=list(os.getloadavg()),
@@ -472,6 +474,10 @@ def _run_report(args) -> dict:
         if harness.returncode:
             raise RuntimeError("integration harness failed; see harness.log and worker.stderr")
         execution = report["execution"]
+        version = re.search(r"^MuJoCo (\S+)$", (args.output / "worker.stderr").read_text(), re.M)
+        if not version:
+            raise RuntimeError("compiled worker did not identify its native MuJoCo version")
+        report["mujoco_version"] = version[1]
         identities = execution["processes"]
         if (set(identities) != {"worker", "qemu"} or any(identity is None for identity in identities.values())
                 or any(_identity(identity["pid"]) == identity for identity in identities.values())):
@@ -505,9 +511,6 @@ def _run_report(args) -> dict:
         if args.performance and not report["performance"]["passed"]:
             raise RuntimeError("sustained paced performance gate failed")
         report["status"] = "passed"
-    except ImportError as exc:
-        report["errors"].append("MuJoCo environment unavailable: " + str(exc) +
-                                "; run uv sync --locked --group dev --extra mujoco in the chosen toolchain environment")
     except BaseException as exc:
         report["errors"].append(str(exc) or type(exc).__name__)
         if isinstance(exc, (RunInterrupted, KeyboardInterrupt)):

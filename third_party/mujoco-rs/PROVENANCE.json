@@ -1,0 +1,16 @@
+{
+  "name": "mujoco-rs",
+  "version": "6.1.0+mj-3.12.0",
+  "repository": "https://github.com/davidhozic/mujoco-rs",
+  "commit": "b65f0274d773299f957c603a48da43db41805a0b",
+  "source": "https://crates.io/api/v1/crates/mujoco-rs/6.1.0%2Bmj-3.12.0/download",
+  "crate_sha256": "4404946206be380eb5570474e6aad6e646d8692c383f433709c5585281361daf",
+  "license": "MIT OR Apache-2.0",
+  "native_version": "3.12.0",
+  "changes": [
+    "Cargo.toml rust-version1.95 ->1.91.1 for the verified default feature build",
+    "build.rs HOST_OS cfg_select! replaced by std::env::consts::OS; preserves existing host/target comparison"
+  ],
+  "features": "default-features=false; no viewer/renderer/auto-download/ffi-regenerate",
+  "upgrade": "Replace this canonical published crate from a fixed version/hash; re-evaluate/remove the MSRV-only patch, verify native ABI/version and public adapter gates. Never select a parallel local checkout at runtime."
+}

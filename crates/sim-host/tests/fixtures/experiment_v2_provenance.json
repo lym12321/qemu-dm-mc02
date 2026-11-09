@@ -1,0 +1,17 @@
+{
+  "producer": "existing Python sim.trace.experiment.ExperimentTrace and sim.apps.experiment consumer",
+  "git_head": "9a0f8d632730f13712147d47ce159a9f5befead7",
+  "mcap_version": "1.5.0",
+  "files": {
+    "crates/sim-host/tests/recording_compat.py": "5e52fb7be613345036071b217a1080e1acb29960c9d2305cfd9bd4ee6f0c4f70",
+    "sim/apps/experiment.py": "48acc723176df071f88497a6575fbd452e9085ef077c3278ed5fb5a2ccd54905",
+    "sim/trace/experiment.py": "170f1e35ae86acbf5c42f1f873c50691ebed5a15cbeacc183a004d8f83d87793",
+    "sim/trace/storage.py": "56254b0ccdbef740df622471b4cc9981e1e55a5c362a790ebc6d1308f98412ef",
+    "crates/sim-host/tests/fixtures/python_can_experiment_v2.mcap": "46c8e7af80f5c52d8b0c128466ddc9b64e3d074051f2390b76774ff838379e3b",
+    "crates/sim-host/tests/fixtures/python_can_experiment_v2.json": "e873bd30f294095fe1b522187af01bc81e31ec0dd0affe8d2f371a0e837bea77",
+    "crates/sim-host/tests/fixtures/python_ready_experiment_v2.mcap": "8d3f1719381656489de6859a8b3fca763896ad60c2851b19db2d9d3731c56de6",
+    "crates/sim-host/tests/fixtures/python_ready_experiment_v2.json": "bb675462af8a7476569c00b175c631cda321dc6d9badd03e80b6f7591b02aa98"
+  },
+  "can_command": ".venv/bin/python crates/sim-host/tests/recording_compat.py write <trace> <expected>",
+  "ready_command": ".venv/bin/python crates/sim-host/tests/recording_compat.py write-ready <trace> <expected>"
+}

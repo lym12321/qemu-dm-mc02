@@ -1,6 +1,8 @@
 #ifndef DM_GAZEBO_RENDERING_HH
 #define DM_GAZEBO_RENDERING_HH
 
+#include "render_types.hh"
+
 #include <atomic>
 #include <cmath>
 #include <cstdint>
@@ -20,20 +22,6 @@
 #include <gz/transport/NodeOptions.hh>
 
 namespace dm_gazebo {
-
-struct CameraFrame {
-    int64_t timestampNs;
-    uint32_t width, height, step;
-    std::string frameId, data;
-};
-
-struct LidarScan {
-    int64_t timestampNs;
-    std::string frameId;
-    double angleMin, angleMax, angleStep, rangeMin, rangeMax;
-    double verticalAngleMin, verticalAngleMax, verticalAngleStep;
-    std::vector<double> ranges, intensities;
-};
 
 struct CameraSpec { std::string topic; uint32_t width, height; };
 struct LidarSpec {

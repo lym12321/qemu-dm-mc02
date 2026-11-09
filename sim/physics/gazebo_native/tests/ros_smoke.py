@@ -114,12 +114,14 @@ def produce(sdf: str, finish: Path) -> int:
 def main() -> int:
     if len(sys.argv) == 4 and sys.argv[1] == "--produce":
         return produce(str(Path(sys.argv[2]).resolve(strict=True)), Path(sys.argv[3]).resolve())
-    if len(sys.argv) not in (5, 7) or (len(sys.argv) == 7 and sys.argv[5] != "--production"):
+    if len(sys.argv) not in (5, 7) or (len(sys.argv) == 7 and sys.argv[5] not in ("--production", "--rust-producer")):
         print("usage: ros_smoke.py bridge_node consumer rendering.sdf bridge.yaml "
-              "[--production native-module]", file=sys.stderr)
+              "[--production native-module | --rust-producer executable]", file=sys.stderr)
         return 1
     bridge, consumer, sdf, config = [str(Path(arg).resolve(strict=True)) for arg in sys.argv[1:5]]
-    module = Path(sys.argv[6]).resolve(strict=True) if len(sys.argv) == 7 else None
+    module = Path(sys.argv[6]).resolve(strict=True) if len(sys.argv) == 7 and sys.argv[5] == "--production" else None
+    rust_producer = Path(sys.argv[6]).resolve(strict=True) if len(sys.argv) == 7 and sys.argv[5] == "--rust-producer" else None
+    production = module is not None or rust_producer is not None
     sources = [Path(path) for path in (bridge, consumer, sdf, config)]
     sources += [Path(__file__).resolve(), ROOT / "tools/dm_mc02_test_harness.py",
                 Path(__file__).with_name("rendering_smoke.cc"),
@@ -129,6 +131,13 @@ def main() -> int:
                     *sorted((ROOT / "sim/physics/gazebo_native").rglob("*.cc")),
                     *sorted((ROOT / "sim/physics/gazebo_native").rglob("*.hh")),
                     ROOT / "sim/physics/gazebo_native/CMakeLists.txt"]
+    if rust_producer is not None:
+        sources += [rust_producer, ROOT / "crates/sim-host/examples/gazebo_render_producer.rs",
+                    ROOT / "crates/sim-host/src/physics/gazebo.rs",
+                    ROOT / "crates/sim-host/src/physics/gazebo/ffi.rs",
+                    *sorted((ROOT / "sim/physics/gazebo_native").glob("*.cc")),
+                    *sorted((ROOT / "sim/physics/gazebo_native").glob("*.hh")),
+                    ROOT / "sim/physics/gazebo_native/rust_bridge.inc"]
     inputs = {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources}
     topic_prefix = f"/dm_render/run_{os.getpid()}"
     env = dict(os.environ, GZ_PARTITION=f"dm-ros-render-gate-{os.getpid()}",
@@ -176,9 +185,9 @@ def main() -> int:
                                           "-r", f"/dm_render/ros_image:={topic_prefix}/ros_image",
                                           "-r", f"/dm_render/ros_scan:={topic_prefix}/ros_scan"])
         native = launch("consumer", [consumer, sdf, "--ros-external", str(ready)]
-                        if module is not None else [consumer, sdf, "--ros"])
+                        if production else [consumer, sdf, "--ros"])
         producer = None
-        if module is not None:
+        if production:
             while True:
                 remaining()
                 running("bridge", bridge_process)
@@ -190,11 +199,14 @@ def main() -> int:
                     break
                 time.sleep(min(.01, remaining()))
             producer_env = dict(env)
-            producer_env["DM_GAZEBO_NATIVE_MODULE"] = str(module)
-            producer_env["PYTHONPATH"] = str(module.parent) + (
-                os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
-            producer = launch("producer", [sys.executable, str(Path(__file__).resolve()),
-                                           "--produce", sdf, str(finish)], producer_env)
+            if rust_producer is not None:
+                argv = [str(rust_producer), sdf, str(finish)]
+            else:
+                producer_env["DM_GAZEBO_NATIVE_MODULE"] = str(module)
+                producer_env["PYTHONPATH"] = str(module.parent) + (
+                    os.pathsep + env["PYTHONPATH"] if env.get("PYTHONPATH") else "")
+                argv = [sys.executable, str(Path(__file__).resolve()), "--produce", sdf, str(finish)]
+            producer = launch("producer", argv, producer_env)
         while True:
             running("bridge", bridge_process)
             if producer is not None:
@@ -279,7 +291,7 @@ def main() -> int:
                       "cleanup_errors": cleanup_errors, "input_sha256": inputs,
                       "gz_partition": env["GZ_PARTITION"], "ros_domain_id": env["ROS_DOMAIN_ID"],
                       "ros_topic_prefix": topic_prefix,
-                      "mode": "production" if module is not None else "native",
+                      "mode": "rust" if rust_producer is not None else "production" if module is not None else "native",
                       "children": [{"name": name, "pid": process.pid, "starttime": start,
                                     "exit_code": process.returncode}
                                    for name, process, start in processes]}, indent=2))

@@ -13,6 +13,12 @@ on:
       - 'tools/qemu-build-env.sh'
       - 'tools/package-qemu.py'
       - 'tools/check-qemu-package.py'
+      - 'tools/linux_runtime.py'
+      - 'tools/check-linux-runtime.py'
+      - 'tools/build-linux-runtime.sh'
+      - 'tools/build-linux-sdk.sh'
+      - 'sim/physics/gazebo_native/**'
+      - 'third_party/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'rust-toolchain.toml'
@@ -42,15 +48,29 @@ jobs:
   linux:
     needs: firmware
     runs-on: ubuntu-24.04
-    container: ubuntu:24.04
-    timeout-minutes: 45
+    timeout-minutes: 90
+    env:
+      DM_MUJOCO_PREFIX: ${{ github.workspace }}/build/mujoco-3.12.0
     steps:
       - name: Install standard Ubuntu build tools
         run: |
-          apt-get update
-          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
             build-essential pkg-config libglib2.0-dev zlib1g-dev python3 \
-            python3-venv python3-pip ninja-build git ca-certificates curl
+            python3-venv python3-pip ninja-build git ca-certificates curl \
+            cmake patchelf strace gnupg lsb-release libprotobuf-dev protobuf-compiler \
+            libzmq3-dev libzip-dev libsqlite3-dev libtinyxml2-dev
+      - name: Install standard native ROS2 Jazzy and Gazebo SDK packages
+        run: |
+          sudo curl --fail --location https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+            --output /usr/share/keyrings/ros-archive-keyring.gpg
+          echo 'deb [arch=amd64 signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] http://packages.ros.org/ros2/ubuntu noble main' \
+            | sudo tee /etc/apt/sources.list.d/ros2.list
+          sudo apt-get update
+          sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            ros-jazzy-ros-base ros-jazzy-ros-gz-bridge ros-jazzy-gz-sim-vendor \
+            ros-jazzy-gz-rendering-vendor ros-jazzy-gz-sensors-vendor \
+            libegl1-mesa-dev libgl1-mesa-dri
       - uses: actions/checkout@v4
         with:
           submodules: true
@@ -67,31 +87,67 @@ jobs:
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           git config --global --add safe.directory "$GITHUB_WORKSPACE/qemu/upstream"
           bash tools/build-qemu.sh
-      - name: Package binary, licenses and corresponding sources
+      - name: Build the pinned Python-free native SDK
+        run: bash tools/build-linux-sdk.sh
+      - name: Package the small Linux firmware product
         run: |
           cargo build --release --locked -p sim-host
           python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm \
-            --sim target/release/sim --output dist/dm-mc02-linux-x86_64
+            --sim target/release/sim --output dist/dm-mc02-linux-firmware-x86_64
+          cp build/guest/firmware.elf dist/dm-mc02-linux-firmware-x86_64/example.elf
+          python3 tools/check-qemu-package.py \
+            --sim dist/dm-mc02-linux-firmware-x86_64/sim \
+            --qemu dist/dm-mc02-linux-firmware-x86_64/bin/qemu-system-arm \
+            --firmware dist/dm-mc02-linux-firmware-x86_64/example.elf \
+            --report dist/dm-mc02-linux-firmware-x86_64/smoke.json
+          tar -C dist -czf dist/dm-mc02-linux-firmware-x86_64.tar.gz dm-mc02-linux-firmware-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dm-mc02-linux-firmware-x86_64
+          path: dist/dm-mc02-linux-firmware-x86_64.tar.gz
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 30
+      - name: Build and package the complete Linux runtime
+        run: |
+          bash tools/build-linux-runtime.sh
+          bash tools/build-linux-runtime.sh --example package_native_probe
+          python3 tools/package-qemu.py --qemu build/qemu/qemu-system-arm \
+            --sim target/release/sim --linux-full --mujoco-prefix "$DM_MUJOCO_PREFIX" \
+            --output dist/dm-mc02-linux-x86_64
           cp build/guest/firmware.elf dist/dm-mc02-linux-x86_64/example.elf
-      - name: Run the standalone executable without Python in PATH
+      - name: Run the standalone executable without native SDKs or Python in PATH
         run: |
           ldd dist/dm-mc02-linux-x86_64/sim | tee dist/dm-mc02-linux-x86_64/runtime-libraries.txt
           ldd dist/dm-mc02-linux-x86_64/bin/qemu-system-arm | tee -a dist/dm-mc02-linux-x86_64/runtime-libraries.txt
           ! grep -E '/nix/|not found|libpython' dist/dm-mc02-linux-x86_64/runtime-libraries.txt
-          cd /tmp
-          python3 "$GITHUB_WORKSPACE/tools/check-qemu-package.py" \
-            --sim "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/sim" \
-            --qemu "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/bin/qemu-system-arm" \
-            --firmware "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/example.elf" \
-            --report "$GITHUB_WORKSPACE/dist/dm-mc02-linux-x86_64/smoke.json"
+          # The consumer has only the declared host ABI/graphics drivers. Its
+          # Python, patchelf and strace are test tools, absent from the app PATH.
+          docker run --rm -v "$GITHUB_WORKSPACE:/checkout:ro" \
+            -v "$GITHUB_WORKSPACE/dist:/dist" -w /tmp ubuntu:24.04 bash -euc '
+              apt-get update
+              DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+                python3 patchelf strace libegl1 libgl1 libglx-mesa0 libgl1-mesa-dri
+              python3 /checkout/tools/check-linux-runtime.py \
+                --package /dist/dm-mc02-linux-x86_64 \
+                --native-probe /checkout/target/release/examples/package_native_probe \
+                --report /dist/dm-mc02-linux-x86_64/native-smoke.json
+              python3 /checkout/tools/check-qemu-package.py \
+                --sim /dist/dm-mc02-linux-x86_64/sim \
+                --qemu /dist/dm-mc02-linux-x86_64/bin/qemu-system-arm \
+                --firmware /dist/dm-mc02-linux-x86_64/example.elf \
+                --report /dist/dm-mc02-linux-x86_64/smoke.json
+            '
+          tar -C dist -czf dist/dm-mc02-linux-x86_64.tar.gz dm-mc02-linux-x86_64
       - uses: actions/upload-artifact@v4
         with:
           name: dm-mc02-linux-x86_64
-          path: dist/dm-mc02-linux-x86_64/
+          path: dist/dm-mc02-linux-x86_64.tar.gz
+          compression-level: 0
           if-no-files-found: error
           retention-days: 30
       - name: Record verification
-        run: echo 'Ubuntu 24.04 x86_64 Rust firmware entry — real firmware UART, monitor exit and reset-paused GDB port passed without Python in PATH. QEMU is stored once beside the launcher.' >> "$GITHUB_STEP_SUMMARY"
+        run: echo 'Ubuntu 24.04 x86_64 complete Rust runtime — recursive bundled native closure, actual MuJoCo/Ogre2/ROS context, firmware UART and reset-paused GDB listener passed without Python in PATH. Host glibc and EGL/GLVND graphics drivers remain system dependencies. QEMU and native libraries are stored once.' >> "$GITHUB_STEP_SUMMARY"
 
   windows:
     needs: firmware

@@ -6,13 +6,114 @@ rust-version.workspace = true
 repository.workspace = true
 description = "Native DM-MC02 firmware launcher"
 
+[features]
+host-runtime = ["scene", "trace", "machine", "web", "worker", "devices", "referee", "socketcan", "host-processes"]
+linux-runtime = ["host-runtime", "mujoco", "gazebo-rendering", "ros2"]
+cosim-wire = ["dep:cc"]
+simulation = ["dep:sim-core"]
+qmp = ["dep:qapi", "dep:tokio", "dep:futures", "dep:serde", "dep:serde_json"]
+yaml = ["dep:yaml-rust2", "dep:regex", "dep:num-bigint", "dep:base64"]
+boards = ["dep:sim-core", "dep:serde_json"]
+scene = ["yaml", "simulation", "boards", "dep:serde", "dep:serde_json", "dep:signal-hook"]
+native-process = ["dep:rustix"]
+host-processes = ["simulation", "native-process"]
+socketcan = ["simulation", "dep:socketcan"]
+trace = ["dep:mcap", "dep:binrw"]
+machine = ["simulation", "boards", "qmp", "native-process", "cosim-wire"]
+lab = ["boards", "qmp", "native-process", "cosim-wire", "dep:signal-hook"]
+lab-session = ["lab", "dep:uuid", "dep:base64"]
+web = ["lab-session", "dep:axum", "tokio/sync", "tokio/fs"]
+worker = ["simulation", "physics", "cosim-wire", "native-process", "dep:tokio", "dep:signal-hook", "dep:roxmltree", "dep:sha2"]
+physics = ["dep:sim-core"]
+devices = ["physics"]
+referee = ["dep:crc", "dep:sim-core"]
+mujoco = ["physics", "dep:mujoco-rs"]
+gazebo = ["physics", "dep:cxx", "dep:cxx-build", "dep:pkg-config"]
+gazebo-rendering = ["gazebo"]
+ros2 = ["simulation", "dep:cxx", "dep:cxx-build"]
+
 [[bin]]
 name = "sim"
 path = "src/main.rs"
 
+[[example]]
+name = "host_can"
+required-features = ["simulation"]
+
+[[example]]
+name = "gazebo_render_producer"
+required-features = ["gazebo-rendering"]
+
+[[example]]
+name = "firmware_motor"
+required-features = ["worker", "mujoco", "qmp"]
+
+[[example]]
+name = "trobot_bench"
+required-features = ["worker", "mujoco", "devices", "qmp", "native-process"]
+
+[[example]]
+name = "chassis_worker"
+required-features = ["worker", "mujoco", "devices", "qmp", "native-process"]
+
+[[example]]
+name = "firmware_dji"
+required-features = ["worker", "devices", "boards"]
+
+[[example]]
+name = "native_mujoco"
+required-features = ["worker", "devices", "mujoco", "qmp"]
+
+[[example]]
+name = "edge_events"
+required-features = ["simulation"]
+
+[[example]]
+name = "experiment"
+required-features = ["scene", "machine"]
+
+[[example]]
+name = "mixed_drivers"
+required-features = ["simulation", "mujoco", "devices"]
+
+[[example]]
+name = "imu_consumer"
+required-features = ["scene", "mujoco"]
+
 [dependencies]
+sim-core = { path = "../sim-core", optional = true }
 clap = { version = "4.5.53", features = ["derive"] }
 dunce = "1.0.5"
 tempfile = "3.23.0"
 wait-timeout = "0.2.1"
 which = "8.0.0"
+qapi = { path = "../../third_party/qapi-rs/qapi", version = "=0.15.0", default-features = false, features = ["qmp", "async-tokio-net"], optional = true }
+tokio = { version = "1.48.0", default-features = false, features = ["rt", "net", "time", "io-util"], optional = true }
+futures = { version = "0.3.31", optional = true }
+serde = { version = "1.0.228", features = ["derive"], optional = true }
+serde_json = { version = "1.0.145", features = ["preserve_order", "arbitrary_precision"], optional = true }
+yaml-rust2 = { version = "=0.13.0", default-features = false, optional = true }
+regex = { version = "=1.12.2", optional = true }
+num-bigint = { version = "=0.4.6", optional = true }
+base64 = { version = "=0.22.1", optional = true }
+crc = { version = "=3.4.0", optional = true }
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "process", "event", "net", "fs", "termios", "time"], optional = true }
+mcap = { version = "=0.26.0", default-features = false, optional = true }
+binrw = { version = "=0.15.2", optional = true }
+mujoco-rs = { path = "../../third_party/mujoco-rs", version = "=6.1.0", default-features = false, optional = true }
+cxx = { version = "=1.0.205", optional = true }
+uuid = { version = "=1.29.2", default-features = false, features = ["v4"], optional = true }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "multipart", "ws", "tokio"], optional = true }
+roxmltree = { version = "=0.21.1", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+signal-hook = { version = "=0.3.18", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = { version = "=4.0.0", default-features = false, optional = true }
+
+[build-dependencies]
+cc = { version = "1.2.56", optional = true }
+cxx-build = { version = "=1.0.205", optional = true }
+pkg-config = { version = "=0.3.34", optional = true }

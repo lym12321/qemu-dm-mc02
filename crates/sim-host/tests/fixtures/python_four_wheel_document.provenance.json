@@ -1,0 +1,8 @@
+{
+  "producer": "pre-retirement Python sim.apps.presets.four_wheel_document + add_can_faults",
+  "source_sha256": "f99034438cfe5f5d3b4ab63121e950c6eccdb6b0b97f9de41622074d65717d5f",
+  "source_archive": "build/rust-migration/pre-retirement-worktree.tar.gz:sim/apps/presets.py",
+  "fixture_sha256": "7578c1bf613a183bf654dc526022e207ac6a0ce83c724a156ec40f670fa43b2d",
+  "inputs": "tests/presets.rs::options and preserves_python_wiring_and_fault_order; east/west, IMU true, 50ms, 1ms quantum, equal-time delay before feedback",
+  "purpose": "independent prior-implementation wiring/order oracle, not hardware or physical accuracy evidence"
+}

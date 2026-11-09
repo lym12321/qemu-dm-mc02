@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from collections.abc import Mapping
-from dataclasses import fields, is_dataclass, replace
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -18,9 +19,14 @@ import signal
 import subprocess
 import struct
 import sys
+import tempfile
+import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+from smoke.support.native_cli import NativeCommand, resolve_sim
 CASES = ("minimal-board", "can-motor")
 EXAMPLE_ALIASES = {"pulse": "minimal-board", "dual-board": "can-motor",
                    "digital-link": "minimal-board", "rotor-loop": "can-motor",
@@ -37,6 +43,8 @@ def _plain(value):
         return {"bytes_hex": value.hex()}
     if isinstance(value, Mapping):
         return {key: _plain(item) for key, item in value.items()}
+    if isinstance(value, SimpleNamespace):
+        return _plain(vars(value))
     if isinstance(value, tuple):
         return [_plain(item) for item in value]
     if is_dataclass(value) and not isinstance(value, type):
@@ -93,15 +101,12 @@ class Observations:
             self.uart_batches.append({**stamp, "source": event.source_node,
                                       "data_hex": event.payload.hex()})
         elif event.kind == "snapshot" and event.source_node in ("main", "peer"):
-            # Reuse the public hardware projection. Copying this frozen public
-            # value changes neither the native observation nor its meaning.
-            from sim.boards import digital_level
-
+            # Read only the published native sampled levels.
             snapshot = _plain(event.payload)
             self.snapshots.append({**stamp, "source": event.source_node,
                 "native_timestamp_ns": snapshot["timestamp_ns"],
-                "key": digital_level("gpio.A15", snapshot),
-                "b0": digital_level("gpio.B0", snapshot),
+                "key": (snapshot["gpio"]["A"]["sampled"] >> 15) & 1,
+                "b0": snapshot["gpio"]["B"]["sampled"] & 1,
                 "b0_output": bool(snapshot["gpio"]["B"]["output_mask"] & 1)})
         elif event.kind in ("net.uart.sent", "net.uart.delivery"):
             payload = dict(event.payload)
@@ -373,9 +378,12 @@ class Observations:
         expected_position = (.001 * v_inf * (n - r * (1 - r ** n) / (1 - r))
                              + .001 * velocity * r * (1 - r ** m) / (1 - r))
         expected_velocity = velocity * r ** m
-        if (not math.isclose(state["position_rad"], expected_position, rel_tol=0, abs_tol=1e-12)
-                or not math.isclose(state["velocity_rad_s"], expected_velocity, rel_tol=0, abs_tol=1e-12)):
-            raise AssertionError("completed state disagrees with independent closed-form rotor")
+        # The CLI exposes completed rotor observations through actual feedback.
+        # Compare independent closed-form values at the public C620 quantization.
+        expected_encoder = math.floor((expected_position % (2 * math.pi)) * 8192 / (2 * math.pi))
+        expected_rpm = round(expected_velocity * 60 / (2 * math.pi))
+        if (state["encoder"], state["rpm"]) != (expected_encoder, expected_rpm):
+            raise AssertionError("completed feedback disagrees with independent closed-form rotor")
         self.rotor_consumption = {
             "command_source_ns": [row["source_time_ns"] for row in commands],
             "command_delivery_ns": [drive_ns, zero_ns],
@@ -628,7 +636,11 @@ class Observations:
                 raise AssertionError("IMU native admission lost the completed SI source provenance")
             if not cut:
                 continue
-            wire = payload["wire"]
+            wire = dict(payload["wire"])
+            # JSON preserves the float32 round trip. Recover its declared wire
+            # precision before comparing the independent IEEE-754 literal.
+            wire["accel_g"] = [struct.unpack("<f", struct.pack("<f", value))[0]
+                               for value in wire["accel_g"]]
             if (wire != {"gyro_dps": [0.0, 0.0, 0.0],
                          "accel_g": [0.0, 0.0, expected_accel_g],
                          "gyro_bias_dps": [0.0, 0.0, 0.0], "accel_bias_g": [0.0, 0.0, 0.0],
@@ -786,9 +798,9 @@ class Observations:
             raise AssertionError("key pulse was not delivered at its scheduled native cuts")
         # These are actual QEMU snapshots collected after completed native
         # runs, before that cut's inputs. B0 high at 4ms proves the guest acted
-        # during the 3..4ms pulse, even though UART serialization finishes later.
+        # during the 3..4ms pulse. The CLI's requested endpoint is 20ms.
         for cut, key, b0 in ((3_000_000, 1, 0), (4_000_000, 0, 1),
-                             (10_000_000, 1, 0)):
+                             (20_000_000, 1, 0)):
             rows = [item for item in self.snapshots
                     if item["source"] == "main" and item["mapped_time_ns"] == cut]
             if (len(rows) != 1 or rows[0]["delivery_time_ns"] != cut
@@ -996,111 +1008,6 @@ def _firmware_identity(firmware):
     return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
 
 
-def _capture_machine(resources, name, info, firmware):
-    """Capture actual Linux process arguments, independently of the scene."""
-    pid = info["pid"]
-    resource = {"name": name, "pid": pid, "sockets": dict(info["sockets"])}
-    resources.append(resource)
-    proc = Path(f"/proc/{pid}")
-    # starttime distinguishes an unrelated reused PID during cleanup.
-    resource["starttime"] = proc.joinpath("stat").read_text().rsplit(")", 1)[1].split()[19]
-    arguments = proc.joinpath("cmdline").read_bytes().removesuffix(b"\0").split(b"\0")
-    resource["argv"] = [os.fsdecode(arg) for arg in arguments]
-    argv = resource["argv"]
-    if argv.count("-kernel") != 1 or argv.index("-kernel") + 1 == len(argv):
-        raise AssertionError("actual native process lacks a unique -kernel ELF argument")
-    resource["firmware"] = _firmware_identity(argv[argv.index("-kernel") + 1])
-    if resource["firmware"] != firmware:
-        raise AssertionError("actual native -kernel ELF differs from the requested firmware")
-
-
-def _cleanup_failures(resources):
-    failures = []
-    for resource in resources:
-        try:
-            stat = Path(f"/proc/{resource['pid']}/stat")
-            try:
-                current = stat.read_text().rsplit(")", 1)[1].split()[19]
-            except FileNotFoundError:
-                current = None
-            if current is not None and ("starttime" not in resource or current == resource["starttime"]):
-                failures.append(f"owned QEMU identity remains after cleanup: {resource['pid']}")
-            if any(os.path.lexists(path) for path in resource["sockets"].values()):
-                failures.append("owned native socket path remains after cleanup")
-        except (OSError, ValueError, IndexError) as error:
-            failures.append(f"native cleanup verification failed: {error}")
-    return failures
-
-
-def run_can_faults(*, qemu, firmware, backend_root=ROOT):
-    import yaml
-    from sim.apps.experiment import run_experiment
-    from sim.composition import builtin_registry
-    from sim.config.scene import load_scene
-    from sim.machines.qemu import QemuFactory
-    from sim.machines.qemu.errors import BackendUnavailable
-
-    identity = _firmware_identity(firmware)
-    firmware = Path(identity["path"])
-    document = yaml.safe_load((ROOT / "examples/can-faults/scene.yaml").read_text())
-    document["nodes"]["main"]["firmware"] = str(firmware)
-    prepared = firmware.parent / "can-faults.yaml"
-    with prepared.open("x") as output:
-        yaml.safe_dump(document, output, sort_keys=False)
-    observations = Observations(capture_can_faults=True)
-    machines, resources = {}, []
-
-    class CaptureFactory(QemuFactory):
-        def create(self, spec, context):
-            machine = super().create(spec, context)
-            machines[spec.name] = machine
-            return machine
-
-    def observe(event):
-        observations(event)
-        for name, machine in machines.items():
-            if machine.started and not any(row["name"] == name for row in resources):
-                _capture_machine(resources, name, machine.connection_info, identity)
-
-    registry = builtin_registry(qemu=qemu, backend_root=backend_root)
-    registry["machine.qemu"] = CaptureFactory(qemu=qemu, backend_root=backend_root)
-    scene = load_scene(prepared, registry)
-    primary = None
-    try:
-        experiment = run_experiment(scene, registry, on_event=observe)
-    except BaseException as error:
-        if isinstance(error, BackendUnavailable):
-            unavailable = error
-            error = Blocked(str(unavailable))
-            for note in getattr(unavailable, "__notes__", ()):
-                error.add_note(note)
-        primary = error
-        raise error
-    finally:
-        # run_experiment owns Simulation and independently closes its owners.
-        failures = _cleanup_failures(resources)
-        partial = {**observations.report(), "resources": resources,
-                   "cleanup_completed": not failures, "cleanup_failures": failures}
-        if primary is not None:
-            primary.simulation_observations = partial
-            for failure in failures:
-                primary.add_note(failure)
-        elif failures:
-            error = AssertionError("; ".join(failures))
-            error.simulation_observations = partial
-            raise error
-    try:
-        if {row["name"] for row in resources} != {"main"}:
-            raise AssertionError("actual native QEMU identity was not observed")
-        if _firmware_identity(firmware) != identity:
-            raise AssertionError("firmware ELF changed during the native acceptance run")
-        verified = verify_can_faults(observations, experiment)
-    except BaseException as error:
-        error.simulation_observations = partial
-        raise
-    return {**partial, "state": "closed", "experiment": _plain(experiment), "can_faults": verified}
-
-
 def build_example(case, *, build_dir, build_type="Debug", imu_skip_gyro=False,
                   uart_skip_rx=False, can_skip_rx=False):
     for program in ("cmake", "arm-none-eabi-gcc"):
@@ -1133,121 +1040,146 @@ def build_example(case, *, build_dir, build_type="Debug", imu_skip_gyro=False,
             "build_type": build_type, "build": logs}
 
 
-def _case_scene(case, *, registry, firmware):
-    """Prepare fixed smoke scenes without acquiring execution resources."""
-    from sim.api import LinkSpec, NodeSpec
-    from sim.config.scene import load_scene
+def _case_document(case, *, firmware):
+    """Generate ordinary public scene data; never acquire a native backend."""
+    import yaml
 
     firmware = str(Path(firmware).resolve())
     if case == "hal-gpio":
-        from sim.api import Topology
-        from sim.config.scene import Scene
-
-        scene = Scene(Topology((NodeSpec("main", "machine.qemu", {
-            "model": "dm-mc02", "firmware": firmware, "uarts": ()}),), ()))
+        directory = ROOT
+        document = {"schema": "sim/v1", "runtime": {"quantum": "1ms", "duration": "200ms"},
+                    "nodes": {"main": {"kind": "machine.qemu", "firmware": firmware,
+                                         "uarts": []}}, "links": []}
     else:
         example = "digital-link" if case == "digital-link" else EXAMPLE_ALIASES.get(case, case)
-        scene = load_scene(ROOT / "examples" / example /
-                           (case + ".yaml" if case in ("rotor-loop", "joint-loop") else "scene.yaml"), registry)
+        directory = ROOT / "examples" / example
+        document = yaml.safe_load((directory / (case + ".yaml" if case in
+                                  ("rotor-loop", "joint-loop") else "scene.yaml")).read_text())
         if case == "pulse":
-            scene = replace(scene, quantum_ns=10_000_000, duration_ns=20_000_000)
+            document["runtime"].update(quantum="10ms", duration="20ms")
         if case == "dual-board":
-            main = next(node for node in scene.topology.nodes if node.name == "main")
-            peer = replace(main, name="peer")
-            scene = replace(scene, topology=replace(scene.topology,
-                nodes=(*scene.topology.nodes, peer),
-                links=(*scene.topology.links, LinkSpec("peer.fdcan1", "can0.can"))))
-    nodes = tuple(replace(node, options={**node.options, "firmware": firmware})
-                  if node.kind == "machine.qemu" else node for node in scene.topology.nodes)
-    scene = replace(scene, topology=replace(scene.topology, nodes=nodes))
-    scene.topology.validate(registry)
-    return scene
+            document["nodes"]["peer"] = dict(document["nodes"]["main"])
+            document["links"].append(["peer.fdcan1", "can0.can"])
+    for node in document["nodes"].values():
+        if node["kind"] == "machine.qemu":
+            node["firmware"] = firmware
+        elif node["kind"].startswith("physics."):
+            node["model"] = str((directory / node["model"]).resolve())
+    if case in ("minimal-board", "hal-gpio", "digital-link", "pulse"):
+        start, end = ("3ms", "4ms") if case == "pulse" else ("40ms", "90ms")
+        experiment = document.setdefault("experiment", {})
+        experiment.setdefault("inputs", []).extend([
+            {"at": start, "endpoint": "main.key", "value": True, "origin": "session"},
+            {"at": end, "endpoint": "main.key", "value": False, "origin": "session"}])
+    document.setdefault("experiment", {})
+    return document
 
 
-def run_case(case, *, qemu, firmware, backend_root=ROOT):
-    if case == "can-faults":
-        return run_can_faults(qemu=qemu, firmware=firmware, backend_root=backend_root)
-    from sim.composition import builtin_registry
-    from sim.runtime import Simulation
-    from sim.machines.qemu.errors import BackendUnavailable
+def _trace_value(value):
+    """Decode public typed experiment data with the independent MCAP reader."""
+    if not isinstance(value, dict):
+        return value
+    tag, payload = value["type"], value["value"]
+    if tag == "bytes":
+        return base64.b64decode(payload, validate=True)
+    if tag == "tuple":
+        return tuple(_trace_value(item) if isinstance(item, dict) else item for item in payload)
+    decoded = {key: _trace_value(item) if isinstance(item, dict) else item
+               for key, item in payload.items()}
+    return decoded if tag == "mapping" else SimpleNamespace(**decoded)
 
+
+def _read_observations(path, observations):
+    from mcap.stream_reader import StreamReader
+    from mcap.records import Header, Message, Footer
+
+    completion = None
+    ordinal = 0
+    with Path(path).open("rb") as stream:
+        for record in StreamReader(stream, validate_crcs=True).records:
+            if isinstance(record, Header) and record.profile != "robot-sim/trace/1":
+                raise AssertionError("unexpected experiment MCAP profile")
+            if not isinstance(record, Message):
+                last_record = record
+                continue
+            entry = json.loads(record.data)
+            if entry["format"] != "sim/experiment/2" or entry["ordinal"] != ordinal:
+                raise AssertionError("experiment record format/ordinal changed")
+            ordinal += 1
+            if entry["kind"] == "event":
+                event = dict(entry["data"])
+                event["payload"] = _trace_value(event["payload"]) if isinstance(event["payload"], dict) else event["payload"]
+                observations(SimpleNamespace(**event))
+            elif entry["kind"] == "completion":
+                completion = entry["data"]
+            last_record = record
+    if (not isinstance(last_record, Footer) or completion is None
+            or completion["events"] != observations.total or completion["records"] != ordinal):
+        raise AssertionError("experiment trace lacks complete MCAP/event closure")
+    return _trace_value(completion["summary"])
+
+
+def run_can_faults(*, qemu, firmware, backend_root=ROOT, sim=None):
+    return run_case("can-faults", qemu=qemu, firmware=firmware, backend_root=backend_root, sim=sim)
+
+
+def run_case(case, *, qemu, firmware, backend_root=ROOT, sim=None):
+    import yaml
+
+    executable = resolve_sim(sim)
     identity = _firmware_identity(firmware)
-    observations = Observations()
-    registry = builtin_registry(qemu=qemu, backend_root=backend_root)
-    scene = _case_scene(case, registry=registry, firmware=identity["path"])
-    simulation = Simulation(scene.topology, registry, quantum_ns=scene.quantum_ns,
-        mode=scene.mode, startup_timeout_s=10, host_timeout_s=30,
-        on_event=observations)
+    directory = Path(tempfile.mkdtemp(prefix="rust-cli-", dir=Path(identity["path"]).parent))
+    manifest, trace, report = (directory / name for name in ("scene.yaml", "events.mcap", "result.json"))
+    manifest.write_text(yaml.safe_dump(_case_document(case, firmware=identity["path"]), sort_keys=False))
+    observations = Observations(capture_can_faults=case == "can-faults")
+    command = {}
+    consumer = None
     primary = None
-    resources = []
     try:
-        simulation.start()
-        for name, component in simulation.components.items():
-            info = getattr(component, "connection_info", None)
-            if info is not None:
-                _capture_machine(resources, name, info, identity)
-        if {item["name"] for item in resources} != (
-                {"main", "peer"} if case in ("dual-board", "digital-link") else {"main"}):
-            raise AssertionError("the real machine did not expose its native process identity")
-        if case in ("minimal-board", "hal-gpio", "digital-link"):
-            simulation.schedule_input("main.key", True, at_ns=40_000_000)
-            simulation.schedule_input("main.key", False, at_ns=90_000_000)
-        elif case == "pulse":
-            simulation.schedule_input("main.key", True, at_ns=3_000_000)
-            simulation.schedule_input("main.key", False, at_ns=4_000_000)
-            # One public step must execute the interior cuts and still reach
-            # its requested 10ms endpoint. Continue for the serialized UART.
-            simulation.step(10_000_000)
-        simulation.run_until(scene.duration_ns)
-        if case == "rotor-loop":
-            position, velocity = simulation.components["motor0"].get_rotor_state()
-            observations.rotor_state = {"time_ns": simulation.t_sim_ns,
-                "position_rad": position, "velocity_rad_s": velocity}
+        consumer = NativeCommand([str(executable), "run", str(manifest), "--qemu", str(qemu),
+            "--backend-root", str(backend_root), "--startup-timeout", "10", "--timeout", "30",
+            "--trace", str(trace), "--report", str(report)], time.monotonic() + 35, command)
+        code = consumer.finish()
+        payload = json.loads(report.read_text())
+        if code != 0 or payload["status"] != "passed":
+            error = Blocked if code == 78 else AssertionError
+            raise error(f"Rust Simulation CLI failed: {payload}; {consumer.child.diagnostics()}")
     except BaseException as error:
-        if isinstance(error, BackendUnavailable):
-            unavailable = error
-            error = Blocked(str(unavailable))
-            for note in getattr(unavailable, "__notes__", ()):
-                error.add_note(note)
-            primary = error
-            raise error
         primary = error
         raise
     finally:
-        close_error = None
-        try:
-            simulation.close()
-        except BaseException as error:
-            close_error = error
-        failures = _cleanup_failures(resources)
-        if close_error is not None:
-            failures.insert(0, f"Simulation cleanup also failed: {close_error}")
-            failures.extend(getattr(close_error, "__notes__", ()))
-        partial = {**observations.report(), "resources": resources,
-                   "cleanup_completed": not failures, "cleanup_failures": failures}
+        if consumer is not None:
+            consumer.close(primary)
         if primary is not None:
-            primary.simulation_observations = partial
-            for failure in failures:
-                primary.add_note(failure)
-        elif failures:
-            error = close_error if close_error is not None else AssertionError("; ".join(failures))
-            error.simulation_observations = partial
-            raise error
-    # No success or verification is published before all resource owners close.
+            primary.simulation_observations = {"command": command, "artifacts": str(directory)}
     try:
-        if _firmware_identity(firmware) != identity:
-            raise AssertionError("firmware ELF changed during the native acceptance run")
-        result = observations.verify(case)
-        if str(simulation.state) != "closed":
-            raise AssertionError("Simulation did not reach CLOSED after cleanup")
+        resources = command["resources"]
+        if len(resources) != (2 if case in ("dual-board", "digital-link") else 1):
+            raise AssertionError("actual native QEMU process identities were not observed")
+        if any(row["firmware"] != identity for row in resources) or _firmware_identity(firmware) != identity:
+            raise AssertionError("native -kernel or retained ELF differs from the requested firmware")
+        summary = _read_observations(trace, observations)
+        if case == "can-faults":
+            experiment = SimpleNamespace(**payload["result"], passed=True)
+            verified = verify_can_faults(observations, experiment)
+            result = {**observations.report(), "experiment": payload["result"], "can_faults": verified}
+        else:
+            if case == "rotor-loop":
+                feedback = [row for row in observations.can if row["source"] == "motor0"
+                            and row["can_id"] == 0x201 and row["mapped_time_ns"] == summary["end_ns"]]
+                if len(feedback) == 1:
+                    raw = bytes.fromhex(feedback[0]["data"])
+                    observations.rotor_state = {"time_ns": summary["end_ns"],
+                        "encoder": int.from_bytes(raw[:2], "big"),
+                        "rpm": int.from_bytes(raw[2:4], "big", signed=True)}
+            result = observations.verify(case)
+        return {**result, "state": "closed", "cleanup_completed": command["cleanup_completed"],
+                "cleanup_failures": command["cleanup_failures"], "resources": resources,
+                "command": command, "artifacts": str(directory)}
     except BaseException as error:
-        error.simulation_observations = partial
+        error.simulation_observations = {**observations.report(), "command": command,
+                                         "artifacts": str(directory)}
         raise
-    result["cleanup_completed"] = True
-    result["cleanup_failures"] = []
-    result["resources"] = resources
-    result["state"] = str(simulation.state)
-    return result
 
 
 def _interrupted(signum, _frame):
@@ -1266,6 +1198,7 @@ def main(argv=None):
     parser.add_argument("--qemu", type=Path, default=Path(os.environ.get(
         "QEMU_SYSTEM_ARM", ROOT / "build/qemu/qemu-system-arm")))
     parser.add_argument("--report", type=Path)
+    parser.add_argument("--sim", type=Path, help="compiled Rust sim executable (or SIM_EXECUTABLE)")
     args = parser.parse_args(argv)
     if args.can_skip_rx and args.case != "can-faults":
         parser.error("--can-skip-rx requires --case can-faults")
@@ -1313,7 +1246,7 @@ def main(argv=None):
                         payload["cases"][case] = build_example(case, build_dir=build_dir,
                             build_type=args.build_type, can_skip_rx=args.can_skip_rx)
                     payload["cases"][case]["observations"] = run_case(
-                        case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]))
+                        case, qemu=args.qemu, firmware=Path(payload["cases"][case]["elf"]), sim=args.sim)
                     item = payload["cases"][case]
                     if _firmware_identity(item["elf"])["sha256"] != item["sha256"]:
                         raise AssertionError("firmware ELF changed during the native acceptance run")

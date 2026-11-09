@@ -74,9 +74,9 @@ import signal
 import sys
 import time
 
-from sim.transports import connect_unix
-from sim.transports import step_codec as protocol
-from sim.transports.cosim import (
+from smoke.support.unix import connect_unix
+from smoke.support import step_codec as protocol
+from smoke.support.cosim import (
     QemuTimestampMapper, StepFramedSocket, V2SessionReset,
     poll_v2_response, send_v2_step, wait_v2_reset_ack, wait_v2_response,
 )

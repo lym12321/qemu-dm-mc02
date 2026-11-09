@@ -5,58 +5,42 @@ Only bounded observers live here. Simulation owns every CPU target, world step,
 connection delivery and teardown. UART reports supplement actual CAN/IMU bytes;
 no host PASS text is injected and no global CPU/plant barrier is claimed.
 """
-from contextlib import nullcontext
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import asdict
+from types import SimpleNamespace
+import os
+import yaml
 import argparse
 import hashlib
 import json
 from pathlib import Path
-import signal
 import struct
 import sys
 import time
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from crccheck.crc import Crc8MaximDow, Crc16Mcrf4Xx
-from sim.apps.experiment import run_experiment
-from sim.apps.presets import four_wheel_document, add_can_faults
-from sim.machines.qemu.launch import resolve_qemu
-from sim.composition import builtin_registry
-from sim.config.scene import load_scene
-from sim.transports import step_codec as codec
+from smoke.support.experiment import execute_scene
+from smoke.support.native_cli import regular_file, resolve_sim
+from smoke.support.presets import four_wheel_document, add_can_faults
 
 
 def sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
-def starttime(pid):
-    try:
-        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19]
-    except FileNotFoundError:
-        return None
-
-
 def source_origins():
-    from sim.machines.qemu.qmp import qmp_client_provenance
-    client_root = Path(qmp_client_provenance()["package_root"])
     result = {}
     for name, module in sorted(sys.modules.items()):
-        if name == "__main__" or name.startswith(("sim.", "tools.", "dm_mc02_", "qemu.")):
+        if name == "__main__" or name.startswith(("smoke.", "tools.", "dm_mc02_")):
             value = getattr(module, "__file__", None)
             if value is None:
                 continue
             path = Path(value).resolve()
-            if name == "__main__" and not path.is_file():
-                continue
-            owner = client_root if name.startswith("qemu.") else ROOT
-            if not path.is_relative_to(owner):
-                raise AssertionError(f"actual native module outside checkout: {name} {path}")
-            result[name] = {"path": str(path), "sha256": sha(path)}
+            if path.is_file() and path.is_relative_to(ROOT):
+                result[name] = {"path": str(path), "sha256": sha(path)}
     return result
 
 
@@ -67,6 +51,8 @@ def plain(value):
         return [plain(item) for item in value]
     if isinstance(value, bytes):
         return {"hex": value.hex()}
+    if isinstance(value, SimpleNamespace):
+        return plain(vars(value))
     if hasattr(value, "__dataclass_fields__"):
         return plain(asdict(value))
     return value
@@ -293,192 +279,33 @@ SCENARIO_EAST_PAYLOADS = (
 )
 
 class NativeObservation:
-    """Observe public factories, streams and events without driving component time."""
+    """Independent assertions over completed public MCAP events."""
 
     def __init__(self, report, members, profile):
         self.report, self.members, self.profile = report, tuple(members), profile
-        self.machines, self.streams, self.identities = {}, {}, {}
-        self.host_identities = []
+        self.total = 0
         self.buffers = {name: bytearray() for name in members}
-        self.ready, self.stages, self.controls, self.done = {}, {}, {}, set()
+        self.ready, self.stages, self.done = {}, {}, set()
+        self.controls = {name: {"scheduled_ns": stamp} for name, stamp in report["scheduled_controls"].items()}
         self.samples = {name: {} for name in members}
-        self.latest_cut = 0
-        self.injected_failure = False
-        self.simulation = None
-        self.owners = {}
-        self.observation_id = 0
-        self.committed = {}
 
-    def multi_cut_event(self, kind, **values):
-        evidence = self.report.get("multi_cut")
-        if evidence is None:
-            return
-        self.observation_id += 1
-        bounded(evidence["events"], {"kind": kind, "order": self.observation_id, **values}, 10000)
-
-    def wrap_machine(self, original):
-        def create(spec, context):
-            machine = original(spec, context)
-            self.machines[spec.name] = machine
-            command, command_many = machine.command, machine.command_many
-            busy = False
-            def observed_command(operation, arguments=None):
-                nonlocal busy
-                if busy:
-                    return command(operation, arguments)
-                label = operation + (":" + arguments.get("property", "") if arguments else "")
-                row = self.report["qmp_stats"].setdefault(label, {"calls": 0, "seconds": 0.0})
-                row["calls"] += 1
-                started = time.monotonic()
-                busy = True
-                try:
-                    if operation == "x-run-to-virtual-time":
-                        self.multi_cut_event("cpu-request", member=spec.name,
-                                             native_target_ns=arguments["target-ns"])
-                    return command(operation, arguments)
-                finally:
-                    busy = False
-                    row["seconds"] += time.monotonic() - started
-            def observed_many(commands):
-                nonlocal busy
-                if busy:
-                    return command_many(commands)
-                label = "batch:" + ",".join(operation + ":" + (arguments or {}).get("property", "")
-                                             for operation, arguments in commands)
-                row = self.report["qmp_stats"].setdefault(label, {"calls": 0, "seconds": 0.0})
-                row["calls"] += 1
-                started = time.monotonic()
-                busy = True
-                try:
-                    return command_many(commands)
-                finally:
-                    busy = False
-                    row["seconds"] += time.monotonic() - started
-            machine.command, machine.command_many = observed_command, observed_many
-            start, close = machine.start, machine.close
-            def started():
-                start()
-                info = plain(machine.connection_info)
-                self.identities[spec.name] = {**info, "starttime": starttime(info["pid"])}
-                self.report["qemu"].setdefault("native_origins", {})[spec.name] = info["native_origin_ns"]
-                self.report["qemu"].setdefault("versions", {})[spec.name] = plain(machine.command("query-version"))
-                streams = dict(machine.streams)
-                self.streams[spec.name] = streams
-                if "multi_cut" in self.report and "cosim" in streams:
-                    stream = streams["cosim"]
-                    send_cosim, receive_cosim = stream.send, stream.receive_records
-                    def observed_cosim_send(encoded):
-                        frame = codec.decode_step_frame(encoded)
-                        result = send_cosim(encoded)
-                        if frame.header.kind == codec.STEP:
-                            self.multi_cut_event("step-send", member=spec.name, header=plain(frame.header))
-                        return result
-                    def observed_cosim_receive():
-                        for raw in receive_cosim():
-                            if int.from_bytes(raw[8:10], "little") == 2:
-                                frame = codec.decode_step_frame(raw)
-                                if frame.header.kind == codec.STEP_ACK:
-                                    self.multi_cut_event("step-ack", member=spec.name,
-                                        header=plain(frame.header), payload=plain(codec.decode_step_ack_payload(frame.payload)))
-                            yield raw
-                    stream.send, stream.receive_records = observed_cosim_send, observed_cosim_receive
-                if "can1" in streams:
-                    stream, sends = streams["can1"], self.report["wire_sends"]
-                    send = stream.send
-                    def observed_send(can_id, flags, dlc, stamp, data):
-                        row = {"member": spec.name, "can_id": can_id, "flags": flags,
-                               "dlc": dlc, "native_ns": stamp, "data_hex": data.hex(), "accepted": False}
-                        bounded(sends, row, 20000)
-                        result = send(can_id, flags, dlc, stamp, data)
-                        row["accepted"] = True
-                        return result
-                    stream.send = observed_send
-                    receive = stream.receive_records
-                    def observed_receive():
-                        for raw in receive():
-                            if len(raw) != 84 or raw[9:12] != bytes(3) or raw[28:] != bytes(56):
-                                raise ValueError("actual CAN transport reserved bytes/length disagree")
-                            bounded(self.report["wire_commands"], {"member": spec.name,
-                                "native_ns": int.from_bytes(raw[12:20], "little"), "wire_hex": raw.hex()}, 20000)
-                            yield raw
-                    stream.receive_records = observed_receive
-            def closed():
-                try:
-                    return close()
-                finally:
-                    self.report["closed_machines"].append(spec.name)
-            commit = machine.commit_inputs
-            def committed(cut_ns):
-                result = commit(cut_ns)
-                if "multi_cut" in self.report:
-                    completed = self.committed.setdefault(cut_ns, set())
-                    completed.add(spec.name)
-                    if completed == set(self.members):
-                        # Fresh public native snapshots after both ACK returns,
-                        # including cuts on which CAN submitted no new frames.
-                        for member in self.members:
-                            state = self.machines[member].command("qom-get", {
-                                "path": "/machine", "property": "can-execution-state"})
-                            submitted = sum(row["member"] == member and row["accepted"]
-                                            for row in self.report["wire_sends"])
-                            self.multi_cut_event("can-observation", member=member, cut_ns=cut_ns,
-                                                 submitted_frames=submitted, state=plain(state))
-                        del self.committed[cut_ns]
-                return result
-            machine.start, machine.close, machine.commit_inputs = started, closed, committed
-            return machine
-        return create
-
-    def capture_factory(self, original):
-        def create(spec, context):
-            owner = original(spec, context)
-            self.owners[spec.name] = owner
-            return owner
-        return create
-
-    def native(self, original):
-        def acquire(*args, **kwargs):
-            native = original(*args, **kwargs)
-            calls = self.report["native_calls"]
-            calls["instances"] += 1
-            reset, step, close = native.reset, native.step, native.close
-            def reset_native():
-                calls["reset"] += 1
-                return reset()
-            def step_native(dt):
-                bounded(calls["step_ns"], dt, 31250)
-                result = step(dt)
-                if abs(native.time_s - sum(calls["step_ns"]) / 1e9) > 1e-10:
-                    raise ValueError("sole native solver time differs from submitted intervals")
-                self.multi_cut_event("world-completed", target_ns=sum(calls["step_ns"]),
-                                     dt_ns=dt, native_time_s=native.time_s)
-                return result
-            def close_native():
-                calls["close"] += 1
-                return close()
-            native.reset, native.step, native.close = reset_native, step_native, close_native
-            return native
-        return acquire
-
-    def watchdog(self, name, stage):
-        from tools.dm_mc02_firmware_rtf import read_iwdg_timeouts
-        count, diagnostics = read_iwdg_timeouts(self.machines[name])
-        self.report["watchdogs"].setdefault(name, {})[stage] = {"timeouts": count, "diagnostics": diagnostics}
-        if count or "window-violations=0" not in diagnostics:
-            raise ValueError("actual firmware watchdog event: " + name)
+    def __call__(self, event):
+        self.total += 1
+        self.event(event)
 
     def event(self, event):
         name, kind, payload = event.source_node, event.kind, event.payload
-        self.latest_cut = event.delivery_time_ns
-        if kind == "process.started":
-            pid = payload["pid"]
-            identity = starttime(pid)
-            if type(pid) is not int or pid <= 0 or identity is None:
-                raise RuntimeError("started host process has no live native identity")
-            bounded(self.host_identities, {"node": name, "name": payload["name"],
-                "pid": pid, "starttime": identity}, 8)
-        elif kind == "uart" and name in self.members and event.source_port == "uart1":
+        if kind == "uart" and name in self.members and event.source_port == "uart1":
             self.uart(name, payload, event)
+        elif kind == "physics.state" and name == "world":
+            bounded(self.report["cut_times_ns"], event.delivery_time_ns, 31251)
+            if abs(payload["native_time_s"] - event.delivery_time_ns / 1e9) > 1e-12:
+                raise ValueError("completed native world time differs from its public cut")
+        elif kind == "can.sent" and "_motor_" in name:
+            frame = payload["frame"]
+            bounded(self.report["feedback_emitted"], {"member": name.split("_motor_")[0],
+                "can_id": frame.can_id, "data_hex": frame.data.hex(),
+                "source_ns": event.source_time_ns}, 20000)
         elif kind == "can-tx":
             bounded(self.report["commands"], {"member": name, "frame": plain(payload),
                 "source_ns": event.source_time_ns, "mapped_ns": event.mapped_time_ns,
@@ -542,7 +369,6 @@ class NativeObservation:
                 bounded(self.report["summaries"][name], {"kind": fields[1], "values": list(map(int, fields[2:]))}, 2)
                 if fields[1] == "DONE":
                     self.done.add(name)
-                    self.watchdog(name, "done")
                 continue
             row = {"status": fields[1], "name": fields[2], "actual": int(fields[3]), "expected": int(fields[4])}
             if row["status"] == "READY":
@@ -565,102 +391,28 @@ class NativeObservation:
                 phase = row["name"].split(".")[2]
                 self.samples[name].setdefault(phase, event.delivery_time_ns)
 
-    def cut(self, cut_ns, simulation):
-        if self.simulation is None:
-            self.simulation = simulation
-            close = simulation.close
-            def observe_failure():
-                from sim.runtime import SimulationState
-                failure = simulation.failure
-                row = {"state": simulation.state.value, "committed_ns": simulation.t_sim_ns,
-                       "failure_type": None if failure is None else type(failure).__name__}
-                self.report["before_cleanup"] = row
-                if simulation.state == SimulationState.FAILED:
-                    steps = tuple(self.report["native_calls"]["step_ns"])
-                    try:
-                        simulation.run_until(simulation.t_sim_ns + 1)
-                    except RuntimeError as error:
-                        row["retry_rejected"] = str(error)
-                    else:
-                        raise AssertionError("failed Simulation accepted a new execution request")
-                    row["effects_preserved"] = (simulation.t_sim_ns == row["committed_ns"]
-                        and tuple(self.report["native_calls"]["step_ns"]) == steps
-                        and simulation.failure is failure)
-                    if not row["effects_preserved"]:
-                        raise AssertionError("failed Simulation replay changed committed/native effects")
-            def observed_close():
-                try:
-                    observe_failure()
-                finally:
-                    close()
-            simulation.close = observed_close
-        mode = self.report["expected_mode"]
-        if mode != "normal" and cut_ns >= 20_000_000 and not self.injected_failure:
-            self.injected_failure = True
-            self.report["failure_injected_ns"] = cut_ns
-            if mode == "peer-exit":
-                self.machines[self.members[-1]].command("quit")
-            elif mode == "reset":
-                self.machines[self.members[0]].command("system_reset")
-            elif mode == "interrupt":
-                raise KeyboardInterrupt("native fixture interrupted at a completed source cut")
-            elif mode == "upper-exit":
-                Path(self.report["upper_exit_file"]).touch()
-        if self.profile == "dji-scenario" and cut_ns >= 250_000_000 and len(self.stages) == len(self.members):
-            for name in self.members:
-                if "1" not in self.samples[name] or self.samples[name]["1"] >= 250_000_000:
-                    raise ValueError("original reset-relative250ms baseline missed")
-                if name not in self.controls:
-                    simulation.schedule_input(name + ".uart1", b"\xa5", at_ns=cut_ns)
-                    self.controls[name] = {"scheduled_ns": cut_ns}
-        if self.profile == "referee-scenario" and "west" in self.stages and "2" in self.samples["east"]:
-            if "west" not in self.controls:
-                if any("1" not in self.samples[name] or self.samples[name]["1"] >= SCENARIO_EVENT_NS for name in self.members):
-                    raise ValueError("original referee session-relative baseline missed")
-                simulation.schedule_input("west.uart1", b"\xa5", at_ns=cut_ns)
-                self.controls["west"] = {"scheduled_ns": cut_ns}
-        self.report["cuts"] += 1
-        bounded(self.report["cut_times_ns"], cut_ns, 31251)
-        if self.profile == "bare":
-            self.report["final_networks"] = {name: {"pending": owner.pending,
-                "next_due_ns": owner.next_due_ns} for name, owner in self.owners.items()
-                if name.endswith("_can")}
-        if self.profile.startswith(("dji-", "referee")):
-            for name in self.members:
-                # Refresh final native diagnostics at every completed final-ready
-                # cut only once; each CPU is paused at this exact boundary.
-                duration = self.report["duration_ns"]
-                if len(self.ready) == len(self.members) and cut_ns == max(self.ready.values()) + duration:
-                    self.watchdog(name, "paused")
-
     def verify(self, result):
         report = self.report
-        calls = report["native_calls"]
-        if calls["instances"] != 1 or calls["reset"] != 1 or calls["close"] != 1:
-            raise ValueError("scene must own exactly one native solver/reset/close")
-        if sum(calls["step_ns"]) != result.end_ns:
-            raise ValueError("native effects differ from final logical commit")
+        cuts = report["cut_times_ns"]
+        if not cuts or cuts[-1] != result.end_ns:
+            raise ValueError("completed native world does not reach the logical endpoint")
         for name in self.members:
             if self.profile.startswith("dji-"):
                 coverage = check_dji_scenario_coverage if self.profile == "dji-scenario" else check_dji_feedback_coverage
                 coverage(report["cases"][name], report["summaries"][name])
             elif self.profile.startswith("referee"):
                 check_referee_coverage(report["cases"][name], report["summaries"][name], name)
-            if self.profile.startswith(("dji-", "referee")):
-                if set(report["watchdogs"].get(name, {})) != {"done", "paused"}:
-                    raise ValueError("firmware done/final watchdog evidence missing")
             feedback = [row for row in report["feedback"] if row["member"] == name and not row["dropped"]]
-            sends = [row for row in report["wire_sends"] if row["member"] == name]
-            if not feedback or len(feedback) != len(sends) or not all(row["accepted"] for row in sends):
-                raise ValueError("feedback does not match actual native transport submissions")
-            origin = self.identities[name]["native_origin_ns"]
-            for row, send in zip(feedback, sends, strict=True):
-                if (row["can_id"], row["data_hex"], origin + row["delivery_ns"]) != (
-                        send["can_id"], send["data_hex"], send["native_ns"]):
-                    raise ValueError("CAN source/delivery/native epoch provenance differs")
+            if not feedback:
+                raise ValueError("same-peer actual motor feedback is missing")
+            origin = result.boards[name]["native_origin_ns"]
             receipts = [row for row in report["can_receipts"] if row["member"] == name]
             if not receipts or any(row["native_ns"] != origin + row["delivery_ns"] for row in receipts):
                 raise ValueError("actual native CAN receipt epoch missing")
+            for row in receipts:
+                delivered = sum(item["delivery_ns"] <= row["delivery_ns"] for item in feedback)
+                if row["receipt"]["completed_frames"] != delivered:
+                    raise ValueError("native receipt count differs from prior same-peer deliveries")
             if self.profile == "dji-scenario":
                 values = {row["name"]: row["actual"] for row in report["cases"][name]}
                 for phase in (1, 2):
@@ -674,11 +426,24 @@ class NativeObservation:
                 if name not in self.controls or "delivered_ns" not in self.controls[name]:
                     raise ValueError("firmware observation handshake was not actually delivered")
         if self.profile == "dji-scenario":
+            for name in self.members:
+                if (self.samples[name].get("1", 250_000_000) >= 250_000_000
+                        or self.stages.get(name, 250_000_000) > 250_000_000
+                        or self.controls[name]["delivered_ns"] != 250_000_000
+                        or self.samples[name].get("2", 0) <= 250_000_000):
+                    raise ValueError("DJI250ms baseline/stage/control/second-sample order differs")
             east = [row for row in report["feedback"] if row["member"] == "east"]
             if not any(row["due_ns"] - row["source_ns"] == 5_000_000 for row in east):
                 raise ValueError("delayed feedback evidence absent")
             if not any(row["source_ns"] > 250_000_000 and row["due_ns"] == row["source_ns"] for row in east):
                 raise ValueError("restored feedback evidence absent")
+        if self.profile == "referee-scenario":
+            control = self.controls.get("west", {}).get("delivered_ns")
+            if (control != 300_000_000 or self.stages.get("west", control + 1) >= control
+                    or self.samples["east"].get("2", control + 1) >= control
+                    or any(self.samples[name].get("1", SCENARIO_EVENT_NS) >= SCENARIO_EVENT_NS for name in self.members)
+                    or self.samples["west"].get("2", 0) <= control):
+                raise ValueError("referee event/east sample/west control order differs")
         if self.profile == "dji-feedback":
             for name in self.members:
                 dropped = [row for row in report["feedback"] if row["member"] == name and row["dropped"]]
@@ -711,85 +476,59 @@ class NativeObservation:
             check_multi_cut_observations(report)
         report["controls"] = self.controls
 
-    def cleanup(self):
-        errors = []
-        for name, info in self.identities.items():
-            sockets = info["sockets"]
-            row = {"member": name, **info,
-                "alive": starttime(info["pid"]) == info["starttime"],
-                "remaining_sockets": [path for path in sockets.values() if Path(path).exists()],
-                "open_streams": [key for key, stream in self.streams[name].items() if stream.sock.fileno() >= 0]}
-            self.report["cleanup"].append(row)
-            if row["alive"] or row["remaining_sockets"] or row["open_streams"]:
-                errors.append(name)
-        self.report["host_cleanup"] = []
-        for identity in self.host_identities:
-            owner = self.owners[identity["node"]]
-            child = next(child for child in owner.children if child.process.pid == identity["pid"])
-            process = child.process
-            row = {**identity, "alive": starttime(identity["pid"]) == identity["starttime"],
-                "reaped": process.returncode is not None, "owner_closed": owner.closed,
-                "pipes_closed": all(getattr(process, pipe).closed for pipe in ("stdout", "stderr"))}
-            self.report["host_cleanup"].append(row)
-            if row["alive"] or not all(row[key] for key in ("reaped", "owner_closed", "pipes_closed")):
-                errors.append(identity["node"] + "." + identity["name"])
-        if errors or set(self.report["closed_machines"]) != set(self.members):
-            raise ValueError("native scene cleanup incomplete: " + repr(errors))
-        self.report["cleanup_verified"] = True
 
-    def verify_negative(self, primary):
-        """An injected failure remains failed; this only checks its evidence."""
-        report = self.report
-        if (primary is None or not self.injected_failure
-                or "failure_injected_ns" not in report):
-            raise AssertionError("negative native scene did not reach its injected failure")
-        row = report.get("before_cleanup", {})
-        if (row.get("state") != "failed" or not row.get("failure_type")
-                or not row.get("retry_rejected") or not row.get("effects_preserved")):
-            raise AssertionError("negative native scene lacks frozen-state/non-replay evidence")
-        if report["expected_mode"] == "interrupt" and not isinstance(primary, KeyboardInterrupt):
-            raise AssertionError("native interrupt did not preserve KeyboardInterrupt")
-        if not report.get("cleanup_verified"):
-            raise AssertionError("negative native scene did not release its owned resources")
-        report["negative_verified"] = {"mode": report["expected_mode"],
-            "injected_ns": report["failure_injected_ns"], "error_type": type(primary).__name__,
-            "retry_rejected": True, "effects_preserved": True}
+
+def duration_ns(value):
+    # Only smoke fixture data is read here; Rust independently admits the scene.
+    for suffix, factor in (("ms", 1_000_000), ("us", 1000), ("ns", 1), ("s", 1_000_000_000)):
+        if value.endswith(suffix):
+            return int(value[:-len(suffix)]) * factor
+    raise ValueError("unknown fixture duration")
 
 
 def run_scene(document, output, *, qemu=None, profile="bare", host_timeout=20, firmware=None,
-              expected_mode="normal", trace=False, use_cli=False):
-    """Acquire through the builtin factories and publish only after cleanup."""
-    from sim.physics.mujoco import MujocoPhysics
-    from sim.machines.qemu.qmp import qmp_client_provenance
+              expected_mode="normal", trace=False, use_cli=False, sim=None):
+    """Run the supplied Rust CLI; publish only after its process cleanup."""
+    if expected_mode != "normal":
+        raise ValueError("private Python failure injection retired; use Rust machine/process/physics failure gates")
     output = Path(output).resolve()
     if output.exists():
         raise FileExistsError("native scene refuses to overwrite an existing result directory")
     output.mkdir(parents=True)
+    binary = regular_file(qemu or os.environ.get("QEMU_SYSTEM_ARM", ROOT / "build/qemu/qemu-system-arm"), "QEMU", executable=True)
+    executable = resolve_sim(sim)
+    members = [name for name, node in document["nodes"].items() if node["kind"] == "machine.qemu"]
+    controls = {name: 250_000_000 for name in members} if profile == "dji-scenario" else (
+        {"west": 300_000_000} if profile == "referee-scenario" else {})
+    for name, stamp in controls.items():
+        document["experiment"]["inputs"].append({"at": str(stamp) + "ns", "endpoint": name + ".uart1",
+            "value": b"\xa5", "origin": "session"})
     path = output / "scene.yaml"
-    path.write_text(json.dumps(document, indent=2) + "\n")
-    binary = resolve_qemu(qemu)
-    registry = builtin_registry(qemu=binary, allow_host_processes=True)
-    scene = load_scene(path, registry)
-    members = [node.name for node in scene.topology.nodes if node.kind == "machine.qemu"]
-    report = {"status": "running", "result": "failed", "schema": "sim/native-scene/1", "profile": profile,
-        "qemu": {"path": str(binary), "sha256": sha(binary), "qmp_client": qmp_client_provenance()},
-        "scene": str(path), "expected_mode": expected_mode, "duration_ns": scene.duration_ns, "quantum_ns": scene.quantum_ns,
-        "commands": [], "wire_commands": [], "feedback": [], "wire_sends": [], "can_receipts": [],
-        "faults": [], "referee": [], "world_results": [], "imu_witnesses": {name: [] for name in members}, "closed_machines": [], "cleanup": [], "watchdogs": {},
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    report = {"status": "running", "result": "failed", "schema": "sim/native-scene/2", "profile": profile,
+        "qemu": {"path": str(binary), "sha256": sha(binary)},
+        "sim": {"path": str(executable), "sha256": sha(executable)},
+        "scene": str(path), "expected_mode": expected_mode,
+        "duration_ns": duration_ns(document["runtime"]["duration"]), "quantum_ns": duration_ns(document["runtime"]["quantum"]),
+        "commands": [], "feedback": [], "feedback_emitted": [], "can_receipts": [],
+        "faults": [], "referee": [], "world_results": [], "imu_witnesses": {name: [] for name in members},
+        "scheduled_controls": controls,
         "uart": {name: "" for name in members}, "cases": {name: [] for name in members},
         "summaries": {name: [] for name in members},
         "imu": {name: {"imu-input-accepted": 0, "imu-consumption": 0, "full_consumed": 0} for name in members},
         "known_deadlines": any(node.get("fault_profiles", {}).get("policy0", {}).get("delay_ns") == 250_000
                                 for node in document["nodes"].values()),
-        "cut_times_ns": [], "native_calls": {"instances": 0, "reset": 0, "step_ns": [], "close": 0}, "cuts": 0,
+        "cut_times_ns": [],
+        "retired_private_instrumentation": {
+            "solver_reset_close_counts": "physics_simulation::actual_shared_mujoco_and_can_devices_split_union_expiries_once_then_feedback",
+            "raw_STEP_ACK_and_cpu_requests": "machine_imu::origin_is_observation_only_then_adc_and_si_share_one_step_and_done_is_distinct",
+            "failure_injection": "machine::interrupted_or_wrong_target_freezes_last_committed_time_and_cleanup_still_reaps; physics_simulation::native_solver_failure_freezes_simulation_at_last_commit_with_original_error",
+            "private_stream_watchdog_probes": "firmware TTEST reset/watchdog assertions and separate native firmware runner"},
         "limitations": ["sampled outputs and transport receipts do not establish guest consumption",
             "native CPU cuts, CAN receipt and firmware/BSP timestamps remain distinct",
             "toy mechanics/physical calibration SKIP; no global CPU/World barrier or RTF claim"],
-        "errors": [], "notes": [], "qmp_stats": {},
-        "upper_exit_file": str(output / "exit-upper")}
-    if scene.quantum_ns == 400_000:
-        report["multi_cut"] = {"members": members, "events": []}
-    inputs = [path, binary, Path(document["nodes"]["world"]["model"])]
+        "errors": [], "notes": []}
+    inputs = [path, binary, executable, Path(document["nodes"]["world"]["model"])]
     inputs += [Path(document["nodes"][name]["firmware"]) for name in members]
     report["inputs_before"] = {str(item): sha(item) for item in inputs}
     report["actual_sources_before"] = source_origins()
@@ -798,92 +537,44 @@ def run_scene(document, output, *, qemu=None, profile="bare", host_timeout=20, f
         report["firmware_before"] = checkout_snapshot(firmware)
         report["firmware_sources_before"] = source_snapshot(inputs[-1], binary, firmware)
     observer = NativeObservation(report, members, profile)
-    factory = registry["machine.qemu"]
-    original_create = factory.create
-    can_factory = registry["bus.can"]
-    original_can = can_factory.create
-    host_factory = registry["app.host-processes"]
-    original_hosts = host_factory.create
-    original_native = MujocoPhysics.from_xml_path
     started = time.monotonic()
-    primary = result = None
-    previous_signal = signal.getsignal(signal.SIGTERM)
-    def interrupted(signum, _frame):
-        raise KeyboardInterrupt(f"native scene interrupted by signal {signum}")
-    signal.signal(signal.SIGTERM, interrupted)
+    primary = None
     try:
-        with patch.object(factory, "create", observer.wrap_machine(original_create)), \
-             patch.object(can_factory, "create", observer.capture_factory(original_can)), \
-             patch.object(host_factory, "create", observer.capture_factory(original_hosts)), \
-             patch.object(MujocoPhysics, "from_xml_path", observer.native(original_native)), \
-             ((output / "observations.mcap").open("xb") if trace else nullcontext(None)) as trace_stream:
-            if use_cli:
-                from sim import cli, composition
-                from sim.apps import experiment as application
-                results = []
-                def observed_run(*args, **options):
-                    emitted = options.pop("on_event", None)
-                    def observe(event):
-                        if emitted is not None:
-                            emitted(event)
-                        observer.event(event)
-                    value = run_experiment(*args, **options, on_event=observe, on_cut=observer.cut)
-                    results.append(value)
-                    return value
-                with patch.object(composition, "builtin_registry", lambda **_options: registry), \
-                     patch.object(application, "run_experiment", observed_run):
-                    code = cli.main(["run", str(path), "--qemu", str(binary), "--timeout", str(host_timeout),
-                        "--report", str(output / "cli-report.json"), "--allow-host-processes"])
-                report["cli"] = {"exit_code": code, "report": json.loads((output / "cli-report.json").read_text())}
-                if code or len(results) != 1:
-                    if code == 130:
-                        raise KeyboardInterrupt("canonical CLI interrupted")
-                    raise RuntimeError("canonical sim run failed; inspect cli-report.json")
-                result = results[0]
-            else:
-                result = run_experiment(scene, registry, host_timeout_s=host_timeout,
-                    startup_timeout_s=min(10, host_timeout), on_event=observer.event, on_cut=observer.cut,
-                    trace=trace_stream)
+        _, result, command = execute_scene(path, qemu=binary, sim=executable,
+            timeout=host_timeout, allow_host_processes=True, measure=True, observations=observer)
+        report["command"] = command
         report["runtime_result"] = plain(result)
+        report["cleanup_verified"] = command["cleanup_completed"]
+        actual = sorted(row["firmware"]["path"] for row in command["resources"])
+        expected = sorted(str(Path(document["nodes"][name]["firmware"]).resolve()) for name in members)
+        if actual != expected:
+            raise ValueError("actual native kernel argv differs from admitted firmware")
         if not result.passed:
             raise ValueError("scene experiment assertion failure: " + repr(result.failures))
-        if expected_mode != "normal":
-            raise AssertionError("negative native scene completed without its failure")
         observer.verify(result)
     except BaseException as error:
         primary = error
+        report.update(getattr(error, "native_observations", {}))
     finally:
         report["host_elapsed_s"] = time.monotonic() - started
-        signal.signal(signal.SIGTERM, previous_signal)
-        for verify in (observer.cleanup,):
-            try:
-                verify()
-            except BaseException as error:
-                if primary is None:
-                    primary = error
-                else:
-                    primary.add_note(f"post-cleanup verification: {type(error).__name__}: {error}")
-        if expected_mode != "normal":
-            try:
-                observer.verify_negative(primary)
-            except BaseException as error:
-                if primary is None:
-                    primary = error
-                else:
-                    primary.add_note(f"negative verification: {type(error).__name__}: {error}")
         try:
             report["inputs_after"] = {str(item): sha(item) for item in inputs}
-            report["actual_sources_after"] = source_origins()
             if report["inputs_before"] != report["inputs_after"]:
-                raise ValueError("scene/ELF/model/QEMU input changed through cleanup")
-            if any(report["actual_sources_after"].get(name) != row for name, row in report["actual_sources_before"].items()):
-                raise ValueError("executed sources changed through cleanup")
+                raise ValueError("scene/ELF/model/QEMU/Rust input changed through cleanup")
             if firmware is not None:
                 report["firmware_after"] = checkout_snapshot(firmware)
                 report["firmware_sources_after"] = source_snapshot(inputs[-1], binary, firmware)
-                if report["firmware_before"] != report["firmware_after"] or report["firmware_sources_before"] != report["firmware_sources_after"]:
+                # The concurrent host checkout contains unrelated, authorized
+                # work. Consumed host files are checked below by exact hashes.
+                firmware_before = {key: value for key, value in report["firmware_before"].items() if key != "project"}
+                firmware_after = {key: value for key, value in report["firmware_after"].items() if key != "project"}
+                report["unconsumed_project_metadata_changed"] = report["firmware_before"].get("project") != report["firmware_after"].get("project")
+                if firmware_before != firmware_after or report["firmware_sources_before"] != report["firmware_sources_after"]:
                     raise ValueError("firmware input sources changed through cleanup")
             report["source_preserved"] = True
+            report["actual_sources_after"] = source_origins()
+            if any(report["actual_sources_after"].get(name) != row for name, row in report["actual_sources_before"].items()):
+                raise ValueError("executed smoke source changed through cleanup")
         except BaseException as error:
             if primary is None:
                 primary = error
@@ -937,8 +628,6 @@ def referee_document(elf, *, scenario=False):
 
 
 def run_referee(elf, output, firmware, *, qemu=None, scenario=False, cli=False):
-    # CLI behavior is verified separately against the same serialized scene;
-    # native receipts here remain obtained from real registered factory owners.
     return run_scene(referee_document(elf, scenario=scenario), output, qemu=qemu,
         profile="referee-scenario" if scenario else "referee", firmware=Path(firmware), use_cli=cli)
 
@@ -952,88 +641,24 @@ def check_can_deadline_observations(report):
     if not delivered or any(row["due_ns"] - row["source_ns"] != 250_000
                             or row["delivery_ns"] != row["due_ns"] for row in delivered):
         raise ValueError("CAN-deadlines source/due/delivery mismatch")
-    networks = report["final_networks"]
-    pending = networks["east_can"]
     end = report["runtime_result"]["end_ns"]
-    if pending["pending"] != 4 or pending["next_due_ns"] != end + 250_000:
-        raise ValueError("CAN-deadlines future feedback was flushed, hidden or lost")
-    report["deadline_verified"] = {"first_due_ns": 1_250_000, "future_frames": 4,
-        "next_due_ns": pending["next_due_ns"], "cuts": len(cuts) - 1,
-        "delivered_feedback": len(report["feedback"])}
+    future = [row for row in report["feedback_emitted"] if row["member"] == "east" and row["source_ns"] == end]
+    if (len(future) != 4 or {row["can_id"] for row in future} != set(range(0x201, 0x205))
+            or any(row["source_ns"] >= end for row in delivered)):
+        raise ValueError("CAN-deadlines future emission/delivery ledger differs")
+    report["deadline_verified"] = {"first_due_ns": 1_250_000, "future_frames": len(future),
+        "next_expected_due_ns": end + 250_000, "cuts": len(cuts) - 1,
+        "delivered_feedback": len(delivered), "future_evidence": "four public emissions at final cut; no premature delivery"}
 
 
 def check_multi_cut_observations(report):
-    """Require actual raw STEP/ACK and fresh native receipts on every cut."""
-    evidence, cuts = report["multi_cut"], report["cut_times_ns"]
+    cuts = report["cut_times_ns"]
     intervals = [b - a for a, b in zip(cuts, cuts[1:])]
-    if (report["quantum_ns"] != 400_000 or not intervals
-            or any(not 0 < dt <= 400_000 for dt in intervals)
-            or report["native_calls"]["step_ns"] != intervals
+    if (not intervals or any(not 0 < dt <= 400_000 for dt in intervals)
             or report["runtime_result"]["end_ns"] != cuts[-1]):
-        raise ValueError("multi-cut CPU/World intervals differ from the bounded400us cuts")
-    events, members = evidence["events"], evidence["members"]
-    origins = report["qemu"]["native_origins"]
-    baselines, goals, sessions, unchanged = {}, {}, {}, 0
-    for member in members:
-        initial = [row for row in events if row["kind"] == "can-observation"
-                   and row["member"] == member and row["cut_ns"] == 0]
-        if not initial or initial[-1]["submitted_frames"]:
-            raise ValueError("multi-cut lacks the original empty native CAN baseline")
-        baseline = initial[-1]["state"]["fdcan-rx-state"]["controllers"]["dm-mc02.fdcan1"]["completed_frames"]
-        baselines[member] = goals[member] = baseline
-    for step_id, (target, dt) in enumerate(zip(cuts[1:], intervals), 1):
-        world = [row for row in events if row["kind"] == "world-completed" and row["target_ns"] == target]
-        if len(world) != 1 or world[0]["dt_ns"] != dt or abs(world[0]["native_time_s"] - target / 1e9) > 1e-12:
-            raise ValueError("multi-cut requires one completed native World step per cut")
-        acks = []
-        for member in members:
-            requests = [row for row in events if row["kind"] == "cpu-request" and row["member"] == member
-                        and row["native_target_ns"] == origins[member] + target]
-            sent = [row for row in events if row["kind"] == "step-send" and row["member"] == member
-                    and row["header"]["step_id"] == step_id]
-            accepted = [row for row in events if row["kind"] == "step-ack" and row["member"] == member
-                        and row["header"]["step_id"] == step_id]
-            if len(requests) != 1 or len(sent) != 1 or len(accepted) != 1:
-                raise ValueError("multi-cut requires one real CPU request/STEP/ACK per peer and cut")
-            sent, ack = sent[0], accepted[0]
-            session = sessions.setdefault(member, sent["header"]["flags"])
-            if type(session) is not int or not 0 < session <= 0xffffffff:
-                raise ValueError("multi-cut requires a nonzero native wire session")
-            for row, kind in ((sent, codec.STEP), (ack, codec.STEP_ACK)):
-                header = row["header"]
-                if tuple(header[key] for key in ("version", "kind", "flags", "step_id", "t_sim_ns", "dt_ns")) != (
-                        2, kind, session, step_id, target, dt):
-                    raise ValueError("multi-cut STEP/ACK session/cut/dt identity differs")
-            if not requests[0]["order"] < world[0]["order"] < sent["order"] < ack["order"] or ack["payload"]["status"]:
-                raise ValueError("multi-cut native CPU/World/STEP/ACK order or status differs")
-            acks.append(ack["order"])
-        for member in members:
-            receipts = [row for row in events if row["kind"] == "can-observation" and row["member"] == member
-                        and row["cut_ns"] == target and row["order"] > max(acks)]
-            if not receipts:
-                raise ValueError("multi-cut lacks a fresh native receipt after both ACKs")
-            row = receipts[-1]
-            state, native_target = row["state"], origins[member] + target
-            execution, status = state["execution"], state["status"]
-            rx_state = state["fdcan-rx-state"]
-            rx = rx_state["controllers"]["dm-mc02.fdcan1"]
-            goal = row["submitted_frames"] + baselines[member]
-            if (execution.get("state") != "reached" or execution.get("current-ns") != native_target
-                    or execution.get("target-ns") != native_target or status.get("running") is not False
-                    or status.get("status") != "paused" or rx_state["timestamp_ns"] != native_target
-                    or rx["completed_frames"] != goal or rx["partial_bytes"]
-                    or state["fdcan-transports"]["dm-mc02.fdcan1"]["connected"] is not True
-                    or goal < goals[member]):
-                raise ValueError("multi-cut native target/receipt goal or connection differs")
-            if target in (400_000, 800_000):
-                if goal != goals[member] or row["submitted_frames"]:
-                    raise ValueError("multi-cut early no-feedback receipt goal changed")
-                unchanged += 1
-            goals[member] = goal
-    if unchanged != 2 * len(members):
-        raise ValueError("multi-cut lacks both early unchanged receipt goals")
-    evidence.update(verified=True, cuts=len(intervals), unchanged_receipt_goals=unchanged,
-                    final_receipt_goals=goals, wire_sessions=sessions)
+        raise ValueError("completed native World cuts exceed400us or miss final endpoint")
+    report["public_multi_cut"] = {"cuts": len(intervals), "maximum_interval_ns": max(intervals),
+        "private_STEP_ACK_proof": "retired; see Rust machine_imu gate"}
 
 
 def bare_document(firmwares, *, two_chassis=True, arena_runtime=False, quantum="1ms", can_deadlines=False):
@@ -1056,9 +681,9 @@ def bare_document(firmwares, *, two_chassis=True, arena_runtime=False, quantum="
 
 
 def main(args):
-    if args.can_deadlines and (args.multi_cut or args.cli or args.mode != "normal"):
+    if args.can_deadlines and (args.multi_cut or args.mode != "normal"):
         raise ValueError("--can-deadlines requires normal mode without --cli or --multi-cut")
-    if args.multi_cut and (args.cli or args.mode != "normal"):
+    if args.multi_cut and args.mode != "normal":
         raise ValueError("--multi-cut requires normal mode without --cli")
     target = Path(args.result).resolve()
     output = target.with_suffix("")
@@ -1071,7 +696,7 @@ def main(args):
             "command": [sys.executable, "-c", "import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); "
                         "exec('while not p.exists(): time.sleep(.001)')", str(exit_file)]}}}
     code = run_scene(document, output, qemu=args.qemu, profile="bare", host_timeout=15,
-                     expected_mode=args.mode, trace=False, use_cli=args.cli)
+                     expected_mode=args.mode, use_cli=args.cli, sim=args.sim)
     if target.exists():
         raise FileExistsError("native report refuses to overwrite an existing result")
     target.write_bytes((output / "report.json").read_bytes())
@@ -1081,6 +706,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--qemu")
+    parser.add_argument("--sim", help="compiled Rust sim executable (or SIM_EXECUTABLE)")
     parser.add_argument("--firmware", nargs=2, required=True)
     parser.add_argument("--mode", choices=("normal", "peer-exit", "reset", "upper-exit", "interrupt"), default="normal")
     parser.add_argument("--result", required=True)

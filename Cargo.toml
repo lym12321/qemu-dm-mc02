@@ -1,11 +1,15 @@
 [workspace]
-members = ["crates/sim-host"]
+members = ["crates/sim-core", "crates/sim-host"]
+exclude = ["third_party/qapi-rs", "third_party/binrw", "third_party/mujoco-rs"]
 resolver = "2"
+
+[patch.crates-io]
+binrw = { path = "third_party/binrw" }
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.85"
+rust-version = "1.91.1"
 repository = "https://github.com/lym12321/qemu-dm-mc02"
 
 [profile.release]

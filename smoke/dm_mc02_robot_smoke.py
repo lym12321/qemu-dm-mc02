@@ -15,10 +15,15 @@ import sys
 
 import yaml
 
-ROOT, ELF, RUN = map(Path, sys.argv[1:])
+arguments = sys.argv[1:]
+negative_only = arguments[-1:] == ["--negative-only"]
+if negative_only:
+    arguments.pop()
+ROOT, ELF, RUN = map(Path, arguments)
 sys.path.insert(0, str(ROOT))
-from sim.apps.presets import four_wheel_document
-from sim.machines.qemu.process import stop
+from smoke.support.presets import four_wheel_document
+from smoke.support.process import stop
+from smoke.support.native_cli import resolve_sim
 
 binary = Path(os.environ.get('QEMU_SYSTEM_ARM', str(ROOT / 'build/qemu/qemu-system-arm'))).resolve()
 print(json.dumps({'firmware': str(ELF), 'elf_sha256': hashlib.sha256(ELF.read_bytes()).hexdigest(),
@@ -37,14 +42,12 @@ def identity(pid):
 upper, observations, external_qmp = RUN / "upper.py", RUN / "upper.json", RUN / "robot-qmp.sock"
 upper.write_text('''import json,os,pathlib,sys,time
 sys.path.insert(0,sys.argv[1])
-from sim.machines.qemu.qmp import qmp_session_class
-from sim.boards import QemuBoard
+from smoke.support.qmp import qmp_session_class
 socket=pathlib.Path(sys.argv[2]); deadline=time.monotonic()+5
 while not socket.exists():
     if time.monotonic()>deadline: raise TimeoutError('native monitor startup')
     time.sleep(.001)
 qmp=qmp_session_class()(str(socket),timeout=1,connect_timeout=1,close_timeout=1)
-board=QemuBoard(qmp)
 identities={}
 try:
     while True:
@@ -54,7 +57,7 @@ try:
                 identities[pid]={"pid":int(pid),"starttime":int(stat[19])}
             except FileNotFoundError:
                 pass
-        state=board.snapshot()
+        state=qmp.command('qom-get',{'path':'/machine','property':'board-state'})
         diagnostics=qmp.command('qom-get',{'path':'/machine','property':'cosim-diagnostics'})
         pathlib.Path(sys.argv[3]).write_text(json.dumps({'state':state,'cosim':diagnostics,'identities':list(identities.values())}))
         print(json.dumps({'upper_time_ns':state['timestamp_ns']}),flush=True)
@@ -74,7 +77,7 @@ def run_case(name, manifest, options):
     process = None
     with (RUN / (name + ".log")).open("wb") as log:
         try:
-            process = subprocess.Popen([sys.executable, "-m", "sim", "run", str(path),
+            process = subprocess.Popen([str(resolve_sim()), "run", str(path),
                 "--allow-host-processes", "--qemu", os.environ.get("QEMU_SYSTEM_ARM", str(ROOT / "build/qemu/qemu-system-arm")),
                 "--report", str(report), *options], cwd=ROOT,
                 stdout=log, stderr=log, start_new_session=True)
@@ -90,19 +93,20 @@ def run_case(name, manifest, options):
     return process.returncode, record, output
 
 
-code, report, output = run_case("robot", document, ["--startup-timeout", "5", "--timeout", "120", "--qmp", str(external_qmp)])
-assert code == 0 and report["status"] == "passed", (report, output)
-result = report["result"]
-assert result["end_ns"] - result["origin_ns"] == 2_000_000_000 and set(result["ready_receipts"]) == {"main"}
-observed = json.loads(observations.read_text())
-print(json.dumps({"case": "native-upper", "observation": observed}), flush=True)
-diagnostics = dict(field.split("=", 1) for field in observed["cosim"].split(","))
-assert diagnostics["v2_initialized"] == "1" and int(diagnostics["rx_frames"]) >= 100, observed
-assert observed["state"]["board"] == "DM-MC02" and observed["state"]["timestamp_ns"] > 0
-assert len(observed["identities"]) == 2, observed["identities"]
-assert all(identity(item["pid"]) != item for item in observed["identities"])
-assert not external_qmp.exists(), "native external QMP socket remains"
-print("Scene native composition: actual UART ready, v2 traffic, upper QMP and cleanup passed")
+if not negative_only:
+    code, report, output = run_case("robot", document, ["--startup-timeout", "5", "--timeout", "120", "--qmp", str(external_qmp)])
+    assert code == 0 and report["status"] == "passed", (report, output)
+    result = report["result"]
+    assert result["end_ns"] - result["origin_ns"] == 2_000_000_000 and set(result["ready_receipts"]) == {"main"}
+    observed = json.loads(observations.read_text())
+    print(json.dumps({"case": "native-upper", "observation": observed}), flush=True)
+    diagnostics = dict(field.split("=", 1) for field in observed["cosim"].split(","))
+    assert diagnostics["v2_initialized"] == "1" and int(diagnostics["rx_frames"]) >= 100, observed
+    assert observed["state"]["board"] == "DM-MC02" and observed["state"]["timestamp_ns"] > 0
+    assert len(observed["identities"]) == 2, observed["identities"]
+    assert all(identity(item["pid"]) != item for item in observed["identities"])
+    assert not external_qmp.exists(), "native external QMP socket remains"
+    print("Scene native composition: actual UART ready, v2 traffic, upper QMP and cleanup passed")
 
 document["experiment"]["ready"][0]["text"] = "missing application marker"
 document["nodes"].pop("upper")

@@ -1,0 +1,22 @@
+{
+  "project": "binrw",
+  "version": "0.15.2",
+  "license": "MIT",
+  "repository": "https://github.com/jam1garner/binrw",
+  "commit": "db9ef7bece9525057001edd260439fa2748287df",
+  "path_in_vcs": "binrw",
+  "crate_url": "https://static.crates.io/crates/binrw/binrw-0.15.2.crate",
+  "crate_sha256": "6ad120d555272286c1017d25165ab8bd74806f13fc85b258484ec7e4ce75458f",
+  "license_url": "https://github.com/jam1garner/binrw/blob/db9ef7bece9525057001edd260439fa2748287df/LICENSE",
+  "license_sha256": "08159509fe99d146416fe110053a7360ddfccbba5f0c8f955bdbda025d4d2a20",
+  "canonical_source": "third_party/binrw; root Cargo [patch.crates-io] selects this path for all consumers",
+  "modifications": [
+    {
+      "file": "src/helpers.rs",
+      "change": "Delete bytes.reserve_exact(n) in Vec<u8> fast path only. Keep native take(n).read_to_end and exact byte-count rejection unchanged.",
+      "reason": "Untrusted nested length otherwise reserves 4294967295 bytes before bounded Cursor discovers EOF.",
+      "evidence": "build/rust-mcap-source/nested-red.log; tests/trace.rs::bounded_nested_length runs under RLIMIT_AS=256MiB."
+    }
+  ],
+  "upgrade": "When upgrading the pinned crate, rerun bounded_nested_length and remove the local deletion if upstream no longer preallocates untrusted n. Never select the registry and patched production source in parallel."
+}

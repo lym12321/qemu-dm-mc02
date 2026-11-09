@@ -1,10 +1,9 @@
-#!/usr/bin/env python3
-"""Project-local sim entry, also usable with python -I from another cwd."""
-
-from pathlib import Path
-import sys
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.cli import main
-
-raise SystemExit(main())
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root_dir=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+sim_executable=${SIM_EXECUTABLE:-"$root_dir/target/release/sim"}
+if [[ ! -x "$sim_executable" ]]; then
+    printf '%s\n' 'Rust sim executable missing. Build cargo build --locked --release --features sim-host/host-runtime, or set SIM_EXECUTABLE.' >&2
+    exit 78
+fi
+exec "$sim_executable" "$@"

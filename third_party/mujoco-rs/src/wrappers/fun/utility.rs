@@ -1,0 +1,1173 @@
+//! Module containing safe wrappers around utility functions.
+use crate::wrappers::mj_model::MjtGeom;
+use crate::wrappers::mj_primitive::*;
+use crate::util::checked_c_len;
+use crate::mujoco_c;
+use std::ptr;
+
+/* Manually added */
+/// Set res = 0.
+///
+/// # Panics
+/// Panics if `res` has more than [`i32::MAX`] elements.
+pub fn mju_zero(res: &mut [MjtNum])  {
+    // SAFETY: pointer and length derived from a valid slice, length bounded above.
+    unsafe { mujoco_c::mju_zero(res.as_mut_ptr(), checked_c_len(res.len())) }
+}
+
+/// Set res = val.
+pub fn mju_fill(res: &mut [MjtNum], val: MjtNum)  {
+    // SAFETY: pointer and length derived from a valid slice.
+    unsafe { mujoco_c::mju_fill(res.as_mut_ptr(), val, res.len() as i32) }
+}
+
+/// Set res = vec.
+///
+/// # Panics
+/// - Panics if `res` and `vec` have different lengths.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+pub fn mju_copy(res: &mut [MjtNum], vec: &[MjtNum])  {
+    assert!(res.len() == vec.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_copy(res.as_mut_ptr(), vec.as_ptr(), checked_c_len(res.len())) }
+}
+
+/// Return the sum of all elements in the vector `vec`.
+pub fn mju_sum(vec: &[MjtNum]) -> MjtNum {
+    // SAFETY: pointer and length derived from a valid slice.
+    unsafe { mujoco_c::mju_sum(vec.as_ptr(), vec.len() as i32) }
+}
+
+/// Return the L1 norm of the vector `vec` (sum of absolute values).
+pub fn mju_l1(vec: &[MjtNum]) -> MjtNum {
+    // SAFETY: pointer and length derived from a valid slice.
+    unsafe { mujoco_c::mju_L1(vec.as_ptr(), vec.len() as i32) }
+}
+
+/// Scale a vector: `res = vec * scl`.
+///
+/// # Panics
+/// Panics if `res` and `vec` have different lengths.
+pub fn mju_scl(res: &mut [MjtNum], vec: &[MjtNum], scl: MjtNum) {
+    assert!(res.len() == vec.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_scl(res.as_mut_ptr(), vec.as_ptr(), scl, vec.len() as i32) }
+}
+
+/// Add two vectors element-wise: `res = vec1 + vec2`.
+///
+/// # Panics
+/// Panics if `res`, `vec1`, and `vec2` do not all have the same length.
+pub fn mju_add(res: &mut [MjtNum], vec1: &[MjtNum], vec2: &[MjtNum]) {
+    assert!(res.len() == vec1.len() && vec1.len() == vec2.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_add(res.as_mut_ptr(), vec1.as_ptr(), vec2.as_ptr(), vec1.len() as i32) }
+}
+
+/// Subtract two vectors element-wise: `res = vec1 - vec2`.
+///
+/// # Panics
+/// Panics if `res`, `vec1`, and `vec2` do not all have the same length.
+pub fn mju_sub(res: &mut [MjtNum], vec1: &[MjtNum], vec2: &[MjtNum]) {
+    assert!(res.len() == vec1.len() && vec1.len() == vec2.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_sub(res.as_mut_ptr(), vec1.as_ptr(), vec2.as_ptr(), vec1.len() as i32) }
+}
+
+/// Add vector `vec` to `res` in place: `res += vec`.
+///
+/// # Panics
+/// Panics if `res` and `vec` have different lengths.
+pub fn mju_add_to(res: &mut [MjtNum], vec: &[MjtNum]) {
+    assert!(res.len() == vec.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_addTo(res.as_mut_ptr(), vec.as_ptr(), vec.len() as i32) }
+}
+
+/// Subtract vector `vec` from `res` in place: `res -= vec`.
+///
+/// # Panics
+/// Panics if `res` and `vec` have different lengths.
+pub fn mju_sub_from(res: &mut [MjtNum], vec: &[MjtNum]) {
+    assert!(res.len() == vec.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_subFrom(res.as_mut_ptr(), vec.as_ptr(), vec.len() as i32) }
+}
+
+/// Add scaled vector to `res` in place: `res += vec * scl`.
+///
+/// # Panics
+/// Panics if `res` and `vec` have different lengths.
+pub fn mju_add_to_scl(res: &mut [MjtNum], vec: &[MjtNum], scl: MjtNum) {
+    assert!(res.len() == vec.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_addToScl(res.as_mut_ptr(), vec.as_ptr(), scl, vec.len() as i32) }
+}
+
+/// Add a vector and a scaled vector: `res = vec1 + vec2 * scl`.
+///
+/// # Panics
+/// Panics if `res`, `vec1`, and `vec2` do not all have the same length.
+pub fn mju_add_scl(res: &mut [MjtNum], vec1: &[MjtNum], vec2: &[MjtNum], scl: MjtNum) {
+    assert!(res.len() == vec1.len() && vec1.len() == vec2.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_addScl(res.as_mut_ptr(), vec1.as_ptr(), vec2.as_ptr(), scl, vec1.len() as i32) }
+}
+
+/// Normalize a vector in place and return its length before normalization.
+///
+/// # Panics
+/// - Panics if `res` is empty.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+pub fn mju_normalize(res: &mut [MjtNum]) -> MjtNum {
+    // For n == 0 the C function writes res[0] = 1 and then mju_zero(res + 1, n - 1),
+    // i.e. memset with a (size_t)(-1) length, both out of bounds. A truncated length reaches
+    // the same branch, because mju_dot then sums nothing and the norm compares below mjMINVAL.
+    assert!(!res.is_empty());
+    // SAFETY: pointer and length derived from a valid, non-empty slice, length bounded above.
+    unsafe { mujoco_c::mju_normalize(res.as_mut_ptr(), checked_c_len(res.len())) }
+}
+
+/// Return the Euclidean norm (length) of a vector.
+pub fn mju_norm(vec: &[MjtNum]) -> MjtNum {
+    // SAFETY: pointer and length derived from a valid slice.
+    unsafe { mujoco_c::mju_norm(vec.as_ptr(), vec.len() as i32) }
+}
+
+/// Return the dot product of two vectors.
+///
+/// # Panics
+/// Panics if `vec1` and `vec2` have different lengths.
+pub fn mju_dot(vec1: &[MjtNum], vec2: &[MjtNum]) -> MjtNum {
+    assert!(vec1.len() == vec2.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_dot(vec1.as_ptr(), vec2.as_ptr(), vec1.len() as i32) }
+}
+
+/// Multiply matrix and vector: `res = mat * vec`.
+///
+/// # Panics
+/// - Panics if `mat` does not have `res.len() * vec.len()` elements.
+/// - Panics if `res` or `vec` has more than [`i32::MAX`] elements.
+pub fn mju_mul_mat_vec(res: &mut [MjtNum], mat: &[MjtNum], vec: &[MjtNum]) {
+    let nr = res.len();
+    let nc = vec.len();
+    assert!(mat.len() == nr.strict_mul(nc));
+    let (nr, nc) = (checked_c_len::<i32>(nr), checked_c_len::<i32>(nc));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulMatVec(res.as_mut_ptr(), mat.as_ptr(), vec.as_ptr(), nr, nc) }
+}
+
+/// Multiply transposed matrix and vector: `res = mat^T * vec`.
+///
+/// # Panics
+/// - Panics if `mat` does not have `vec.len() * res.len()` elements.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+pub fn mju_mul_mat_t_vec(res: &mut [MjtNum], mat: &[MjtNum], vec: &[MjtNum]) {
+    let nc = res.len();
+    let nr = vec.len();
+    assert!(mat.len() == nr.strict_mul(nc));
+    let (nr, nc) = (checked_c_len::<i32>(nr), checked_c_len::<i32>(nc));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulMatTVec(res.as_mut_ptr(), mat.as_ptr(), vec.as_ptr(), nr, nc) }
+}
+
+/// Multiply square matrix with vectors on both sides: returns `vec1^T * mat * vec2`.
+///
+/// # Panics
+/// - Panics if `vec1` and `vec2` have different lengths.
+/// - Panics if `mat` does not have `vec1.len() * vec1.len()` elements (must be square).
+/// - Panics if `vec1` has more than [`i32::MAX`] elements.
+pub fn mju_mul_vec_mat_vec(vec1: &[MjtNum], mat: &[MjtNum], vec2: &[MjtNum]) -> MjtNum {
+    let n = vec1.len();
+    assert!(vec2.len() == n && mat.len() == n.strict_mul(n));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulVecMatVec(vec1.as_ptr(), mat.as_ptr(), vec2.as_ptr(), checked_c_len(n)) }
+}
+
+/// Transpose a matrix: `res = mat^T`.
+///
+/// # Panics
+/// - Panics if `res` or `mat` does not have `nr * nc` elements.
+/// - Panics if `nr` or `nc` has more than [`i32::MAX`] elements, or if their product overflows.
+pub fn mju_transpose(res: &mut [MjtNum], mat: &[MjtNum], nr: usize, nc: usize) {
+    let size = nr.strict_mul(nc);
+    assert!(res.len() == size && mat.len() == size);
+    let (nr, nc) = (checked_c_len::<i32>(nr), checked_c_len::<i32>(nc));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_transpose(res.as_mut_ptr(), mat.as_ptr(), nr, nc) }
+}
+
+/// Symmetrize a square matrix: `res = (mat + mat^T)/2`.
+///
+/// The order `n` is `res.len().isqrt()`.
+///
+/// # Panics
+/// - Panics if `res` is not a perfect square in length, or if `mat` has a different length.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+pub fn mju_symmetrize(res: &mut [MjtNum], mat: &[MjtNum]) {
+    let n = res.len().isqrt();
+    assert!(res.len() == n * n && mat.len() == n * n);
+    checked_c_len::<i32>(res.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_symmetrize(res.as_mut_ptr(), mat.as_ptr(), n as i32) }
+}
+
+/// Convert a lower-triangular symmetric CSR matrix to a full dense matrix.
+/// Entries whose column index is above the row index are ignored.
+///
+/// # Panics
+/// - Panics if `res` does not have `n * n` elements, for `n = rownnz.len()`.
+/// - Panics if `mat` and `colind` have different lengths.
+/// - Panics if `rowadr` and `rownnz` have different lengths.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+///
+/// # Safety
+/// The C routine reads `mat[adr + j]` / `colind[adr + j]` for `adr = rowadr[i]`,
+/// `0 <= j < rownnz[i]`, and writes `res[i*n + col]` / `res[col*n + i]` for `col = colind[adr + j]`,
+/// all without bounds checks. The caller must guarantee a self-consistent sparse structure:
+/// - for every row `i`, `rowadr[i] >= 0`, `rownnz[i] >= 0`, and `rowadr[i] + rownnz[i] <= mat.len()`;
+/// - every column index in `colind[rowadr[i] .. rowadr[i] + rownnz[i]]` lies in `0..n`.
+///
+/// Violating either is an out-of-bounds read/write. (These checks require iterating the index
+/// arrays, so they are the caller's obligation rather than a runtime check.) A sparse matrix
+/// produced by MuJoCo itself always satisfies them.
+pub unsafe fn mju_sym2dense(
+    res: &mut [MjtNum], mat: &[MjtNum], rownnz: &[i32], rowadr: &[i32], colind: &[i32]
+) {
+    let n = rownnz.len();
+    assert!(res.len() == n * n);
+    checked_c_len::<i32>(res.len());
+    assert!(rowadr.len() == n);
+    assert!(mat.len() == colind.len());
+    // SAFETY: lengths checked above; the caller upholds the sparse-structure precondition that
+    // keeps every mat/colind read and res write performed by the C routine in bounds.
+    unsafe {
+        mujoco_c::mju_sym2dense(
+            res.as_mut_ptr(), mat.as_ptr(), n as i32, rownnz.as_ptr(), rowadr.as_ptr(), colind.as_ptr(),
+        )
+    }
+}
+
+/// Set a square matrix to identity.
+///
+/// The order `n` is `mat.len().isqrt()`.
+///
+/// # Panics
+/// - Panics if `mat` is not a perfect square in length.
+/// - Panics if `mat` has more than [`i32::MAX`] elements.
+pub fn mju_eye(mat: &mut [MjtNum]) {
+    let n = mat.len().isqrt();
+    assert!(mat.len() == n * n);
+    checked_c_len::<i32>(mat.len());
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_eye(mat.as_mut_ptr(), n as i32) }
+}
+
+/// Multiply matrices: `res = mat1 * mat2`.
+///
+/// # Panics
+/// - Panics if `mat1` does not have `r1 * c1` elements.
+/// - Panics if `mat2` does not have `c1 * c2` elements.
+/// - Panics if `res` does not have `r1 * c2` elements.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+/// - Panics if `r1`, `c1` or `c2` is larger than [`i32::MAX`], or if any product overflows.
+pub fn mju_mul_mat_mat(res: &mut [MjtNum], mat1: &[MjtNum], mat2: &[MjtNum], r1: usize, c1: usize, c2: usize) {
+    assert!(mat1.len() == r1.strict_mul(c1));
+    assert!(mat2.len() == c1.strict_mul(c2));
+    assert!(res.len() == r1.strict_mul(c2));
+    checked_c_len::<i32>(res.len());
+    let (r1, c1, c2) = (checked_c_len::<i32>(r1), checked_c_len::<i32>(c1), checked_c_len::<i32>(c2));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulMatMat(res.as_mut_ptr(), mat1.as_ptr(), mat2.as_ptr(), r1, c1, c2) }
+}
+
+/// Multiply matrices, second transposed: `res = mat1 * mat2^T`.
+///
+/// # Panics
+/// - Panics if `mat1` does not have `r1 * c1` elements.
+/// - Panics if `mat2` does not have `r2 * c1` elements.
+/// - Panics if `res` does not have `r1 * r2` elements.
+/// - Panics if `r1`, `c1` or `r2` is larger than [`i32::MAX`], or if any product overflows.
+pub fn mju_mul_mat_mat_t(res: &mut [MjtNum], mat1: &[MjtNum], mat2: &[MjtNum], r1: usize, c1: usize, r2: usize) {
+    assert!(mat1.len() == r1.strict_mul(c1));
+    assert!(mat2.len() == r2.strict_mul(c1));
+    assert!(res.len() == r1.strict_mul(r2));
+    let (r1, c1, r2) = (checked_c_len::<i32>(r1), checked_c_len::<i32>(c1), checked_c_len::<i32>(r2));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulMatMatT(res.as_mut_ptr(), mat1.as_ptr(), mat2.as_ptr(), r1, c1, r2) }
+}
+
+/// Multiply matrices, first transposed: `res = mat1^T * mat2`.
+///
+/// # Panics
+/// - Panics if `mat1` does not have `r1 * c1` elements.
+/// - Panics if `mat2` does not have `r1 * c2` elements.
+/// - Panics if `res` does not have `c1 * c2` elements.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+/// - Panics if `r1`, `c1` or `c2` is larger than [`i32::MAX`], or if any product overflows.
+pub fn mju_mul_mat_t_mat(res: &mut [MjtNum], mat1: &[MjtNum], mat2: &[MjtNum], r1: usize, c1: usize, c2: usize) {
+    assert!(mat1.len() == r1.strict_mul(c1));
+    assert!(mat2.len() == r1.strict_mul(c2));
+    assert!(res.len() == c1.strict_mul(c2));
+    checked_c_len::<i32>(res.len());
+    let (r1, c1, c2) = (checked_c_len::<i32>(r1), checked_c_len::<i32>(c1), checked_c_len::<i32>(c2));
+    // SAFETY: pointers and lengths derived from valid slices; matching lengths asserted above.
+    unsafe { mujoco_c::mju_mulMatTMat(res.as_mut_ptr(), mat1.as_ptr(), mat2.as_ptr(), r1, c1, c2) }
+}
+
+/// Compute `res = mat^T * diag * mat` if `diag` is Some, else `res = mat^T * mat`.
+///
+/// The column count `nc` is `res.len().isqrt()`.
+///
+/// # Panics
+/// - Panics if `res` is not a perfect square in length.
+/// - Panics if `mat` does not have `nr * nc` elements.
+/// - Panics if `diag` is `Some` and does not have `nr` elements.
+/// - Panics if `res` has more than [`i32::MAX`] elements.
+/// - Panics if `nr` is larger than [`i32::MAX`], or if `nr * nc` overflows.
+pub fn mju_sqr_mat_td(res: &mut [MjtNum], mat: &[MjtNum], diag: Option<&[MjtNum]>, nr: usize) {
+    let nc = res.len().isqrt();
+    assert!(res.len() == nc * nc);
+    assert!(mat.len() == nr.strict_mul(nc));
+    checked_c_len::<i32>(res.len());
+    if let Some(d) = diag {
+        assert!(d.len() == nr);
+    }
+    let (nr, nc) = (checked_c_len::<i32>(nr), checked_c_len::<i32>(nc));
+    let diag_ptr = diag.map_or(ptr::null(), |d| d.as_ptr());
+    // SAFETY: all arguments are valid references; nullable parameters use null when None.
+    unsafe { mujoco_c::mju_sqrMatTD(res.as_mut_ptr(), mat.as_ptr(), diag_ptr, nr, nc) }
+}
+
+
+/********************************/
+/* Auto generated */
+/*******************************/
+/// Intersect ray with pure geom, return nearest distance or -1 if no intersection.
+/// If `normal_out` is `Some`, it will be filled with the surface normal at the intersection.
+///
+/// # Note
+/// MuJoCo raises a fatal error, which ends the process, when `geomtype` is not a plane, sphere,
+/// capsule, ellipsoid, cylinder or box.
+pub fn mju_ray_geom(pos: &[MjtNum; 3], mat: &[MjtNum; 9], size: &[MjtNum; 3], pnt: &[MjtNum; 3], vec: &[MjtNum; 3], geomtype: MjtGeom, normal_out: Option<&mut [MjtNum; 3]>) -> MjtNum  {
+    // SAFETY: all arguments are valid references; nullable parameters use null when None.
+    unsafe { mujoco_c::mju_rayGeom(pos, mat, size, pnt, vec, geomtype as i32, normal_out.map_or(ptr::null_mut(), |x| x)) }
+}
+
+/// Set res = 0.
+pub fn mju_zero_3(res: &mut [MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_zero3(res) }
+}
+
+/// Set res = data.
+pub fn mju_copy_3(res: &mut [MjtNum; 3], data: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_copy3(res, data) }
+}
+
+/// Set res = vec*scl.
+pub fn mju_scl_3(res: &mut [MjtNum; 3], vec: &[MjtNum; 3], scl: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_scl3(res, vec, scl) }
+}
+
+/// Set res = vec_1 + vec_2.
+pub fn mju_add_3(res: &mut [MjtNum; 3], vec_1: &[MjtNum; 3], vec_2: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_add3(res, vec_1, vec_2) }
+}
+
+/// Set res = vec_1 - vec_2.
+pub fn mju_sub_3(res: &mut [MjtNum; 3], vec_1: &[MjtNum; 3], vec_2: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_sub3(res, vec_1, vec_2) }
+}
+
+/// Set res = res + vec.
+pub fn mju_add_to_3(res: &mut [MjtNum; 3], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_addTo3(res, vec) }
+}
+
+/// Set res = res - vec.
+pub fn mju_sub_from_3(res: &mut [MjtNum; 3], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_subFrom3(res, vec) }
+}
+
+/// Set res = res + vec*scl.
+pub fn mju_add_to_scl_3(res: &mut [MjtNum; 3], vec: &[MjtNum; 3], scl: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_addToScl3(res, vec, scl) }
+}
+
+/// Set res = vec_1 + vec_2*scl.
+pub fn mju_add_scl_3(res: &mut [MjtNum; 3], vec_1: &[MjtNum; 3], vec_2: &[MjtNum; 3], scl: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_addScl3(res, vec_1, vec_2, scl) }
+}
+
+/// Normalize vector, return length before normalization.
+pub fn mju_normalize_3(vec: &mut [MjtNum; 3]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_normalize3(vec) }
+}
+
+/// Return vector length (without normalizing the vector).
+pub fn mju_norm_3(vec: &[MjtNum; 3]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_norm3(vec) }
+}
+
+/// Return dot-product of vec_1 and vec_2.
+pub fn mju_dot_3(vec_1: &[MjtNum; 3], vec_2: &[MjtNum; 3]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_dot3(vec_1, vec_2) }
+}
+
+/// Return Cartesian distance between 3D vectors pos_1 and pos_2.
+pub fn mju_dist_3(pos_1: &[MjtNum; 3], pos_2: &[MjtNum; 3]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_dist3(pos_1, pos_2) }
+}
+
+/// Multiply 3-by-3 matrix by vector: res = mat * vec.
+pub fn mju_mul_mat_vec_3(res: &mut [MjtNum; 3], mat: &[MjtNum; 9], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mulMatVec3(res, mat, vec) }
+}
+
+/// Multiply transposed 3-by-3 matrix by vector: res = mat' * vec.
+pub fn mju_mul_mat_t_vec_3(res: &mut [MjtNum; 3], mat: &[MjtNum; 9], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mulMatTVec3(res, mat, vec) }
+}
+
+/// Compute cross-product: res = cross(a, b).
+pub fn mju_cross(res: &mut [MjtNum; 3], a: &[MjtNum; 3], b: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_cross(res, a, b) }
+}
+
+/// Set res = 0.
+pub fn mju_zero_4(res: &mut [MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_zero4(res) }
+}
+
+/// Set res = (1,0,0,0).
+pub fn mju_unit_4(res: &mut [MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_unit4(res) }
+}
+
+/// Set res = data.
+pub fn mju_copy_4(res: &mut [MjtNum; 4], data: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_copy4(res, data) }
+}
+
+/// Normalize vector, return length before normalization.
+pub fn mju_normalize_4(vec: &mut [MjtNum; 4]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_normalize4(vec) }
+}
+
+/// Coordinate transform of 6D motion or force vector in rotation:translation format.
+/// `rotnew_2old` is 3-by-3; pass `None` for no rotation. `flg_force`: `true` for force vector, `false` for motion vector.
+pub fn mju_transform_spatial(res: &mut [MjtNum; 6], vec: &[MjtNum; 6], flg_force: bool, newpos: &[MjtNum; 3], oldpos: &[MjtNum; 3], rotnew_2old: Option<&[MjtNum; 9]>)  {
+    // SAFETY: all arguments are valid references; nullable parameters use null when None.
+    unsafe { mujoco_c::mju_transformSpatial(
+        res, vec, flg_force as i32, newpos, oldpos,
+        rotnew_2old.map_or(ptr::null(), |d| d)
+    ) }
+}
+
+/// Rotate vector by quaternion.
+pub fn mju_rot_vec_quat(res: &mut [MjtNum; 3], vec: &[MjtNum; 3], quat: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_rotVecQuat(res, vec, quat) }
+}
+
+/// Conjugate quaternion, corresponding to opposite rotation.
+pub fn mju_neg_quat(res: &mut [MjtNum; 4], quat: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_negQuat(res, quat) }
+}
+
+/// Set res = quat_1 * quat_2 (quaternion product).
+pub fn mju_mul_quat(res: &mut [MjtNum; 4], quat_1: &[MjtNum; 4], quat_2: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mulQuat(res, quat_1, quat_2) }
+}
+
+/// Multiply quaternion and axis.
+pub fn mju_mul_quat_axis(res: &mut [MjtNum; 4], quat: &[MjtNum; 4], axis: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mulQuatAxis(res, quat, axis) }
+}
+
+/// Convert axisAngle to quaternion. `angle` is in radians, and `axis` must be a unit vector,
+/// because the result is not normalized.
+pub fn mju_axis_angle_2_quat(res: &mut [MjtNum; 4], axis: &[MjtNum; 3], angle: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_axisAngle2Quat(res, axis, angle) }
+}
+
+/// Convert quaternion (corresponding to orientation difference) to 3D velocity.
+pub fn mju_quat_2_vel(res: &mut [MjtNum; 3], quat: &[MjtNum; 4], dt: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_quat2Vel(res, quat, dt) }
+}
+
+/// Subtract quaternions, express as 3D velocity: qb*quat(res) = qa.
+pub fn mju_sub_quat(res: &mut [MjtNum; 3], qa: &[MjtNum; 4], qb: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_subQuat(res, qa, qb) }
+}
+
+/// Convert quaternion to 3D rotation matrix.
+pub fn mju_quat_2_mat(res: &mut [MjtNum; 9], quat: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_quat2Mat(res, quat) }
+}
+
+/// Convert 3D rotation matrix to quaternion.
+pub fn mju_mat_2_quat(quat: &mut [MjtNum; 4], mat: &[MjtNum; 9])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mat2Quat(quat, mat) }
+}
+
+/// Compute time-derivative of quaternion, given 3D rotational velocity.
+pub fn mju_deriv_quat(res: &mut [MjtNum; 4], quat: &[MjtNum; 4], vel: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_derivQuat(res, quat, vel) }
+}
+
+/// Integrate quaternion given 3D angular velocity.
+pub fn mju_quat_integrate(quat: &mut [MjtNum; 4], vel: &[MjtNum; 3], scale: MjtNum)  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_quatIntegrate(quat, vel, scale) }
+}
+
+/// Construct quaternion performing rotation from z-axis to given vector.
+pub fn mju_quat_z2_vec(quat: &mut [MjtNum; 4], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_quatZ2Vec(quat, vec) }
+}
+
+/// Extract 3D rotation from an arbitrary 3x3 matrix by refining the input quaternion.
+/// Returns the number of iterations required to converge
+pub fn mju_mat_2_rot(quat: &mut [MjtNum; 4], mat: &[MjtNum; 9]) -> i32  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mat2Rot(quat, mat) }
+}
+
+/// Convert a sequence of Euler angles (radians) to a quaternion. Every character of `seq` is one of
+/// `xyzXYZ`, where lower case means an intrinsic rotation and upper case an extrinsic one.
+///
+/// # Panics
+/// Panics when `seq` holds other than 3 characters, or a character outside `xyzXYZ`.
+pub fn mju_euler_2_quat(euler: &[MjtNum; 3], seq: &str) -> [MjtNum; 4]  {
+    // MuJoCo aborts the process through mjERROR on a bad sequence. We panic to avoid that.
+    let seq = seq.as_bytes();
+    assert!(
+        seq.len() == 3 && seq.iter().all(|c| b"xyzXYZ".contains(c)),
+        "seq must hold exactly 3 characters out of xyzXYZ"
+    );
+
+    let c_seq = [seq[0], seq[1], seq[2], 0];
+    let mut quat = [0 as MjtNum; 4];
+    // SAFETY: all arguments are valid references with correct sizes. c_seq is NUL terminated.
+    unsafe { mujoco_c::mju_euler2Quat(&mut quat, euler, c_seq.as_ptr().cast()) };
+    quat
+}
+
+/// Multiply two poses.
+pub fn mju_mul_pose(posres: &mut [MjtNum; 3], quatres: &mut [MjtNum; 4], pos_1: &[MjtNum; 3], quat_1: &[MjtNum; 4], pos_2: &[MjtNum; 3], quat_2: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_mulPose(posres, quatres, pos_1, quat_1, pos_2, quat_2) }
+}
+
+/// Conjugate pose, corresponding to the opposite spatial transformation.
+pub fn mju_neg_pose(posres: &mut [MjtNum; 3], quatres: &mut [MjtNum; 4], pos: &[MjtNum; 3], quat: &[MjtNum; 4])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_negPose(posres, quatres, pos, quat) }
+}
+
+/// Transform vector by pose.
+pub fn mju_trn_vec_pose(res: &mut [MjtNum; 3], pos: &[MjtNum; 3], quat: &[MjtNum; 4], vec: &[MjtNum; 3])  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_trnVecPose(res, pos, quat, vec) }
+}
+
+/// Address of diagonal element i in band-dense matrix representation.
+pub fn mju_band_diag(i: i32, ntotal: i32, nband: i32, ndense: i32) -> i32  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_bandDiag(i, ntotal, nband, ndense) }
+}
+
+/// Eigenvalue decomposition of symmetric 3x3 matrix, mat = eigvec * diag(eigval) * eigvec'.
+/// The eigenvalues come out in decreasing order.
+///
+/// # Returns
+/// The number of Jacobi iterations, at most 500.
+pub fn mju_eig_3(eigval: &mut [MjtNum; 3], eigvec: &mut [MjtNum; 9], quat: &mut [MjtNum; 4], mat: &[MjtNum; 9]) -> i32  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_eig3(eigval, eigvec, quat, mat) }
+}
+
+/// Muscle active force, prm = (range\[2\], force, scale, lmin, lmax, vmax, fpmax, fvmax).
+pub fn mju_muscle_gain(len: MjtNum, vel: MjtNum, lengthrange: &[MjtNum; 2], acc_0: MjtNum, prm: &[MjtNum; 9]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_muscleGain(len, vel, lengthrange, acc_0, prm) }
+}
+
+/// Muscle passive force, prm = (range\[2\], force, scale, lmin, lmax, vmax, fpmax, fvmax).
+pub fn mju_muscle_bias(len: MjtNum, lengthrange: &[MjtNum; 2], acc_0: MjtNum, prm: &[MjtNum; 9]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_muscleBias(len, lengthrange, acc_0, prm) }
+}
+
+/// Muscle activation dynamics, prm = (tau_act, tau_deact, smoothing_width).
+pub fn mju_muscle_dynamics(ctrl: MjtNum, act: MjtNum, prm: &[MjtNum; 3]) -> MjtNum  {
+    // SAFETY: all arguments are valid references with correct sizes.
+    unsafe { mujoco_c::mju_muscleDynamics(ctrl, act, prm) }
+}
+
+/// Integrate spring-damper analytically, return pos(dt).
+pub fn mju_spring_damper(pos_0: MjtNum, vel_0: MjtNum, kp: MjtNum, kv: MjtNum, dt: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_springDamper(pos_0, vel_0, kp, kv, dt) }
+}
+
+/// Return min(a,b) with single evaluation of a and b.
+pub fn mju_min(a: MjtNum, b: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_min(a, b) }
+}
+
+/// Return max(a,b) with single evaluation of a and b.
+pub fn mju_max(a: MjtNum, b: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_max(a, b) }
+}
+
+/// Clip x to the range \[min, max\].
+pub fn mju_clip(x: MjtNum, min: MjtNum, max: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_clip(x, min, max) }
+}
+
+/// Return sign of x: +1, -1 or 0.
+pub fn mju_sign(x: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_sign(x) }
+}
+
+/// Round x to nearest integer.
+pub fn mju_round(x: MjtNum) -> i32  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_round(x) }
+}
+
+/// Return true if nan or abs(x)>mjMAXVAL, false otherwise. Used by check functions.
+pub fn mju_is_bad(x: MjtNum) -> bool  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_isBad(x) != 0 }
+}
+
+/// Generate Halton sequence.
+///
+/// # Panics
+/// Panics if `base` is less than 2.
+pub fn mju_halton(index: i32, base: i32) -> MjtNum  {
+    // MuJoCo divides by base without checking it: 0 divides by zero and 1 never terminates.
+    assert!(base >= 2, "halton base must be 2 or more, got {base}");
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_Halton(index, base) }
+}
+
+/// Sigmoid function over 0<=x<=1 using quintic polynomial.
+pub fn mju_sigmoid(x: MjtNum) -> MjtNum  {
+    // SAFETY: pure scalar FFI call with no pointer arguments.
+    unsafe { mujoco_c::mju_sigmoid(x) }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::assert_relative_eq;
+    use super::*;
+
+    #[test]
+    fn test_mju_euler_2_quat() {
+        const EULER: [MjtNum; 3] = [0.3, -0.7, 1.1];
+
+        let mut axis_quat = [[0.0; 4]; 3];
+        for (i, quat) in axis_quat.iter_mut().enumerate() {
+            let mut axis = [0.0; 3];
+            axis[i] = 1.0;
+            mju_axis_angle_2_quat(quat, &axis, EULER[i]);
+        }
+
+        let mut partial = [0.0; 4];
+        let mut expected_moving = [0.0; 4];
+        mju_mul_quat(&mut partial, &axis_quat[0], &axis_quat[1]);
+        mju_mul_quat(&mut expected_moving, &partial, &axis_quat[2]);
+
+        let mut expected_fixed = [0.0; 4];
+        mju_mul_quat(&mut partial, &axis_quat[1], &axis_quat[0]);
+        mju_mul_quat(&mut expected_fixed, &axis_quat[2], &partial);
+
+        let moving = mju_euler_2_quat(&EULER, "xyz");
+        let fixed = mju_euler_2_quat(&EULER, "XYZ");
+        assert_ne!(moving, fixed, "the two conventions must not coincide");
+        for (got, expected) in moving.iter().zip(&expected_moving) {
+            assert_relative_eq!(*got, *expected, epsilon = 1e-12);
+        }
+
+        for (got, expected) in fixed.iter().zip(&expected_fixed) {
+            assert_relative_eq!(*got, *expected, epsilon = 1e-12);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "seq must hold exactly 3 characters out of xyzXYZ")]
+    fn test_mju_euler_2_quat_rejects_bad_seq() {
+        mju_euler_2_quat(&[0.0; 3], "xyw");
+    }
+
+    #[test]
+    fn test_mju_zero_3() {
+        let mut a = [1.0, 2.0, 3.0];
+        mju_zero_3(&mut a);
+        assert_eq!(a, [0.0; 3]);
+    }
+
+    #[test]
+    fn test_mju_add_3() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [5.0, 6.0, 7.0];
+        let mut c = [0.0; 3];
+        mju_add_3(&mut c, &a, &b);
+        assert_eq!(c, [6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn test_mju_sub_3() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [1.0, 4.0, 2.0];
+        let mut c = [0.0; 3];
+        mju_sub_3(&mut c, &a, &b);
+        assert_eq!(c, [0.0, -2.0, 1.0]);
+    }
+
+    #[test]
+    pub fn test_mju_clip() {
+        assert_eq!(mju_clip(1.5, -1.0, 1.0), 1.0);
+    }
+
+    #[test]
+    pub fn test_mju_cross() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [1.0, 4.0, 2.0];
+        let mut c = [0.0; 3];
+        mju_cross(&mut c, &a, &b);
+        assert_eq!(c, [-8.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn test_mju_zero() {
+        let mut a = [1.0, 2.0, 3.0];
+        mju_zero(&mut a);
+        assert_eq!(a, [0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn test_mju_fill() {
+        let mut a = [0.0; 3];
+        mju_fill(&mut a, 5.0);
+        assert_eq!(a, [5.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn test_mju_copy() {
+        let a = [1.0, 2.0, 3.0];
+        let mut b = [0.0; 3];
+        mju_copy(&mut b, &a);
+        assert_eq!(b, [1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_mju_sum() {
+        let a = [1.0, -2.0, 3.0];
+        assert_eq!(mju_sum(&a), 2.0);
+    }
+
+    #[test]
+    fn test_mju_l1() {
+        let a = [1.0, -2.0, 3.0];
+        assert_eq!(mju_l1(&a), 6.0);
+    }
+
+    #[test]
+    fn test_mju_scl() {
+        let a = [1.0, 2.0, 3.0];
+        let mut b = [0.0; 3];
+        mju_scl(&mut b, &a, 2.0);
+        assert_eq!(b, [2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn test_mju_add() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [5.0, 6.0, 7.0];
+        let mut c = [0.0; 3];
+        mju_add(&mut c, &a, &b);
+        assert_eq!(c, [6.0, 8.0, 10.0]);
+    }
+
+    #[test]
+    fn test_mju_sub() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [1.0, 4.0, 2.0];
+        let mut c = [0.0; 3];
+        mju_sub(&mut c, &a, &b);
+        assert_eq!(c, [0.0, -2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_mju_add_to() {
+        let mut a = [1.0, 2.0, 3.0];
+        let b = [4.0, 5.0, 6.0];
+        mju_add_to(&mut a, &b);
+        assert_eq!(a, [5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_mju_sub_from() {
+        let mut a = [5.0, 7.0, 9.0];
+        let b = [1.0, 2.0, 3.0];
+        mju_sub_from(&mut a, &b);
+        assert_eq!(a, [4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn test_mju_add_to_scl() {
+        let mut a = [1.0, 2.0, 3.0];
+        let b = [1.0, 1.0, 1.0];
+        mju_add_to_scl(&mut a, &b, 2.0);
+        assert_eq!(a, [3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_mju_add_scl() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [1.0, 1.0, 1.0];
+        let mut c = [0.0; 3];
+        mju_add_scl(&mut c, &a, &b, 2.0);
+        assert_eq!(c, [3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_mju_normalize() {
+        let mut a = [3.0, 4.0];
+        let len = mju_normalize(&mut a);
+        assert!((len - 5.0).abs() < 1e-10);
+        assert!((mju_norm(&a) - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mju_normalize_panics_on_empty() {
+        // An empty slice would make the C function write res[0] and memset a (size_t)(-1)
+        // length, both out of bounds; the wrapper must reject it instead.
+        let mut empty = [];
+        mju_normalize(&mut empty);
+    }
+
+    #[test]
+    fn test_mju_norm() {
+        let a = [3.0, 4.0];
+        let len = mju_norm(&a);
+        assert!((len - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_mju_dot() {
+        let a = [1.0, 2.0, 3.0];
+        let b = [4.0, -5.0, 6.0];
+        assert_eq!(mju_dot(&a, &b), 12.0);
+    }
+
+    #[test]
+    fn test_mju_mul_mat_vec() {
+        // 2x3 matrix * 3-vector
+        let mat = [1.0, 2.0, 3.0,
+                   4.0, 5.0, 6.0];
+        let vec = [1.0, 2.0, 3.0];
+        let mut res = [0.0; 2];
+        mju_mul_mat_vec(&mut res, &mat, &vec);
+        assert_eq!(res, [14.0, 32.0]);
+    }
+
+    #[test]
+    fn test_mju_mul_mat_t_vec() {
+        // (2x3 matrix)^T * 2-vector
+        let mat = [1.0, 2.0, 3.0,
+                   4.0, 5.0, 6.0]; // shape (2,3)
+        let vec = [1.0, 1.0];       // len = 2
+        let mut res = [0.0; 3];     // len = 3
+        mju_mul_mat_t_vec(&mut res, &mat, &vec);
+        assert_eq!(res, [5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_mju_mul_vec_mat_vec() {
+        // v1^T * M * v2
+        let v1 = [1.0, 2.0];
+        let v2 = [3.0, 4.0];
+        let mat = [1.0, 2.0,
+                   3.0, 4.0]; // 2x2
+        let result = mju_mul_vec_mat_vec(&v1, &mat, &v2);
+        // v1^T * M = [7, 10], dot with v2 = 7*3 + 10*4 = 61
+        assert_eq!(result, 61.0);
+    }
+
+    #[test]
+    fn test_mju_transpose() {
+        let mat = [1.0, 2.0, 3.0,
+                   4.0, 5.0, 6.0]; // 2x3
+        let mut res = [0.0; 6];     // 3x2
+        mju_transpose(&mut res, &mat, 2, 3);
+        assert_eq!(res, [1.0, 4.0,
+                         2.0, 5.0,
+                         3.0, 6.0]);
+    }
+
+    #[test]
+    fn test_mju_symmetrize() {
+        let mat = [1.0, 2.0,
+                   3.0, 4.0]; // 2x2
+        let mut res = [0.0; 4];
+        mju_symmetrize(&mut res, &mat);
+        // (M + M^T)/2 = [[1,2.5],[2.5,4]]
+        assert_eq!(res, [1.0, 2.5,
+                         2.5, 4.0]);
+    }
+
+    #[test]
+    fn test_mju_sym2dense() {
+        let mut dense = [0.0; 4];
+        let sym = [1.0, 2.0, 3.0];
+        let rownnz = [1, 2];
+        let rowadr = [0, 1];
+        let colind = [0, 0, 1];
+        // SAFETY: self-consistent sparse structure (rowadr/rownnz in bounds, colind in 0..n).
+        unsafe { mju_sym2dense(&mut dense, &sym, &rownnz, &rowadr, &colind) };
+        assert_eq!(dense, [1.0, 2.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mju_sym2dense_panics_on_bad_dense_size() {
+        let mut dense = [0.0; 3];
+        let sym = [1.0, 2.0, 3.0];
+        let rownnz = [1, 2];
+        let rowadr = [0, 1];
+        let colind = [0, 0, 1];
+        // SAFETY: structure is consistent; only the `res` length precondition (checked) is violated.
+        unsafe { mju_sym2dense(&mut dense, &sym, &rownnz, &rowadr, &colind) };
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_mju_sym2dense_panics_on_mismatched_sparse_lengths() {
+        let mut dense = [0.0; 4];
+        let sym = [1.0, 2.0, 3.0];
+        let rownnz = [1, 2];
+        let rowadr = [0, 1];
+        let colind = [0, 0];
+        // SAFETY: only the `mat.len() == colind.len()` precondition (checked) is violated.
+        unsafe { mju_sym2dense(&mut dense, &sym, &rownnz, &rowadr, &colind) };
+    }
+
+    /// `n` is now derived, so a length that is not a perfect square must still be rejected
+    /// instead of being silently rounded down to the nearest square.
+    #[test]
+    #[should_panic]
+    fn test_mju_eye_panics_on_non_square() {
+        let mut mat = [0.0; 5];
+        mju_eye(&mut mat);
+    }
+
+    /// `nc` is now derived from `res`, so a non-square `res` must still be rejected.
+    #[test]
+    #[should_panic]
+    fn test_mju_sqr_mat_td_panics_on_non_square_res() {
+        let mat = [1.0; 6];
+        let mut res = [0.0; 5];
+        mju_sqr_mat_td(&mut res, &mat, None, 3);
+    }
+
+    /// `n` is now `rownnz.len()`, so `rowadr` is the one length still checked against it.
+    #[test]
+    #[should_panic]
+    fn test_mju_sym2dense_panics_on_short_rowadr() {
+        let mut dense = [0.0; 4];
+        let sym = [1.0, 2.0, 3.0];
+        let rownnz = [1, 2];
+        let rowadr = [0];
+        let colind = [0, 0, 1];
+        // SAFETY: only the `rowadr.len() == n` precondition (checked) is violated.
+        unsafe { mju_sym2dense(&mut dense, &sym, &rownnz, &rowadr, &colind) };
+    }
+
+    #[test]
+    fn test_mju_eye() {
+        let mut mat = [0.0; 9];
+        mju_eye(&mut mat);
+        assert_eq!(mat, [1.0, 0.0, 0.0,
+                         0.0, 1.0, 0.0,
+                         0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn test_mju_mul_mat_mat() {
+        // (2x3) * (3x2) = (2x2)
+        let mat1 = [1.0, 2.0, 3.0,
+                    4.0, 5.0, 6.0];
+        let mat2 = [7.0,  8.0,
+                    9.0, 10.0,
+                    11.0, 12.0];
+        let mut res = [0.0; 4];
+        mju_mul_mat_mat(&mut res, &mat1, &mat2, 2, 3, 2);
+        assert_eq!(res, [58.0, 64.0,
+                         139.0, 154.0]);
+    }
+
+    #[test]
+    fn test_mju_mul_mat_mat_t() {
+        let mat1 = [1.0, 2.0, 3.0,
+                    4.0, 5.0, 6.0];
+        let mat2 = [7.0,  8.0,  9.0,
+                    10.0, 11.0, 12.0,
+                    13.0, 14.0, 15.0,
+                    16.0, 17.0, 18.0]; // 4x3
+        let mut res = [0.0; 8]; // 2x4
+        mju_mul_mat_mat_t(&mut res, &mat1, &mat2, 2, 3, 4);
+        assert_eq!(res, [50.0, 68.0, 86.0, 104.0,
+                        122.0, 167.0, 212.0, 257.0]);
+    }
+
+    #[test]
+    fn test_mju_mul_mat_t_mat() {
+        // (2x3)^T * (2x2) = (3x2)
+        let mat1 = [1.0, 2.0, 3.0,
+                    4.0, 5.0, 6.0]; // 2x3
+        let mat2 = [7.0, 8.0,
+                    9.0, 10.0];    // 2x2
+        let mut res = [0.0; 6]; // 3x2
+        mju_mul_mat_t_mat(&mut res, &mat1, &mat2, 2, 3, 2);
+        assert_eq!(res, [43.0, 48.0,
+                         59.0, 66.0,
+                         75.0, 84.0]);
+    }
+
+    #[test]
+    fn test_mju_sqr_mat_td_no_diag() {
+        // res = mat^T * mat
+        let mat = [1.0, 2.0,
+                   3.0, 4.0,
+                   5.0, 6.0]; // 3x2
+        let mut res = [0.0; 4]; // 2x2
+        mju_sqr_mat_td(&mut res, &mat, None, 3);
+        assert_eq!(res, [35.0, 44.0,
+                         44.0, 56.0]);
+    }
+
+    #[test]
+    fn test_mju_sqr_mat_td_with_diag() {
+        // res = mat^T * diag * mat
+        let mat = [1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0]; // 3x2
+        let diag = [1.0, 2.0, 3.0];
+        let mut res = [0.0; 4]; // 2x2
+        mju_sqr_mat_td(&mut res, &mat, Some(&diag), 3);
+        assert_eq!(res, [94.0, 116.0,
+                        116.0, 144.0]);
+    }
+
+    #[test]
+    fn test_identity_transform_motion() {
+        let vec = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut res = [0.0; 6];
+
+        let newpos = [0.0, 0.0, 0.0];
+        let oldpos = [0.0, 0.0, 0.0];
+
+        // No rotation
+        mju_transform_spatial(&mut res, &vec, false, &newpos, &oldpos, None);
+
+        assert_relative_eq!(res[0], vec[0], epsilon = 1e-9);
+        assert_relative_eq!(res[1], vec[1], epsilon = 1e-9);
+        assert_relative_eq!(res[2], vec[2], epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_identity_transform_force() {
+        let vec = [10.0, 20.0, 30.0, 40.0, 50.0, 60.0];
+        let mut res = [0.0; 6];
+
+        let newpos = [0.0, 0.0, 0.0];
+        let oldpos = [0.0, 0.0, 0.0];
+
+        // Force flag
+        mju_transform_spatial(&mut res, &vec, true, &newpos, &oldpos, None);
+
+        assert_relative_eq!(res[0], vec[0], epsilon = 1e-9);
+        assert_relative_eq!(res[1], vec[1], epsilon = 1e-9);
+        assert_relative_eq!(res[2], vec[2], epsilon = 1e-9);
+    }
+
+    #[test]
+    fn test_rotation_identity_matrix() {
+        let vec = [7.0, 8.0, 9.0, 1.0, 2.0, 3.0];
+        let mut res = [0.0; 6];
+
+        let newpos = [0.0, 0.0, 0.0];
+        let oldpos = [0.0, 0.0, 0.0];
+
+        // Identity rotation matrix (should not change the result)
+        let rot_identity: [MjtNum; 9] = [
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+
+        mju_transform_spatial(&mut res, &vec, false, &newpos, &oldpos, Some(&rot_identity));
+
+        assert_relative_eq!(res[0], vec[0], epsilon = 1e-9);
+        assert_relative_eq!(res[1], vec[1], epsilon = 1e-9);
+        assert_relative_eq!(res[2], vec[2], epsilon = 1e-9);
+    }
+
+    /// The radical inverse in base 2 of 1, 2, 3 is 1/2, 1/4, 3/4.
+    #[test]
+    fn test_mju_halton() {
+        assert_relative_eq!(mju_halton(1, 2), 0.5, epsilon = 1e-12);
+        assert_relative_eq!(mju_halton(2, 2), 0.25, epsilon = 1e-12);
+        assert_relative_eq!(mju_halton(3, 2), 0.75, epsilon = 1e-12);
+    }
+
+    /// Base 1 makes MuJoCo's loop run forever, so the wrapper must reject it before the FFI call.
+    #[test]
+    #[should_panic(expected = "base must be 2 or more")]
+    fn test_mju_halton_base_one_panics() {
+        let _ = mju_halton(1, 1);
+    }
+}

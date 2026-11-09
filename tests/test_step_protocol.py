@@ -702,7 +702,7 @@ def test_begin_reset_seeds_nonzero_ack_baseline_and_clears_old_history(
 
 
 def test_nonzero_reset_baseline_through_actual_cosim_waiter():
-    from sim.transports.cosim import StepFramedSocket, wait_v2_response
+    from smoke.support.cosim import StepFramedSocket, wait_v2_response
 
     local, remote = socket.socketpair()
     try:

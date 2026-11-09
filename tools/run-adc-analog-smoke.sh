@@ -7,14 +7,11 @@ export PYTHONPATH="$root_dir/tools${PYTHONPATH:+:$PYTHONPATH}"
 qemu_bin=${QEMU_SYSTEM_ARM:-"$root_dir/build/qemu/qemu-system-arm"}
 command -v python3 >/dev/null 2>&1 || { printf '%s\n' 'blocked: python3 is required' >&2; exit 2; }
 
-python3 - "$root_dir/tools/dm_mc02_sim_worker.py" <<'PY'
-import importlib.util
+python3 - "$root_dir" <<'PY'
 import struct
 import sys
-spec = importlib.util.spec_from_file_location("dm_worker", sys.argv[1])
-worker = importlib.util.module_from_spec(spec)
-sys.modules[spec.name] = worker
-spec.loader.exec_module(worker)
+sys.path.insert(0, sys.argv[1])
+from smoke.support import cosim as worker
 packet = worker.adc_voltage_frame(7, 123456, 19, 3300000, flags=1)
 body_len = struct.unpack_from("<I", packet)[0]
 body = packet[4:]

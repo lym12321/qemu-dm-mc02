@@ -1,0 +1,11 @@
+[workspace]
+
+members = [
+	"parser",
+	"codegen",
+	"spec",
+	"qmp",
+	"qga",
+	"qapi",
+	"examples",
+]

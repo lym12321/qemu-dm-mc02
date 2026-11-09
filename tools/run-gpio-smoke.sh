@@ -36,7 +36,6 @@ python3 "$script_dir/dm_mc02_test_harness.py" --timeout 20 \
     -display none -monitor none -serial none \
     -qmp "unix:{qmp},server=on,wait=off" <<'PY'
 from dm_mc02_qmp import QmpSession
-from sim.boards import QemuBoard
 import re
 import sys
 
@@ -57,18 +56,17 @@ expected = [0x47495031,
 if words[:len(expected)] != expected:
     raise RuntimeError("GPIO marker/readback mismatch: %r expected %r" %
                        (words[:len(expected)], expected))
-board = QemuBoard(sock)
-board.pause()
-state = board.snapshot()
+sock.command("stop")
+state = sock.command("qom-get", {"path": "/machine", "property": "board-state"})
 assert state["gpio"]["A"] == {
     "moder": 1, "sampled": 0x8000, "odr": 0x0202, "output_mask": 1}, state
 assert state["gpio"]["C"] == {
     "moder": 0x55555555, "sampled": 9, "odr": 9, "output_mask": 0xffff}, state
 assert state["key"] == {"pin": "A15", "pressed": False, "level": 1}, state
-board.set_key(True)
-assert board.digital("key") == 0
-board.set_key(False)
-assert board.digital("key") == 1
+sock.command("qom-set", {"path": "/machine", "property": "user-key", "value": True})
+assert sock.command("qom-get", {"path": "/machine", "property": "board-state"})["key"]["level"] == 0
+sock.command("qom-set", {"path": "/machine", "property": "user-key", "value": False})
+assert sock.command("qom-get", {"path": "/machine", "property": "board-state"})["key"]["level"] == 1
 print("RESULT: STM32H7 GPIO A-E bank smoke passed")
 print("  marker/readback:", " ".join("0x%08x" % x for x in words[:len(expected)]))
 command("quit")

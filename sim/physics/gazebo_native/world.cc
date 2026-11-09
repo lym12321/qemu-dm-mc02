@@ -15,9 +15,9 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <optional>
+#include "render_types.hh"
 
-#include <pybind11/pybind11.h>
-#include <pybind11/stl.h>
 #include <gz/sim/Joint.hh>
 #include <gz/sim/Link.hh>
 #include <gz/sim/Model.hh>
@@ -62,7 +62,7 @@ using ImuBindings = std::map<std::string, ImuTarget>;
 using ImuSample = std::array<double, 6>;
 using ImuSamples = std::map<std::string, ImuSample>;
 
-namespace {
+namespace dm_gazebo::native {
 bool Finite(const gz::math::Vector3d &value)
 {
     return std::isfinite(value.X()) && std::isfinite(value.Y()) &&
@@ -848,33 +848,25 @@ public:
         return sample->second;
     }
 
-    pybind11::object Camera(const std::string &name) const
+    std::optional<dm_gazebo::CameraFrame> Camera(const std::string &name) const
     {
         Guard guard(busy);
         Live();
 #ifdef DM_GAZEBO_RENDERING
         if (render) {
-            const auto frame = render->Camera(name);
-            if (!frame) return pybind11::none();
-            return pybind11::make_tuple(frame->timestampNs, frame->width, frame->height,
-                frame->step, frame->frameId, pybind11::bytes(frame->data));
+            return render->Camera(name);
         }
 #endif
         throw std::invalid_argument("unbound camera: " + name);
     }
 
-    pybind11::object Lidar(const std::string &name) const
+    std::optional<dm_gazebo::LidarScan> Lidar(const std::string &name) const
     {
         Guard guard(busy);
         Live();
 #ifdef DM_GAZEBO_RENDERING
         if (render) {
-            const auto scan = render->Lidar(name);
-            if (!scan) return pybind11::none();
-            return pybind11::make_tuple(scan->timestampNs, scan->frameId, scan->angleMin,
-                scan->angleMax, scan->angleStep, scan->rangeMin, scan->rangeMax,
-                scan->verticalAngleMin, scan->verticalAngleMax, scan->verticalAngleStep,
-                scan->ranges, scan->intensities);
+            return render->Lidar(name);
         }
 #endif
         throw std::invalid_argument("unbound lidar: " + name);
@@ -920,42 +912,11 @@ private:
     int64_t tickNs = 0;
     bool failed = true;
     bool closed = false;
-    // Gazebo releases the Python GIL around its parallel PostUpdate barrier.
-    // Reject concurrent/reentrant calls before accessing any owned state.
+    // Reject concurrent/reentrant calls before the native parallel
+    // PostUpdate barrier accesses any owned state.
     mutable std::atomic_flag busy = ATOMIC_FLAG_INIT;
 };
-} // namespace
+} // namespace dm_gazebo::native
+using dm_gazebo::native::NativeWorld;
 
-PYBIND11_MODULE(_dm_gazebo_native, module)
-{
-    module.attr("gazebo_version") = GZ_SIM_VERSION_FULL;
-#ifdef DM_GAZEBO_RENDERING
-    module.attr("rendering_enabled") = true;
-#else
-    module.attr("rendering_enabled") = false;
-#endif
-    pybind11::class_<NativeWorld>(module, "World")
-        .def(pybind11::init<const std::string &, const Bindings &, const Bindings &,
-                           const ImuBindings &, const std::vector<std::string> &,
-                           const ImuBindings &, const ImuBindings &>(),
-             pybind11::arg("path"), pybind11::arg("joints"),
-             pybind11::arg("bodies") = Bindings{},
-             pybind11::arg("imus") = ImuBindings{},
-             pybind11::arg("resource_paths") = std::vector<std::string>{},
-             pybind11::arg("cameras") = ImuBindings{},
-             pybind11::arg("lidars") = ImuBindings{})
-        .def("step", &NativeWorld::Step)
-        .def("validate_step", &NativeWorld::ValidateStep)
-        .def("validate_steps", &NativeWorld::ValidateSteps)
-        .def("reset", &NativeWorld::Reset)
-        .def("close", &NativeWorld::Close)
-        .def("set_joint_effort", &NativeWorld::SetEffort)
-        .def("validate_joint_effort", &NativeWorld::ValidateEffort)
-        .def("get_joint_state", &NativeWorld::JointState)
-        .def("get_body_pose", &NativeWorld::BodyPose)
-        .def("get_imu", &NativeWorld::Imu)
-        .def("get_camera", &NativeWorld::Camera)
-        .def("get_lidar", &NativeWorld::Lidar)
-        .def_property_readonly("time_ns", &NativeWorld::TimeNs)
-        .def_property_readonly("timestep_ns", &NativeWorld::TickNs);
-}
+#include "rust_bridge.inc"

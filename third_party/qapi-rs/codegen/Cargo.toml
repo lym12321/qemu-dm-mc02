@@ -1,0 +1,20 @@
+[package]
+name = "qapi-codegen"
+version = "0.11.3" # keep in sync with html_root_url
+authors = ["arcnmx"]
+edition = "2018"
+
+description = "QEMU QAPI codegen helper"
+keywords = ["qemu", "qmp", "qga", "qapi"]
+
+documentation = "https://docs.rs/qapi-codegen/"
+repository = "https://github.com/arcnmx/qapi-rs"
+readme = "../README.md"
+license = "MIT"
+
+[badges]
+travis-ci = { repository = "arcnmx/qapi-rs" }
+maintenance = { status = "passively-maintained" }
+
+[dependencies]
+qapi-parser = { version = "0.11", path = "../parser" }

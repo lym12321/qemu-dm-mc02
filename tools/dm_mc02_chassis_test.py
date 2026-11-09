@@ -16,21 +16,23 @@ from pathlib import Path
 import select
 import signal
 import struct
+import socket
+import tempfile
 import subprocess
 import sys
 import time
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tools"))
-import dm_mc02_sim_worker as worker
 from dm_mc02_firmware_rtf import deadline_qmp_call, read_iwdg_timeouts
 from dm_mc02_qmp import QmpSession
 from dm_mc02_test_harness import stop
-from dm_mc02_trobot_business import _identity
-from sim.apps.four_wheel import four_wheel_simulation_factory, four_wheel_imu
-from sim.transports import connect_unix
+from smoke.support.process import identity as _identity
+from smoke.support.unix import connect_unix
+from smoke.support.stream import FixedRecordStream, LengthPrefixedStream
+from smoke.support.can_codec import unpack_wire_frame
+from smoke.support import step_codec
 
 STEPS = 7500
 JOINTS = ("wheel_fl", "wheel_fr", "wheel_rl", "wheel_rr")
@@ -46,7 +48,7 @@ LIMITS = [
     "Fixed uncalibrated toy four-wheel model; physical calibration SKIP.",
     "Production worker: 7500 x 1 ms, realtime pacing, ACK-only consumption policy.",
     "DONE is an observed advisory response; not every source is consumed.",
-    "CAN tx_queued records transport admission, not guest reception or consumption.",
+    "CAN tx_queued records test proxy forwarding admission, not guest reception or consumption.",
     "UART read/ack host windows have polling/formatting quantization; no CPU/plant barrier.",
     "This functional consumer gate makes no sustained performance claim.",
 ]
@@ -91,102 +93,133 @@ class Trace:
         self.file.close()
 
 
-def run_worker(cosim, can, trace_path, ready_path):
-    def interrupted(sig, _frame):
-        raise RuntimeError(f"chassis worker interrupted by signal {sig}")
+class ObservedChannels:
+    """Test-only exact-record proxies; the compiled worker owns execution.
 
-    signal.signal(signal.SIGTERM, interrupted)
-    trace = Trace(trace_path)
-    primary = None
+    Each source uses the existing bounded transport, reading once <=4096 bytes
+    per pump. Forwarding retains physical suffixes and never resets the streams.
+    """
 
-    class ObservedCan(worker.CanStream):
-        def receive(self):
-            frames = super().receive()
-            for ident, flags, dlc, stamp, data in frames:
-                trace.record("can_rx", can_id=ident, flags=flags, dlc=dlc,
-                             timestamp_ns=stamp, data=data.hex())
-            return frames
+    def __init__(self, cosim, can, trace_path, deadline):
+        self.trace = self.directory = None
+        self.sockets = []
+        self.listeners = []
+        self.sources = []
+        self.bridges = []
+        self.worker_peers = set()
+        self.closed_sources = set()
+        self.paths = {}
+        try:
+            self.trace = Trace(trace_path)
+            self.directory = tempfile.TemporaryDirectory(prefix="dm-chassis-")
+            for name, path in (("cosim", cosim), ("can", can)):
+                listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                self.sockets.append(listener)
+                local = str(Path(self.directory.name) / name)
+                listener.bind(local)
+                listener.listen(1)
+                listener.setblocking(False)
+                self.paths[name] = local
+                upstream = connect_unix(path, max(.001, deadline - time.monotonic()))
+                self.sockets.append(upstream)
+                self.listeners.append((name, listener, upstream))
+        except BaseException as primary:
+            try:
+                self.close()
+            except BaseException as cleanup:
+                primary.add_note(str(cleanup))
+            raise
 
-        def send(self, can_id, flags, dlc, timestamp_ns, data):
-            super().send(can_id, flags, dlc, timestamp_ns, data)
-            trace.record("can_tx_queued", can_id=can_id, flags=flags, dlc=dlc,
-                         timestamp_ns=timestamp_ns, data=data.hex())
+    def accept(self, process, deadline):
+        for name, listener, upstream in self.listeners:
+            while True:
+                if process.poll() is not None:
+                    raise RuntimeError("compiled worker exited before proxy connect")
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("compiled worker proxy connect deadline expired")
+                if select.select([listener], [], [], .001)[0]:
+                    downstream, _ = listener.accept()
+                    downstream.setblocking(False)
+                    self.sockets.append(downstream)
+                    self.worker_peers.add(downstream)
+                    break
+            if name == "cosim":
+                make = lambda sock: LengthPrefixedStream(sock, min_length=28, max_length=552)
+            else:
+                make = lambda sock: FixedRecordStream(sock, record_size=84)
+            native, compiled = make(upstream), make(downstream)
+            self.bridges.extend(((native, compiled, "control" if name == "cosim" else "can_rx"),
+                                 (compiled, native, None if name == "cosim" else "can_tx_queued")))
+            self.sources.extend((upstream, downstream))
 
-    class ObservedStep(worker.StepFramedSocket):
-        def receive(self):
-            already_decoded = bool(self.pending_frames)
-            frames = super().receive()
-            if not already_decoded:
-                for frame in frames:
+    def pump(self):
+        for source, target, event in self.bridges:
+            if source.sock in self.closed_sources or (self.closed_sources and target.sock in self.worker_peers):
+                continue
+            target.flush()
+            try:
+                records = list(source.receive_records())
+            except ConnectionError:
+                if source.sock not in self.worker_peers or source.buffer:
+                    raise
+                # Socket EOF may precede waitpid visibility. The consumer's
+                # actual exit status remains authoritative in run_inside.
+                self.closed_sources.add(source.sock)
+                continue
+            for raw in records:
+                target.send(raw)
+                if event == "control":
+                    # The opening v1 telemetry is forwarded unchanged. Only
+                    # actual v2 responses contribute ACK/DONE observations.
+                    if int.from_bytes(raw[8:10], "little") != 2:
+                        continue
+                    frame = step_codec.decode_step_frame(raw)
                     header = frame.header
                     fields = dict(kind=header.kind, step_id=header.step_id,
                                   timestamp_ns=header.t_sim_ns, session_id=header.session_id,
                                   payload=frame.payload.hex())
-                    if header.kind == worker.step_protocol.STEP_DONE:
-                        done = worker.step_protocol.decode_step_done_payload(frame.payload)
+                    if header.kind == step_codec.STEP_DONE:
+                        done = step_codec.decode_step_done_payload(frame.payload)
                         fields.update(status=done.status, consumed_mask=done.consumed_mask,
                                       missing_mask=done.missing_mask, queue_depth=done.queue_depth,
                                       dropped_count=done.dropped_count)
-                    elif header.kind == worker.step_protocol.STEP_ACK:
-                        ack = worker.step_protocol.decode_step_ack_payload(frame.payload)
+                    elif header.kind == step_codec.STEP_ACK:
+                        ack = step_codec.decode_step_ack_payload(frame.payload)
                         fields.update(status=ack.status, queue_depth=ack.queue_depth,
                                       dropped_count=ack.dropped_count)
-                    trace.record("control", **fields)
-            return frames
+                    self.trace.record(event, **fields)
+                elif event is not None:
+                    frame = unpack_wire_frame(raw)
+                    self.trace.record(event, can_id=frame.can_id, flags=frame.flags,
+                                      dlc=frame.dlc, timestamp_ns=frame.timestamp_ns,
+                                      data=frame.data.hex())
 
-    latest_mapper = None
+    def close(self):
+        errors = []
+        operations = [sock.close for sock in self.sockets]
+        if self.trace is not None:
+            operations.append(self.trace.close)
+        if self.directory is not None:
+            operations.append(self.directory.cleanup)
+        for operation in operations:
+            try:
+                operation()
+            except BaseException as error:
+                errors.append(str(error))
+        if errors:
+            raise RuntimeError("chassis proxy cleanup failed: " + "; ".join(errors))
 
-    def started(simulation):
-        session = simulation.session
-        trace.record("reset", session_id=session.session_id, timestamp_ns=session.t_sim_ns,
-                     qemu_origin_ns=latest_mapper.qemu_origin_ns,
-                     worker_origin_ns=session.t_sim_ns)
-        Path(ready_path).write_text("Simulation session started\n")
 
-    def read_imu(simulation):
-        sample = four_wheel_imu(simulation)
-        world = simulation.components["world"]
-        pose = world.get_body_pose("chassis")
-        joints = [world.get_joint_state(name) for name in JOINTS]
-        trace.record("step", timestamp_ns=simulation.t_sim_ns, plant_time_s=world.time_s,
-                     position_m=pose.position_m, quaternion_wxyz=pose.quaternion_wxyz,
-                     joint_position_rad=[joint.position_rad for joint in joints],
-                     joint_velocity_rad_s=[joint.velocity_rad_s for joint in joints],
-                     current_raw=[simulation.components[f"motor{i}"].device.current_raw
-                                  for i in range(1, 5)],
-                     gyro_rad_s=sample.gyro_rad_s, accel_m_s2=sample.accel_m_s2)
-        return sample
-
-    try:
-        acquire = four_wheel_simulation_factory(ROOT / "models/four_wheel.xml")
-
-        def factory(session, mapper, stream, datagrams):
-            nonlocal latest_mapper
-            latest_mapper = mapper
-            simulation = acquire(session, mapper, stream, datagrams)
-            # Record the exact admitted mapper supplied by the worker, without
-            # inferring native origin from solver time or a delivery timestamp.
-            trace.record("mapper", session_id=session.session_id,
-                         qemu_origin_ns=mapper.qemu_origin_ns,
-                         worker_origin_ns=mapper.worker_origin_ns)
-            return simulation
-
-        args = worker.parse_args(["--cosim", cosim, "--fdcan", can, "--protocol", "v2",
-                                  "--rate", "1000", "--frames", str(STEPS), "--realtime"])
-        with patch.object(worker, "CanStream", ObservedCan), \
-                patch.object(worker, "StepFramedSocket", ObservedStep):
-            return worker.run(args, simulation_factory=factory, imu_reader=read_imu,
-                              on_session_started=started)
-    except BaseException as exc:
-        primary = exc
-        raise
-    finally:
-        try:
-            trace.close()
-        except BaseException as error:
-            if primary is None:
-                raise
-            primary.add_note(f"trace cleanup failed: {error}")
+def merge_trace(out):
+    rows = []
+    for name in ("state.jsonl", "wire.jsonl"):
+        path = out / name
+        if path.exists():
+            rows.extend(json.loads(line) for line in path.read_text().splitlines())
+    # Both writers use CLOCK_MONOTONIC; preserve each recorded observation time.
+    rows.sort(key=lambda row: row["wall_time_ns"])
+    (out / "trace.jsonl").write_text("".join(json.dumps(row, allow_nan=False) + "\n" for row in rows))
+    return rows
 
 
 def _yaw(row):
@@ -370,8 +403,13 @@ def source_snapshot(elf, qemu, firmware):
     firmware = Path(firmware)
     paths = [Path(elf), Path(qemu), ROOT / "models/four_wheel.xml", ROOT / "uv.lock",
              ROOT / "qemu.lock", ROOT / "pyproject.toml"]
-    paths += sorted((ROOT / "sim").rglob("*.py"))
-    paths += sorted(p for p in (ROOT / "tools").iterdir() if p.suffix in (".py", ".sh"))
+    paths += [Path(os.environ.get("SIM_CHASSIS_CONSUMER", ROOT / "target/debug/examples/chassis_worker")),
+              Path(__file__), ROOT / "tools/run-trobot-chassis-test.sh",
+              ROOT / "tools/dm_mc02_test_harness.py", ROOT / "tools/dm_mc02_qmp.py",
+              ROOT / "tools/dm_mc02_firmware_rtf.py"]
+    paths += [ROOT / "smoke/support" / name for name in (
+        "process.py", "qmp.py", "deadline.py", "unix.py", "stream.py",
+        "can_codec.py", "can_frame.py", "step_codec.py", "__init__.py")]
     paths += [firmware / p for p in (
         "CMakeLists.txt", "CMakePresets.json", "app/CMakeLists.txt", "bsp/CMakeLists.txt",
         "app/selftest/main.cc", "app/selftest/chassis.cc", "bsp/test/core.c",
@@ -393,7 +431,7 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
     out = Path(output)
     report = dict(result="failed", errors=[], notes=[], cleanup_errors=[], cases=[],
                   stages=[], summaries=[], missing=[], limits=LIMITS)
-    qmp = uart = process = None
+    qmp = uart = process = channels = None
     files = []
     primary = None
     started = int(start_ns) / 1e9
@@ -427,14 +465,19 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
             files.append((out / name).open("wb"))
         ready = out / "worker.ready"
         ready.unlink(missing_ok=True)
-        command = [sys.executable, str(Path(__file__).resolve()), "--worker", cosim_path,
-                   can_path, str(out / "trace.jsonl"), str(ready)]
+        channels = ObservedChannels(cosim_path, can_path, out / "wire.jsonl", startup_deadline)
+        consumer = os.environ.get("SIM_CHASSIS_CONSUMER", str(ROOT / "target/debug/examples/chassis_worker"))
+        command = [consumer, "--cosim", channels.paths["cosim"], "--fdcan", channels.paths["can"],
+                   "--model", str(ROOT / "models/four_wheel.xml"),
+                   "--trace", str(out / "state.jsonl"), "--ready", str(ready)]
         process = subprocess.Popen(command, stdin=subprocess.DEVNULL,
                                    stdout=files[0], stderr=files[1])
         report["processes"] = dict(qemu=_identity(int(qemu_pid)), worker=_identity(process.pid))
         if any(value is None for value in report["processes"].values()):
             raise RuntimeError("process identity missing at acquisition")
+        channels.accept(process, startup_deadline)
         while not ready.exists():
+            channels.pump()
             if process.poll() is not None:
                 raise RuntimeError("worker exited before runtime reset: " + str(process.returncode))
             if time.monotonic() >= startup_deadline:
@@ -446,8 +489,11 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
         while time.monotonic() < run_deadline:
             if (not report["stages"] and time.monotonic() >= startup_deadline):
                 raise TimeoutError("actual chassis READY startup deadline expired")
-            readable, _, _ = select.select([uart], [], [], max(0, min(.01, run_deadline - time.monotonic())))
-            if readable:
+            if process.poll() is None:
+                channels.pump()
+            readable, _, _ = select.select([uart, *channels.sources], [], [],
+                                            max(0, min(.001, run_deadline - time.monotonic())))
+            if uart in readable:
                 read_before_ns = time.monotonic_ns()
                 chunk = uart.recv(4096)
                 read_after_ns = time.monotonic_ns()
@@ -504,9 +550,8 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
                     break
         else:
             raise TimeoutError("chassis run deadline expired")
-        report["analysis"] = analyze_trace(
-            [json.loads(line) for line in (out / "trace.jsonl").read_text().splitlines()],
-            report["stages"])
+        channels.trace.file.flush()
+        report["analysis"] = analyze_trace(merge_trace(out), report["stages"])
         passes = Counter(r["name"] for r in report["cases"] if r["status"] == "PASS")
         skips = [r["name"] for r in report["cases"] if r["status"] == "SKIP"]
         report["missing"] = sorted(REQUIRED - passes.keys())
@@ -525,6 +570,7 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
         report["notes"].extend(getattr(exc, "__notes__", ()))
     finally:
         for name, action in (("worker", lambda: stop(process, process_group=False)),
+                             ("proxies", lambda: channels.close() if channels is not None else None),
                              ("QMP", lambda: qmp.close() if qmp is not None else None),
                              ("UART", lambda: uart.close() if uart is not None else None),
                              *(("diagnostic", f.close) for f in files)):
@@ -550,13 +596,12 @@ def run_inside(qmp_path, uart_path, cosim_path, can_path, output, elf, qemu, fir
             with stderr_path.open("rb") as stream:
                 stream.seek(max(0, stderr_path.stat().st_size - 12000))
                 report["worker_stderr_tail"] = stream.read(12000).decode(errors="replace")
+        if report.get("worker_status") not in (None, 0) and report.get("worker_stderr_tail"):
+            report["errors"].append("compiled worker failed: " + report["worker_stderr_tail"].strip())
         if primary is not None:
             report["notes"] = list(getattr(primary, "__notes__", ()))
         try:
-            trace_path = out / "trace.jsonl"
-            report["control_coverage"] = control_coverage(
-                [json.loads(line) for line in trace_path.read_text().splitlines()]
-                if trace_path.exists() else [])
+            report["control_coverage"] = control_coverage(merge_trace(out))
         except BaseException as exc:
             report["errors"].append("cannot summarize retained control observations: " + str(exc))
         report["result"] = "candidate" if not report["errors"] and not report["cleanup_errors"] else "failed"
@@ -600,8 +645,6 @@ def finalize(output, harness_status):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
-    if argv[:1] == ["--worker"]:
-        return run_worker(*argv[1:])
     if argv[:1] == ["--initialize"]:
         initialize(*argv[1:])
         return 0

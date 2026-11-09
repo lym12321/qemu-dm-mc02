@@ -1,0 +1,12 @@
+initial:
+  game: {game_type: 1, game_progress: 2, stage_remain_time: 1, sync_timestamp: 72623859790382856}
+  robot: {robot_id: 3, robot_level: 2, current_hp: 100, maximum_hp: 200, cooling_per_s: 3, heat_limit: 100, chassis_power_limit: 80, power_outputs: 5}
+  power_heat: {buffer_energy_j: 40, heat_17mm: 10, heat_42mm: 20}
+  buff: {recovery_percent: 5, cooling_per_s: 9, defence_percent: 7, vulnerability_percent: 11, attack_percent: 13, remaining_energy: 254}
+durations: {countdown_s: 3, battle_s: 300}
+cooling_42mm_per_s: 2
+events:
+  - {offset_ns: 500000000, hit: {damage_hp: 30}}
+  - {offset_ns: 500000000, shot: {heat_17mm: 5, heat_42mm: 7}}
+  - {offset_ns: 500000000, robot: {robot_id: 3, robot_level: 2, current_hp: 70, maximum_hp: 200, cooling_per_s: 3, heat_limit: 100, chassis_power_limit: 120, power_outputs: 6}}
+  - {offset_ns: 500000000, buff: {recovery_percent: 8, cooling_per_s: 17, defence_percent: 19, vulnerability_percent: 23, attack_percent: 29, remaining_energy: 128}}

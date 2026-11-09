@@ -1,0 +1,7 @@
+[package]
+name = "sim-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "Protocol-neutral deterministic simulation runtime"

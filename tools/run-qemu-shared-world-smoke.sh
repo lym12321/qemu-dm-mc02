@@ -8,14 +8,14 @@ mode=normal
 scene_args=()
 for argument in "$@"; do
     case "$argument" in
-        --peer-exit|--reset|--upper-exit|--interrupt) mode=${argument#--} ;;
+        --peer-exit|--reset|--upper-exit|--interrupt) printf '%s\n' 'Private Python injection retired; use Rust machine/process/physics failure gates.' >&2; exit 2 ;;
         --multi-cut|--can-deadlines|--cli) scene_args+=("$argument") ;;
         *) printf 'usage: %s [--multi-cut|--can-deadlines] [--cli] [--peer-exit|--reset|--upper-exit|--interrupt]\n' "$0" >&2; exit 2 ;;
     esac
 done
 [[ -x "$qemu_bin" ]] || { printf 'BLOCKED: QEMU not found: %s\n' "$qemu_bin" >&2; exit 78; }
 command -v arm-none-eabi-gcc >/dev/null 2>&1 || { printf '%s\n' 'BLOCKED: arm-none-eabi-gcc required' >&2; exit 78; }
-"$scene_python" -c 'import mujoco,crccheck,yaml,qemu.qmp' || { printf '%s\n' 'BLOCKED: native Python dependencies required' >&2; exit 78; }
+"$scene_python" -c 'import crccheck,yaml,mcap' || { printf '%s\n' 'BLOCKED: black-box test dependencies required' >&2; exit 78; }
 run_dir=$(mktemp -d '/tmp/dm-qemu.shared-world.XXXXXX')
 trap 'rm -rf -- "$run_dir"' EXIT
 for peer in 0 1; do

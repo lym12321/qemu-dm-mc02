@@ -16,9 +16,9 @@ if [[ ! -x "$qemu_bin" ]]; then
     printf 'blocked: QEMU not found: %s\n' "$qemu_bin" >&2
     blocked=1
 fi
-if [[ ! -f "$root_dir/tools/dm_mc02_sim_worker.py" ]]; then
+if [[ ! -f "$root_dir/tools/run-worker.sh" ]]; then
     printf 'blocked: worker not found: %s\n' \
-        "$root_dir/tools/dm_mc02_sim_worker.py" >&2
+        "$root_dir/tools/run-worker.sh" >&2
     blocked=1
 fi
 if [[ ! -f "$root_dir/tools/run-mc02-smoke.sh" ]]; then

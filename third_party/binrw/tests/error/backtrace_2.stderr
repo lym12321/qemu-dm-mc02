@@ -1,0 +1,7 @@
+ 0: Error: failed to fill whole buffer
+           len = 6
+     at binrw/tests/error/backtrace_2.rs:10
+ 1: While parsing the innerest most struct
+     at binrw/tests/error/backtrace_2.rs:17
+ 2: While parsing field '_middle' in OutermostStruct
+     at binrw/tests/error/backtrace_2.rs:23

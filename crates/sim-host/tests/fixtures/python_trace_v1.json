@@ -1,0 +1,33 @@
+{
+  "format": "robot-sim/trace/1",
+  "source": "sim.trace.storage.TraceWriter in existing Python production source; mcap==1.5.0",
+  "source_commit": "worktree migration baseline",
+  "writer_source_sha256": "56254b0ccdbef740df622471b4cc9981e1e55a5c362a790ebc6d1308f98412ef",
+  "fixture_sha256": "d3f58a9c7b5a517366f0d54a45af0eeb6969b31db969662401af842c8f503641",
+  "events": [
+    [
+      900,
+      "east",
+      "fdcan1",
+      "can.tx",
+      "00ff41",
+      "qemu:east:reset0"
+    ],
+    [
+      3,
+      "west",
+      "fdcan1",
+      "can.tx",
+      "77657374",
+      "qemu:west:reset0"
+    ],
+    [
+      0,
+      "east",
+      "fdcan1",
+      "can.tx",
+      "",
+      "qemu:east:reset1"
+    ]
+  ]
+}

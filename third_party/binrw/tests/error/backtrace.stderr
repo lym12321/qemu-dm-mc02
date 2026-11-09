@@ -1,0 +1,21 @@
+ 0: Error: no variants matched at 0x0...
+   ╭───────────────────────┄ OnlyOption ┄────────────────────┄
+   ┆
+   ┆ 0: Error: failed to fill whole buffer
+   ┆           While parsing field '_items' in InnerMostStruct
+   ┆     at binrw/tests/error/backtrace.rs:9
+   ┆ 1: While parsing field 'inner' in MiddleEnum::OnlyOption
+   ┆     at binrw/tests/error/backtrace.rs:18
+   ┆
+   ╰─────────────────────────────────────────────────────────┄
+   ╭───────────────────────┄ OtherOption ┄────────────────────┄
+   ┆
+   ┆ 0: Error: failed to fill whole buffer
+   ┆           While parsing field 'self_1' in MiddleEnum::OtherOption
+   ┆     at binrw/tests/error/backtrace.rs:13
+   ┆
+   ╰──────────────────────────────────────────────────────────┄
+    ...While parsing field '_middle' in MiddleStruct
+     at binrw/tests/error/backtrace.rs:27
+ 1: While parsing field '_middle' in OutermostStruct
+     at binrw/tests/error/backtrace.rs:33

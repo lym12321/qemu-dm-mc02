@@ -5,7 +5,7 @@ from pathlib import Path
 
 # Direct tools execution and importlib consumers resolve the same package.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.transports import step_codec as _step_codec
+from smoke.support import step_codec as _step_codec
 
 # Preserve the historical public wildcard surface and direct private imports.
 # Every class and function is the canonical object, regardless of import mode.

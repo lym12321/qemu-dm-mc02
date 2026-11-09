@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import importlib.util
-from io import StringIO
 import json
 from pathlib import Path
 import signal
@@ -295,52 +294,6 @@ def test_pacing_quiet_tail_is_checked_through_sample_end(
     ]
 
 
-@pytest.mark.parametrize("configured, limit", [(None, 50_000),
-                                               (str(3 * 72_000), 216_000)])
-def test_bench_trace_event_budget_is_explicit(
-        monkeypatch, tmp_path, configured, limit):
-    bench = _load_tool("dm_mc02_trobot_bench", PROJECT / "smoke")
-    monkeypatch.setenv("DM_TROBOT_BENCH_TRACE", str(tmp_path / "trace.jsonl"))
-    if configured is None:
-        monkeypatch.delenv("DM_TROBOT_BENCH_MAX_EVENTS", raising=False)
-    else:
-        monkeypatch.setenv("DM_TROBOT_BENCH_MAX_EVENTS", configured)
-    config = SimpleNamespace(mujoco_model="unused.xml", motor_count=1,
-                             rate=1000, dm_t_max=7)
-    # Isolate trace configuration; this is not MuJoCo solver validation.
-    with patch.object(bench.MujocoEngine, "__init__", return_value=None):
-        engine = bench.BenchEngine(config)
-    try:
-        assert engine.max_events == limit
-    finally:
-        engine.close()
-
-    engine = bench.BenchEngine.__new__(bench.BenchEngine)
-    engine.trace = StringIO()
-    engine.physics = SimpleNamespace(time_s=0.001)
-    engine.events = limit - 1
-    engine.max_events = limit
-    engine.record("step", dt=.001)
-    with pytest.raises(BufferError):
-        engine.record("step", dt=.001)
-    assert engine.events == limit
-    assert len(engine.trace.getvalue().splitlines()) == 1
-
-
-def test_bench_zero_event_budget_is_rejected(monkeypatch, tmp_path):
-    bench = _load_tool("dm_mc02_trobot_bench", PROJECT / "smoke")
-    monkeypatch.setenv("DM_TROBOT_BENCH_TRACE", str(tmp_path / "trace.jsonl"))
-    monkeypatch.setenv("DM_TROBOT_BENCH_MAX_EVENTS", "0")
-    config = SimpleNamespace(mujoco_model="unused.xml", motor_count=1,
-                             rate=1000, dm_t_max=7)
-
-    # Invalid admission must not start the external solver.
-    with patch.object(bench.MujocoEngine, "__init__", return_value=None) as init:
-        with pytest.raises(ValueError):
-            bench.BenchEngine(config)
-    init.assert_not_called()
-
-
 def test_direct_worker_cleanup_reaps_without_group_signals():
     harness = _load_tool("dm_mc02_test_harness")
     process = Mock(pid=1234)
@@ -387,6 +340,7 @@ def test_consumer_preserves_qmp_close_failure(business, monkeypatch, tmp_path):
     qmp.close.side_effect = RuntimeError("QMP close failed")
     process = Mock(pid=1234)
     process.poll.return_value = 1
+    monkeypatch.setattr(business, "_bench_worker", lambda: Path("compiled-worker"))
     monkeypatch.setattr(business, "QmpSession", lambda *a, **kw: qmp)
     monkeypatch.setattr(business.subprocess, "Popen", lambda *a, **kw: process)
     monkeypatch.setattr(business, "_identity", lambda pid: dict(pid=pid, starttime=7))
@@ -412,13 +366,14 @@ def test_failed_consumer_cannot_publish_passed_report(
     process.poll.return_value = harness_status
 
     def launch(*args, **kwargs):
+        (output / "worker.stderr").write_text("MuJoCo test\n")
         business._write_json(output / "candidate.json", dict(
             error=None, cleanup_errors=["QMP close failed"],
             processes={"qemu": dict(pid=123, starttime=7),
                        "worker": dict(pid=456, starttime=8)}))
         return process
 
-    monkeypatch.setitem(sys.modules, "mujoco", SimpleNamespace(__version__="test"))
+    monkeypatch.setattr(business, "_bench_worker", lambda: executable)
     monkeypatch.setattr(business, "_inputs", lambda *args: {"fixture": "same"})
     monkeypatch.setattr(business, "_identity", lambda pid: None)
     monkeypatch.setattr(business.subprocess, "check_output",

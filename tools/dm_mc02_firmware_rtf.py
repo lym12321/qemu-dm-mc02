@@ -21,7 +21,7 @@ else:
     from dm_mc02_qmp import QmpSession
 
 
-from sim.machines.qemu.deadline import (StartupTimeoutError,
+from smoke.support.deadline import (StartupTimeoutError,
     QMP_COMMAND_TIMEOUT_SECONDS, _deadline_remaining,
     _set_startup_qmp_timeout, deadline_qmp_call)
 

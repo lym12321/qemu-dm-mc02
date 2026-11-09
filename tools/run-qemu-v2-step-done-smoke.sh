@@ -130,69 +130,13 @@ def release(owners):
 
 def prepare_mujoco_source(mode):
     from types import SimpleNamespace
-    from sim.api import NodeSpec, NodeDescription, Topology
-    from sim.runtime import Simulation
-    from sim.devices.bmi088 import imu_to_bmi088_units
-    from sim.devices.dji import M3508Device, M3508JointPlant
-    from sim.fabric import CanBus, CanFrame
-    from sim.fabric.runtime import BorrowedCanDispatcher
-    from sim.physics import MujocoPhysics
-    from dm_mc02_step_protocol import ImuSampleV2, encode_imu_sample_v2
-
-    joints = {f"wheel_{corner}": f"drive_{corner}"
-              for corner in ("fl", "fr", "rl", "rr")}
-    physics = MujocoPhysics.from_xml_path(
-        Path(ROOT) / "models" / "four_wheel.xml", joints=joints,
-        imus={"imu": ("imu_gyro", "imu_accel")})
-    bus = CanBus()
-
-    class Host:
-        def receive(self, frame):
-            pass  # The shared adapter owns rotor feedback; this fixture sends.
-
-    host = Host()
-    bus.attach(host, "fixture-host")
-    devices = []
-    owner = None
-    try:
-        for motor_id in (1, 2, 3, 4):
-            devices.append(M3508Device(bus, motor_id))
-        owner = M3508JointPlant(physics, dict(zip(devices, joints)))
-        plant = owner
-        owner = Simulation(Topology((NodeSpec("bus", "bus"), NodeSpec("plant", "plant"))), {
-            "bus": SimpleNamespace(
-                describe=lambda spec: NodeDescription(capabilities={"dispatch"}),
-                create=lambda spec, context: BorrowedCanDispatcher(bus)),
-            "plant": SimpleNamespace(
-                describe=lambda spec: NodeDescription(capabilities={"step"}),
-                create=lambda spec, context: plant),
-        })
-        owner.start()
-
-        def advance(command):
-            bus.send(host, CanFrame(0x200, dlc=8, data=command,
-                                   timestamp_ns=owner.t_sim_ns))
-            owner.step(1_000_000)
-
-        for _ in range(500):
-            advance(bytes.fromhex("0000 0000 0000 0000"))
-        if mode == "turn":
-            for _ in range(500):
-                advance(bytes.fromhex("0015 006b 0015 006b"))
-        sample = physics.get_imu("imu")  # Completed native site-local SI state.
-        gyro, accel = imu_to_bmi088_units(sample)
-        # Peer sample_id is metadata. Native link admission alone assigns the
-        # retained, nonzero source identity used by each real die's raw read.
-        imu = ImuSampleV2(gyro, accel, (0.0,) * 3, (0.0,) * 3,
-                          owner.t_sim_ns, 1)
-        encoded = encode_imu_sample_v2(imu)
-        return sample, physics.time_s, owner.t_sim_ns, encoded
-    finally:
-        if owner is not None:
-            release((("plant/coordinator", owner),))
-        else:
-            release(tuple((f"M3508 {device.motor_id}", device)
-                          for device in reversed(devices)))
+    import os
+    import subprocess
+    executable = os.environ.get("SIM_MUJOCO_FIXTURE", str(Path(ROOT) / "target/debug/examples/native_mujoco"))
+    result = json.loads(subprocess.check_output(
+        [executable, str(Path(ROOT) / "models/four_wheel.xml"), mode], timeout=7))
+    sample = SimpleNamespace(gyro_rad_s=result["gyro_rad_s"], accel_m_s2=result["accel_m_s2"])
+    return sample, result["native_time_s"], result["target_ns"], bytes.fromhex(result["wire_hex"])
 
 
 def check_source_readback(source, words):

@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import shutil
 import subprocess
+import tarfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,7 +25,7 @@ def digest(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
-def source_identities():
+def source_identities(development=False):
     root_commit = command("git", "rev-parse", "HEAD", cwd=ROOT)
     native_commit = command("git", "rev-parse", "HEAD", cwd=NATIVE)
     gitlink = command("git", "ls-tree", root_commit, "qemu/upstream", cwd=ROOT)
@@ -34,11 +35,37 @@ def source_identities():
             lock.get("fork_commit") != native_commit):
         raise ValueError("native HEAD, root gitlink and qemu.lock must agree")
     # ROM submodule checkouts are not part of the board binary or source archive.
-    subprocess.run(["git", "diff", "--quiet", "--ignore-submodules=all", "HEAD"],
-                   cwd=ROOT, check=True)
+    if not development:
+        subprocess.run(["git", "diff", "--quiet", "--ignore-submodules=all", "HEAD"],
+                       cwd=ROOT, check=True)
+        untracked = command("git", "ls-files", "--others", "--exclude-standard", cwd=ROOT)
+        if untracked:
+            raise ValueError("release source tree contains untracked files; use an explicit development snapshot")
     subprocess.run(["git", "diff", "--quiet", "--ignore-submodules=all", "HEAD"],
                    cwd=NATIVE, check=True)
     return root_commit, native_commit
+
+
+def archive_worktree(commit, directory):
+    """Explicit development evidence; never describe uncommitted bytes as HEAD."""
+    names = subprocess.check_output(
+        ["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"], cwd=ROOT
+    ).decode().split("\0")
+    prefix = f"dm-mc02-qemu-development-{commit}"
+    archive = directory / f"{prefix}.tar.gz"
+    files = {}
+    with tarfile.open(archive, "w:gz", dereference=False) as output:
+        for name in sorted(set(names)):
+            path = ROOT / name
+            if not name or (not path.is_file() and not path.is_symlink()):
+                continue
+            output.add(path, arcname=f"{prefix}/{name}", recursive=False)
+            files[name] = {"symlink": str(path.readlink())} if path.is_symlink() else digest(path)
+    manifest = directory / "development-worktree.json"
+    manifest.write_text(json.dumps({"head": commit, "files": files}, indent=2) + "\n")
+    return {"path": f"sources/{archive.name}", "head": commit,
+            "uncommitted": True, "sha256": digest(archive),
+            "manifest": f"sources/{manifest.name}", "manifest_sha256": digest(manifest)}
 
 
 def archive_source(repository, commit, name, directory):
@@ -144,7 +171,7 @@ def rust_provenance(sim, sources, licenses):
     }
 
 
-def package(binary, sim, output, dll_directory=None):
+def package(binary, sim, output, dll_directory=None, *, development=False, linux_full=None):
     binary = binary.resolve(strict=True)
     sim = sim.resolve(strict=True)
     if not binary.is_file():
@@ -160,7 +187,9 @@ def package(binary, sim, output, dll_directory=None):
         dll_directory = dll_directory.resolve(strict=True)
         if not dll_directory.is_dir():
             raise ValueError("--dll-dir must be a directory")
-    root_commit, native_commit = source_identities()
+    if windows and linux_full:
+        raise ValueError("the full native runtime profile is Linux only")
+    root_commit, native_commit = source_identities(development)
     output = output.absolute()
     output.mkdir(parents=True)
     (output / "bin").mkdir()
@@ -192,7 +221,8 @@ def package(binary, sim, output, dll_directory=None):
 
     sources = output / "sources"
     sources.mkdir()
-    source_archives = [archive_source(ROOT, root_commit, "dm-mc02-qemu", sources),
+    source_archives = [archive_worktree(root_commit, sources) if development else
+                       archive_source(ROOT, root_commit, "dm-mc02-qemu", sources),
                        archive_source(NATIVE, native_commit, "qemu", sources)]
     # libfdt is linked statically; generated keycode tables are linked into QEMU.
     # Berkeley softfloat/testfloat subprojects are only used by unpublished tests.
@@ -210,7 +240,16 @@ def package(binary, sim, output, dll_directory=None):
         "sources": source_archives,
         "source_submodules": "Git archives omit submodule checkouts, including ROM repositories.",
         "rust": rust_provenance(launcher, sources, licenses),
+        "development_worktree": development,
     }
+    if linux_full:
+        import linux_runtime
+        provenance["linux_runtime"] = linux_runtime.collect(output, **linux_full)
+        provenance["rust"].update(
+            scope="complete Linux native runtime", features=["linux-runtime"],
+            sha256=digest(launcher), unpatched_sha256=digest(sim))
+        provenance["qemu"].update(unpatched_sha256=digest(binary),
+                                  sha256=digest(output / "bin" / binary.name))
     (output / "provenance.json").write_text(
         json.dumps(provenance, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return output
@@ -223,8 +262,17 @@ def main():
                         help="Rust CLI built with cargo build --release --locked -p sim-host")
     parser.add_argument("--output", required=True, type=Path, help="new release directory")
     parser.add_argument("--dll-dir", type=Path, help="MSYS2 MinGW bin directory, for Windows")
+    parser.add_argument("--linux-full", action="store_true", help="bundle the complete Linux native runtime")
+    parser.add_argument("--gazebo-prefix", type=Path, default=ROOT / "build/rust-gazebo-native/install")
+    parser.add_argument("--ros-prefix", type=Path, default=Path("/opt/ros/jazzy"))
+    parser.add_argument("--mujoco-prefix", type=Path, default=Path("/opt/mujoco-3.12.0"))
+    parser.add_argument("--development-worktree", action="store_true",
+                        help="explicitly archive uncommitted root sources and mark the result as development")
     arguments = parser.parse_args()
-    destination = package(arguments.qemu, arguments.sim, arguments.output, arguments.dll_dir)
+    full = dict(gazebo_prefix=arguments.gazebo_prefix, ros_prefix=arguments.ros_prefix,
+                mujoco_prefix=arguments.mujoco_prefix) if arguments.linux_full else None
+    destination = package(arguments.qemu, arguments.sim, arguments.output, arguments.dll_dir,
+                          development=arguments.development_worktree, linux_full=full)
     print(f"Release staged: {destination}")
 
 

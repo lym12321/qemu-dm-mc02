@@ -22,7 +22,7 @@ try:
 except importlib.metadata.PackageNotFoundError:
     pytest.skip('the optional pinned QEMU Python wheel is not installed', allow_module_level=True)
 
-from sim.machines.qemu.qmp import qmp_session_class
+from smoke.support.qmp import qmp_session_class
 
 QmpSession = qmp_session_class()
 from qemu.qmp import QMPClient
@@ -30,8 +30,8 @@ from qemu.qmp.message import Message
 
 
 def test_namespace_shadow_is_rejected_before_its_init_can_execute(tmp_path, monkeypatch):
-    from sim.api import BackendUnavailable
-    from sim.machines.qemu.qmp import qmp_client_provenance
+    from smoke.support.errors import BackendUnavailable
+    from smoke.support.qmp import qmp_client_provenance
 
     root = Path(qmp_client_provenance()['package_root'])
     shadow = tmp_path / 'qemu'

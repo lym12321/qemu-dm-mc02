@@ -14,14 +14,19 @@ import signal
 import struct
 import subprocess
 import sys
+from types import SimpleNamespace
 from collections.abc import Mapping
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from smoke.simulation_smoke import Blocked, build_example
+from smoke.support.experiment import execute_scene
+from smoke.support.native_cli import resolve_sim
 
 
 def plain(value):
+    if isinstance(value, SimpleNamespace):
+        return plain(vars(value))
     if isinstance(value, bytes):
         return {"bytes_hex": value.hex()}
     if isinstance(value, Mapping):
@@ -99,7 +104,7 @@ def verify_combined(events, result):
         wire = sample.payload["wire"]
         if (sample.payload["status"] != 0 or wire["sensor_time_ns"] != cut
                 or list(wire["gyro_dps"]) != [0.0, 0.0, 0.0]
-                or list(wire["accel_g"]) != [0.0, 0.0, accel_g]):
+                or [struct.unpack("<f", struct.pack("<f", value))[0] for value in wire["accel_g"]] != [0.0, 0.0, accel_g]):
             raise AssertionError("joint IMU admission differs from the independent rest fixture")
         terminal = [event for event in done if identity(event) == identity(accepted)]
         if len(terminal) != 1 or any(terminal[0].payload[name] != value for name, value in (
@@ -178,72 +183,26 @@ def build_combined(directory, build_type, skip_gyro):
     return built
 
 
-def run_scene(case, *, qemu, firmware, directory):
+def run_scene(case, *, qemu, firmware, directory, sim=None):
     import yaml
-    from sim.apps.experiment import run_experiment
-    from sim.composition import builtin_registry
-    from sim.config.scene import load_scene
-    from sim.machines.qemu import QemuFactory
-
     source = ROOT / ("examples/labs/board-io.yaml" if case == "board-io"
                      else "examples/adc-imu-readback/scene.yaml")
     document = yaml.safe_load(source.read_text())
-    document["nodes"]["main"]["firmware"] = str(firmware)
+    document["nodes"]["main"]["firmware"] = str(firmware.resolve())
     if "world" in document["nodes"]:
         document["nodes"]["world"]["model"] = str((source.parent /
             document["nodes"]["world"]["model"]).resolve())
     prepared = directory / f"{case}.yaml"
     prepared.write_text(yaml.safe_dump(document, sort_keys=False))
-    machines, resources, events = {}, {}, []
-
-    class CaptureFactory(QemuFactory):
-        def create(self, spec, context):
-            machine = super().create(spec, context)
-            machines[spec.name] = machine
-            return machine
-
-    def observe(event):
-        if len(events) >= 8192:
-            raise BufferError("native Lab observation budget exhausted")
-        events.append(event)
-        for name, machine in machines.items():
-            if machine.started and name not in resources:
-                info = machine.connection_info
-                pid = info["pid"]
-                resources[name] = {"pid": pid, "starttime": Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[19],
-                    "sockets": dict(info["sockets"]), "native_origin_ns": info["native_origin_ns"]}
-
-    registry = builtin_registry(qemu=qemu)
-    registry["machine.qemu"] = CaptureFactory(qemu=qemu)
-    scene = load_scene(prepared, registry)
-    primary = None
+    events, result, command = execute_scene(prepared, qemu=qemu, sim=sim)
+    resources = command["resources"]
+    partial = {"events": plain(events), "resources": resources,
+               "command": command, "cleanup_completed": command["cleanup_completed"],
+               "cleanup_failures": command["cleanup_failures"]}
     try:
-        result = run_experiment(scene, registry, on_event=observe)
-    except BaseException as error:
-        primary = error
-        raise
-    finally:
-        # run_experiment owns actual Simulation/native cleanup on every path.
-        failures = []
-        for name, resource in resources.items():
-            stat = Path(f"/proc/{resource['pid']}/stat")
-            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[19] == resource["starttime"]:
-                failures.append(f"native QEMU identity remains: {name}")
-            if any(Path(path).exists() for path in resource["sockets"].values()):
-                failures.append(f"native QEMU socket remains: {name}")
-        partial = {"events": plain(events), "resources": resources,
-                   "cleanup_completed": not failures, "cleanup_failures": failures}
-        if primary is not None:
-            primary.native_observations = partial
-            for failure in failures:
-                primary.add_note(failure)
-        elif failures:
-            error = AssertionError("; ".join(failures))
-            error.native_observations = partial
-            raise error
-    if set(resources) != {"main"}:
-        raise AssertionError("actual native process identity was not observed")
-    try:
+        if len(resources) != 1 or resources[0]["firmware"] != {
+                "path": str(firmware.resolve()), "sha256": digest(firmware)}:
+            raise AssertionError("actual native process identity/ELF was not observed")
         verified = (verify_board if case == "board-io" else verify_combined)(events, result)
     except BaseException as error:
         error.native_observations = partial
@@ -261,6 +220,7 @@ def main(argv=None):
     parser.add_argument("--build-type", choices=("Debug", "Release"), default="Debug")
     parser.add_argument("--case", choices=("board-io", "adc-imu-readback", "all"), default="all")
     parser.add_argument("--build-only", action="store_true")
+    parser.add_argument("--sim", type=Path, help="Rust sim executable (or SIM_EXECUTABLE)")
     parser.add_argument("--skip-gyro-test", action="store_true",
                         help="test-only mutant; the ordinary acceptance must reject its missing gyro consumption")
     parser.add_argument("--report", type=Path)
@@ -303,7 +263,7 @@ def main(argv=None):
                 build, args.build_type, args.skip_gyro_test)
             payload["cases"][case] = built
             if not args.build_only:
-                built["observations"] = run_scene(case, qemu=args.qemu, firmware=Path(built["elf"]), directory=directory)
+                built["observations"] = run_scene(case, qemu=args.qemu, firmware=Path(built["elf"]), directory=directory, sim=args.sim)
             if digest(built["elf"]) != built["sha256"]:
                 raise AssertionError("native ELF input changed during execution")
         if any(digest(ROOT / name) != expected for name, expected in payload["source_hashes"].items()):
@@ -311,17 +271,12 @@ def main(argv=None):
         if not args.build_only:
             if digest(args.qemu) != payload["qemu"]["sha256"]:
                 raise AssertionError("QEMU input changed during execution/cleanup")
-            from sim.machines.qemu.qmp import qmp_client_provenance
-            payload["qmp_client"] = qmp_client_provenance()
-            if args.case != "board-io":
-                import mujoco
-                payload["versions"]["mujoco"] = mujoco.__version__
+            executable = resolve_sim(args.sim)
+            payload["rust_sim"] = {"path": str(executable), "sha256": digest(executable)}
         payload["status"] = "prepared" if args.build_only else "passed"
         code = 0
     except (Exception, KeyboardInterrupt) as error:
-        from sim.api import BackendUnavailable
-        blocked = isinstance(error, (Blocked, BackendUnavailable, FileNotFoundError)) or (
-            isinstance(error, ModuleNotFoundError) and error.name == "mujoco")
+        blocked = isinstance(error, (Blocked, FileNotFoundError))
         payload.update(status="blocked" if blocked else "failed", error=str(error),
             error_type=type(error).__name__, notes=list(getattr(error, "__notes__", ())))
         if hasattr(error, "native_observations"):

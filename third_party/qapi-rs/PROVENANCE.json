@@ -1,0 +1,20 @@
+{
+  "upstream": "https://github.com/arcnmx/qapi-rs",
+  "tag": "v0.15.0",
+  "commit": "ca17bf8f834db0922a7a13c6b018c47301d872b7",
+  "archive_sha256": "b37d729f731f15ba839877483fd9a3b3d1ccc6b91c3de7f2b79907e0774a294f",
+  "schema": {
+    "upstream": "https://github.com/arcnmx/qemu-qapi-filtered",
+    "commit": "69f820d7ff45927cce1f251a01a1b1a3da8b2d86",
+    "version": "9.1.0",
+    "archive_sha256": "080f841cda4fc274662318c9edd3dae1e8251340bd04368c3a045119043a8da3",
+    "license": "QEMU schema retains per-file notices, including GPL-2.0-or-later; see schema/COPYING",
+    "license_text_source": "Canonical project qemu/upstream/COPYING (unmodified GNU GPL version 2 text)"
+  },
+  "license": "qapi-rs MIT; see COPYING. Vendored QEMU schema has separate per-file notices.",
+  "local_changes": [
+    "Async QMP IDs independent of OOB, bounded prepared batches and cancellation cleanup",
+    "Async QMP raw events for query-only discard, bounded framing and EOF consumption"
+  ],
+  "scope": "One canonical path dependency. The synchronous API and generated schema remain upstream. Project x-* commands are typed in sim-host from the native 8.2.2 schema."
+}

@@ -1,0 +1,91 @@
+{
+  "oracle": "3.12.3 (main, Aug 31 2026, 10:18:26) [GCC 13.3.0]",
+  "source": "CPython Lib/shlex.py split(comments=False,posix=True)",
+  "cases": [
+    {
+      "input": "",
+      "words": []
+    },
+    {
+      "input": " ",
+      "words": []
+    },
+    {
+      "input": "'' \"\" x''y",
+      "words": [
+        "",
+        "",
+        "xy"
+      ]
+    },
+    {
+      "input": "a\rb\tc",
+      "words": [
+        "a",
+        "b",
+        "c"
+      ]
+    },
+    {
+      "input": "é 中  ",
+      "words": [
+        "é",
+        "中",
+        " "
+      ]
+    },
+    {
+      "input": "a#b #literal",
+      "words": [
+        "a#b",
+        "#literal"
+      ]
+    },
+    {
+      "input": "\"hello world $(never) `literal`\"",
+      "words": [
+        "hello world $(never) `literal`"
+      ]
+    },
+    {
+      "input": "\"\\$ \\` \\q \\\\ \\\"\"",
+      "words": [
+        "\\$ \\` \\q \\ \""
+      ]
+    },
+    {
+      "input": "a\\ b 'c\\d' \"e\\f\"",
+      "words": [
+        "a b",
+        "c\\d",
+        "e\\f"
+      ]
+    },
+    {
+      "input": "a\\\nb",
+      "words": [
+        "a\nb"
+      ]
+    },
+    {
+      "input": "\"a\\\nb\"",
+      "words": [
+        "a\\\nb"
+      ]
+    },
+    {
+      "input": "a\u0000b",
+      "words": [
+        "a\u0000b"
+      ]
+    },
+    {
+      "input": "'unclosed",
+      "words": null
+    },
+    {
+      "input": "trailing\\",
+      "words": null
+    }
+  ]
+}

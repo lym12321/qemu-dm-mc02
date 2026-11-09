@@ -1,0 +1,25 @@
+[package]
+name = "qapi-qmp"
+version = "0.15.0" # keep in sync with html_root_url
+build = "build.rs"
+authors = ["arcnmx"]
+edition = "2018"
+
+description = "QEMU Machine Protocol types"
+keywords = ["qemu", "qmp", "qapi"]
+
+documentation = "https://docs.rs/qapi-qmp/"
+repository = "https://github.com/arcnmx/qapi-rs"
+readme = "../README.md"
+license = "MIT"
+
+[badges]
+travis-ci = { repository = "arcnmx/qapi-rs" }
+maintenance = { status = "passively-maintained" }
+
+[build-dependencies]
+qapi-codegen = { version = "0.11.1", path = "../codegen" }
+
+[dependencies]
+serde = { version = "^1.0.27", features = [ "derive" ] }
+qapi-spec = { version = "0.3", path = "../spec" }

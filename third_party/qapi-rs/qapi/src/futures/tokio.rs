@@ -1,0 +1,275 @@
+#[cfg(feature = "qapi-qmp")]
+use super::QmpStreamNegotiation;
+use super::{codec::JsonLinesCodec, QapiEvents, QapiService, QapiShared, QapiStream};
+#[cfg(feature = "qapi-qmp")]
+use super::{QmpPreparedFrame, QMP_MAX_FRAME_LENGTH};
+#[cfg(any(feature = "qapi-qmp", feature = "qapi-qga"))]
+use futures::Sink;
+use futures::Stream;
+#[cfg(feature = "qapi-qmp")]
+use qapi_qmp::{QapiCapabilities, QmpCommand, QmpMessageRaw};
+#[cfg(any(feature = "qapi-qmp", feature = "qapi-qga"))]
+use qapi_spec::Execute;
+use qapi_spec::{Any, Response};
+use std::io;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+use tokio::io::{split, AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tokio_util::codec::{Framed, FramedParts};
+
+pub struct QgaStreamTokio<S> {
+    stream: Framed<S, JsonLinesCodec<Response<Any>>>,
+}
+
+impl<S> QgaStreamTokio<S> {
+    fn new(stream: S) -> Self {
+        Self {
+            stream: Framed::from_parts(FramedParts::new::<()>(stream, JsonLinesCodec::new())),
+        }
+    }
+
+    fn pair<W>(self, write: W) -> QapiStream<Self, W> {
+        let shared = Arc::new(QapiShared::new(false));
+        let events = QapiEvents {
+            stream: self,
+            shared: shared.clone(),
+        };
+        let service = QapiService::new(write, shared);
+        QapiStream { service, events }
+    }
+
+    pub fn open_split<W>(read: S, write: W) -> QapiStream<Self, QgaStreamTokio<W>> {
+        let r = Self::new(read);
+        let w = QgaStreamTokio::new(write);
+
+        r.pair(w)
+    }
+}
+
+impl<R> QgaStreamTokio<ReadHalf<R>> {
+    pub fn open(stream: R) -> QapiStream<Self, QgaStreamTokio<WriteHalf<R>>>
+    where
+        R: AsyncRead + AsyncWrite,
+    {
+        let (r, w) = split(stream);
+        let r = Self::new(r);
+        let w = QgaStreamTokio::new(w);
+
+        r.pair(w)
+    }
+}
+
+#[cfg(all(unix, feature = "async-tokio-net"))]
+impl QgaStreamTokio<ReadHalf<tokio::net::UnixStream>> {
+    pub async fn open_uds<P: AsRef<std::path::Path>>(
+        socket_addr: P,
+    ) -> io::Result<QapiStream<Self, QgaStreamTokio<WriteHalf<tokio::net::UnixStream>>>> {
+        let socket = tokio::net::UnixStream::connect(socket_addr).await?;
+        let (r, w) = split(socket);
+        Ok(Self::open_split(r, w))
+    }
+}
+
+#[cfg(feature = "async-tokio-net")]
+impl QgaStreamTokio<ReadHalf<tokio::net::TcpStream>> {
+    pub async fn open_tcp<A: tokio::net::ToSocketAddrs>(
+        socket_addr: A,
+    ) -> io::Result<QapiStream<Self, QgaStreamTokio<WriteHalf<tokio::net::TcpStream>>>> {
+        let socket = tokio::net::TcpStream::connect(socket_addr).await?;
+        let (r, w) = split(socket);
+        Ok(Self::open_split(r, w))
+    }
+}
+
+impl<S> QgaStreamTokio<S> {
+    fn stream(self: Pin<&mut Self>) -> Pin<&mut Framed<S, JsonLinesCodec<Response<Any>>>> {
+        unsafe { self.map_unchecked_mut(|this| &mut this.stream) }
+    }
+}
+
+impl<S: AsyncRead> Stream for QgaStreamTokio<S> {
+    type Item = io::Result<Response<Any>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.stream().poll_next(cx)
+    }
+}
+
+#[cfg(feature = "qapi-qga")]
+impl<S: AsyncWrite, C: qapi_qga::QgaCommand, I: serde::Serialize> Sink<Execute<C, I>>
+    for QgaStreamTokio<S>
+{
+    type Error = io::Error;
+
+    fn start_send(self: Pin<&mut Self>, item: Execute<C, I>) -> Result<(), Self::Error> {
+        self.stream().start_send(item)
+    }
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_ready(self.stream(), cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_flush(self.stream(), cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_close(self.stream(), cx)
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+pub struct QmpStreamTokio<S> {
+    stream: Framed<S, JsonLinesCodec<QmpMessageRaw>>,
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<S> QmpStreamTokio<S> {
+    fn stream(self: Pin<&mut Self>) -> Pin<&mut Framed<S, JsonLinesCodec<QmpMessageRaw>>> {
+        unsafe { self.map_unchecked_mut(|this| &mut this.stream) }
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<S: AsyncRead> Stream for QmpStreamTokio<S> {
+    type Item = io::Result<QmpMessageRaw>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Option<Self::Item>> {
+        self.stream().poll_next(cx)
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<S: AsyncWrite, C: QmpCommand, I: serde::Serialize> Sink<Execute<C, I>> for QmpStreamTokio<S> {
+    type Error = io::Error;
+
+    fn start_send(self: Pin<&mut Self>, item: Execute<C, I>) -> Result<(), Self::Error> {
+        self.stream().start_send(item)
+    }
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_ready(self.stream(), cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_flush(self.stream(), cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Sink::<Execute<C, I>>::poll_close(self.stream(), cx)
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<S: AsyncWrite + Unpin> Sink<QmpPreparedFrame> for QmpStreamTokio<S> {
+    type Error = io::Error;
+
+    fn start_send(self: Pin<&mut Self>, frame: QmpPreparedFrame) -> io::Result<()> {
+        // Frames were completely serialized and bounded during batch admission.
+        self.get_mut()
+            .stream
+            .write_buffer_mut()
+            .extend_from_slice(&frame.0);
+        Ok(())
+    }
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Sink::<Execute<qapi_qmp::qmp_capabilities, u32>>::poll_ready(self.stream(), cx)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Sink::<Execute<qapi_qmp::qmp_capabilities, u32>>::poll_flush(self.stream(), cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context) -> Poll<io::Result<()>> {
+        Sink::<Execute<qapi_qmp::qmp_capabilities, u32>>::poll_close(self.stream(), cx)
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<S> QmpStreamTokio<S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            stream: Framed::from_parts(FramedParts::new::<()>(
+                stream,
+                JsonLinesCodec::<QmpMessageRaw>::bounded(QMP_MAX_FRAME_LENGTH),
+            )),
+        }
+    }
+
+    pub async fn open_split<W>(
+        read: S,
+        write: W,
+    ) -> io::Result<QmpStreamNegotiation<Self, QmpStreamTokio<W>>>
+    where
+        S: AsyncRead + Unpin,
+    {
+        use futures::StreamExt;
+
+        let mut lines = Framed::from_parts(FramedParts::new::<()>(
+            read,
+            JsonLinesCodec::<QapiCapabilities>::bounded(QMP_MAX_FRAME_LENGTH),
+        ));
+
+        let capabilities = lines.next().await.ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "QMP greeting expected")
+        })??;
+
+        let lines = lines.into_parts();
+        let mut read =
+            FramedParts::new::<()>(lines.io, JsonLinesCodec::bounded(QMP_MAX_FRAME_LENGTH));
+        read.read_buf = lines.read_buf;
+        let stream = Framed::from_parts(read);
+
+        // In-band IDs do not depend on advertising or enabling OOB.
+        let shared = Arc::new(QapiShared::new(true));
+        let events = QapiEvents {
+            stream: Self { stream },
+            shared: shared.clone(),
+        };
+        let service = QapiService::new(QmpStreamTokio::new(write), shared);
+
+        Ok(QmpStreamNegotiation {
+            stream: QapiStream { service, events },
+            capabilities,
+        })
+    }
+}
+
+#[cfg(feature = "qapi-qmp")]
+impl<RW: AsyncRead + AsyncWrite> QmpStreamTokio<ReadHalf<RW>> {
+    pub async fn open(
+        stream: RW,
+    ) -> io::Result<QmpStreamNegotiation<Self, QmpStreamTokio<WriteHalf<RW>>>>
+    where
+        RW: Unpin,
+    {
+        let (r, w) = split(stream);
+        Self::open_split(r, w).await
+    }
+}
+
+#[cfg(all(unix, feature = "qapi-qmp", feature = "async-tokio-net"))]
+impl QmpStreamTokio<ReadHalf<tokio::net::UnixStream>> {
+    pub async fn open_uds<P: AsRef<std::path::Path>>(
+        socket_addr: P,
+    ) -> io::Result<QmpStreamNegotiation<Self, QmpStreamTokio<WriteHalf<tokio::net::UnixStream>>>>
+    {
+        let socket = tokio::net::UnixStream::connect(socket_addr).await?;
+        let (r, w) = split(socket);
+        Self::open_split(r, w).await
+    }
+}
+
+#[cfg(all(feature = "qapi-qmp", feature = "async-tokio-net"))]
+impl QmpStreamTokio<ReadHalf<tokio::net::TcpStream>> {
+    pub async fn open_tcp<A: tokio::net::ToSocketAddrs>(
+        socket_addr: A,
+    ) -> io::Result<QmpStreamNegotiation<Self, QmpStreamTokio<WriteHalf<tokio::net::TcpStream>>>>
+    {
+        let socket = tokio::net::TcpStream::connect(socket_addr).await?;
+        let (r, w) = split(socket);
+        Self::open_split(r, w).await
+    }
+}

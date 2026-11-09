@@ -1,8 +1,9 @@
 # Two motors in one native world
 
 The optional joint-loop variant uses one actual bare-metal DM-MC02 guest, two
-C620 protocol devices and the existing shared MuJoCo world. Install the pinned
-`mujoco` extra and build QEMU as described in the main usage guide. The original
+C620 protocol devices and the existing shared MuJoCo world. Build the Rust CLI
+with `scene,machine,devices,mujoco` and MuJoCo 3.12.0, and build QEMU as described
+in the main usage guide. The original
 fixed-rotor and rigid-rotor examples remain available in [README.txt](README.txt).
 
 From the repository root:
@@ -11,8 +12,8 @@ From the repository root:
 cmake -S examples/can-motor -B examples/can-motor/build-joint-loop \
   -DCMAKE_BUILD_TYPE=Debug -DSIM_JOINT_LOOP_TEST=ON -DSIM_ROTOR_LOOP_TEST=OFF
 cmake --build examples/can-motor/build-joint-loop
-uv run --frozen --extra mujoco sim validate examples/can-motor/joint-loop.yaml
-uv run --frozen --extra mujoco sim run examples/can-motor/joint-loop.yaml
+tools/sim validate examples/can-motor/joint-loop.yaml
+tools/sim run examples/can-motor/joint-loop.yaml
 SIM_PYTHON=.venv/bin/python bash tools/run-simulation-smoke.sh --case joint-loop
 # Rebuild the same admitted variant path and repeat with Release:
 SIM_PYTHON=.venv/bin/python bash tools/run-simulation-smoke.sh --case joint-loop --build-type Release

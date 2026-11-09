@@ -4,7 +4,7 @@ import sys
 
 if __package__ in (None, ''):
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from sim.machines.qemu.qmp import qmp_session_class
+from smoke.support.qmp import qmp_session_class
 
 def QmpSession(*args, **kwargs):
     """Construct the optional installed client only when a tool needs QMP."""

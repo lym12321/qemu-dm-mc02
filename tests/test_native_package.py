@@ -31,7 +31,7 @@ def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suff
     output = tmp_path / "release"
     monkeypatch.setattr(native_package, "ROOT", root)
     monkeypatch.setattr(native_package, "NATIVE", native)
-    monkeypatch.setattr(native_package, "source_identities", lambda: ("root", "native"))
+    monkeypatch.setattr(native_package, "source_identities", lambda development=False: ("root", "native"))
     monkeypatch.setattr(native_package, "archive_source", lambda *args: {"commit": args[1]})
     monkeypatch.setattr(native_package, "archive_subproject", lambda *args: {"name": args[0]})
     monkeypatch.setattr(native_package, "windows_dependencies", lambda *args: [])
