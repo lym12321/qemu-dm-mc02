@@ -8,6 +8,7 @@ use crate::{
     transports::{fixed84::CanStream, stream::StreamTransport},
     Error, Result,
 };
+#[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
 use std::{
     collections::BTreeSet,
@@ -295,6 +296,7 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
         Ok(events)
     }
 }
+#[cfg(unix)]
 impl<T: Read + Write + AsFd> LabChannels<'_, T> {
     pub(super) fn descriptors(&self) -> Vec<BorrowedFd<'_>> {
         self.uarts

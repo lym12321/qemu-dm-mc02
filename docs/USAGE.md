@@ -3,7 +3,7 @@
 项目以真实 MCU ELF 为输入，用一个 Rust `Simulation` 组合机器、通信网络、虚拟设备和物理世界。
 当前唯一真实 Machine Profile 是 DM-MC02 / STM32H723；改变 `model` 名称不能增加 MCU 支持。
 产品运行不需要 Python。QEMU、MuJoCo、Gazebo 和 ROS 2 保留原生实现；Python 仅用于构建和独立测试驱动。
-Windows 产品提供固件终端/GDB；完整场景、Lab/Web、worker 和 SocketCAN 面向 Linux 或 WSL2。
+Windows 产品提供固件终端、交互/Web Lab 与原生 ARM GDB 调试；场景、worker 和 SocketCAN 使用 Linux。
 
 下载包命令从解压目录执行；源码命令默认从仓库根目录执行。按需要阅读：
 
@@ -25,7 +25,7 @@ Windows 产品提供固件终端/GDB；完整场景、Lab/Web、worker 和 Socke
 
 | Artifact | 平台与范围 |
 | --- | --- |
-| `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端及从复位暂停的原生 GDB 监听 |
+| `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端、交互/Web Lab 与原生 ARM GDB 调试 |
 | `dm-mc02-linux-firmware-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，轻量固件入口 |
 | `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，完整场景、Lab/Web、worker、MuJoCo/Gazebo/ROS 2 |
 
@@ -37,6 +37,8 @@ Windows PowerShell：
 ```powershell
 .\sim.exe firmware .\example.elf
 .\sim.exe firmware .\example.elf --debug
+.\sim.exe lab interactive --elf .\example.elf
+.\sim.exe lab web --elf .\example.elf
 ```
 
 Linux，在解压目录执行：
@@ -66,7 +68,9 @@ sudo apt-get install -y --no-install-recommends \
 依赖闭包、实际 MuJoCo 转子、Ogre2 相机/LiDAR、ROS context、固件 UART/monitor/reset-paused
 GDB 监听，以及场景/完整 MCAP 重放验收；原生探针未访问外部 SDK 或 Python。
 本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)。
-平台可用性以该运行和随包报告为准；Windows 仅覆盖固件终端/GDB 监听，实板校准仍未完成。
+平台可用性以运行和随包报告为准；Windows Lab 包的 `lab-smoke.json` 记录真实交互/Web 通道、
+外部 QMP、GDB 断点/继续/单步/复位/寄存器与内存读写及退出清理。Windows 原生门运行于 Windows Server 2022。
+实板校准仍未完成。
 
 ### 从源码构建
 
@@ -92,12 +96,20 @@ Cargo 的产品选择如下：
 | features | 用途 |
 | --- | --- |
 | 默认 | 轻量 `sim firmware`，支持 Linux/Windows |
+| `windows-lab` | 原生 Windows 固件终端、完整交互/Web Lab 和调试 |
 | `scene` | YAML 准入、Host 场景与唯一 Simulation |
 | `host-runtime` | 场景、trace、machine、Lab/Web、worker、设备、裁判、SocketCAN、显式上位机进程 |
 | `mujoco` | MuJoCo 3.12.0，使用成熟的 mujoco-rs 绑定 |
 | `gazebo` / `gazebo-rendering` | 原生 Gazebo CXX 接口 / Ogre2 相机与 LiDAR |
 | `ros2` | 原生 ROS 2 CXX transport |
 | `linux-runtime` | `host-runtime` 加全部上述原生物理/ROS 功能 |
+
+Windows 原生 Lab（MSVC Rust 工具链，原生 QEMU 构建见 Windows CI）：
+
+```powershell
+cargo build --release --locked -p sim-host --features windows-lab
+.\target\release\sim.exe lab web --elf .\app.elf --qemu .\build\qemu\qemu-system-arm.exe
+```
 
 仅固件入口：
 
@@ -779,6 +791,17 @@ quit
 错误返回非零。输入使用 pipe 或 TTY，行最多 4096 字节，超长行丢弃到换行；不支持重定向
 普通文件作为 stdin。EOF 和 quit 会清理退出。默认总期限 300 秒，调试可用 `--gdb-port`、
 `--paused` 和 `--qmp`，期限可显式调整。当前不提供交互 reset 或自动 IMU 环境。
+
+Windows PowerShell 使用同一组命令；原生 GDB 调试从暂停启动：
+
+```powershell
+.\sim.exe lab interactive --elf .\example.elf --gdb-port 1234 --paused --timeout 3600
+```
+
+在另一终端用 ARM GDB 连接 `127.0.0.1:1234`，加载相同 ELF 后可设置断点、继续、单步、
+读写寄存器/内存，或用 `monitor system_reset` 复位。`--qmp` 另开 QEMU 原生 Unix socket，
+Windows 使用较短的新绝对路径；该选项的既有 100 字节路径上限也适用于 Windows。
+外部调试器退出后，Lab 会话继续由原终端或 Web 管理；总期限包含调试停留时间。
 
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。

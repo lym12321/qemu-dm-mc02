@@ -4,9 +4,12 @@ use sim_host::{
     lab::{interactive::run_interactive, LabOptions},
     launch::LaunchError,
 };
+#[cfg(unix)]
+use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::AsHandle;
 use std::{
     io::{self, Write},
-    os::fd::AsFd,
     path::PathBuf,
     time::Duration,
 };
@@ -119,16 +122,19 @@ fn interactive(args: InteractiveOptions) -> Result<i32, LaunchError> {
     options.gdb_port = args.gdb_port;
     options.cancellation = Some(signals.cancelled.clone());
     let input = io::stdin();
+    #[cfg(unix)]
+    let handle = input.as_fd();
+    #[cfg(windows)]
+    let handle = input.as_handle();
     let mut output = io::stdout().lock();
-    let result =
-        run_interactive(options, input.as_fd(), &mut output, args.paused).map_err(|error| {
-            let code = error_code(&error.primary);
-            let mut message = error.to_string();
-            for note in error.notes {
-                message.push_str(&format!("\n{note}"));
-            }
-            LaunchError { code, message }
-        })?;
+    let result = run_interactive(options, handle, &mut output, args.paused).map_err(|error| {
+        let code = error_code(&error.primary);
+        let mut message = error.to_string();
+        for note in error.notes {
+            message.push_str(&format!("\n{note}"));
+        }
+        LaunchError { code, message }
+    })?;
     writeln!(
         output,
         "Lab finished: {} commands, {} observation batches, end_ns={}",

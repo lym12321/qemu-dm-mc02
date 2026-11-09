@@ -14,8 +14,8 @@ native_package = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(native_package)
 
 
-@pytest.mark.parametrize("suffix", ["", ".exe"])
-def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suffix):
+@pytest.mark.parametrize("suffix, windows_lab", [("", False), (".exe", False), (".exe", True)])
+def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suffix, windows_lab):
     root = tmp_path / "checkout"
     native = root / "qemu/upstream"
     native.mkdir(parents=True)
@@ -24,6 +24,9 @@ def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suff
         (root / filename).write_text(filename)
     for filename in ("COPYING", "COPYING.LIB"):
         (native / filename).write_text(filename)
+    notice = root / "crates/sim-host/src/native_process/LICENSE-process-wrap.txt"
+    notice.parent.mkdir(parents=True)
+    notice.write_text("fixed process-wrap MIT notice")
     qemu = tmp_path / ("qemu-system-arm" + suffix)
     qemu.write_bytes(b"native QEMU bytes")
     sim = tmp_path / ("built-sim" + suffix)
@@ -40,7 +43,7 @@ def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suff
         "scope": "firmware terminal and reset-paused GDB listener",
     })
 
-    native_package.package(qemu, sim, output, tmp_path if suffix else None)
+    native_package.package(qemu, sim, output, tmp_path if suffix else None, windows_lab=windows_lab)
 
     assert (output / ("sim" + suffix)).read_bytes() == b"Rust executable"
     assert [(path.name, path.read_bytes()) for path in (output / "bin").iterdir()] == [
@@ -48,6 +51,9 @@ def test_package_keeps_launcher_and_backend_separate(monkeypatch, tmp_path, suff
     provenance = json.loads((output / "provenance.json").read_text())
     assert provenance["rust"]["sha256"] == hashlib.sha256(b"Rust executable").hexdigest()
     assert provenance["qemu"]["file"] == "bin/" + qemu.name
+    assert (output / "licenses/LICENSE-process-wrap.txt").read_text() == notice.read_text()
+    if windows_lab:
+        assert provenance["rust"]["scope"] == "native Windows interactive/Web Lab and ARM GDB debugging"
 
 
 def test_package_rejects_mixed_platform_before_staging(tmp_path):

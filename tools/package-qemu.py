@@ -132,10 +132,11 @@ def msys2_license(owner, destination):
             "package_url": f"https://packages.msys2.org/package/{owner}"}
 
 
-def rust_provenance(sim, sources, licenses):
+def rust_provenance(sim, sources, licenses, features=()):
     """Use Cargo's own vendoring format, including upstream license files."""
+    options = ("--features", ",".join(f"sim-host/{feature}" for feature in features)) if features else ()
     metadata = json.loads(command("cargo", "metadata", "--locked", "--format-version=1",
-                                  cwd=ROOT))
+                                  *options, cwd=ROOT))
     (sources / "rust-crates").mkdir()
     vendor_config = command("cargo", "vendor", "--locked", "--versioned-dirs",
                             "--respect-source-config",
@@ -159,6 +160,7 @@ def rust_provenance(sim, sources, licenses):
         "file": sim.name,
         "sha256": digest(sim),
         "scope": "firmware terminal and reset-paused GDB listener",
+        "features": list(features),
         "rustc": command("rustc", "--version", "--verbose"),
         "cargo": command("cargo", "--version"),
         "cargo_lock_sha256": digest(ROOT / "Cargo.lock"),
@@ -171,7 +173,8 @@ def rust_provenance(sim, sources, licenses):
     }
 
 
-def package(binary, sim, output, dll_directory=None, *, development=False, linux_full=None):
+def package(binary, sim, output, dll_directory=None, *, development=False, linux_full=None,
+            windows_lab=False):
     binary = binary.resolve(strict=True)
     sim = sim.resolve(strict=True)
     if not binary.is_file():
@@ -189,6 +192,8 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
             raise ValueError("--dll-dir must be a directory")
     if windows and linux_full:
         raise ValueError("the full native runtime profile is Linux only")
+    if windows_lab and not windows:
+        raise ValueError("--windows-lab requires Windows executables")
     root_commit, native_commit = source_identities(development)
     output = output.absolute()
     output.mkdir(parents=True)
@@ -207,6 +212,8 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
     root_license = ROOT / "LICENSE"
     if root_license.is_file():
         shutil.copy2(root_license, licenses / "LICENSE")
+    shutil.copy2(ROOT / "crates/sim-host/src/native_process/LICENSE-process-wrap.txt",
+                 licenses / "LICENSE-process-wrap.txt")
 
     dlls, owners = [], {}
     if dll_directory is not None:
@@ -239,9 +246,13 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
         "msys2_packages": owners,
         "sources": source_archives,
         "source_submodules": "Git archives omit submodule checkouts, including ROM repositories.",
-        "rust": rust_provenance(launcher, sources, licenses),
+        "rust": rust_provenance(launcher, sources, licenses,
+                                ["linux-runtime"] if linux_full else
+                                ["windows-lab"] if windows_lab else []),
         "development_worktree": development,
     }
+    if windows_lab:
+        provenance["rust"]["scope"] = "native Windows interactive/Web Lab and ARM GDB debugging"
     if linux_full:
         import linux_runtime
         provenance["linux_runtime"] = linux_runtime.collect(output, **linux_full)
@@ -263,6 +274,7 @@ def main():
     parser.add_argument("--output", required=True, type=Path, help="new release directory")
     parser.add_argument("--dll-dir", type=Path, help="MSYS2 MinGW bin directory, for Windows")
     parser.add_argument("--linux-full", action="store_true", help="bundle the complete Linux native runtime")
+    parser.add_argument("--windows-lab", action="store_true", help="record the native Windows Lab feature profile")
     parser.add_argument("--gazebo-prefix", type=Path, default=ROOT / "build/rust-gazebo-native/install")
     parser.add_argument("--ros-prefix", type=Path, default=Path("/opt/ros/jazzy"))
     parser.add_argument("--mujoco-prefix", type=Path, default=Path("/opt/mujoco-3.12.0"))
@@ -272,7 +284,8 @@ def main():
     full = dict(gazebo_prefix=arguments.gazebo_prefix, ros_prefix=arguments.ros_prefix,
                 mujoco_prefix=arguments.mujoco_prefix) if arguments.linux_full else None
     destination = package(arguments.qemu, arguments.sim, arguments.output, arguments.dll_dir,
-                          development=arguments.development_worktree, linux_full=full)
+                          development=arguments.development_worktree, linux_full=full,
+                          windows_lab=arguments.windows_lab)
     print(f"Release staged: {destination}")
 
 

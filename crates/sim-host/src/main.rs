@@ -1,10 +1,11 @@
 #[cfg(any(
     feature = "scene",
-    all(target_os = "linux", any(feature = "lab", feature = "worker"))
+    feature = "lab",
+    all(target_os = "linux", feature = "worker")
 ))]
 mod cli_support;
 mod firmware;
-#[cfg(all(target_os = "linux", feature = "lab"))]
+#[cfg(feature = "lab")]
 mod lab_cli;
 #[cfg(feature = "scene")]
 mod scene_cli;
@@ -28,7 +29,7 @@ enum Command {
     )]
     Firmware(firmware::Options),
     /// Free-running native board tools.
-    #[cfg(all(target_os = "linux", feature = "lab"))]
+    #[cfg(feature = "lab")]
     Lab(lab_cli::Options),
     /// Run the native co-simulation worker.
     #[cfg(all(target_os = "linux", feature = "worker"))]
@@ -52,7 +53,7 @@ fn main() {
     }
     let result = match Cli::parse().command {
         Command::Firmware(options) => firmware::run(options),
-        #[cfg(all(target_os = "linux", feature = "lab"))]
+        #[cfg(feature = "lab")]
         Command::Lab(options) => lab_cli::run(options),
         #[cfg(all(target_os = "linux", feature = "worker"))]
         Command::Worker(options) => worker_cli::run(*options),

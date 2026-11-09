@@ -2,11 +2,11 @@
 use super::{
     channels::{ChannelData, ChannelEvent},
     command::{parse, Command, Lines},
+    input::{BorrowedInput, Input},
     with_lab, AdcPausedError, LabError, LabOptions,
 };
-use rustix::fs::{fstat, FileType};
 use sim_core::{Error, Failure, Result};
-use std::{io::Write, os::fd::BorrowedFd, sync::Arc, time::Duration};
+use std::{io::Write, sync::Arc, time::Duration};
 
 pub const HELP: &str = "Commands:\n  help | state | pause | cont | quit\n  key press|release\n  gpio A0 0|1\n  vin MILLIVOLTS\n  uart uart1 TEXT\n  can can1 ID FLAGS DLC HEX\n  adc chN raw|voltage_uv VALUE\nUART text uses UTF-8; quotes group spaces. No shell expansion or reset command.\n";
 
@@ -63,19 +63,17 @@ pub struct InteractiveResult {
 /// errors are terminal; a blocking caller-owned sink cannot be preempted.
 pub fn run_interactive(
     options: LabOptions,
-    input: BorrowedFd<'_>,
+    input: BorrowedInput<'_>,
     output: &mut impl Write,
     paused: bool,
 ) -> std::result::Result<InteractiveResult, LabError> {
-    let mode = fstat(input)
-        .map_err(|error| LabError::from(io(error)))?
-        .st_mode;
-    if FileType::from_raw_mode(mode) != FileType::Fifo && !rustix::termios::isatty(input) {
-        return Err((Arc::new(Error::Admission(
-            "interactive input must be a pipe or terminal; regular files are unsupported".into(),
-        )) as Failure)
-            .into());
-    }
+    let mut driver = Input::new(input).map_err(|error| {
+        LabError::from(if error.kind() == std::io::ErrorKind::InvalidInput {
+            Arc::new(Error::Admission(error.to_string())) as Failure
+        } else {
+            io(error)
+        })
+    })?;
     if paused && options.gdb_port.is_none() {
         return Err((Arc::new(Error::Admission(
             "paused Lab console requires a native GDB port".into(),
@@ -96,12 +94,12 @@ pub fn run_interactive(
             let (_, observations) = lab.pump()?;
             batches += 1;
             events(output, observations)?;
-            if lines.needs_read() && lab.wait(Some(input), Duration::from_millis(5))? {
+            if lines.needs_read()
+                && (driver.buffered() || lab.wait(Some(input), Duration::from_millis(5))?)
+            {
                 let mut bytes = [0; 4096];
-                match rustix::io::read(input, &mut bytes) {
-                    Ok(count) => lines.feed(&bytes[..count]),
-                    Err(rustix::io::Errno::INTR) => (),
-                    Err(error) => return Err(io(error)),
+                if let Some(count) = driver.read(&mut bytes, output).map_err(io)? {
+                    lines.feed(&bytes[..count]);
                 }
             }
             let Some(line) = lines.next_line() else {

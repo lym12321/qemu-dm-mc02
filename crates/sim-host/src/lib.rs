@@ -28,12 +28,12 @@ pub mod endpoints;
 pub mod event_json;
 #[cfg(feature = "simulation")]
 pub mod fabric;
-#[cfg(all(target_os = "linux", feature = "lab"))]
+#[cfg(all(any(target_os = "linux", windows), feature = "lab"))]
 pub mod lab;
 pub mod launch;
 #[cfg(all(target_os = "linux", feature = "machine"))]
 pub mod machine;
-#[cfg(all(target_os = "linux", feature = "native-process"))]
+#[cfg(all(any(target_os = "linux", windows), feature = "native-process"))]
 pub mod native_process;
 #[cfg(feature = "physics")]
 pub mod physics;

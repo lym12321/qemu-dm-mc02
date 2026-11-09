@@ -49,7 +49,7 @@ pub struct VirtualExecutionInfo {
     pub target_ns: Option<i64>,
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod session;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub use session::*;

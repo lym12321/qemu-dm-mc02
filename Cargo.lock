@@ -1346,6 +1346,7 @@ dependencies = [
  "uuid",
  "wait-timeout",
  "which",
+ "windows-sys",
  "yaml-rust2",
 ]
 

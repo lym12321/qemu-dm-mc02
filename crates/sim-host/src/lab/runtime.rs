@@ -1,5 +1,8 @@
 //! One free-running native QEMU owner, shared by console and Web consumers.
-use super::channels::{AdcValue, ChannelEvent, LabChannels};
+use super::{
+    channels::{AdcValue, ChannelEvent, LabChannels},
+    input::BorrowedInput,
+};
 use crate::{
     boards,
     can::CanFrame,
@@ -8,13 +11,17 @@ use crate::{
     qmp::{commands, QmpSession},
     transports::{fixed84::CanStream, stream::StreamTransport},
 };
+#[cfg(unix)]
 use rustix::event::{poll, PollFd, PollFlags, Timespec};
 use serde_json::{json, Value};
 use sim_core::{Error, Failure, Result};
+#[cfg(windows)]
+use std::net::TcpStream as NativeStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as NativeStream;
 use std::{
     collections::BTreeSet,
     fmt,
-    os::{fd::BorrowedFd, unix::net::UnixStream},
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -132,7 +139,7 @@ pub struct ConnectedLab<'a> {
     owner: &'a mut NativeProcess,
     qmp: &'a mut QmpSession,
     runtime: &'a tokio::runtime::Runtime,
-    channels: LabChannels<'a, UnixStream>,
+    channels: LabChannels<'a, NativeStream>,
     startup_deadline: Instant,
     host_deadline: Instant,
     startup: bool,
@@ -222,7 +229,8 @@ impl ConnectedLab<'_> {
         Ok((after, events))
     }
     /// Wait only for host readiness. QEMU owns every virtual-time advance.
-    pub fn wait(&mut self, input: Option<BorrowedFd<'_>>, maximum: Duration) -> Result<bool> {
+    #[cfg(unix)]
+    pub fn wait(&mut self, input: Option<BorrowedInput<'_>>, maximum: Duration) -> Result<bool> {
         self.check()?;
         let descriptors = self.channels.descriptors();
         let mut pollfds = Vec::new();
@@ -254,6 +262,27 @@ impl ConnectedLab<'_> {
         drop(descriptors);
         self.check()?;
         Ok(readable)
+    }
+    /// Windows console handles and Winsock streams use different readiness
+    /// APIs. A bounded host wait lets the same owner pump each nonblocking
+    /// stream and observe cancellation/child exit at least every five ms.
+    #[cfg(windows)]
+    pub fn wait(&mut self, input: Option<BorrowedInput<'_>>, maximum: Duration) -> Result<bool> {
+        self.check()?;
+        let readable = || {
+            input
+                .map(super::input::ready)
+                .transpose()
+                .map(|value| value.unwrap_or(false))
+                .map_err(lower)
+        };
+        if !readable()? {
+            let remaining = self.deadline().saturating_duration_since(Instant::now());
+            std::thread::sleep(maximum.min(remaining).min(Duration::from_millis(5)));
+        }
+        let ready = readable()?;
+        self.check()?;
+        Ok(ready)
     }
     /// Returned time observes admission; it does not attest guest consumption.
     pub fn inject(&mut self, input: LabInput) -> Result<u64> {
@@ -361,21 +390,33 @@ pub fn with_lab<T>(
         owner
             .check_with_deadline(startup_deadline.min(host_deadline))
             .map_err(|error| error as Failure)?;
-        qmp = Some(
+        #[cfg(unix)]
+        let connection = runtime
+            .block_on(QmpSession::connect_uds(
+                owner.socket("qmp").unwrap(),
+                startup_deadline.min(host_deadline),
+            ))
+            .map_err(|error| error as Failure)?;
+        #[cfg(windows)]
+        let connection = {
+            let stream = owner.take_stream("qmp").map_err(|error| error as Failure)?;
             runtime
-                .block_on(QmpSession::connect_uds(
-                    owner.socket("qmp").unwrap(),
+                .block_on(QmpSession::from_tcp(
+                    stream,
                     startup_deadline.min(host_deadline),
                 ))
-                .map_err(|error| error as Failure)?,
-        );
+                .map_err(|error| error as Failure)?
+        };
+        qmp = Some(connection);
         for name in &streams {
             owner
                 .check_with_deadline(startup_deadline.min(host_deadline))
                 .map_err(|error| error as Failure)?;
+            #[cfg(unix)]
             let deadline = startup_deadline
                 .min(host_deadline)
                 .min(Instant::now() + Duration::from_secs(2));
+            #[cfg(unix)]
             let stream = runtime
                 .block_on(async {
                     tokio::time::timeout_at(
@@ -390,6 +431,8 @@ pub fn with_lab<T>(
                 .map_err(lower)?
                 .into_std()
                 .map_err(lower)?;
+            #[cfg(windows)]
+            let stream = owner.take_stream(name).map_err(|error| error as Failure)?;
             if name == "cosim" {
                 cosim = Some(StreamTransport::new(stream, 256).map_err(|error| error as Failure)?);
             } else if options.cans.contains(name) {

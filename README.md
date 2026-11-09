@@ -24,7 +24,7 @@ QEMU、MuJoCo、Gazebo 与 ROS 2 继续使用各自的原生实现。
 
 | Artifact | 平台与范围 |
 | --- | --- |
-| `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端和原生 GDB 监听 |
+| `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端、交互/Web Lab 与原生 GDB 调试 |
 | `dm-mc02-linux-firmware-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，轻量固件入口 |
 | `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，场景、Lab/Web、worker、MuJoCo/Gazebo/ROS 2 |
 
@@ -35,13 +35,15 @@ Linux 下载后解开 Artifact 外层，再用 `tar -xzf` 解开其中的 tar.gz
 本地完整包已在干净 Ubuntu 24.04.3 容器、checkout 外和空应用 PATH 下，通过原生依赖、
 MuJoCo/Ogre2/ROS、固件 UART/GDB、场景及完整 MCAP 重放验收。
 本次发布构建见 [Actions 42610464978](https://github.com/lym12321/qemu-dm-mc02/actions/runs/42610464978)；
-下载时以该运行的平台结果和随包报告为准。Windows 范围为固件终端与 GDB 监听。
+下载时以该运行的平台结果和随包报告为准；新 Windows Lab 包以 `lab-smoke.json` 中的原生验收结果为准。
 
 Windows PowerShell：
 
 ```powershell
 .\sim.exe firmware .\example.elf
 .\sim.exe firmware .\example.elf --debug
+.\sim.exe lab interactive --elf .\example.elf
+.\sim.exe lab web --elf .\example.elf
 ```
 
 Linux，在解压目录执行：
@@ -95,7 +97,8 @@ sim run examples/minimal-board/scene.yaml --report build/minimal-board.json
 sim lab web --elf examples/minimal-board/build/firmware.elf
 ```
 
-默认 Cargo 构建只提供轻量 `firmware`；`host-runtime` 提供不含原生物理 SDK 的宿主功能。
+默认 Cargo 构建只提供轻量 `firmware`；Windows 用 `cargo build --release --locked -p sim-host --features windows-lab`
+构建交互/Web Lab 和调试工具，`host-runtime` 提供 Linux 下不含原生物理 SDK 的宿主功能。
 完整 Linux 构建用 `bash tools/build-linux-sdk.sh`、`bash tools/build-linux-runtime.sh`；
 细分 Cargo features、原生 SDK 与 Rust API 见[安装](docs/USAGE.md#installation)。
 原 Robot/Arena/Scenario schema 与独立执行器已由普通场景替代。

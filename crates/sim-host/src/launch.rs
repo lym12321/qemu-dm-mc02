@@ -226,7 +226,11 @@ pub fn native_qemu_command(
             "none",
             "-S",
             "-qmp",
-            "unix:{qmp},server=on,wait=off",
+            if cfg!(windows) {
+                "tcp:127.0.0.1:{qmp},server=off"
+            } else {
+                "unix:{qmp},server=on,wait=off"
+            },
         ]
         .map(OsString::from),
     );
@@ -234,7 +238,12 @@ pub fn native_qemu_command(
         if streams.iter().any(|stream| stream == slot) {
             argv.extend([
                 "-chardev".into(),
-                format!("socket,id={slot},path={{{slot}}},server=on,wait=off").into(),
+                if cfg!(windows) {
+                    format!("socket,id={slot},host=127.0.0.1,port={{{slot}}},server=off")
+                } else {
+                    format!("socket,id={slot},path={{{slot}}},server=on,wait=off")
+                }
+                .into(),
                 "-serial".into(),
                 format!("chardev:{slot}").into(),
             ]);

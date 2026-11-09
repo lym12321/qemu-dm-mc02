@@ -6,22 +6,24 @@ use qapi::futures::{
 use serde_json::Value;
 use std::{
     fmt, io,
-    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+use tokio::net::TcpStream as NativeStream;
 use tokio::{
     io::WriteHalf,
-    net::UnixStream,
     task::{JoinError, JoinHandle},
 };
+#[cfg(unix)]
+use {std::path::Path, tokio::net::UnixStream as NativeStream};
 
 const RPC_LIMIT: Duration = Duration::from_secs(2);
 const CLOSE_LIMIT: Duration = Duration::from_secs(2);
-type Service = QapiService<QmpStreamTokio<WriteHalf<UnixStream>>>;
+type Service = QapiService<QmpStreamTokio<WriteHalf<NativeStream>>>;
 pub type Failure = Arc<Error>;
 pub type Result<T> = std::result::Result<T, Failure>;
 
@@ -205,13 +207,30 @@ async fn observe<T>(
 
 impl QmpSession {
     /// Socket, greeting and capability negotiation share one absolute deadline.
+    #[cfg(unix)]
     pub async fn connect_uds(path: impl AsRef<Path>, host_deadline: Instant) -> Result<Self> {
         let deadline = rpc_deadline(host_deadline);
         if Instant::now() >= deadline {
             return Err(Arc::new(expired()));
         }
+        let stream = tokio::time::timeout_at(deadline.into(), NativeStream::connect(path))
+            .await
+            .map_err(|_| Arc::new(expired()))?
+            .map_err(|error| Arc::new(Error::io(error)))?;
+        Self::negotiate(stream, deadline).await
+    }
+
+    /// Take the Windows owner's accepted, nonblocking loopback peer. The owner
+    /// has already bounded connection admission; no second listener is created.
+    #[cfg(windows)]
+    pub async fn from_tcp(stream: std::net::TcpStream, host_deadline: Instant) -> Result<Self> {
+        let stream = NativeStream::from_std(stream).map_err(|error| Arc::new(Error::io(error)))?;
+        Self::negotiate(stream, rpc_deadline(host_deadline)).await
+    }
+
+    async fn negotiate(stream: NativeStream, deadline: Instant) -> Result<Self> {
         let stream = tokio::time::timeout_at(deadline.into(), async {
-            QmpStreamTokio::open_uds(path).await?.negotiate().await
+            QmpStreamTokio::open(stream).await?.negotiate().await
         })
         .await
         .map_err(|_| Arc::new(expired()))?

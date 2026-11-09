@@ -9,6 +9,7 @@ description = "Native DM-MC02 firmware launcher"
 [features]
 host-runtime = ["scene", "trace", "machine", "web", "worker", "devices", "referee", "socketcan", "host-processes"]
 linux-runtime = ["host-runtime", "mujoco", "gazebo-rendering", "ros2"]
+windows-lab = ["web"]
 cosim-wire = ["dep:cc"]
 simulation = ["dep:sim-core"]
 qmp = ["dep:qapi", "dep:tokio", "dep:futures", "dep:serde", "dep:serde_json"]
@@ -112,6 +113,9 @@ signal-hook = { version = "=0.3.18", optional = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = { version = "=4.0.0", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
 
 [build-dependencies]
 cc = { version = "1.2.56", optional = true }

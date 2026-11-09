@@ -1,4 +1,4 @@
-#![cfg(all(unix, feature = "qmp"))]
+#![cfg(all(any(unix, windows), feature = "qmp"))]
 
 use futures::{channel::oneshot, Future, FutureExt};
 use serde_json::{json, Value};
@@ -7,14 +7,32 @@ use sim_host::qmp::{
     VirtualExecutionState, QMP_MAX_FRAME_LENGTH,
 };
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
-use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf},
-    net::{UnixListener, UnixStream},
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
+#[cfg(windows)]
+use {
+    std::net::SocketAddr as Address,
+    tokio::net::{TcpListener as Listener, TcpStream as Stream},
 };
+#[cfg(unix)]
+use {
+    std::path::PathBuf as Address,
+    tokio::net::{UnixListener as Listener, UnixStream as Stream},
+};
+
+async fn connect(address: Address, deadline: Instant) -> sim_host::qmp::Result<QmpSession> {
+    #[cfg(unix)]
+    {
+        QmpSession::connect_uds(address, deadline).await
+    }
+    #[cfg(windows)]
+    {
+        let stream = Stream::connect(address).await.unwrap().into_std().unwrap();
+        QmpSession::from_tcp(stream, deadline).await
+    }
+}
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(3)
@@ -35,11 +53,11 @@ fn run(future: impl Future<Output = ()>) {
 }
 
 struct Peer {
-    read: BufReader<ReadHalf<UnixStream>>,
-    write: WriteHalf<UnixStream>,
+    read: BufReader<ReadHalf<Stream>>,
+    write: WriteHalf<Stream>,
 }
 impl Peer {
-    async fn accept(listener: UnixListener) -> Self {
+    async fn accept(listener: Listener) -> Self {
         let (socket, _) = listener.accept().await.unwrap();
         let (read, write) = tokio::io::split(socket);
         Self {
@@ -94,12 +112,19 @@ async fn socket_case<S, SF, C, CF>(server: S, client: C)
 where
     S: FnOnce(Peer) -> SF + Send + 'static,
     SF: Future<Output = ()> + Send + 'static,
-    C: FnOnce(PathBuf) -> CF,
+    C: FnOnce(Address) -> CF,
     CF: Future<Output = ()>,
 {
+    #[cfg(unix)]
     let directory = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
     let path = directory.path().join("qmp.sock");
-    let listener = UnixListener::bind(&path).unwrap();
+    #[cfg(unix)]
+    let listener = Listener::bind(&path).unwrap();
+    #[cfg(windows)]
+    let listener = Listener::bind("127.0.0.1:0").await.unwrap();
+    #[cfg(windows)]
+    let path = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { server(Peer::accept(listener).await).await });
     client(path).await;
     server.await.unwrap();
@@ -144,7 +169,7 @@ fn no_oob_batch_waits_for_all_requests_and_restores_input_order() {
             peer.eof().await;
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let result = session
                 .command_many(
                     vec![
@@ -207,7 +232,7 @@ fn command_errors_wait_for_every_reply_and_keep_input_position_primary() {
             peer.eof().await;
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let mut result = Box::pin(
                 session.command_many(
                     (0..3)
@@ -255,7 +280,7 @@ fn batch_admission_and_capacity_reject_without_partial_requests() {
             peer.eof().await;
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             assert!(session.prepare_batch(Vec::new()).is_err());
             assert!(session
                 .prepare_batch(
@@ -324,7 +349,8 @@ fn lower_cancellation_reclaims_capacity_and_drops_late_replies() {
             peer.eof().await;
         },
         |path| async move {
-            let stream = QmpStreamTokio::open_uds(path)
+            let socket = Stream::connect(path).await.unwrap();
+            let stream = QmpStreamTokio::open(socket)
                 .await
                 .unwrap()
                 .negotiate()
@@ -371,7 +397,7 @@ fn dropping_a_finish_future_freezes_the_session_before_another_write() {
             peer.eof().await;
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let batch = session
                 .prepare_batch(vec![prepared(commands::query_status {})])
                 .unwrap();
@@ -409,7 +435,7 @@ fn malformed_frames_and_idless_errors_preserve_the_driver_failure() {
                     let _ = peer.write.write_all(&bytes).await;
                 },
                 |path| async move {
-                    let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+                    let mut session = connect(path, deadline()).await.unwrap();
                     let error = session
                         .command(commands::query_status {}, deadline())
                         .await
@@ -443,18 +469,14 @@ fn connection_and_rpc_deadlines_share_the_callers_absolute_budget() {
                 },
                 |path| async move {
                     if phase < 2 {
-                        let error = match QmpSession::connect_uds(
-                            path,
-                            Instant::now() + Duration::from_millis(30),
-                        )
-                        .await
-                        {
-                            Err(error) => error,
-                            Ok(_) => panic!("missing negotiation timeout"),
-                        };
+                        let error =
+                            match connect(path, Instant::now() + Duration::from_millis(30)).await {
+                                Err(error) => error,
+                                Ok(_) => panic!("missing negotiation timeout"),
+                            };
                         assert_eq!(error.kind, ErrorKind::Timeout);
                     } else {
-                        let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+                        let mut session = connect(path, deadline()).await.unwrap();
                         let error = session
                             .command(
                                 commands::query_status {},
@@ -490,7 +512,7 @@ fn dropping_a_backpressured_submit_freezes_and_closes_the_partial_write() {
             );
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let batch = session
                 .prepare_batch(
                     (0..8)
@@ -528,9 +550,7 @@ fn a_prepared_batch_cannot_write_to_another_session() {
             peer.eof().await;
         },
         |first_path| async move {
-            let mut first = QmpSession::connect_uds(first_path, deadline())
-                .await
-                .unwrap();
+            let mut first = connect(first_path, deadline()).await.unwrap();
             let batch = first
                 .prepare_batch(vec![prepared(commands::query_status {})])
                 .unwrap();
@@ -544,9 +564,7 @@ fn a_prepared_batch_cannot_write_to_another_session() {
                     peer.eof().await;
                 },
                 |second_path| async move {
-                    let mut second = QmpSession::connect_uds(second_path, deadline())
-                        .await
-                        .unwrap();
+                    let mut second = connect(second_path, deadline()).await.unwrap();
                     let error = match second.submit_batch(batch, deadline()).await {
                         Err(error) => error,
                         Ok(_) => panic!("foreign session accepted batch"),
@@ -577,7 +595,7 @@ fn a_backpressured_send_obeys_the_host_deadline() {
             assert!(!bytes.is_empty() && bytes.len() < 8 * 1024 * 1024);
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let batch = session
                 .prepare_batch(
                     (0..8)
@@ -613,7 +631,7 @@ fn cancelling_close_retains_failure_and_aborts_its_driver() {
             peer.eof().await;
         },
         |path| async move {
-            let mut session = QmpSession::connect_uds(path, deadline()).await.unwrap();
+            let mut session = connect(path, deadline()).await.unwrap();
             let mut close = Box::pin(session.close());
             assert!(close.as_mut().now_or_never().is_none());
             drop(close);
@@ -626,12 +644,13 @@ fn cancelling_close_retains_failure_and_aborts_its_driver() {
 
 #[test]
 #[ignore = "requires an owned paused native QEMU with icount shift=0; set QMP_SOCKET"]
+#[cfg(unix)]
 fn native_qmp_consumer() {
     run(async {
         let path =
             std::env::var_os("QMP_SOCKET").expect("set QMP_SOCKET to the harness-owned QEMU");
         let host_deadline = deadline();
-        let mut session = QmpSession::connect_uds(PathBuf::from(path), host_deadline)
+        let mut session = QmpSession::connect_uds(Address::from(path), host_deadline)
             .await
             .unwrap();
         let supported = session
