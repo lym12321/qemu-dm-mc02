@@ -1,9 +1,6 @@
 name: Rust platform contracts
 
 on:
-  pull_request:
-  push:
-    branches: [main, refactor/composable-platform]
   workflow_dispatch:
 
 jobs:

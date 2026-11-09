@@ -19,8 +19,9 @@ QEMU、MuJoCo、Gazebo 与 ROS 2 继续使用各自的原生实现。
 
 ## 下载并运行
 
-[Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)
-提供以下产品；下载需要登录 GitHub，Artifacts 保留 30 天。
+目前以本地构建包交付，自动 CI 已暂停。需要 GitHub 构建时，可手动运行
+[Native packages 工作流](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)；
+下载需要登录 GitHub，新 Artifacts 保留 3 天。
 
 | Artifact | 平台与范围 |
 | --- | --- |

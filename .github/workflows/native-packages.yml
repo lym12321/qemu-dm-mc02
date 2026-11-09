@@ -2,28 +2,6 @@ name: Native packages
 
 on:
   workflow_dispatch:
-  push:
-    branches: [main, refactor/composable-platform]
-    paths:
-      - '.github/workflows/native-packages.yml'
-      - 'qemu/upstream'
-      - 'qemu.lock'
-      - 'cosim/**'
-      - 'tools/build-qemu.sh'
-      - 'tools/qemu-build-env.sh'
-      - 'tools/package-qemu.py'
-      - 'tools/check-qemu-package.py'
-      - 'tools/check-windows-lab.py'
-      - 'tools/linux_runtime.py'
-      - 'tools/check-linux-runtime.py'
-      - 'tools/build-linux-runtime.sh'
-      - 'tools/build-linux-sdk.sh'
-      - 'sim/physics/gazebo_native/**'
-      - 'third_party/**'
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'rust-toolchain.toml'
-      - 'crates/**'
 
 permissions:
   contents: read
@@ -50,11 +28,13 @@ jobs:
           name: package-test-firmware
           path: build/guest/firmware.elf
           if-no-files-found: error
+          retention-days: 3
       - uses: actions/upload-artifact@v4
         with:
           name: package-test-lab-firmware
           path: build/lab/lab.elf
           if-no-files-found: error
+          retention-days: 3
 
   linux:
     needs: firmware
@@ -119,7 +99,7 @@ jobs:
           path: dist/dm-mc02-linux-firmware-x86_64.tar.gz
           compression-level: 0
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
       - name: Build and package the complete Linux runtime
         run: |
           bash tools/build-linux-runtime.sh
@@ -161,14 +141,14 @@ jobs:
             dist/dm-mc02-linux-x86_64/smoke.json
             dist/dm-mc02-linux-x86_64/runtime-libraries.txt
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 3
       - uses: actions/upload-artifact@v4
         with:
           name: dm-mc02-linux-x86_64
           path: dist/dm-mc02-linux-x86_64.tar.gz
           compression-level: 0
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
       - name: Record verification
         run: echo 'Ubuntu 24.04 x86_64 complete Rust runtime — recursive bundled native closure, actual MuJoCo/Ogre2/ROS context, firmware UART and reset-paused GDB listener passed without Python in PATH. Host glibc and EGL/GLVND graphics drivers remain system dependencies. QEMU and native libraries are stored once.' >> "$GITHUB_STEP_SUMMARY"
 
@@ -307,13 +287,13 @@ jobs:
             dist/dm-mc02-windows-x86_64/smoke.json
             dist/dm-mc02-windows-x86_64/lab-smoke.json
           if-no-files-found: ignore
-          retention-days: 30
+          retention-days: 3
       - uses: actions/upload-artifact@v4
         with:
           name: dm-mc02-windows-x86_64
           path: dist/dm-mc02-windows-x86_64/
           if-no-files-found: error
-          retention-days: 30
+          retention-days: 3
       - name: Record verification boundary
         shell: pwsh
         run: Add-Content $env:GITHUB_STEP_SUMMARY 'Windows x86_64 native Rust Lab — interactive UART/CAN/ADC, board state/key/GPIO/vin, pause/continue, Web upload/controller/session lifecycle, real ARM GDB break/continue/step/reset/register/memory and bounded cleanup passed without Python or MSYS2 in application PATH. QEMU/DLLs are stored once beside the executable. Linux-only plant/ROS2/SocketCAN capabilities remain separate.'

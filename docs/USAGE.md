@@ -20,8 +20,8 @@ Windows 产品提供固件终端、交互/Web Lab 与原生 ARM GDB 调试；场
 
 ### 下载原生包
 
-登录 GitHub，打开 [Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
-在所选运行记录底部的 **Artifacts** 下载。包保留 30 天。
+目前以本地构建包交付，自动 CI 已暂停；需要时手动运行 [Native packages](https://github.com/lym12321/qemu-dm-mc02/actions/workflows/native-packages.yml)，
+登录 GitHub 后，在所选运行记录底部的 **Artifacts** 下载。新包保留 3 天。
 
 | Artifact | 平台与范围 |
 | --- | --- |
