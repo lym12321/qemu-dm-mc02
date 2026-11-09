@@ -54,6 +54,8 @@ pub mod step_wire;
 #[cfg(feature = "trace")]
 pub mod trace;
 pub mod transports;
+#[cfg(feature = "lab")]
+pub mod usbip;
 #[cfg(feature = "simulation")]
 pub mod worker;
 

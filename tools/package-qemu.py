@@ -174,7 +174,7 @@ def rust_provenance(sim, sources, licenses, features=()):
 
 
 def package(binary, sim, output, dll_directory=None, *, development=False, linux_full=None,
-            windows_lab=False):
+            lab=False):
     binary = binary.resolve(strict=True)
     sim = sim.resolve(strict=True)
     if not binary.is_file():
@@ -192,8 +192,6 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
             raise ValueError("--dll-dir must be a directory")
     if windows and linux_full:
         raise ValueError("the full native runtime profile is Linux only")
-    if windows_lab and not windows:
-        raise ValueError("--windows-lab requires Windows executables")
     root_commit, native_commit = source_identities(development)
     output = output.absolute()
     output.mkdir(parents=True)
@@ -214,6 +212,7 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
         shutil.copy2(root_license, licenses / "LICENSE")
     shutil.copy2(ROOT / "crates/sim-host/src/native_process/LICENSE-process-wrap.txt",
                  licenses / "LICENSE-process-wrap.txt")
+    shutil.copy2(NATIVE / "LICENSES/renode-dwc2-MIT.txt", licenses / "renode-dwc2-MIT.txt")
 
     dlls, owners = [], {}
     if dll_directory is not None:
@@ -248,10 +247,17 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
         "source_submodules": "Git archives omit submodule checkouts, including ROM repositories.",
         "rust": rust_provenance(launcher, sources, licenses,
                                 ["linux-runtime"] if linux_full else
-                                ["windows-lab"] if windows_lab else []),
+                                ["windows-lab"] if lab else []),
         "development_worktree": development,
     }
-    if windows_lab or linux_full:
+    if lab or linux_full:
+        shutil.copy2(ROOT / "crates/sim-host/src/usbip/LICENSE-usbip", licenses / "LICENSE-usbip")
+        provenance["usbip_codec"] = {
+            "upstream": "https://github.com/jiegec/usbip", "version": "0.9.0",
+            "commit": "5561aa4abf372f5d3eb05c65b1474a9489b735f8",
+            "license": "MIT", "notice": "licenses/LICENSE-usbip",
+            "scope": "wire serialization and metadata; guest firmware owns USB classes",
+        }
         material = ROOT / "third_party/material/mdui"
         notices = licenses / "mdui"
         notices.mkdir()
@@ -264,8 +270,9 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
             "provenance": "licenses/mdui/PROVENANCE.json",
             "vendored_sources": "third_party/material/mdui",
         }
-    if windows_lab:
-        provenance["rust"]["scope"] = "native Windows interactive/Web Lab and ARM GDB debugging"
+    if lab:
+        provenance["rust"]["scope"] = (
+            f"native {'Windows' if windows else 'Linux'} interactive/Web Lab, USB/IP and ARM GDB debugging")
     if linux_full:
         import linux_runtime
         provenance["linux_runtime"] = linux_runtime.collect(output, **linux_full)
@@ -287,7 +294,8 @@ def main():
     parser.add_argument("--output", required=True, type=Path, help="new release directory")
     parser.add_argument("--dll-dir", type=Path, help="MSYS2 MinGW bin directory, for Windows")
     parser.add_argument("--linux-full", action="store_true", help="bundle the complete Linux native runtime")
-    parser.add_argument("--windows-lab", action="store_true", help="record the native Windows Lab feature profile")
+    parser.add_argument("--lab", "--windows-lab", dest="lab", action="store_true",
+                        help="record the native interactive/Web Lab feature profile")
     parser.add_argument("--gazebo-prefix", type=Path, default=ROOT / "build/rust-gazebo-native/install")
     parser.add_argument("--ros-prefix", type=Path, default=Path("/opt/ros/jazzy"))
     parser.add_argument("--mujoco-prefix", type=Path, default=Path("/opt/mujoco-3.12.0"))
@@ -298,7 +306,7 @@ def main():
                 mujoco_prefix=arguments.mujoco_prefix) if arguments.linux_full else None
     destination = package(arguments.qemu, arguments.sim, arguments.output, arguments.dll_dir,
                           development=arguments.development_worktree, linux_full=full,
-                          windows_lab=arguments.windows_lab)
+                          lab=arguments.lab)
     print(f"Release staged: {destination}")
 
 

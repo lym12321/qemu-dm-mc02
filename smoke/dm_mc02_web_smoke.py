@@ -144,10 +144,10 @@ class Server:
         self.port = free_gdb_port()
         self.process = self.child = None
 
-    def start(self, qemu):
+    def start(self, qemu, extra=()):
         self.process = subprocess.Popen(
             [str(self.executable), "lab", "web", "--port", str(self.port),
-             "--qemu", str(qemu), "--startup-timeout", "10", "--timeout", "45"],
+             "--qemu", str(qemu), "--startup-timeout", "10", "--timeout", "45", *extra],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             start_new_session=True)
         self.child = ChildProcess("Web Lab CLI", self.process)

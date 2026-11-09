@@ -27,6 +27,7 @@ Windows 产品提供固件终端、交互/Web Lab 与原生 ARM GDB 调试；场
 | --- | --- |
 | `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端、交互/Web Lab 与原生 ARM GDB 调试 |
 | `dm-mc02-linux-firmware-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，轻量固件入口 |
+| `dm-mc02-linux-lab-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，固件、交互/Web Lab、USB/IP 与 GDB，使用系统原生库 |
 | `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，完整场景、Lab/Web、worker、MuJoCo/Gazebo/ROS 2 |
 
 Linux Artifact 外层解开后，使用 `tar -xzf` 解开内层 tar.gz；它保留可执行权限和插件符号链接。
@@ -846,9 +847,63 @@ LED 明示 WS2812 DMA 波形或 GPIO latch 近似，ADC 输入值不是固件的
 UART 时间是轮询样本，CAN 保留 wire 时间；页面刷新不驱动仿真，也不建立全局锁步。
 服务端历史最多保留 4096 条或 1 MiB，页面最多显示 600 条或 256 KiB，省略均可见。
 
-板卡图为原创逻辑示意。当前快照未公开的 IMU、Flash、蜂鸣器和 USB 等内部状态没有网页读数。
+板卡图为原创逻辑示意。当前快照未公开的 IMU、Flash、蜂鸣器等内部状态没有网页读数。
+USB 卡片显示独立的固件枚举和本机连接状态，使用方式见下节。
 当前固件若依赖 IMU 或电机环境，仍需使用已验证的对应 worker 入口；此板卡实验台尚未接入
 物理场景。源码断点与变量继续使用原生 GDB/VS Code；启用 `--gdb-port` 后网页显示连接地址。
+
+<a id="usb-host"></a>
+
+### 将固件 USB 连接到本机
+
+使用带 Lab 的新运行包并启用 USB/IP：
+
+```powershell
+.\sim.exe lab web --elf .\trobot.elf --usbip
+```
+
+Linux 使用 `./sim lab web --elf ./trobot.elf --usbip`。加载、运行固件后，USB 卡片从
+“正在枚举”变为“可连接”；点击“连接本机”，系统即可枚举固件提供的设备。trobot 的
+`0483:5741` 包含 CDC 串口和 WinUSB 接口，串口工具及现有 trobot 主机工具可连接它。
+描述符、BOS、Microsoft OS 2.0 描述符和数据来自正在运行的固件。
+
+Windows 先安装官方签名的 [usbip-win2 v.0.9.8.1 x64](https://github.com/vadimgrn/usbip-win2/releases/download/v.0.9.8.1/USBip-0.9.8.1-x64.exe)，
+安装驱动需要管理员权限。安装包 SHA256 为
+`38cad6d4432b52d5bb9409d9ad03b72fdffc4ada4cd3a48fbeca1a2752a8518a`。
+安装完成后重新打开终端，确保 `usbip.exe` 在 PATH；Lab 的连接/断开调用该工具。
+当前 Windows 包已交叉构建，真实 Windows 的 COM/WinUSB、Lab/GDB 和清理验收尚未完成。
+Linux 已通过真实内核枚举、串口打开/写入及未修改 trobot 主机工具的调试和日志请求。
+普通测试固件没有主动发送 CDC 数据，因此串口读取方向尚未验收。
+
+Linux 先安装系统 `usbip`（Ubuntu 通常由对应内核版本的 `linux-tools` 提供），执行
+`sudo modprobe vhci_hcd` 和 `sudo -v`。Lab 使用 `sudo -n usbip`，不会在网页等待密码；
+权限过期时重新执行 `sudo -v`，再连接。Linux Lab 包使用宿主 GLib、zlib、zstd、libusb、
+libdw、libudev、libnuma、curl 和音频库；完整 Linux 包的原生物理 SDK 是另一种分发范围。
+
+trobot 若通过开机按键进入 Debug，需在固件启动的前 100 ms 保持 USER 按下。
+控制台可以先停在复位处，再输入按键、运行和 USB 连接命令：
+
+```text
+sim lab interactive --elf trobot.elf --usbip --gdb-port 1234 --paused
+key press
+cont
+usb state
+usb attach
+usb state
+key release
+usb detach
+quit
+```
+
+在状态变为 `available` 后执行 `usb attach`。网页也可以先聚焦“运行”，再用鼠标按住
+USER 并按 Enter 启动，待启动后松开 USER。“断开”、停止会话或退出 Lab 会卸载本次
+连接所记录的端口；外部手动连接的端口由调用者负责卸载。若清理失败，Lab 报错并保留原因。
+
+USB/IP 默认仅监听 `127.0.0.1:3240`，可用 `--usbip 127.0.0.1:33240` 改端口。
+不加该选项时不开启导出。当前为全速、PIO、control/bulk/interrupt 数据路径，最多
+64 个待处理请求、单请求 1 MiB、合计 8 MiB；不支持高速、ISO、USB DMA、PHY 电气时序
+或该设备数据路径的 migration。固件未初始化 USB、主动软断连或停在 GDB 断点时，
+系统枚举/传输会等待或超时；加载成功不代表 USB 或应用已经就绪。
 
 开发验证可安装测试专用 Chromium：
 

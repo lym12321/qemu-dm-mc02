@@ -89,6 +89,13 @@
             </section>
           </mdui-card>
         </div>
+        <mdui-card variant="outlined">
+          <section class="card-content stack" aria-label="USB 连接">
+            <div class="section-heading"><h2>USB</h2><mdui-chip id="usb-status">未启用</mdui-chip></div>
+            <div class="toolbar"><span id="usb-message" class="secondary-text">使用 --usbip 启动实验台以连接本机。</span><mdui-button id="usb-attach" variant="tonal" disabled>连接本机</mdui-button><mdui-button id="usb-detach" variant="outlined" disabled>断开</mdui-button></div>
+            <small>Windows 先安装 usbip-win2；Linux 先加载 vhci_hcd，连接需要 sudo 权限。</small>
+          </section>
+        </mdui-card>
         <mdui-card variant="outlined" class="channels">
           <section class="channel-controls" aria-label="通道输入">
             <mdui-tabs id="channel-tabs" value="uart" full-width>

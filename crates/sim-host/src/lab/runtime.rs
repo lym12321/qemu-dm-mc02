@@ -47,6 +47,7 @@ pub struct LabOptions {
     pub uarts: Vec<String>,
     pub cans: Vec<String>,
     pub adc: bool,
+    pub usbip: Option<std::net::SocketAddr>,
     pub startup_timeout: Duration,
     pub timeout: Duration,
     pub qmp_path: Option<PathBuf>,
@@ -61,6 +62,7 @@ impl LabOptions {
             uarts: vec!["uart1".into()],
             cans: vec![],
             adc: false,
+            usbip: None,
             startup_timeout: Duration::from_secs(10),
             timeout: Duration::from_secs(30),
             qmp_path: None,
@@ -145,6 +147,7 @@ pub struct ConnectedLab<'a> {
     startup: bool,
     cancellation: Option<Arc<AtomicBool>>,
     last_adc_ns: u64,
+    usb: Option<crate::usbip::Exporter<'a, NativeStream>>,
 }
 impl ConnectedLab<'_> {
     fn deadline(&self) -> Instant {
@@ -164,7 +167,11 @@ impl ConnectedLab<'_> {
         }
         self.owner
             .check_with_deadline(self.deadline())
-            .map_err(|error| error as Failure)
+            .map_err(|error| error as Failure)?;
+        if let Some(usb) = &mut self.usb {
+            usb.service().map_err(lower)?;
+        }
+        Ok(())
     }
     pub fn remaining(&mut self) -> Result<Duration> {
         self.check()?;
@@ -187,6 +194,28 @@ impl ConnectedLab<'_> {
             .map_err(|error| error as Failure)?;
         self.check()?;
         Ok(value)
+    }
+    pub fn attach_usb(&mut self) -> Result<()> {
+        self.check()?;
+        self.usb
+            .as_mut()
+            .ok_or_else(|| admission("USB/IP is disabled; start Lab with --usbip"))?
+            .attach()
+            .map_err(|e| admission(e.to_string()))
+    }
+    pub fn detach_usb(&mut self) -> Result<()> {
+        self.check()?;
+        self.usb
+            .as_mut()
+            .ok_or_else(|| admission("USB/IP is disabled"))?
+            .detach()
+            .map_err(|e| admission(e.to_string()))
+    }
+    pub fn usb_status(&self) -> Value {
+        self.usb
+            .as_ref()
+            .map(|usb| usb.status())
+            .unwrap_or_else(|| json!({"state":"disabled"}))
     }
     pub fn snapshot(&mut self) -> Result<Value> {
         let value = self.command(commands::qom_get {
@@ -346,12 +375,18 @@ pub fn with_lab<T>(
     consumer: impl FnOnce(&mut ConnectedLab<'_>) -> Result<T>,
 ) -> std::result::Result<T, LabError> {
     let (firmware, qemu) = options.admit()?;
+    let usb_listener = options
+        .usbip
+        .map(crate::usbip::listen)
+        .transpose()
+        .map_err(|e| LabError::from(lower(e)))?;
     let streams: Vec<_> = options
         .uarts
         .iter()
         .chain(&options.cans)
         .cloned()
         .chain(options.adc.then_some("cosim".into()))
+        .chain(options.usbip.map(|_| "usb".into()))
         .collect();
     let argv = launch::native_qemu_command(
         &qemu,
@@ -386,6 +421,8 @@ pub fn with_lab<T>(
     let mut uarts = Vec::new();
     let mut cans = Vec::new();
     let mut cosim = None;
+    let mut usb_stream = None;
+    let mut notes = Vec::new();
     let execution = (|| -> Result<T> {
         owner
             .check_with_deadline(startup_deadline.min(host_deadline))
@@ -433,7 +470,9 @@ pub fn with_lab<T>(
                 .map_err(lower)?;
             #[cfg(windows)]
             let stream = owner.take_stream(name).map_err(|error| error as Failure)?;
-            if name == "cosim" {
+            if name == "usb" {
+                usb_stream = Some(StreamTransport::new(stream, 128).map_err(|e| e as Failure)?);
+            } else if name == "cosim" {
                 cosim = Some(StreamTransport::new(stream, 256).map_err(|error| error as Failure)?);
             } else if options.cans.contains(name) {
                 cans.push((
@@ -468,6 +507,10 @@ pub fn with_lab<T>(
             startup: true,
             cancellation: options.cancellation.clone(),
             last_adc_ns: 0,
+            usb: usb_stream
+                .as_mut()
+                .zip(usb_listener)
+                .map(|(stream, listener)| crate::usbip::Exporter::new(stream, listener)),
         };
         while !lab
             .channels
@@ -484,15 +527,34 @@ pub fn with_lab<T>(
             .map_err(|error| error as Failure)?;
         lab.last_adc_ns = stamp;
         lab.startup = false;
-        let result = consumer(&mut lab)?;
-        lab.check()?;
-        Ok(result)
+        let result = consumer(&mut lab).and_then(|value| {
+            lab.check()?;
+            Ok(value)
+        });
+        // USB importer commands have their own cleanup deadlines. End the
+        // native active budget before waiting for OS detach.
+        let active = lab.owner.begin_cleanup().map_err(|error| error as Failure);
+        let result = result.and_then(|value| active.map(|()| value));
+        let closed = lab
+            .usb
+            .as_mut()
+            .map(|usb| usb.close())
+            .transpose()
+            .map_err(lower);
+        match (result, closed) {
+            (Err(primary), Err(cleanup)) => {
+                notes.push(format!("USB importer cleanup: {cleanup}"));
+                Err(primary)
+            }
+            (Err(primary), _) => Err(primary),
+            (_, Err(cleanup)) => Err(cleanup),
+            (Ok(value), _) => Ok(value),
+        }
     })();
     let (value, mut primary) = match execution {
         Ok(value) => (Some(value), None),
         Err(error) => (None, Some(error)),
     };
-    let mut notes = Vec::new();
     if let Err(error) = owner.begin_cleanup() {
         cleanup_error(&mut primary, &mut notes, "Lab final active check", error);
     }
@@ -503,6 +565,7 @@ pub fn with_lab<T>(
         }
     }
     drop(qmp);
+    drop(usb_stream);
     drop(cosim);
     drop(cans);
     drop(uarts);

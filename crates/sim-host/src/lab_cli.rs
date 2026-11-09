@@ -45,6 +45,9 @@ struct WebOptions {
     qmp: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     gdb_port: Option<u16>,
+    /// Export the guest USB device over loopback USB/IP (default 127.0.0.1:3240).
+    #[arg(long, num_args=0..=1, default_missing_value="127.0.0.1:3240")]
+    usbip: Option<std::net::SocketAddr>,
 }
 #[derive(Args)]
 struct InteractiveOptions {
@@ -67,6 +70,9 @@ struct InteractiveOptions {
     qmp: Option<PathBuf>,
     #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
     gdb_port: Option<u16>,
+    /// Export the guest USB device over loopback USB/IP (default 127.0.0.1:3240).
+    #[arg(long, num_args=0..=1, default_missing_value="127.0.0.1:3240")]
+    usbip: Option<std::net::SocketAddr>,
     /// Start paused for native GDB (requires --gdb-port).
     #[arg(long, requires = "gdb_port")]
     paused: bool,
@@ -89,6 +95,7 @@ pub fn run(options: Options) -> Result<i32, LaunchError> {
                     startup_timeout: args.startup_timeout,
                     qmp_path: args.qmp,
                     gdb_port: args.gdb_port,
+                    usbip: args.usbip,
                 },
                 args.port,
                 signals.cancelled.clone(),
@@ -115,6 +122,7 @@ fn interactive(args: InteractiveOptions) -> Result<i32, LaunchError> {
     }
     options.cans = args.cans;
     options.adc = args.adc;
+    options.usbip = args.usbip;
     options.qemu = args.qemu;
     options.timeout = args.timeout;
     options.startup_timeout = args.startup_timeout;

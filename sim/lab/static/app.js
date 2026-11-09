@@ -159,6 +159,9 @@
     $("stop-button").disabled = !connected || !["starting", "paused", "running"].includes(state.status);
     $("restart-button").disabled = !connected || uploading || !state.firmware || transitioning || lifecyclePending;
     for (const id of ["key-button", "vin-send", "gpio-send", "uart-send", "can-send"]) $(id).disabled = !connected || !active;
+    const usb = state.usb || {state:"disabled"};
+    $("usb-attach").disabled = !connected || !active || usb.state !== "available" || usb.importer_busy;
+    $("usb-detach").disabled = !connected || !active || usb.local_port == null || usb.importer_busy;
     $("adc-send").disabled = !connected || state.status !== "running";
     $("adc-hint").textContent = state.status === "paused" ? "输入刺激，非传感器读数 · 请先运行再发送" : "输入刺激，非传感器读数 · 仅运行时可发送";
   }
@@ -194,6 +197,9 @@
     $("firmware-name").textContent = value.firmware?.name || "尚未选择固件";
     $("firmware-hint").textContent = uploading ? "正在上传…" : "上传后加载，初始停在复位处 · 最大 64 MiB";
     $("remaining-time").textContent = typeof value.remaining_seconds === "number" ? `${Math.max(0, Math.ceil(value.remaining_seconds))} s` : "—";
+    const usb = value.usb || {state:"disabled"};
+    $("usb-status").textContent = ({disabled:"未启用",disconnected:"未连接",enumerating:"正在枚举",available:"可连接",attached:"已连接"})[usb.state] || usb.state;
+    $("usb-message").textContent = usb.message || "使用 --usbip 启动实验台以连接本机。";
     $("gdb-address").textContent = value.gdb_port ? `GDB 127.0.0.1:${value.gdb_port}` : "GDB 未启用";
     $("observation-status").textContent = !value.board ? "等待板卡快照" : value.observation_stale ? "最后快照 · 已过期" : "原生快照";
     $("observation-status").dataset.stale = String(Boolean(value.observation_stale));
@@ -349,6 +355,8 @@
     }
     selectPin("B0");
     for (const button of document.querySelectorAll("[data-action]")) button.addEventListener("click", () => send(button.dataset.action));
+    $("usb-attach").addEventListener("click", () => send("usb_attach"));
+    $("usb-detach").addEventListener("click", () => send("usb_detach"));
     $("upload-button").addEventListener("click", () => $("firmware-input").click());
     $("gpio-pin").addEventListener("change", () => selectPin($("gpio-pin").value));
     $("key-button").addEventListener("pointerdown", pressKey);

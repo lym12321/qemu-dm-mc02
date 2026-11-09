@@ -71,6 +71,7 @@ pub struct SessionOptions {
     pub startup_timeout: Duration,
     pub qmp_path: Option<PathBuf>,
     pub gdb_port: Option<u16>,
+    pub usbip: Option<std::net::SocketAddr>,
 }
 impl Default for SessionOptions {
     fn default() -> Self {
@@ -81,6 +82,7 @@ impl Default for SessionOptions {
             startup_timeout: Duration::from_secs(10),
             qmp_path: None,
             gdb_port: None,
+            usbip: None,
         }
     }
 }
@@ -121,6 +123,7 @@ impl SessionOptions {
                 .map(|name| (*name).into())
                 .collect(),
             adc: true,
+            usbip: self.usbip,
             startup_timeout: self.startup_timeout,
             timeout: self.timeout,
             qmp_path: self.qmp_path.clone(),
@@ -135,6 +138,8 @@ enum Action {
     Load,
     Run,
     Pause,
+    UsbAttach,
+    UsbDetach,
     Vin(u32),
     Input(LabInput),
 }
@@ -165,6 +170,14 @@ fn admit_action(action: &str, args: &Value) -> Result<Action> {
                 "load" => Action::Load,
                 "run" => Action::Run,
                 _ => Action::Pause,
+            }
+        }
+        "usb_attach" | "usb_detach" => {
+            fields(args, &[])?;
+            if action == "usb_attach" {
+                Action::UsbAttach
+            } else {
+                Action::UsbDetach
             }
         }
         "key" => {
@@ -676,6 +689,7 @@ fn observe(
     state.value["board"] = board;
     state.value["pins"] = pins;
     state.value["remaining_seconds"] = json!(remaining);
+    state.value["usb"] = lab.usb_status();
     state.value["observation_stale"] = false.into();
     Ok(())
 }
@@ -729,6 +743,8 @@ fn run_session(
                     )) as Failure),
                     Action::Run => lab.resume(),
                     Action::Pause => lab.pause(),
+                    Action::UsbAttach => lab.attach_usb(),
+                    Action::UsbDetach => lab.detach_usb(),
                     Action::Vin(value) => lab.set_vin(value),
                     Action::Input(input) => {
                         let pressed = if let LabInput::Key(value) = &input {
@@ -749,6 +765,7 @@ fn run_session(
                     }
                     Err(error) => {
                         let retryable = error.downcast_ref::<AdcPausedError>().is_some()
+                            || matches!(error.downcast_ref::<Error>(), Some(Error::Admission(_)))
                             || matches!(
                                 error.downcast_ref::<crate::Error>(),
                                 Some(crate::Error::Capacity(_))
@@ -781,6 +798,8 @@ fn run_session(
             state.value["status"] = "stopped".into();
             state.value["observation_stale"] = true.into();
             state.value["remaining_seconds"] = Value::Null;
+            state.value["usb"] =
+                json!({"state": if options.usbip.is_some() { "disconnected" } else { "disabled" }});
             Ok(json!({"accepted":true}))
         }
         Err(LabError { primary, notes }) => {

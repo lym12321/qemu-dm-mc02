@@ -77,6 +77,7 @@ fn native_options(qmp: &Path, firmware: &str) -> SessionOptions {
         timeout: Duration::from_secs(10),
         qmp_path: Some(qmp.to_owned()),
         gdb_port: None,
+        usbip: None,
     }
 }
 fn identity(qmp: &Path) -> (u32, PathBuf) {

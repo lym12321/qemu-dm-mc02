@@ -16,6 +16,7 @@ QEMU、MuJoCo、Gazebo 与 ROS 2 继续使用各自的原生实现。
 | [共享世界与异构驱动器](examples/shared-world/) | 单一 MuJoCo World、M3508 和独立 joint driver |
 | [HAL 教学](docs/USAGE.md#hal-teaching) | 固定 HAL/CMSIS 的独立工程 |
 | [Web Lab](docs/USAGE.md#web-lab) | `sim lab web` 本地网页实验台 |
+| [USB 连接本机](docs/USAGE.md#usb-host) | `sim lab web --usbip`，固件 CDC/WinUSB 通过 USB/IP 接入本机 |
 
 ## 下载并运行
 
@@ -27,6 +28,7 @@ QEMU、MuJoCo、Gazebo 与 ROS 2 继续使用各自的原生实现。
 | --- | --- |
 | `dm-mc02-windows-x86_64` | Windows x86_64 ZIP，固件终端、交互/Web Lab 与原生 GDB 调试 |
 | `dm-mc02-linux-firmware-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，轻量固件入口 |
+| `dm-mc02-linux-lab-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，固件、交互/Web Lab、USB/IP 与 GDB，使用系统原生库 |
 | `dm-mc02-linux-x86_64` | Ubuntu 24.04+ x86_64 tar.gz，场景、Lab/Web、worker、MuJoCo/Gazebo/ROS 2 |
 
 Linux 下载后解开 Artifact 外层，再用 `tar -xzf` 解开其中的 tar.gz，保留执行权限和插件符号链接。

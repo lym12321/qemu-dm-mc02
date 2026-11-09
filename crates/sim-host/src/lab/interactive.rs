@@ -8,7 +8,7 @@ use super::{
 use sim_core::{Error, Failure, Result};
 use std::{io::Write, sync::Arc, time::Duration};
 
-pub const HELP: &str = "Commands:\n  help | state | pause | cont | quit\n  key press|release\n  gpio A0 0|1\n  vin MILLIVOLTS\n  uart uart1 TEXT\n  can can1 ID FLAGS DLC HEX\n  adc chN raw|voltage_uv VALUE\nUART text uses UTF-8; quotes group spaces. No shell expansion or reset command.\n";
+pub const HELP: &str = "Commands:\n  help | state | pause | cont | quit\n  usb state|attach|detach\n  key press|release\n  gpio A0 0|1\n  vin MILLIVOLTS\n  uart uart1 TEXT\n  can can1 ID FLAGS DLC HEX\n  adc chN raw|voltage_uv VALUE\nUART text uses UTF-8; quotes group spaces. No shell expansion or reset command.\n";
 
 fn io(error: impl std::error::Error + Send + Sync + 'static) -> Failure {
     Arc::new(error)
@@ -87,6 +87,7 @@ pub fn run_interactive(
             lab.resume()?;
         }
         write(output, HELP)?;
+        write(output, &format!("USB {}\n", lab.usb_status()))?;
         let mut lines = Lines::default();
         let mut commands = 0;
         let mut batches = 0;
@@ -127,6 +128,20 @@ pub fn run_interactive(
                 }
                 Command::Help => write(output, HELP)?,
                 Command::State => write(output, &(lab.snapshot()?.to_string() + "\n"))?,
+                Command::UsbState => write(output, &(lab.usb_status().to_string() + "\n"))?,
+                Command::UsbAttach | Command::UsbDetach => {
+                    let result = if matches!(command, Command::UsbAttach) {
+                        lab.attach_usb()
+                    } else {
+                        lab.detach_usb()
+                    };
+                    if let Err(error) = result {
+                        if !matches!(error.downcast_ref::<Error>(), Some(Error::Admission(_))) {
+                            return Err(error);
+                        }
+                        write(output, &format!("error: {error}\n"))?;
+                    }
+                }
                 Command::Pause => lab.pause()?,
                 Command::Continue => lab.resume()?,
                 Command::Vin(value) => lab.set_vin(value)?,
