@@ -915,7 +915,7 @@ static void test_host_port_reset_reaches_dwc2_bus_reset(void)
                                 DM_USB_DWC2_DXEPCTL_STALL;
 
     dm_usb_control_init(&test.control, NULL, NULL, 64);
-    dm_usb_dwc2_init(&test.device, &test.control, NULL, NULL, 64);
+    dm_usb_dwc2_init(&test.device, &test.control, NULL, NULL, 64, 16);
     dm_stm32h7_otg_host_init(&test.host, test_dwc2_bus_reset, &test,
                               NULL, NULL);
     test.control.address = 19;

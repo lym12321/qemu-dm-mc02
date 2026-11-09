@@ -34,7 +34,7 @@ static void fixture_init(Dwc2VmstateFixture *fixture)
     memset(fixture, 0, sizeof(*fixture));
     dm_usb_control_init(&fixture->control, NULL, fixture, 4);
     dm_usb_dwc2_init(&fixture->device, &fixture->control, fixture_irq,
-                     fixture, 4);
+                     fixture, 4, 16);
 }
 
 static uint32_t endpoint_offset(uint32_t base, unsigned endpoint)

@@ -168,11 +168,18 @@ bool dm_usb_dwc2_state_valid(const DmUsbDwc2Device *state)
     return true;
 }
 
+/* The historical component format describes only the synthetic fixture.
+ * Guest PIO queues and an attached external host cannot be migrated. */
+static int fixture_only(void *opaque)
+{
+    return ((DmUsbDwc2Device *)opaque)->control ? 0 : -ENOTSUP;
+}
+
 static int dm_usb_dwc2_post_load(void *opaque, int version_id)
 {
     DmUsbDwc2Device *state = opaque;
 
-    if (version_id != 1 || !dm_usb_dwc2_state_valid(state)) {
+    if (fixture_only(state) || version_id != 1 || !dm_usb_dwc2_state_valid(state)) {
         return -EINVAL;
     }
 
@@ -215,6 +222,8 @@ const VMStateDescription vmstate_dm_usb_dwc2_raw = {
     .name = "dm-usb-dwc2-device-raw",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = fixture_only,
+    .pre_load = fixture_only,
     .fields = vmstate_dm_usb_dwc2_fields,
 };
 
@@ -223,6 +232,8 @@ static const VMStateDescription vmstate_dm_usb_dwc2 = {
     .version_id = 1,
     .minimum_version_id = 1,
     .post_load = dm_usb_dwc2_post_load,
+    .pre_save = fixture_only,
+    .pre_load = fixture_only,
     .fields = vmstate_dm_usb_dwc2_fields,
 };
 

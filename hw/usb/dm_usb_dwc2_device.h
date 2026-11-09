@@ -17,11 +17,13 @@
 
 #define DM_USB_DWC2_GAHBCFG 0x008
 #define DM_USB_DWC2_GRSTCTL 0x010
+#define DM_USB_DWC2_GRXSTSR 0x01c
+#define DM_USB_DWC2_GRXSTSP 0x020
 #define DM_USB_DWC2_GINTSTS 0x014
 #define DM_USB_DWC2_GINTMSK 0x018
 #define DM_USB_DWC2_GRXFSIZ 0x024
 #define DM_USB_DWC2_GNPTXFSIZ 0x028
-#define DM_USB_DWC2_DIEPTXF0 0x100
+#define DM_USB_DWC2_DIEPTXF1 0x104
 #define DM_USB_DWC2_DIEPTXF_STRIDE 0x4
 #define DM_USB_DWC2_GSNPSID 0x040
 #define DM_USB_DWC2_DCFG 0x800
@@ -64,6 +66,8 @@
 #define DM_USB_DXEPTSIZ_XFERSIZE_MASK 0x7ffffu
 #define DM_USB_DXEPTSIZ_PKTCNT_SHIFT 19
 
+typedef void DmUsbDwc2Notify(void *opaque);
+
 typedef void DmUsbDwc2Irq(void *opaque, bool level);
 
 typedef struct DmUsbDwc2Endpoint {
@@ -89,6 +93,15 @@ typedef struct DmUsbDwc2Device {
     DmUsbDwc2Irq *irq;
     void *irq_opaque;
     uint16_t ep0_max_packet_size;
+    unsigned endpoint_count; /* Destination-owned synthesized profile. */
+    /* Guest PIO RX status/data queue. Non-NULL control is test-fixture only. */
+    DmUsbDwc2Notify *notify;
+    void *notify_opaque;
+    uint32_t rx_status[64];
+    size_t rx_status_head, rx_status_count;
+    uint8_t rx_data[DM_USB_DWC2_FIFO_BYTES];
+    size_t rx_head, rx_count;
+    uint32_t global[64];
     uint32_t gahbcfg;
     uint32_t grstctl;
     uint32_t gintsts;
@@ -111,8 +124,13 @@ typedef struct DmUsbDwc2Device {
 void dm_usb_dwc2_init(DmUsbDwc2Device *device,
                       DmUsbControlDevice *control,
                       DmUsbDwc2Irq *irq, void *irq_opaque,
-                      uint16_t ep0_max_packet_size);
+                      uint16_t ep0_max_packet_size, unsigned endpoint_count);
 void dm_usb_dwc2_reset(DmUsbDwc2Device *device);
+void dm_usb_dwc2_set_notify(DmUsbDwc2Device *device,
+                             DmUsbDwc2Notify *notify, void *opaque);
+bool dm_usb_dwc2_connected(const DmUsbDwc2Device *device);
+uint16_t dm_usb_dwc2_max_packet(const DmUsbDwc2Device *device,
+                                unsigned endpoint, bool in);
 void dm_usb_dwc2_bus_reset(DmUsbDwc2Device *device, uint64_t timestamp_ns);
 
 DmUsbTransactionResult dm_usb_dwc2_submit(

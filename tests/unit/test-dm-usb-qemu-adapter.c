@@ -388,7 +388,7 @@ static void fixture_init_with_lower(AdapterFixture *fixture, bool use_dwc2)
 
     dm_usb_control_init(&fixture->control, &control_ops, fixture, 64);
     if (use_dwc2) {
-        dm_usb_dwc2_init(&fixture->dwc2, &fixture->control, NULL, NULL, 64);
+        dm_usb_dwc2_init(&fixture->dwc2, &fixture->control, NULL, NULL, 64, 16);
     } else {
         dm_usb_transaction_init(&fixture->target, &fixture->control,
                                 &transaction_ops, fixture, 64);

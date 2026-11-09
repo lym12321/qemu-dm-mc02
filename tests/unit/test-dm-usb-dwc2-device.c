@@ -68,7 +68,7 @@ static void test_init(TestDwc2 *test, uint16_t max_packet_size)
     dm_usb_control_init(&test->control, &control_ops, test,
                         max_packet_size);
     dm_usb_dwc2_init(&test->device, &test->control, test_irq, test,
-                     max_packet_size);
+                     max_packet_size, 16);
     dm_usb_host_init(&test->host, test_host_submit, test, max_packet_size);
 }
 
@@ -439,9 +439,107 @@ static void test_bus_reset(void)
     g_assert_cmpint(result.status, ==, DM_USB_TRANSACTION_NAK);
 }
 
+/* RM0468 Rev3 62.14: device RX statuses 6/4 and 2/3, EP0 MPS
+ * encodings, DIEPCTL.TXFNUM, TXFE level and 4 KiB shared FIFO geometry. */
+static void test_guest_pio(void)
+{
+    DmUsbDwc2Device d;
+    uint8_t setup[] = {0x80, 6, 0, 1, 0, 0, 18, 0}, data[4];
+    DmUsbTransaction t = {.token = DM_USB_TRANSACTION_SETUP,
+        .out_data = setup, .length = 8};
+    dm_usb_dwc2_init(&d, NULL, NULL, NULL, 64, 16);
+    g_assert_false(dm_usb_dwc2_connected(&d));
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DCTL, 0, 4);
+    g_assert_true(dm_usb_dwc2_connected(&d));
+    /* Global IRQ masking must not physically disconnect the device. */
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GAHBCFG, 0, 4);
+    g_assert_true(dm_usb_dwc2_connected(&d));
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GRXFSIZ, 256, 4);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GNPTXFSIZ, (16u << 16) | 256, 4);
+    for (unsigned i = 0; i < DM_USB_DWC2_DIEPTXF_COUNT; i++) {
+        dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPTXF1 + 4*i, 0, 4);
+    }
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DOEPTSIZ0, (1u << 29) | (1u << 19) | 8, 4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d, &t).status, ==, DM_USB_TRANSACTION_ACCEPTED);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_GRXSTSR, 4), ==, (6u << 17) | (8u << 4));
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_GRXSTSP, 4), ==, (6u << 17) | (8u << 4));
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_FIFO0, 4), ==, 0x01000680);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_FIFO0, 4), ==, 0x00120000);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_GRXSTSP, 4), ==, 4u << 17);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_DOEPINT0, 4), ==, DM_USB_DXEPINT_STUP);
+    g_assert_cmpuint(dm_usb_dwc2_max_packet(&d, 0, true), ==, 64);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPTSIZ0, (1u << 19) | 4, 4);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPCTL0, DM_USB_DWC2_DXEPCTL_EPENA, 4);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_DTXFSTS0, 4), ==, 16);
+    g_assert_true(dm_usb_dwc2_read(&d, DM_USB_DWC2_DIEPINT0, 4) & 128);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_FIFO0, 0x78563412, 4);
+    t = (DmUsbTransaction){.token = DM_USB_TRANSACTION_IN, .in_data = data, .capacity = 4};
+    g_assert_cmpint(dm_usb_dwc2_submit(&d, &t).status, ==, DM_USB_TRANSACTION_ACCEPTED);
+    g_assert_cmpmem(data, 4, "\x12\x34\x56\x78", 4);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_DIEPINT0, 4), ==, 1);
+    /* A wrongly overlapping or out-of-RAM partition offers no capacity. */
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPTXF1, (32u << 16) | 256, 4);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_DTXFSTS0, 4), ==, 0);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPCTL0 + 32, 1u << 22, 4);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_DIEPTXF1, (32u << 16) | 1000, 4);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_DTXFSTS0 + 32, 4), ==, 0);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GRSTCTL, 1u << 4, 4);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_GRXSTSP, 4), ==, 0);
+    dm_usb_dwc2_bus_reset(&d, 0);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d, DM_USB_DWC2_GINTSTS, 4), ==, (1u << 12) | (1u << 13));
+}
+
+static void test_guest_short_and_halt(void)
+{
+    DmUsbDwc2Device d;
+    uint8_t bytes[] = {1, 2, 3}, received[8];
+    DmUsbTransaction out = {.token=DM_USB_TRANSACTION_OUT, .endpoint=1,
+        .out_data=bytes, .length=3};
+    DmUsbTransaction in = {.token=DM_USB_TRANSACTION_IN, .endpoint=1,
+        .in_data=received, .capacity=8};
+    dm_usb_dwc2_init(&d, NULL, NULL, NULL, 64, 9);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GRXFSIZ, 32, 4);
+    dm_usb_dwc2_write(&d, DM_USB_DWC2_GNPTXFSIZ, (16u<<16)|32, 4);
+    for (unsigned i=0; i<15; i++) {dm_usb_dwc2_write(&d, 0x104+4*i, 0, 4);}
+    dm_usb_dwc2_write(&d, 0x108, (16u<<16)|48, 4);
+    dm_usb_dwc2_write(&d, 0xb30, (2u<<19)|16, 4);
+    dm_usb_dwc2_write(&d, 0xb20, (1u<<31)|(1u<<26)|(1u<<15)|8, 4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&out).status, ==, DM_USB_TRANSACTION_ACCEPTED);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d,0xb28,4), ==, 0);
+    g_assert_cmphex(dm_usb_dwc2_read(&d,0x20,4), ==, (2u<<17)|(3u<<4)|1);
+    g_assert_cmphex(dm_usb_dwc2_read(&d,0x1000,4), ==, 0x030201);
+    g_assert_cmphex(dm_usb_dwc2_read(&d,0x20,4), ==, (3u<<17)|1);
+    g_assert_cmphex(dm_usb_dwc2_read(&d,0xb28,4), ==, 1);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d,0xb30,4)&0x7ffff, ==, 13);
+    dm_usb_dwc2_write(&d,0xb20,(1u<<21)|8,4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&out).status, ==, DM_USB_TRANSACTION_STALL);
+    dm_usb_dwc2_write(&d,0xb30,(1u<<19)|8,4);
+    dm_usb_dwc2_write(&d,0xb20,(1u<<31)|(1u<<27)|(1u<<15)|8,4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&out).status, ==, DM_USB_TRANSACTION_NAK);
+    dm_usb_dwc2_write(&d,0xb20,(1u<<31)|(1u<<26)|(1u<<15)|8,4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&out).status, ==, DM_USB_TRANSACTION_ACCEPTED);
+    /* EP1 consumes FIFO2, including packed last-word padding and a ZLP. */
+    dm_usb_dwc2_write(&d,0x930,(1u<<19)|7,4);
+    dm_usb_dwc2_write(&d,0x920,(1u<<31)|(1u<<26)|(1u<<15)|(2u<<22)|8,4);
+    dm_usb_dwc2_write(&d,0x3000,0x64636261,4);
+    dm_usb_dwc2_write(&d,0x3000,0x00676665,4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&in).status, ==, DM_USB_TRANSACTION_ACCEPTED);
+    g_assert_cmpmem(received,7,"abcdefg",7);
+    g_assert_cmpuint(dm_usb_dwc2_read(&d,0x938,4), ==, 16);
+    dm_usb_dwc2_write(&d,0x930,1u<<19,4);
+    dm_usb_dwc2_write(&d,0x920,(1u<<31)|(1u<<26)|(1u<<15)|(2u<<22)|8,4);
+    g_assert_cmpuint(dm_usb_dwc2_submit(&d,&in).actual_length, ==, 0);
+    dm_usb_dwc2_write(&d,0x930,(1u<<19)|4,4);
+    dm_usb_dwc2_write(&d,0x920,(1u<<31)|(1u<<26)|(1u<<15)|(2u<<22)|8,4);
+    dm_usb_dwc2_write(&d,0x3000,0xdeadbeef,4);
+    dm_usb_dwc2_write(&d,0x10,(1u<<5)|(2u<<6),4);
+    g_assert_cmpint(dm_usb_dwc2_submit(&d,&in).status, ==, DM_USB_TRANSACTION_NAK);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-usb/dwc2/guest-pio", test_guest_pio);
     g_test_add_func("/dm-usb/dwc2/reset-defaults",
                     test_reset_register_defaults);
     g_test_add_func("/dm-usb/dwc2/endpoint-fifo-count-query",
@@ -455,5 +553,6 @@ int main(int argc, char **argv)
     g_test_add_func("/dm-usb/dwc2/mask-w1c-reset",
                     test_interrupt_mask_w1c_and_reset_deassert);
     g_test_add_func("/dm-usb/dwc2/bus-reset", test_bus_reset);
+    g_test_add_func("/dm-usb/dwc2/guest-short-halt-fifo",test_guest_short_and_halt);
     return g_test_run();
 }

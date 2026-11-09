@@ -241,6 +241,47 @@ static void test_invalid_arguments_do_not_submit(void)
     g_assert_cmpuint(test.in_calls, ==, 0);
 }
 
+/* Fixed packet trace: accepted SETUP/data must not be replayed after NAK. */
+typedef struct PacketTrace { unsigned call; } PacketTrace;
+static DmUsbTransactionResult trace_submit(void *opaque, const DmUsbTransaction *t)
+{
+    PacketTrace *trace = opaque;
+    unsigned call = trace->call++;
+    const DmUsbTransactionToken tokens[] = {
+        DM_USB_TRANSACTION_SETUP, DM_USB_TRANSACTION_OUT,
+        DM_USB_TRANSACTION_OUT, DM_USB_TRANSACTION_OUT,
+        DM_USB_TRANSACTION_IN, DM_USB_TRANSACTION_IN
+    };
+    g_assert_cmpuint(call, <, G_N_ELEMENTS(tokens));
+    g_assert_cmpint(t->token, ==, tokens[call]);
+    g_assert_cmpuint(t->timestamp_ns, ==, 77);
+    if (call == 1) { g_assert_cmpmem(t->out_data, t->length, "abcd", 4); }
+    if (call == 2 || call == 3) { g_assert_cmpmem(t->out_data, t->length, "efg", 3); }
+    return (DmUsbTransactionResult){
+        .status = call == 2 || call == 4 ? DM_USB_TRANSACTION_NAK : DM_USB_TRANSACTION_ACCEPTED,
+        .actual_length = call == 2 || call == 4 ? 0 : t->length
+    };
+}
+static void test_resumable_control(void)
+{
+    PacketTrace trace = {0};
+    DmUsbHost host;
+    DmUsbHostRequest r;
+    uint8_t setup[] = {0x21, 0x20, 0, 0, 0, 0, 7, 0};
+    uint8_t data[] = "abcdefg";
+    const DmUsbTransactionStatus expected[] = {
+        DM_USB_TRANSACTION_DEFERRED, DM_USB_TRANSACTION_DEFERRED,
+        DM_USB_TRANSACTION_NAK, DM_USB_TRANSACTION_DEFERRED,
+        DM_USB_TRANSACTION_NAK, DM_USB_TRANSACTION_ACCEPTED
+    };
+    dm_usb_host_init(&host, trace_submit, &trace, 4);
+    g_assert_true(dm_usb_host_request_init(&r, &host, 0, false, 4, setup, data, 7, false));
+    for (unsigned i = 0; i < G_N_ELEMENTS(expected); i++) {
+        g_assert_cmpint(dm_usb_host_request_pump(&r, 77), ==, expected[i]);
+    }
+    g_assert_cmpuint(r.offset, ==, 7);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -252,5 +293,6 @@ int main(int argc, char **argv)
                     test_bulk_nak_and_packetization);
     g_test_add_func("/dm-usb/host/invalid-arguments",
                     test_invalid_arguments_do_not_submit);
+    g_test_add_func("/dm-usb/host/resumable-control", test_resumable_control);
     return g_test_run();
 }

@@ -10,6 +10,7 @@ system_ss.add(when: 'CONFIG_STM32H723', if_true: files(
   'dm_usb_control_vmstate.c',
   'dm_usb_transaction.c',
   'dm_usb_dwc2_device.c',
+  'dm_usb_bridge.c',
   'dm_usb_dwc2_device_vmstate.c',
   'dm_usb_dwc2_control_vmstate.c',
   'dm_stm32h7_otg_host.c',

@@ -15,7 +15,7 @@ void dm_usb_dwc2_control_link_init(
     dm_usb_control_init(&link->control, control_ops, control_opaque,
                         ep0_max_packet_size);
     dm_usb_dwc2_init(&link->dwc2, &link->control, irq, irq_opaque,
-                     ep0_max_packet_size);
+                     ep0_max_packet_size, 16);
 }
 
 static int dm_usb_dwc2_control_link_post_load(void *opaque, int version_id)

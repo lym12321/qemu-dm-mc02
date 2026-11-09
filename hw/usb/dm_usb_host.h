@@ -22,6 +22,27 @@ typedef struct DmUsbHost {
     uint16_t ep0_max_packet_size;
 } DmUsbHost;
 
+/* A resumable transfer borrows its host and buffer. A pump submits at most
+ * one packet. NAK preserves its stage/offset; cancel is a caller-owned removal
+ * of the request and never rolls back packets already accepted by the device. */
+typedef struct DmUsbHostRequest {
+    DmUsbHost *host;
+    uint8_t setup[8];
+    uint8_t *data;
+    size_t length, offset;
+    unsigned stage, transactions;
+    uint16_t max_packet;
+    uint8_t endpoint;
+    bool in, control, zero_packet;
+    DmUsbTransactionStatus status;
+} DmUsbHostRequest;
+
+bool dm_usb_host_request_init(DmUsbHostRequest *request, DmUsbHost *host,
+    uint8_t endpoint, bool in, uint16_t max_packet, const uint8_t *setup,
+    uint8_t *data, size_t length, bool zero_packet);
+DmUsbTransactionStatus dm_usb_host_request_pump(DmUsbHostRequest *request,
+                                               uint64_t timestamp_ns);
+
 void dm_usb_host_init(DmUsbHost *host,
                       DmUsbHostSubmitTransaction *submit,
                       void *opaque, uint16_t ep0_max_packet_size);
