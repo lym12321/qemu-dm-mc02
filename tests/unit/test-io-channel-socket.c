@@ -240,6 +240,25 @@ static void test_io_channel(bool async,
         test_io_channel_setup_sync(listen_addr, connect_addr,
                                    &srv, &src, &dst);
 
+#ifdef CONFIG_WIN32
+        if (listen_addr->type == SOCKET_ADDRESS_TYPE_INET) {
+            GMainContext *context = g_main_context_new();
+            GSource *watch = qio_channel_create_watch(dst, G_IO_HUP);
+
+            /*
+             * SocketChardev uses this watch even with no incoming data.
+             * Winsock select rejects three empty fd_sets with WSAEINVAL.
+             */
+            g_source_attach(watch, context);
+            WSASetLastError(0);
+            g_assert_false(g_main_context_iteration(context, false));
+            g_assert_cmpint(WSAGetLastError(), ==, 0);
+            g_source_destroy(watch);
+            g_source_unref(watch);
+            g_main_context_unref(context);
+        }
+#endif
+
 #ifndef _WIN32
         g_assert(!passFD ||
                  qio_channel_has_feature(src, QIO_CHANNEL_FEATURE_FD_PASS));

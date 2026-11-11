@@ -118,7 +118,8 @@ qio_channel_socket_source_check(GSource *source)
     QIOChannelSocketSource *ssource = (QIOChannelSocketSource *)source;
     fd_set rfds, wfds, xfds;
 
-    if (!ssource->condition) {
+    /* A HUP-only watch has no select interest; Winsock rejects empty sets. */
+    if (!(ssource->condition & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
         return 0;
     }
 
