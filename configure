@@ -252,6 +252,7 @@ python=
 download="enabled"
 skip_meson=no
 werror_default=true
+meson_prefix=/qemu
 use_containers="yes"
 gdb_bin=$(command -v "gdb-multiarch" || command -v "gdb")
 gdb_arches=""
@@ -757,6 +758,9 @@ for opt do
   --container-engine=*) container_engine="$optarg"
   ;;
   --gdb=*) gdb_bin="$optarg"
+  ;;
+  --prefix=*|-Dprefix=*) meson_prefix="$optarg"
+      meson_option_add "--prefix=$optarg"
   ;;
   --disable-werror|-Dwerror=false) werror_default=false
       meson_option_add -Dwerror=false
@@ -1826,9 +1830,12 @@ if test "$skip_meson" = no; then
       # Native Meson validates Windows paths again during Ninja regeneration.
       # Keep the source defaults suitable for Linux cross builds, but persist
       # a Windows absolute default for this native build.
-      windows_prefix=$(cygpath -m /qemu)
-      sed "s|prefix = '/qemu'|prefix = '$windows_prefix'|" \
-        "$source_path/configs/meson/windows.txt" > config-meson.windows
+      windows_prefix=$(cygpath -m "$meson_prefix")
+      $python -c 'import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+pathlib.Path("config-meson.windows").write_text(
+    source.replace("prefix = " + repr("/qemu"), "prefix = " + repr(sys.argv[2])))' \
+        "$source_path/configs/meson/windows.txt" "$windows_prefix"
       meson_add_machine_file config-meson.windows
     else
       meson_add_machine_file $source_path/configs/meson/$targetos.txt
