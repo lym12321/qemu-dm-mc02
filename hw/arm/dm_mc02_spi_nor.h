@@ -2,7 +2,7 @@
 #ifndef HW_ARM_DM_MC02_SPI_NOR_H
 #define HW_ARM_DM_MC02_SPI_NOR_H
 
-#include "../../../../cosim/dm_nor_flash.h"
+#include "cosim/dm_nor_flash.h"
 #include "dm_mc02_spi_target.h"
 
 #include <stdbool.h>

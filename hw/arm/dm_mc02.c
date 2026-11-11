@@ -7,6 +7,7 @@
  * matrix remains separate milestones.
  */
 #include "qemu/osdep.h"
+#include "qemu/accel.h"
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qemu/timer.h"
@@ -3498,6 +3499,11 @@ static void dm_mc02_finalize(Object *obj)
 static void dm_mc02_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+#ifdef CONFIG_WIN32
+    static GlobalProperty windows_tcg_defaults[] = {
+        { ACCEL_CLASS_NAME("tcg"), "tb-size", "64" },
+    };
+#endif
     static const char * const valid_cpu_types[] = {
         ARM_CPU_TYPE_NAME("cortex-m7"),
         NULL
@@ -3511,6 +3517,15 @@ static void dm_mc02_machine_class_init(ObjectClass *oc, void *data)
     mc->valid_cpu_types = valid_cpu_types;
     mc->default_ram_size = 0;
     mc->max_cpus = 1;
+#ifdef CONFIG_WIN32
+    /*
+     * Bound the committed Windows JIT cache for this small MCU instead of
+     * using the generic 1 GiB system-emulation default. Explicit -accel
+     * properties are applied after these machine defaults.
+     */
+    compat_props_add(mc->compat_props, windows_tcg_defaults,
+                     G_N_ELEMENTS(windows_tcg_defaults));
+#endif
 }
 
 static const TypeInfo dm_mc02_machine_type = {

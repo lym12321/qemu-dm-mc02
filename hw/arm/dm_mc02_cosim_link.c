@@ -14,9 +14,9 @@
 #include "qemu/timer.h"
 #include "hw/arm/dm_mc02_adc.h"
 #include "hw/arm/dm_mc02_cosim_link.h"
-#include "../../../../cosim/dm_mc02_wire.h"
-#include "../../../../cosim/dm_mc02_v2_payload.h"
-#include "../../../../cosim/dm_mc02_v2_wire.h"
+#include "cosim/dm_mc02_wire.h"
+#include "cosim/dm_mc02_v2_payload.h"
+#include "cosim/dm_mc02_v2_wire.h"
 
 #include <math.h>
 

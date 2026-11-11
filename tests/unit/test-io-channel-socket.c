@@ -357,6 +357,164 @@ static void test_io_channel_ipv4_async(void)
     return test_io_channel_ipv4(true);
 }
 
+#ifdef CONFIG_WIN32
+typedef struct TestIOChannelWatchLevel {
+    unsigned int calls;
+    unsigned int bytes;
+} TestIOChannelWatchLevel;
+
+static gboolean test_io_channel_watch_read(QIOChannel *ioc,
+                                           GIOCondition condition,
+                                           gpointer opaque)
+{
+    TestIOChannelWatchLevel *level = opaque;
+    char byte;
+
+    g_assert_true(condition & G_IO_IN);
+    if (++level->calls == 1) {
+        /* A retained source must remain ready without another network edge. */
+        return G_SOURCE_CONTINUE;
+    }
+    g_assert_cmpint(qio_channel_read(ioc, &byte, 1, &error_abort), ==, 1);
+    g_assert_cmpint(byte, ==, 'a' + level->bytes);
+    return ++level->bytes < 3;
+}
+
+static gboolean test_io_channel_watch_write(QIOChannel *ioc,
+                                            GIOCondition condition,
+                                            gpointer opaque)
+{
+    unsigned int *calls = opaque;
+
+    g_assert_true(condition & G_IO_OUT);
+    /* No write consumes the first notification; writable is level readiness. */
+    return ++*calls < 2;
+}
+
+static gboolean test_io_channel_watch_remove(QIOChannel *ioc,
+                                             GIOCondition condition,
+                                             gpointer opaque)
+{
+    unsigned int *calls = opaque;
+
+    g_assert_true(condition & G_IO_IN);
+    ++*calls;
+    return G_SOURCE_REMOVE;
+}
+
+static void test_io_channel_watch_until(GMainContext *context,
+                                        unsigned int *calls,
+                                        unsigned int expected)
+{
+    gint64 deadline = g_get_monotonic_time() + 5 * G_TIME_SPAN_SECOND;
+
+    while (*calls < expected && g_get_monotonic_time() < deadline) {
+        if (!g_main_context_iteration(context, false)) {
+            g_usleep(1000);
+        }
+    }
+    g_assert_cmpuint(*calls, ==, expected);
+}
+
+static void test_io_channel_win32_level_watch(void)
+{
+    SocketAddress listen_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    SocketAddress connect_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    QIOChannel *src, *dst, *srv;
+    GMainContext *context = g_main_context_new();
+    GSource *hup, *reader, *writer;
+    TestIOChannelWatchLevel level = { 0 };
+    unsigned int writes = 0;
+
+    test_io_channel_setup_sync(&listen_addr, &connect_addr, &srv, &src, &dst);
+    qio_channel_set_blocking(src, false, &error_abort);
+    qio_channel_set_blocking(dst, false, &error_abort);
+
+    /* Data is already readable when the new watch is registered. */
+    g_assert_cmpint(qio_channel_write(src, "abc", 3, &error_abort), ==, 3);
+    hup = qio_channel_create_watch(dst, G_IO_HUP);
+    g_source_attach(hup, context);
+    reader = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_callback(reader, (GSourceFunc)test_io_channel_watch_read,
+                          &level, NULL);
+    g_source_attach(reader, context);
+    test_io_channel_watch_until(context, &level.calls, 1);
+
+    /* Removing a second watch sharing the HANDLE must preserve the reader. */
+    g_source_destroy(hup);
+    g_source_unref(hup);
+    test_io_channel_watch_until(context, &level.calls, 4);
+    g_assert_cmpuint(level.bytes, ==, 3);
+    g_source_unref(reader);
+
+    writer = qio_channel_create_watch(src, G_IO_OUT);
+    g_source_set_callback(writer, (GSourceFunc)test_io_channel_watch_write,
+                          &writes, NULL);
+    g_source_attach(writer, context);
+    test_io_channel_watch_until(context, &writes, 2);
+    g_source_unref(writer);
+
+    object_unref(OBJECT(src));
+    object_unref(OBJECT(dst));
+    object_unref(OBJECT(srv));
+    g_main_context_unref(context);
+    g_free(connect_addr.u.inet.port);
+}
+
+static void test_io_channel_win32_priority_watch(void)
+{
+    SocketAddress listen_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    SocketAddress connect_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    QIOChannel *src, *dst, *srv;
+    GMainContext *context = g_main_context_new();
+    GSource *high, *low;
+    TestIOChannelWatchLevel level = { 0 };
+    unsigned int high_calls = 0;
+
+    test_io_channel_setup_sync(&listen_addr, &connect_addr, &srv, &src, &dst);
+    qio_channel_set_blocking(src, false, &error_abort);
+    qio_channel_set_blocking(dst, false, &error_abort);
+    g_assert_cmpint(qio_channel_write(src, "abc", 3, &error_abort), ==, 3);
+
+    low = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_callback(low, (GSourceFunc)test_io_channel_watch_read,
+                          &level, NULL);
+    g_source_attach(low, context);
+    high = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_priority(high, G_PRIORITY_HIGH);
+    g_source_set_callback(high, (GSourceFunc)test_io_channel_watch_remove,
+                          &high_calls, NULL);
+    g_source_attach(high, context);
+
+    test_io_channel_watch_until(context, &high_calls, 1);
+    g_assert_cmpuint(level.calls, ==, 0);
+    g_source_unref(high);
+    /* The high-priority watch consumed the HANDLE wakeup, but not the data. */
+    test_io_channel_watch_until(context, &level.calls, 4);
+    g_assert_cmpuint(level.bytes, ==, 3);
+    g_source_unref(low);
+
+    object_unref(OBJECT(src));
+    object_unref(OBJECT(dst));
+    object_unref(OBJECT(srv));
+    g_main_context_unref(context);
+    g_free(connect_addr.u.inet.port);
+}
+
+#endif
+
 
 static void test_io_channel_ipv6(bool async)
 {
@@ -606,6 +764,12 @@ int main(int argc, char **argv)
                         test_io_channel_ipv4_async);
         g_test_add_func("/io/channel/socket/ipv4-fd",
                         test_io_channel_ipv4_fd);
+#ifdef CONFIG_WIN32
+        g_test_add_func("/io/channel/socket/win32-level-watch",
+                        test_io_channel_win32_level_watch);
+        g_test_add_func("/io/channel/socket/win32-priority-watch",
+                        test_io_channel_win32_priority_watch);
+#endif
     }
     if (has_ipv6) {
         g_test_add_func("/io/channel/socket/ipv6-sync",

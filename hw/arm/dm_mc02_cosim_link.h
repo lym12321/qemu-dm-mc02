@@ -14,8 +14,8 @@
 
 #include "chardev/char-fe.h"
 #include "qemu/timer.h"
-#include "../../../../cosim/dm_mc02_v2_wire.h"
-#include "../../../../cosim/dm_mc02_v2_payload.h"
+#include "cosim/dm_mc02_v2_wire.h"
+#include "cosim/dm_mc02_v2_payload.h"
 
 #include <stdbool.h>
 #include <stdint.h>

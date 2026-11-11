@@ -10,7 +10,7 @@
 #include "migration/vmstate.h"
 #include "qemu/log.h"
 #include "qemu/module.h"
-#include "../../../../cosim/dm_nor_flash.h"
+#include "cosim/dm_nor_flash.h"
 
 OBJECT_DECLARE_SIMPLE_TYPE(DmW25q64, DM_W25Q64)
 

@@ -117,6 +117,7 @@ qio_channel_socket_source_check(GSource *source)
     static struct timeval tv0;
     QIOChannelSocketSource *ssource = (QIOChannelSocketSource *)source;
     fd_set rfds, wfds, xfds;
+    int ret;
 
     /* A HUP-only watch has no select interest; Winsock rejects empty sets. */
     if (!(ssource->condition & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
@@ -136,7 +137,8 @@ qio_channel_socket_source_check(GSource *source)
         FD_SET(ssource->socket, &xfds);
     }
     ssource->revents = 0;
-    if (select(0, &rfds, &wfds, &xfds, &tv0) == 0) {
+    ret = select(0, &rfds, &wfds, &xfds, &tv0);
+    if (ret <= 0) {
         return 0;
     }
 

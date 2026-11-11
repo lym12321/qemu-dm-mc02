@@ -270,6 +270,12 @@ tests = {
     io,
     hwcore,
   ],
+  'test-dm-dma-mmio': [
+    meson.project_source_root() / 'hw/arm/dm_mc02_dma.c',
+    meson.project_source_root() / 'hw/arm/dm_mc02_dma_endpoint.c',
+    'test-dm-dma-vmstate-stubs.c',
+    hwcore,
+  ],
   'test-dm-dma-subsystem-vmstate': [
     meson.project_source_root() / 'hw/arm/dm_mc02_dma.c',
     meson.project_source_root() / 'hw/arm/dm_mc02_dma_endpoint.c',
@@ -377,9 +383,9 @@ tests = {
     io,
   ],
   'test-dm-cosim-link': [
-    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_wire.c',
-    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_wire.c',
-    meson.project_source_root() / '..' / '..' / 'cosim' / 'dm_mc02_v2_payload.c',
+    meson.project_source_root() / 'cosim' / 'dm_mc02_wire.c',
+    meson.project_source_root() / 'cosim' / 'dm_mc02_v2_wire.c',
+    meson.project_source_root() / 'cosim' / 'dm_mc02_v2_payload.c',
   ],
   'test-dm-adc-runtime-sync': [
     meson.project_source_root() / 'hw/arm/dm_mc02_adc.c',
@@ -420,7 +426,7 @@ tests = {
     meson.project_source_root() / 'hw/arm/dm_mc02_ssi_nor.c',
     meson.project_source_root() / 'hw/ssi/ssi.c',
     meson.project_source_root() / 'hw/core/gpio.c',
-    meson.project_source_root() / '..' / '..' / 'cosim/dm_nor_flash.c',
+    meson.project_source_root() / 'cosim/dm_nor_flash.c',
     migration,
     io,
     hwcore,

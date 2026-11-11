@@ -251,6 +251,7 @@ ninja=""
 python=
 download="enabled"
 skip_meson=no
+werror_default=true
 use_containers="yes"
 gdb_bin=$(command -v "gdb-multiarch" || command -v "gdb")
 gdb_arches=""
@@ -756,6 +757,12 @@ for opt do
   --container-engine=*) container_engine="$optarg"
   ;;
   --gdb=*) gdb_bin="$optarg"
+  ;;
+  --disable-werror|-Dwerror=false) werror_default=false
+      meson_option_add -Dwerror=false
+  ;;
+  --enable-werror|-Dwerror=true) werror_default=true
+      meson_option_add -Dwerror=true
   ;;
   # everything else has the same name in configure and meson
   --*) meson_option_parse "$opt" "$optarg"
@@ -1752,7 +1759,7 @@ if test "$skip_meson" = no; then
   echo "# the command line" >> $cross
   if test -e "$source_path/.git" && \
       { test "$targetos" = linux || test "$targetos" = "windows"; }; then
-      echo 'werror = true' >> $cross
+      echo "werror = $werror_default" >> $cross
   fi
   echo "[project options]" >> $cross
   if test "$SMBD" != ''; then
@@ -1815,7 +1822,17 @@ if test "$skip_meson" = no; then
   mv $cross config-meson.cross
   meson_add_machine_file config-meson.cross
   if test -f "$source_path/configs/meson/$targetos.txt"; then
-    meson_add_machine_file $source_path/configs/meson/$targetos.txt
+    if test "$targetos" = windows && test "$cross_compile" = no; then
+      # Native Meson validates Windows paths again during Ninja regeneration.
+      # Keep the source defaults suitable for Linux cross builds, but persist
+      # a Windows absolute default for this native build.
+      windows_prefix=$(cygpath -m /qemu)
+      sed "s|prefix = '/qemu'|prefix = '$windows_prefix'|" \
+        "$source_path/configs/meson/windows.txt" > config-meson.windows
+      meson_add_machine_file config-meson.windows
+    else
+      meson_add_machine_file $source_path/configs/meson/$targetos.txt
+    fi
   fi
 
   rm -rf meson-private meson-info meson-logs

@@ -5,8 +5,8 @@
 #include "exec/memory.h"
 #include "hw/arm/dm_mc02_dma_endpoint.h"
 #include "hw/arm/dm_mc02_ssi_nor.h"
-#include "../../../../cosim/dm_nor_flash.h"
-#include "../../../../cosim/dm_nor_flash_persistence.h"
+#include "cosim/dm_nor_flash.h"
+#include "cosim/dm_nor_flash_persistence.h"
 #include "migration/vmstate.h"
 
 #include <stdbool.h>

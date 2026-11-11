@@ -79,6 +79,8 @@
 #define DMA_FLAG_TCIF  (1u << 5)
 #define DMA_FLAG_HTIF  (1u << 4)
 #define DMA_FLAG_TEIF  (1u << 3)
+#define DMA_FLAG_MASK  (DMA_FLAG_FEIF | DMA_FLAG_DMEIF | DMA_FLAG_TEIF | \
+                       DMA_FLAG_HTIF | DMA_FLAG_TCIF)
 static unsigned dm_mc02_dma_flag_shift(unsigned stream)
 {
     /* RM0433 packs stream 0/1/2/3 into status slots 0/6/16/22;
@@ -177,6 +179,23 @@ static void dm_mc02_dma_update_irqs(DmMc02Dma *s)
 {
     for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
         dm_mc02_dma_update_irq(s, stream);
+    }
+}
+
+static void dm_mc02_dma_clear_flags(DmMc02Dma *s, hwaddr status,
+                                    uint32_t clear)
+{
+    uint32_t flags = dm_mc02_dma_load(s->regs, status, 4);
+    uint32_t changed = flags & clear;
+    unsigned first = status == DMA_LISR ? 0 : 4;
+
+    dm_mc02_dma_store(s->regs, status, flags & ~clear, 4);
+    /* Only changed interrupt flags in this bank can change an IRQ level.
+     * Still clear reserved bits in the byte-backed status register as before. */
+    for (unsigned stream = first; stream < first + 4; ++stream) {
+        if ((changed >> dm_mc02_dma_flag_shift(stream)) & DMA_FLAG_MASK) {
+            dm_mc02_dma_update_irq(s, stream);
+        }
     }
 }
 
@@ -1413,31 +1432,40 @@ static void dm_mc02_dma_maybe_run(DmMc02Dma *s, hwaddr offset)
 static uint64_t dm_mc02_dma_read(void *opaque, hwaddr offset, unsigned size)
 {
     DmMc02Dma *s = opaque;
+    uint32_t value;
 
     if (offset + size > DM_MC02_DMA_REGION_SIZE || size > 4) {
         return 0;
     }
-    for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
-        if (offset == dm_mc02_dma_stream_base(stream) + DMA_SxFCR &&
-            size == 4) {
-            uint32_t value = dm_mc02_dma_load(s->regs, offset, size);
+    value = dm_mc02_dma_load(s->regs, offset, size);
+    if (size == 4 && offset >= DMA_STREAM_BASE &&
+        offset < DMA_STREAM_BASE + DMA_STREAM_COUNT * DMA_STREAM_STRIDE) {
+        unsigned relative = offset - DMA_STREAM_BASE;
+
+        if (relative % DMA_STREAM_STRIDE == DMA_SxFCR) {
+            unsigned stream = relative / DMA_STREAM_STRIDE;
 
             value &= ~DMA_FCR_FS_MASK;
             value |= dm_mc02_dma_fifo_status(s, stream) << DMA_FCR_FS_SHIFT;
-            return value;
         }
     }
-    return dm_mc02_dma_load(s->regs, offset, size);
+    return value;
 }
 
 static void dm_mc02_dma_write(void *opaque, hwaddr offset, uint64_t value,
                               unsigned size)
 {
     DmMc02Dma *s = opaque;
-    uint32_t clear;
     uint32_t old_cr = 0;
 
     if (offset + size > DM_MC02_DMA_REGION_SIZE || size > 4) {
+        return;
+    }
+
+    /* Full-word LIFCR/HIFCR writes cannot alter stream configuration.  Keep
+     * them out of the request-cache and configuration-register scans. */
+    if (size == 4 && (offset == DMA_LIFCR || offset == DMA_HIFCR)) {
+        dm_mc02_dma_clear_flags(s, offset - DMA_LIFCR, value);
         return;
     }
 
@@ -1453,21 +1481,6 @@ static void dm_mc02_dma_write(void *opaque, hwaddr offset, uint64_t value,
         }
     }
 
-    /* LIFCR/HIFCR are write-one-to-clear views of the flag registers. */
-    if (offset == DMA_LIFCR && size == 4) {
-        clear = value;
-        dm_mc02_dma_store(s->regs, DMA_LISR,
-                          dm_mc02_dma_load(s->regs, DMA_LISR, 4) & ~clear, 4);
-        dm_mc02_dma_update_irqs(s);
-        return;
-    }
-    if (offset == DMA_HIFCR && size == 4) {
-        clear = value;
-        dm_mc02_dma_store(s->regs, DMA_HISR,
-                          dm_mc02_dma_load(s->regs, DMA_HISR, 4) & ~clear, 4);
-        dm_mc02_dma_update_irqs(s);
-        return;
-    }
     if (size == 4) {
         for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
             if (offset == dm_mc02_dma_stream_base(stream) + DMA_SxFCR) {
