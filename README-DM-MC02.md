@@ -8,6 +8,8 @@ diagnostics and product packaging live in
 The engine owns board registers, interrupts, device timing and migration state,
 QEMU-side co-simulation, and the portable C codecs in [`cosim/`](cosim/README.md).
 The Simulator pins an engine commit and consumes those codecs from its checkout.
+Engine development follows `main`; version checkpoints use tags and the
+Simulator's `qemu.lock` records the exact engine revision.
 
 ## Build on Windows
 
@@ -24,7 +26,7 @@ pacman -S --needed git make mingw-w64-x86_64-gcc \
 From PowerShell:
 
 ```powershell
-git clone -c core.symlinks=true -b dm-mc02/v8.2.2 https://github.com/lym12321/qemu-dm-mc02.git
+git clone -c core.symlinks=true https://github.com/lym12321/qemu-dm-mc02.git
 cd qemu-dm-mc02
 .\scripts\build-dm-mc02.ps1 -MsysRoot C:\msys64
 ```
