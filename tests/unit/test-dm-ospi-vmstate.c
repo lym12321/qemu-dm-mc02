@@ -26,7 +26,13 @@ static QEMUFile *open_test_file(bool write)
     g_assert_cmpint(fd, >=, 0);
     g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
     if (write) {
+#ifdef _WIN32
+        /* The isolated fixture does not link the block driver containing
+         * QEMU's ftruncate wrapper. Truncate its temporary CRT file directly. */
+        g_assert_cmpint(_chsize_s(fd, 0), ==, 0);
+#else
         g_assert_cmpint(ftruncate(fd, 0), ==, 0);
+#endif
     }
     ioc = QIO_CHANNEL(qio_channel_file_new_fd(fd));
     file = write ? qemu_file_new_output(ioc) : qemu_file_new_input(ioc);
