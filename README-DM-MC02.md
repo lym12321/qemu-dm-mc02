@@ -62,7 +62,7 @@ Run in the same MINGW64 or Linux environment used for the build:
 ninja -C build -j4 tests/unit/test-dm-cosim-link tests/unit/test-dm-w25q64 \
   tests/unit/test-dm-ospi-vmstate tests/unit/test-dm-dma-mmio \
   tests/unit/test-dm-dma-subsystem-vmstate tests/unit/test-io-channel-socket
-build/pyvenv/bin/meson test -C build --print-errorlogs \
+build/pyvenv/bin/meson test -C build --no-rebuild --print-errorlogs \
   test-dm-cosim-link test-dm-w25q64 test-dm-ospi-vmstate test-dm-dma-mmio \
   test-dm-dma-subsystem-vmstate test-io-channel-socket
 ```

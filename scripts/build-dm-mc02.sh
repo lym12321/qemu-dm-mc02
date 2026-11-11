@@ -38,4 +38,6 @@ if [[ ! -f "$build_dir/build.ninja" || ${QEMU_RECONFIGURE:-0} == 1 ]]; then
     )
 fi
 
-ninja -C "$build_dir" -j "$jobs" qemu-system-arm${EXESUF:-$(case "$(uname -s)" in MINGW*|MSYS*) printf '.exe' ;; esac)}
+exe_suffix=
+case "$(uname -s)" in MINGW*|MSYS*) exe_suffix=.exe ;; esac
+ninja -C "$build_dir" -j "$jobs" "qemu-system-arm$exe_suffix"

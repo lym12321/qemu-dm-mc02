@@ -2,6 +2,11 @@
 QEMU README
 ===========
 
+This fork provides the DM-MC02 / STM32H723 simulation engine. See
+`README-DM-MC02.md <README-DM-MC02.md>`_ for the independent Windows/Linux
+build and focused device tests. The desktop application and Rust host live in
+`dm-mc02-simulator <https://github.com/lym12321/dm-mc02-simulator>`_.
+
 QEMU is a generic and open source machine & userspace emulator and
 virtualizer.
 
