@@ -2,3 +2,7 @@
 *.h.inc         diff=c
 *.m             diff=objc
 *.py            diff=python
+
+# MSYS2 invokes these files directly from a native Windows checkout.
+/configure      text eol=lf
+*.sh            text eol=lf
