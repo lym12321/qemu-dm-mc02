@@ -26,6 +26,7 @@
 #include "qemu/main-loop.h"
 #include "qemu/timer.h"
 #include "qemu/lockable.h"
+#include "qemu/error-report.h"
 #include "sysemu/cpu-timers.h"
 #include "sysemu/replay.h"
 #include "sysemu/cpus.h"
@@ -329,6 +330,89 @@ int qemu_timeout_ns_to_ms(int64_t ns)
 }
 
 
+#ifdef _WIN32
+typedef struct Win32PollTimer {
+    HANDLE timer;
+    GArray *fds;
+} Win32PollTimer;
+
+static void win32_poll_timer_free(void *opaque)
+{
+    Win32PollTimer *poll = opaque;
+
+    if (poll->timer) {
+        CloseHandle(poll->timer);
+    }
+    g_array_free(poll->fds, true);
+    g_free(poll);
+}
+
+static GPrivate win32_poll_timer = G_PRIVATE_INIT(win32_poll_timer_free);
+
+static int win32_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
+{
+    Win32PollTimer *poll;
+    GPollFD *wait_fds;
+    LARGE_INTEGER due;
+    int ret;
+
+    if (timeout <= 0) {
+        return g_poll(fds, nfds, timeout < 0 ? -1 : 0);
+    }
+
+    poll = g_private_get(&win32_poll_timer);
+    if (!poll) {
+        poll = g_new0(Win32PollTimer, 1);
+        poll->fds = g_array_new(false, false, sizeof(GPollFD));
+        poll->timer = CreateWaitableTimerExW(
+            NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+            TIMER_ALL_ACCESS);
+        if (!poll->timer) {
+            warn_report("high-resolution poll timer unavailable (error %lu); "
+                        "using millisecond waits", GetLastError());
+        }
+        g_private_set(&win32_poll_timer, poll);
+    }
+    if (!poll->timer) {
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    /*
+     * Relative, one-shot deadline in 100 ns units, rounded up without overflow.
+     * g_poll's millisecond timeout otherwise delays sub-ms device timers and
+     * can coalesce periodic IRQs before the vCPU gets to handle them.
+     */
+    due.QuadPart = -(timeout / 100 + (timeout % 100 != 0));
+    if (!SetWaitableTimer(poll->timer, &due, 0, NULL, NULL, false)) {
+        warn_report("cannot arm high-resolution poll timer (error %lu); "
+                    "using millisecond waits", GetLastError());
+        CloseHandle(poll->timer);
+        poll->timer = NULL;
+        return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
+    }
+
+    g_array_set_size(poll->fds, nfds + 1);
+    wait_fds = (GPollFD *)poll->fds->data;
+    for (guint i = 0; i < nfds; i++) {
+        wait_fds[i] = fds[i];
+    }
+    wait_fds[nfds] = (GPollFD) {
+        .fd = (gintptr)poll->timer,
+        .events = G_IO_IN,
+    };
+    ret = g_poll(wait_fds, nfds + 1, -1);
+    CancelWaitableTimer(poll->timer);
+    for (guint i = 0; i < nfds; i++) {
+        fds[i].revents = wait_fds[i].revents;
+    }
+    /* The private timer is a timeout, never caller-visible IO readiness. */
+    if (ret > 0 && wait_fds[nfds].revents) {
+        ret--;
+    }
+    return ret;
+}
+#endif
+
 /* qemu implementation of g_poll which uses a nanosecond timeout but is
  * otherwise identical to g_poll
  */
@@ -350,6 +434,8 @@ int qemu_poll_ns(GPollFD *fds, guint nfds, int64_t timeout)
         ts.tv_nsec = timeout % 1000000000LL;
         return ppoll((struct pollfd *)fds, nfds, &ts, NULL);
     }
+#elif defined(_WIN32)
+    return win32_poll_ns(fds, nfds, timeout);
 #else
     return g_poll(fds, nfds, qemu_timeout_ns_to_ms(timeout));
 #endif

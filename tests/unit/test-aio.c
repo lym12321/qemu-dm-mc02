@@ -889,6 +889,69 @@ static void test_worker_thread_co_enter(void)
     g_assert(!aio_poll(ctx, false));
 }
 
+static GPollFD poll_notifier(EventNotifier *notifier)
+{
+    return (GPollFD) {
+#ifdef _WIN32
+        .fd = (gintptr)event_notifier_get_handle(notifier),
+#else
+        .fd = event_notifier_get_fd(notifier),
+#endif
+        .events = G_IO_IN,
+    };
+}
+
+static void *poll_wake_thread(void *opaque)
+{
+    /* Exercise a concurrent caller's private timeout before waking IO. */
+    g_assert_cmpint(qemu_poll_ns(NULL, 0, 5 * SCALE_MS), ==, 0);
+    event_notifier_set(opaque);
+    return NULL;
+}
+
+static void test_poll_ns(void)
+{
+    EventNotifier idle, ready;
+    GPollFD fds[2];
+    QemuThread worker;
+    int64_t start;
+
+    g_assert_cmpint(event_notifier_init(&idle, false), ==, 0);
+    g_assert_cmpint(event_notifier_init(&ready, false), ==, 0);
+    fds[0] = poll_notifier(&idle);
+    fds[1] = poll_notifier(&ready);
+    g_assert_cmpint(qemu_poll_ns(fds, 2, 0), ==, 0);
+
+    qemu_thread_create(&worker, "poll-wake", poll_wake_thread, &ready,
+                       QEMU_THREAD_JOINABLE);
+    start = g_get_monotonic_time();
+    g_assert_cmpint(qemu_poll_ns(fds, 2, 1000 * SCALE_MS), ==, 1);
+    g_assert_cmpint(g_get_monotonic_time() - start, <, 500000);
+    qemu_thread_join(&worker);
+    g_assert_cmpint(fds[0].revents, ==, 0);
+    g_assert_cmpint(fds[1].revents, ==, G_IO_IN);
+    g_assert_cmpint(qemu_poll_ns(fds, 2, -1), ==, 1);
+    g_assert_cmpint(qemu_poll_ns(fds, 2, INT64_MAX), ==, 1);
+    event_notifier_test_and_clear(&ready);
+
+    /*
+     * A prior IO wake must not leave a signaled timer/ready bit. Repeated
+     * short waits also measure precision without a flaky realtime assertion.
+     */
+    start = g_get_monotonic_time();
+    for (int i = 0; i < 32; i++) {
+        int64_t before = g_get_monotonic_time();
+
+        g_assert_cmpint(qemu_poll_ns(fds, 2, 100 * SCALE_US), ==, 0);
+        g_assert_cmpint(fds[0].revents | fds[1].revents, ==, 0);
+        g_assert_cmpint(g_get_monotonic_time() - before, >=, 99);
+    }
+    g_test_message("32 x 100 us waits: %" PRId64 " us",
+                   g_get_monotonic_time() - start);
+    event_notifier_cleanup(&ready);
+    event_notifier_cleanup(&idle);
+}
+
 /* End of tests.  */
 
 int main(int argc, char **argv)
@@ -899,6 +962,7 @@ int main(int argc, char **argv)
     while (g_main_context_iteration(NULL, false));
 
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/aio/poll-ns",                 test_poll_ns);
     g_test_add_func("/aio/acquire",                 test_acquire);
     g_test_add_func("/aio/bh/schedule",             test_bh_schedule);
     g_test_add_func("/aio/bh/schedule10",           test_bh_schedule10);
