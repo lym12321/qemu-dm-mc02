@@ -211,9 +211,12 @@ static void uart_tx_flush(void *opaque)
 static void uart_tx_timer_tick(void *opaque)
 {
     DmMc02Uart *s = opaque;
-    int written;
+    uint64_t deadline = s->tx_next_ns;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    unsigned due;
+    bool moved = false;
 
-    s->tx_next_ns = 0;
+    uart_timer_del(s->tx_timer, &s->tx_next_ns);
 
     if (s->tx_fifo_len == 0) {
         uart_store(s, USART_ISR,
@@ -230,18 +233,46 @@ static void uart_tx_timer_tick(void *opaque)
         return;
     }
 
-    written = qemu_chr_fe_write(&s->chr, s->tx_fifo + s->tx_fifo_head, 1);
-    if (written <= 0) {
-        /* Preserve the frame boundary while allowing a non-blocking backend
-         * to recover from temporary backpressure. */
-        uart_tx_schedule(s, 1000);
-        return;
+    /*
+     * Host wakeups can be later than a frame deadline. Drain only the frames
+     * which have elapsed, retaining their phase instead of adding the host's
+     * wakeup latency to every byte. The existing FIFO bounds this work.
+     */
+    due = MIN((uint64_t)s->tx_fifo_len,
+              1 + (now - deadline) / s->tx_timing.frame_duration_ns);
+    while (due) {
+        unsigned contiguous = MIN(due, DM_MC02_UART_TX_FIFO_SIZE -
+                                       s->tx_fifo_head);
+        int written = qemu_chr_fe_write(&s->chr,
+                                        s->tx_fifo + s->tx_fifo_head,
+                                        contiguous);
+
+        if (written > 0) {
+            s->tx_fifo_head = (s->tx_fifo_head + written) %
+                              DM_MC02_UART_TX_FIFO_SIZE;
+            s->tx_fifo_len -= written;
+            moved = true;
+            due -= written;
+            deadline += written * s->tx_timing.frame_duration_ns;
+        }
+        if (written < (int)contiguous) {
+            if (written > 0) {
+                s->tx_short_writes++;
+            }
+            /*
+             * Retain the physical suffix. Backpressure restarts the frame
+             * cadence at the existing retry deadline, without past credit.
+             */
+            uart_tx_schedule(s, 1000);
+            if (moved) {
+                uart_dma_tx_kick(s);
+            }
+            return;
+        }
     }
 
-    s->tx_fifo_head = (s->tx_fifo_head + 1) % DM_MC02_UART_TX_FIFO_SIZE;
-    s->tx_fifo_len--;
     if (s->tx_fifo_len != 0) {
-        uart_tx_schedule(s, s->tx_timing.frame_duration_ns);
+        uart_timer_mod(s->tx_timer, &s->tx_next_ns, deadline);
     } else {
         uart_store(s, USART_ISR,
                    uart_load(s, USART_ISR, 4) | USART_ISR_TC, 4);
@@ -254,6 +285,15 @@ static void uart_tx_enqueue(DmMc02Uart *s, uint8_t byte)
 {
     unsigned slot;
 
+    /*
+     * Service old deadlines before adding a new tail. If the old queue has
+     * already finished, this byte must start a fresh frame at the current
+     * time, not inherit time elapsed while the transmitter was idle.
+     */
+    if (s->tx_next_ns &&
+        s->tx_next_ns <= qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) {
+        uart_tx_timer_tick(s);
+    }
     if (s->tx_fifo_len == DM_MC02_UART_TX_FIFO_SIZE) {
         /* Preserve ordering by dropping the newest byte and expose the loss
          * through the counter for a future diagnostics surface. */

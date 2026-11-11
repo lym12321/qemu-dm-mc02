@@ -340,6 +340,14 @@ tests = {
     migration,
     io,
   ],
+  'test-dm-uart-tx': [
+    meson.project_source_root() / 'hw/arm/dm_mc02_uart.c',
+    meson.project_source_root() / 'hw/char/dm_uart_timing.c',
+    'test-dm-fdcan-vmstate-stubs.c',
+    io,
+    chardev,
+    hwcore,
+  ],
   'test-dm-pwr-rcc-vmstate': [
     meson.project_source_root() / 'hw/arm/dm_mc02_pwr_rcc.c',
     meson.project_source_root() / 'hw/arm/dm_mc02_pwr_rcc_vmstate.c',
