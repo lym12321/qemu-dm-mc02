@@ -20,6 +20,7 @@ pub mod cosim_session;
     feature = "devices",
     feature = "machine",
     feature = "referee",
+    feature = "lab",
     feature = "worker"
 ))]
 pub mod devices;
@@ -47,7 +48,7 @@ pub mod qmp;
 pub mod ros2;
 #[cfg(feature = "simulation")]
 pub mod runtime;
-#[cfg(any(feature = "simulation", feature = "physics"))]
+#[cfg(any(feature = "simulation", feature = "physics", feature = "lab"))]
 pub mod signals;
 #[cfg(feature = "cosim-wire")]
 pub mod step_wire;

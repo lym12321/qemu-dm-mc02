@@ -270,6 +270,15 @@ def package(binary, sim, output, dll_directory=None, *, development=False, linux
             "provenance": "licenses/mdui/PROVENANCE.json",
             "vendored_sources": "third_party/material/mdui",
         }
+        terminal = ROOT / "third_party/xterm"
+        notices = licenses / "xterm"
+        notices.mkdir()
+        for name in ("LICENSE", "LICENSE-addon-fit", "PROVENANCE.json"):
+            shutil.copy2(terminal / name, notices / name)
+        provenance["web_terminal"] = {
+            **json.loads((terminal / "PROVENANCE.json").read_text(encoding="utf-8")),
+            "licenses": "licenses/xterm", "vendored_sources": "third_party/xterm",
+        }
     if lab:
         provenance["rust"]["scope"] = (
             f"native {'Windows' if windows else 'Linux'} interactive/Web Lab, USB/IP and ARM GDB debugging")

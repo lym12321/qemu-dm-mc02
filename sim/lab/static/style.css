@@ -1,87 +1,92 @@
-/* MDUI owns control appearance and Material tokens. This file arranges the
-   workbench and its read-only board/trace data. */
-body { margin: 0; font-family: system-ui, "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; }
+/* MDUI owns controls, theme and interactions. CSS arranges the workspace and observations. */
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-main { max-width: 1560px; margin: 0 auto; padding: 24px 32px; }
-.mdui-prose h1, .mdui-prose h2, .mdui-prose h3, .mdui-prose p { margin: 0; }
-.mdui-prose h1 { font-size: var(--mdui-typescale-headline-medium-size); }
-.mdui-prose h2 { font-size: var(--mdui-typescale-title-large-size); }
-.mdui-prose h3 { font-size: var(--mdui-typescale-headline-small-size); }
-.mdui-prose small, .secondary-text { color: rgb(var(--mdui-color-on-surface-variant)); }
+body { margin: 0; height: 100dvh; min-height: 540px; display: flex; flex-direction: column; font-family: system-ui, "Microsoft YaHei", "Noto Sans CJK SC", sans-serif; color: rgb(var(--mdui-color-on-surface)); }
 .mono { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; }
-.app-subtitle { margin-left: 12px; font-size: var(--mdui-typescale-title-medium-size); }
-mdui-top-app-bar { padding-inline: 24px; }
-mdui-card { display: block; min-width: 0; }
-.card-content { padding: 24px; }
-.stack { display: flex; flex-direction: column; gap: 20px; }
-.page-heading, .toolbar, .section-heading, .session-meta, .actions, .firmware,
-.key-control, .form-footer, .log-toolbar, .log-options, .page-footer {
-  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
-}
-.page-heading, .toolbar, .section-heading, .key-control, .form-footer,
-.log-toolbar, .page-footer { justify-content: space-between; }
-.page-heading { margin-bottom: 24px; }
-.page-heading p { margin-top: 8px; }
-.firmware { flex: 1; min-width: 0; }
-.firmware-name { display: flex; flex-direction: column; min-width: 0; gap: 4px; }
-#firmware-name { max-width: 360px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.session-meta { gap: 16px 28px; font-size: var(--mdui-typescale-body-medium-size); }
-#gdb-address { margin-left: auto; user-select: all; }
-.workspace { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); gap: 24px; margin-block: 24px; }
-.led-observation { padding: 20px; }
-.led-preview { display: flex; align-items: center; gap: 24px; margin-bottom: 16px; }
-.led-preview svg { width: 88px; height: 88px; flex: none; }
-#led-value { margin-block: 4px; }
-#led-rgb { font-size: var(--mdui-typescale-body-small-size); }
+.secondary-text { color: rgb(var(--mdui-color-on-surface-variant)); font-size: 12px; }
+.app-toolbar { display: flex; gap: 16px; align-items: center; min-height: 72px; padding: 12px 24px; }
+.app-title { white-space: nowrap; font-size: 17px; letter-spacing: .2px; }
+.firmware-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; color: rgb(var(--mdui-color-on-surface-variant)); }
+.lifecycle-actions, .board-actions, .receive-actions { display: flex; align-items: center; gap: 4px; }
+.lifecycle-actions { margin-left: auto; }
+#session-progress { flex: none; }
+.workspace { flex: 1; min-height: 0; display: flex; flex-direction: column; margin: 0 24px; background: rgb(var(--mdui-color-surface-container-lowest)); }
+.workspace-toolbar { display: flex; align-items: center; border-bottom: 1px solid rgb(var(--mdui-color-outline-variant)); }
+#channel-tabs { width: 220px; }
+.board-actions { margin-left: auto; padding-right: 12px; gap: 8px; }
 #key-button { touch-action: none; user-select: none; }
-.inline-form { display: flex; align-items: flex-start; gap: 16px; }
-.inline-form mdui-text-field { flex: 1; min-width: 0; }
-.inline-form mdui-button { margin-top: 8px; }
-.form-row { display: flex; gap: 12px; align-items: flex-start; }
+.console-content { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.console-toolbar { display: flex; gap: 16px; align-items: center; padding: 8px 20px; flex: none; }
+.console-toolbar mdui-select { width: 180px; }
+.receive-actions { margin-left: auto; }
+.receive { flex: 1; min-height: 100px; overflow: auto; padding: 16px 20px; margin: 0; font-size: 13px; line-height: 1.65; white-space: pre-wrap; overflow-wrap: anywhere; tab-size: 4; }
+.receive:empty::before { content: "等待数据"; color: rgb(var(--mdui-color-on-surface-variant)); font-family: system-ui, sans-serif; }
+.receive-footer { display: flex; gap: 16px; justify-content: space-between; padding: 4px 20px 12px; color: rgb(var(--mdui-color-on-surface-variant)); font-size: 11px; }
+.composer { flex: none; padding: 12px 20px; display: flex; flex-direction: column; gap: 12px; border-top: 1px solid rgb(var(--mdui-color-outline-variant)); }
+#uart-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px 20px; }
+.send-options { display: flex; align-items: center; gap: 12px; }
+#uart-newline { width: 116px; }
+#uart-error { grid-column: 1 / -1; }
+.form-row { display: flex; gap: 12px; align-items: center; min-width: 0; }
 .form-row > mdui-select, .form-row > mdui-text-field { flex: 1; min-width: 0; }
-.form-row > mdui-button { flex: none; margin-top: 8px; }
-.gpio-scroll { overflow-x: auto; padding-block: 4px; }
-.gpio-grid { display: grid; grid-template-columns: 24px repeat(16, 36px); gap: 4px; width: max-content; }
-.gpio-label { display: grid; place-items: center; font: var(--mdui-typescale-label-small-size) ui-monospace, monospace; }
-.gpio-pin { width: 36px; height: 36px; font-size: var(--mdui-typescale-label-small-size); }
-.pin-detail { display: flex; gap: 16px; align-items: baseline; font-size: var(--mdui-typescale-body-medium-size); }
-#raw-state { max-height: 280px; overflow: auto; margin: 0; font-size: 12px; }
-.channels { display: grid; grid-template-columns: minmax(0, .85fr) minmax(0, 1.15fr); }
-.channel-controls { min-width: 0; }
-mdui-tab-panel { padding: 24px; }
-.log-panel { padding: 24px; min-width: 0; display: flex; flex-direction: column; gap: 16px; }
-.log-options { flex-wrap: nowrap; }
-.log-options mdui-select { width: 112px; }
-.log { min-height: 264px; height: 320px; overflow: auto; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
-.log-row { display: grid; grid-template-columns: 132px minmax(0, 1fr); gap: 16px; padding-block: 4px; }
-.log-meta { white-space: pre-line; color: rgb(var(--mdui-color-on-surface-variant)); }
-.log-data { white-space: pre-wrap; }
-.log-row[data-kind="error"] { color: rgb(var(--mdui-color-error)); }
-.log-footer { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
-.page-footer { padding-block: 24px 8px; }
-@media (max-width: 1100px) {
-  .workspace, .channels { grid-template-columns: minmax(0, 1fr); }
-  .toolbar { align-items: flex-start; }
-  .actions { width: 100%; }
+.form-row > mdui-button { flex: none; }
+.can-options > mdui-text-field { max-width: 170px; }
+.can-flags { display: flex; flex-wrap: wrap; gap: 0 8px; }
+.can-table { width: 100%; border-collapse: collapse; white-space: nowrap; text-align: left; font-size: 12px; }
+.can-table th { color: rgb(var(--mdui-color-on-surface-variant)); position: sticky; top: -16px; background: rgb(var(--mdui-color-surface-container-lowest)); font-weight: normal; }
+.can-table th, .can-table td { padding: 5px 16px 5px 0; vertical-align: top; }
+.can-table td:last-child { white-space: pre-wrap; overflow-wrap: anywhere; min-width: 140px; }
+.statusbar { display: flex; align-items: center; gap: 20px; min-height: 44px; padding: 0 24px; font-size: 11px; color: rgb(var(--mdui-color-on-surface-variant)); }
+.led-observation { display: inline-flex; gap: 8px; align-items: center; }
+.led-swatch { display: inline-block; width: 10px; height: 10px; border: 1px solid rgb(var(--mdui-color-outline)); }
+#events-button { margin-left: auto; }
+.stack { display: flex; flex-direction: column; gap: 16px; }
+.operation-error { color: rgb(var(--mdui-color-error)); font-size: 13px; white-space: pre-wrap; overflow-wrap: anywhere; }
+#session-error { padding: 0 24px 12px; }
+mdui-dialog::part(panel) { width: min(600px, calc(100vw - 32px)); max-width: 600px; }
+#events-dialog::part(panel) { width: min(800px, calc(100vw - 32px)); max-width: 800px; }
+.peripheral-content { min-height: 170px; padding-top: 24px; }
+#board-error { margin-top: 16px; }
+.settings-content { max-height: 65dvh; overflow: auto; padding-top: 8px; }
+.settings-group { padding: 16px 0; }
+#project-path { overflow-wrap: anywhere; }
+.channel-settings { display: flex; flex-wrap: wrap; gap: 0 8px; }
+.event-log { height: min(45dvh, 400px); overflow: auto; font-size: 12px; line-height: 1.6; }
+.event-row { display: flex; gap: 16px; padding-block: 4px; white-space: pre-wrap; }
+.event-row time { flex: none; color: rgb(var(--mdui-color-on-surface-variant)); }
+.event-row[data-error="true"] { color: rgb(var(--mdui-color-error)); }
+#raw-state { max-height: 240px; overflow: auto; margin: 0; font-size: 11px; }
+@media (max-width: 900px) {
+  .app-toolbar { gap: 8px; padding-inline: 16px; }
+  .workspace { margin-inline: 16px; }
+  #uart-form { grid-template-columns: minmax(0, 1fr); }
+  .send-options > mdui-button { margin-left: auto; }
+  .statusbar { gap: 12px; padding-inline: 16px; }
 }
 @media (max-width: 600px) {
-  main { padding: 20px 12px; }
-  mdui-top-app-bar { padding-inline: 4px; }
-  .app-subtitle { display: none; }
-  .card-content, mdui-tab-panel, .log-panel { padding: 20px 16px; }
-  .page-heading > span { display: none; }
-  .workspace { gap: 16px; margin-block: 16px; }
-  .stack { gap: 16px; }
-  .actions { gap: 8px; }
-  .firmware { width: 100%; }
-  .firmware-name { flex: 1; }
-  #firmware-name { max-width: 200px; }
-  #gdb-address { margin-left: 0; }
-  .session-meta { gap: 12px 16px; }
-  .form-row { flex-wrap: wrap; }
-  .form-row > mdui-select, .form-row > mdui-text-field { flex-basis: 120px; }
-  .log-options { width: 100%; }
-  .log-options mdui-select { flex: 1; min-width: 0; }
-  .log-row { grid-template-columns: 104px minmax(0, 1fr); gap: 8px; }
+  .app-toolbar { flex-wrap: wrap; padding: 12px; }
+  .app-title { margin-right: auto; }
+  .firmware-name { order: 3; flex-basis: 100%; }
+  .lifecycle-actions { width: 100%; justify-content: space-between; order: 4; }
+  .workspace { margin-inline: 8px; }
+  #channel-tabs { width: 150px; }
+  .board-actions { gap: 0; padding-right: 0; }
+  .console-toolbar { gap: 8px; flex-wrap: wrap; padding: 12px; }
+  .console-toolbar mdui-select { width: 160px; }
+  .receive-actions { flex-basis: 100%; justify-content: flex-end; }
+  .receive, .composer { padding: 12px; }
+  .receive-footer { padding-inline: 12px; }
+  .send-options { gap: 8px; flex-wrap: wrap; }
+  #uart-newline { flex: 1; min-width: 100px; }
+  .can-options { flex-wrap: wrap; }
+  .can-options > mdui-text-field { max-width: none; }
+  .can-flags { width: 100%; }
+  .statusbar { padding-inline: 12px; gap: 10px; flex-wrap: wrap; }
+  .vin-observation, #observation-status { display: none; }
+  #virtual-time { margin-right: auto; }
+  mdui-dialog::part(panel) { padding: 20px; }
 }
+
+#uart-rx { position: relative; padding: 0; overflow: hidden; }
+.uart-terminal, .uart-hex { position: absolute; inset: 12px 20px; }
+.uart-hex { margin: 0; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; }

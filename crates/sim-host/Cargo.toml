@@ -21,8 +21,8 @@ host-processes = ["simulation", "native-process"]
 socketcan = ["simulation", "dep:socketcan"]
 trace = ["dep:mcap", "dep:binrw"]
 machine = ["simulation", "boards", "qmp", "native-process", "cosim-wire"]
-lab = ["boards", "qmp", "native-process", "cosim-wire", "dep:signal-hook"]
-lab-session = ["lab", "dep:uuid", "dep:base64"]
+lab = ["boards", "qmp", "native-process", "cosim-wire", "dep:signal-hook", "dep:object"]
+lab-session = ["lab", "dep:uuid", "dep:base64", "dep:sha2"]
 web = ["lab-session", "dep:axum", "tokio/sync", "tokio/fs"]
 worker = ["simulation", "physics", "cosim-wire", "native-process", "dep:tokio", "dep:signal-hook", "dep:roxmltree", "dep:sha2"]
 physics = ["dep:sim-core"]
@@ -40,6 +40,14 @@ path = "src/main.rs"
 [[example]]
 name = "host_can"
 required-features = ["simulation"]
+
+[[example]]
+name = "headless_lab"
+required-features = ["lab"]
+
+[[example]]
+name = "lab_perf"
+required-features = ["lab"]
 
 [[example]]
 name = "gazebo_render_producer"
@@ -98,7 +106,7 @@ regex = { version = "=1.12.2", optional = true }
 num-bigint = { version = "=0.4.6", optional = true }
 base64 = { version = "=0.22.1", optional = true }
 crc = { version = "=3.4.0", optional = true }
-rustix = { version = "=1.1.6", default-features = false, features = ["std", "process", "event", "net", "fs", "termios", "time"], optional = true }
+rustix = { version = "=1.1.6", default-features = false, features = ["std", "process", "event", "net", "fs", "termios", "time", "param"], optional = true }
 mcap = { version = "=0.26.0", default-features = false, optional = true }
 binrw = { version = "=0.15.2", optional = true }
 mujoco-rs = { path = "../../third_party/mujoco-rs", version = "=6.1.0", default-features = false, optional = true }
@@ -107,6 +115,7 @@ uuid = { version = "=1.29.2", default-features = false, features = ["v4"], optio
 axum = { version = "=0.8.9", default-features = false, features = ["http1", "json", "multipart", "ws", "tokio"], optional = true }
 roxmltree = { version = "=0.21.1", optional = true }
 sha2 = { version = "=0.10.9", optional = true }
+object = { version = "=0.37.3", default-features = false, features = ["read_core", "elf", "std"], optional = true }
 
 [target.'cfg(unix)'.dependencies]
 signal-hook = { version = "=0.3.18", optional = true }
@@ -115,7 +124,7 @@ signal-hook = { version = "=0.3.18", optional = true }
 socketcan = { version = "=4.0.0", default-features = false, optional = true }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_Threading"] }
+windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Pipes", "Win32_System_ProcessStatus", "Win32_System_Threading"] }
 
 [build-dependencies]
 cc = { version = "1.2.56", optional = true }

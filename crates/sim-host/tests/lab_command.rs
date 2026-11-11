@@ -1,8 +1,8 @@
 #![cfg(all(target_os = "linux", feature = "lab"))]
 use sim_host::lab::{
     channels::AdcValue,
-    command::{parse, split_words, Command, Lines},
-    LabInput,
+    command::{decode_uart, parse, split_words, Command, Lines, UartReceiveFormat},
+    BoardCommand, LabInput,
 };
 
 #[test]
@@ -14,6 +14,39 @@ fn quote_and_escape_grammar_keeps_independent_cpython_words() {
         let expected: Option<Vec<String>> = serde_json::from_value(case["words"].clone()).unwrap();
         assert_eq!(actual, expected, "{}", case["input"]);
     }
+}
+
+#[test]
+fn serial_assistant_decodes_raw_hex_and_applies_only_selected_line_ending() {
+    assert_eq!(
+        decode_uart("hex", "crlf", "00 ff E4 b8 ad").unwrap(),
+        b"\0\xff\xe4\xb8\xad\r\n"
+    );
+    assert_eq!(
+        decode_uart("text", "none", "中\0").unwrap(),
+        "中\0".as_bytes()
+    );
+    let ports = vec!["uart5".into()];
+    let command = parse(br#"uart-send uart5 hex none "00 ff""#, &ports, &[], false).unwrap();
+    assert!(
+        matches!(command.board_command(), Some(BoardCommand::Input(LabInput::Uart { endpoint, data }))
+        if endpoint == "uart5" && data == [0, 255])
+    );
+    assert!(matches!(
+        parse(b"receive-format text", &ports, &[], false).unwrap(),
+        Command::ReceiveFormat(UartReceiveFormat::Text)
+    ));
+    assert!(
+        matches!(parse(b"action 'USER low'", &ports, &[], false).unwrap(), Command::Action(name) if name == "USER low")
+    );
+    for (format, ending, payload) in [
+        ("hex", "none", "a a"),
+        ("text", "bad", "x"),
+        ("utf8", "lf", "x"),
+    ] {
+        assert!(decode_uart(format, ending, payload).is_err());
+    }
+    assert!(decode_uart("text", "crlf", &"x".repeat(4095)).is_err());
 }
 
 #[test]

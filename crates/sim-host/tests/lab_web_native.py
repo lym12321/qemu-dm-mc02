@@ -50,6 +50,16 @@ async def scenario(url, args, process, report):
                 except OSError:
                     await asyncio.sleep(.01)
         assert (await response.json())["status"] == "idle"
+        project = await (await client.get(url + "/api/project")).json()
+        assert project["path"] is None and project["project"]["schema"] == "sim/lab-project/v1"
+        assert (await client.post(url + "/api/project", json=project["project"])).status == 400
+        ide = dict(project["project"], firmware=str(args.elf.resolve()), gdb_port=1234)
+        exported = await client.post(url + "/api/ide", json=ide)
+        assert exported.status == 200
+        config = await exported.json()
+        assert config["vscode"]["configurations"][0]["servertype"] == "external"
+        assert config["clion"]["configuration"] == "Remote Debug"
+        assert "target remote 127.0.0.1:1234" in config["gdb"]
         assert not identities(process.pid), "opening UI started a native MCU"
         assert "libpython" not in Path(f"/proc/{process.pid}/maps").read_text()
         for path, content in [("/", "text/html"), ("/app.js", "javascript"), ("/style.css", "text/css")]:
@@ -70,15 +80,19 @@ async def scenario(url, args, process, report):
         assert response.status == 400
         response = await client.post(url + "/api/firmware", data=form(b"bad", field="other"))
         assert response.status == 400
-        duplicate = form(b"first")
-        duplicate.add_field("extra", b"second", filename="extra.elf")
-        assert (await client.post(url + "/api/firmware", data=duplicate)).status == 400
+        # Deliver this small invalid multipart as one body. A streaming writer can
+        # still be sending its suffix when the server rejects/closes the request.
+        duplicate = (b'--duplicate\r\nContent-Disposition: form-data; name="firmware"; filename="a.elf"\r\n\r\nfirst\r\n'
+            b'--duplicate\r\nContent-Disposition: form-data; name="extra"; filename="b.elf"\r\n\r\nsecond\r\n--duplicate--\r\n')
+        assert (await client.post(url + "/api/firmware", data=duplicate,
+            headers={"Content-Type":"multipart/form-data; boundary=duplicate"})).status == 400
         for asset in [args.elf, args.adc]:
             response = await client.post(url + "/api/firmware", data=form(asset.read_bytes(), asset.name))
             assert response.status == 200, await response.text()
             assert (await response.json())["firmware"]["name"] == asset.name
         # Select minimal firmware last, then exercise every native lifecycle.
-        assert (await client.post(url + "/api/firmware", data=form(args.elf.read_bytes(), args.elf.name))).status == 200
+        upload_name = "uploaded-minimal.elf"
+        assert (await client.post(url + "/api/firmware", data=form(args.elf.read_bytes(), upload_name))).status == 200
         events, uart = [], bytearray()
         async def receive(ws, predicate):
             async with asyncio.timeout(5):
@@ -112,18 +126,40 @@ async def scenario(url, args, process, report):
             assert loaded["ok"], loaded
             generation = loaded["session_id"]
             paused = await receive(ws, lambda value:value.get("type") == "state" and value["status"] == "paused")
+            assert paused["firmware"]["name"] == upload_name
             assert isinstance(paused["board"]["timestamp_ns"],str) and len(paused["pins"]) == 128
             report["native_identities"].extend(identities(process.pid))
             assert len(report["native_identities"]) == 1
+            # Every admitted envelope needs a correlated reply, including the
+            # socket's own pending-capacity refusal. Null IDs strand UI requests.
+            pending = {f"capacity-{i}" for i in range(300)}
+            for identifier in sorted(pending):
+                await ws.send_json({"id":identifier, "session_id":generation, "action":"pause", "args":{}})
+            limited = 0
+            async with asyncio.timeout(5):
+                while pending:
+                    reply = await receive(ws, lambda value:value.get("type") == "command_result")
+                    assert reply["id"] in pending, reply
+                    pending.remove(reply["id"])
+                    limited += reply.get("error") == "too many pending requests"
+            assert limited, "burst did not exercise socket pending capacity"
+            report["capacity_refusals"] = limited
             assert (await client.post(url + "/api/firmware", data=form(b"active"))).status == 409
             assert not (await command(ws,"run","stale"))["accepted"]
             assert not (await command(ws,"key",generation,{"pressed":1}))["accepted"]
+            # Invalid replacement configuration is rejected before stopping the active owner.
+            rejected = await command(ws, "restart", generation, {"config": {"schema":"wrong"}})
+            assert not rejected["ok"] and len(identities(process.pid)) == 1
+            assert (await (await client.get(url + "/api/state")).json())["session_id"] == generation
             assert (await command(ws,"run",generation))["ok"]
             if b"SIM_READY minimal-board\n" not in uart:
                 await receive(ws, lambda _: b"SIM_READY minimal-board\n" in uart)
-            assert (await command(ws,"key",generation,{"pressed":True}))["ok"]
-            pressed = await receive(ws, lambda value:value.get("type") == "state" and value.get("board",{}).get("key",{}).get("pressed"))
-            assert int(pressed["board"]["gpio"]["B"]["sampled"]) & 1
+            accepted = await command(ws,"key",generation,{"pressed":True})
+            assert accepted["ok"] and isinstance(accepted["timestamp_ns"], str)
+            # Native input observation can precede the guest's GPIO response.
+            await receive(ws, lambda value:value.get("type") == "state"
+                and value.get("board",{}).get("key",{}).get("pressed")
+                and int(value["board"]["gpio"]["B"]["sampled"]) & 1)
             await ws.close()
             # Disconnect releases momentary key and preserves the finite native session.
             async with asyncio.timeout(5):
@@ -140,13 +176,17 @@ async def scenario(url, args, process, report):
             assert stopped["ok"] and not identities(process.pid), stopped
             restarted = await command(ws,"restart",generation)
             assert restarted["ok"] and restarted["session_id"] != generation, restarted
+            assert (await (await client.get(url + "/api/state")).json())["firmware"]["name"] == upload_name
             report["native_identities"].extend(identities(process.pid))
-            generation = restarted["session_id"]
-            assert (await command(ws,"stop",generation))["ok"] and not identities(process.pid)
-            response = await client.post(url + "/api/firmware", data=form(args.adc.read_bytes(),args.adc.name))
-            assert response.status == 200
-            loaded = await command(ws,"load",generation)
+            previous_generation, generation = generation, restarted["session_id"]
+            assert not (await command(ws,"run",previous_generation))["accepted"]
+            # This controller may still show the old generation between the
+            # reload result and its state frame. Stop must stop the live board.
+            assert (await command(ws,"stop",previous_generation))["ok"] and not identities(process.pid)
+            local_config = dict(project["project"], firmware=str(args.adc.resolve()))
+            loaded = await command(ws,"load",generation,{"config":local_config})
             assert loaded["ok"], loaded
+            assert (await (await client.get(url + "/api/state")).json())["firmware"]["name"] == args.adc.name
             generation = loaded["session_id"]
             report["native_identities"].extend(identities(process.pid))
             refused = await command(ws,"adc",generation,{"channel":4,"raw":1})

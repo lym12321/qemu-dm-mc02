@@ -7,6 +7,7 @@ use sim_host::{
 };
 use sim_host::{
     lab::channels::{AdcValue, LabChannels},
+    signals::ImuSample,
     step_wire::V1Frame,
     transports::stream::StreamTransport,
 };
@@ -38,11 +39,11 @@ fn frame(stamp: u64, byte: u8) -> CanFrame {
     CanFrame::new(0x321, 0, Some(1), vec![byte], stamp).unwrap()
 }
 #[cfg(unix)]
-fn send_v1(peer: &mut UnixStream, kind: u16) {
+fn send_v1(peer: &mut UnixStream, kind: u16, time_ns: u64) {
     let body = V1Frame {
         kind,
         sequence: 0,
-        time_ns: 0,
+        time_ns,
         payload: if kind == 3 { vec![0; 12] } else { vec![] },
     }
     .encode_body()
@@ -137,14 +138,16 @@ fn v1_adc_requires_opening_explicit_reset_and_real_increasing_timestamps() {
     assert!(channels.reset(100).is_err());
     assert!(drain(&mut peer).is_empty());
     assert!(!channels.consume_opening(false).unwrap());
-    send_v1(&mut peer, 3);
+    send_v1(&mut peer, 3, 0);
     assert!(channels.consume_opening(false).unwrap());
     channels.reset(100).unwrap();
     assert!(channels.send_adc(4, AdcValue::Raw(12345), 100).is_err());
     channels.send_adc(4, AdcValue::Raw(12345), 101).unwrap();
-    assert!(channels
-        .send_adc(4, AdcValue::Voltage(3_300_001), 102)
-        .is_err());
+    assert!(
+        channels
+            .send_adc(4, AdcValue::Voltage(3_300_001), 102)
+            .is_err()
+    );
     channels
         .send_adc(4, AdcValue::Voltage(1_650_000), 102)
         .unwrap();
@@ -169,7 +172,7 @@ fn v1_adc_requires_opening_explicit_reset_and_real_increasing_timestamps() {
         },
     ];
     assert_eq!(decode_v1(&drain(&mut peer)), expected);
-    send_v1(&mut peer, 1);
+    send_v1(&mut peer, 1, 0);
     channels.service(103, true).unwrap();
     assert!(channels.send_adc(4, AdcValue::Raw(0), 104).is_err());
     assert!(drain(&mut peer).is_empty());
@@ -180,6 +183,68 @@ fn v1_adc_requires_opening_explicit_reset_and_real_increasing_timestamps() {
         (frames[0].kind, frames[1].sequence, frames[1].time_ns),
         (1, 1, 201)
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn imu_and_adc_share_admission_order_and_freeze_after_native_reset() {
+    let (cosim, mut peer) = pair();
+    let mut cosim = StreamTransport::new(cosim, 256).unwrap();
+    let mut channels = LabChannels::new(vec![], vec![], Some(&mut cosim)).unwrap();
+    let sample = ImuSample {
+        gyro_rad_s: [std::f64::consts::PI, -std::f64::consts::FRAC_PI_2, 0.0],
+        accel_m_s2: [0.0, 0.0, 9.80665],
+    };
+    assert!(channels.send_imu(&sample, 100).is_err());
+    send_v1(&mut peer, 3, 0);
+    assert!(channels.consume_opening(false).unwrap());
+    channels.reset(100).unwrap();
+    assert!(channels.send_imu(&sample, 100).is_err());
+    assert!(
+        channels
+            .send_imu(
+                &ImuSample {
+                    gyro_rad_s: [f64::NAN, 0.0, 0.0],
+                    ..sample
+                },
+                101
+            )
+            .is_err()
+    );
+    channels.send_imu(&sample, 101).unwrap();
+    assert!(channels.send_adc(4, AdcValue::Raw(12345), 101).is_err());
+    channels.send_adc(4, AdcValue::Raw(12345), 102).unwrap();
+    assert!(channels.send_imu(&sample, 102).is_err());
+    channels.send_imu(&sample, 103).unwrap();
+    let frames = decode_v1(&drain(&mut peer));
+    assert_eq!(
+        frames
+            .iter()
+            .map(|frame| (frame.kind, frame.sequence, frame.time_ns))
+            .collect::<Vec<_>>(),
+        [(1, 0, 100), (2, 1, 101), (5, 2, 102), (2, 3, 103)]
+    );
+    // IEEE754 binary32 literals for 180, -90, 0 degrees/s and +1g, independent
+    // of the conversion/serialization helpers used by the producer.
+    assert_eq!(
+        frames[1].payload,
+        [
+            0, 0, 0x34, 0x43, 0, 0, 0xb4, 0xc2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x80,
+            0x3f,
+        ]
+    );
+    send_v1(&mut peer, 1, 80);
+    assert_eq!(
+        channels.service(104, true).unwrap(),
+        [ChannelEvent {
+            endpoint: "cosim".into(),
+            timestamp_ns: 80,
+            data: ChannelData::Reset,
+        }]
+    );
+    assert!(channels.send_imu(&sample, 105).is_err());
+    assert!(channels.send_adc(4, AdcValue::Raw(0), 105).is_err());
+    assert!(drain(&mut peer).is_empty());
 }
 
 // Captured from pinned QEMU's prebound TCP client at startup: OPENED telemetry,

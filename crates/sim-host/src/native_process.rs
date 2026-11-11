@@ -7,7 +7,10 @@ use std::{
     collections::BTreeSet,
     ffi::OsString,
     fmt,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -18,6 +21,7 @@ const STDERR_TAIL: u64 = 12_000;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorKind {
     Admission,
+    Interrupted,
     Deadline,
     Exited,
     Io,
@@ -30,6 +34,7 @@ pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
     notes: Mutex<Vec<String>>,
+    cleanup_failed: AtomicBool,
 }
 pub type Failure = Arc<Error>;
 pub type Result<T> = std::result::Result<T, Failure>;
@@ -40,7 +45,11 @@ impl Error {
             kind,
             message: message.into(),
             notes: Mutex::new(Vec::new()),
+            cleanup_failed: AtomicBool::new(kind == ErrorKind::Cleanup),
         }
+    }
+    pub fn cleanup_failed(&self) -> bool {
+        self.cleanup_failed.load(Ordering::Relaxed)
     }
     pub fn notes(&self) -> Vec<String> {
         self.notes.lock().unwrap().clone()
@@ -111,6 +120,16 @@ impl ProcessOptions {
 
 fn io_failure(label: &str, error: impl fmt::Display) -> Failure {
     Arc::new(Error::new(ErrorKind::Io, format!("{label}: {error}")))
+}
+
+fn check_cancellation(cancellation: Option<&AtomicBool>) -> Result<()> {
+    if cancellation.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(Arc::new(Error::new(
+            ErrorKind::Interrupted,
+            "native startup interrupted",
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]

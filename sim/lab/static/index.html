@@ -4,136 +4,123 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <meta name="color-scheme" content="light">
-  <title>DM-MC02 · 固件实验台</title>
+  <title>DM-MC02 Lab</title>
   <link rel="stylesheet" href="/vendor/mdui.css">
+  <link rel="stylesheet" href="/vendor/xterm.css">
   <link rel="stylesheet" href="/style.css">
   <script src="/vendor/mdui.js" defer></script>
+  <script src="/vendor/xterm.js" defer></script>
+  <script src="/vendor/addon-fit.js" defer></script>
+  <script src="/uart-console.js" defer></script>
   <script src="/app.js" defer></script>
 </head>
 <body>
-  <mdui-layout>
-    <mdui-top-app-bar>
-      <mdui-top-app-bar-title>DM-MC02 <span class="app-subtitle">固件实验台</span></mdui-top-app-bar-title>
-      <mdui-chip id="connection-status" aria-live="polite">正在连接</mdui-chip>
-    </mdui-top-app-bar>
-    <mdui-layout-main>
-      <main class="mdui-prose">
-        <section class="page-heading">
-          <div><h1>固件实验台</h1><p class="secondary-text">加载固件，观察板卡，调试输入与通道。</p></div>
-          <span class="secondary-text mono">STM32H723 · Cortex-M7</span>
-        </section>
-        <mdui-card variant="outlined" class="session">
-          <section class="card-content stack" aria-label="固件与运行控制">
-            <div class="toolbar">
-              <div class="firmware">
-                <mdui-button id="upload-button" class="upload-button" variant="outlined">选择 ELF</mdui-button>
-                <input id="firmware-input" type="file" accept=".elf" aria-label="选择固件 ELF" hidden>
-                <div class="firmware-name"><strong id="firmware-name">尚未选择固件</strong><small id="firmware-hint">上传后加载，初始停在复位处 · 最大 64 MiB</small></div>
-              </div>
-              <div class="actions">
-                <mdui-button id="load-button" data-action="load" variant="tonal" disabled>加载</mdui-button>
-                <mdui-button id="run-button" data-action="run" variant="filled" disabled>运行</mdui-button>
-                <mdui-button id="pause-button" data-action="pause" variant="outlined" disabled>暂停</mdui-button>
-                <mdui-button id="stop-button" data-action="stop" variant="outlined" disabled>停止</mdui-button>
-                <mdui-button id="restart-button" data-action="restart" variant="text" disabled>重新加载</mdui-button>
-              </div>
-            </div>
-            <mdui-divider></mdui-divider>
-            <div class="session-meta">
-              <mdui-chip id="session-status" data-status="idle">未加载</mdui-chip>
-              <span>虚拟时间 <strong id="virtual-time" class="mono">—</strong></span>
-              <span>剩余期限 <strong id="remaining-time" class="mono">—</strong></span>
-              <span id="gdb-address" class="mono">GDB —</span>
-            </div>
-          </section>
-        </mdui-card>
-        <div class="workspace">
-          <mdui-card variant="outlined">
-            <section class="card-content stack" aria-labelledby="board-title">
-              <div class="section-heading"><h2 id="board-title">板卡观察</h2><span id="observation-status" class="secondary-text">等待板卡快照</span></div>
-              <mdui-card variant="filled" class="led-observation">
-                <div class="led-preview">
-                  <svg viewBox="0 0 96 96" role="img" aria-label="状态灯，尚无观察数据">
-                    <defs><pattern id="unknown-led" width="12" height="12" patternUnits="userSpaceOnUse"><path d="M0 12L12 0" stroke="currentColor" stroke-opacity=".2"/></pattern></defs>
-                    <rect id="board-led" x="1" y="1" width="94" height="94" rx="16" fill="url(#unknown-led)" stroke="currentColor" stroke-opacity=".2"/>
-                  </svg>
-                  <div><small>状态灯 · <span id="led-pin">A7</span></small><h3 id="led-value" class="mono">—</h3><div id="led-rgb" class="mono secondary-text">尚无颜色数据</div></div>
-                </div>
-                <small id="led-source">等待板卡观察</small>
-              </mdui-card>
-              <div class="key-control">
-                <div><strong>用户按键 · <span id="key-pin">A15</span></strong><div><span id="key-value">—</span> <small id="key-level">按住按钮或空格键</small></div></div>
-                <mdui-button id="key-button" variant="tonal" disabled aria-label="按住用户按键 A15" aria-pressed="false">按住 USER</mdui-button>
-              </div>
-              <mdui-divider></mdui-divider>
-              <form id="vin-form" class="inline-form">
-                <mdui-text-field id="vin-input" label="VIN 输入 / mV" type="number" min="0" max="4294967295" step="1" value="24000" required helper="当前 —"></mdui-text-field>
-                <mdui-button id="vin-send" type="submit" variant="outlined" disabled>设置</mdui-button>
-              </form>
-              <small>GPIO 为数字采样；灯的波形解码与 GPIO 近似来源分别标注。</small>
-            </section>
-          </mdui-card>
-          <mdui-card variant="outlined">
-            <section class="card-content stack" aria-labelledby="gpio-title">
-              <div class="section-heading"><h2 id="gpio-title">GPIO 观察</h2><span class="secondary-text">A–H · 0–15</span></div>
-              <small>0 低电平 · 1 高电平　 I 输入 · O 输出 · AF 复用 · A 模拟</small>
-              <div class="gpio-scroll"><div id="gpio-grid" class="gpio-grid" role="group" aria-label="GPIO 引脚采样"></div></div>
-              <div class="pin-detail"><strong id="selected-pin" class="mono">B0</strong><span id="pin-summary" class="secondary-text">等待板卡快照</span></div>
-              <form id="gpio-form" class="form-row">
-                <mdui-select id="gpio-pin" label="引脚" value="B0" aria-label="选择 GPIO 引脚"></mdui-select>
-                <mdui-select id="gpio-level" label="外部电平" value="0"><mdui-menu-item value="0">0 · 低</mdui-menu-item><mdui-menu-item value="1">1 · 高</mdui-menu-item></mdui-select>
-                <mdui-button id="gpio-send" type="submit" variant="outlined" disabled>施加输入</mdui-button>
-              </form>
-              <small>外部输入不会改变固件配置的输出与复用模式。</small>
-              <mdui-collapse id="raw-details"><mdui-collapse-item header="原始板卡快照"><pre id="raw-state" tabindex="0">null</pre></mdui-collapse-item></mdui-collapse>
-            </section>
-          </mdui-card>
+  <header class="app-toolbar">
+    <strong class="app-title">DM-MC02</strong>
+    <mdui-button id="upload-button" variant="outlined" disabled>打开 ELF</mdui-button>
+    <span id="firmware-name" class="firmware-name">未选择固件</span>
+    <input id="firmware-input" type="file" accept=".elf" aria-label="选择 ELF" disabled hidden>
+    <div class="lifecycle-actions">
+      <mdui-button id="primary-button" variant="filled" disabled>启动</mdui-button>
+      <mdui-button id="restart-button" variant="text" disabled hidden>重载</mdui-button>
+      <mdui-button id="stop-button" variant="text" disabled hidden>停止</mdui-button>
+      <mdui-button id="settings-button" variant="text" disabled>设置</mdui-button>
+    </div>
+  </header>
+  <mdui-linear-progress id="session-progress" aria-label="连接中…"></mdui-linear-progress>
+  <div id="session-error" class="operation-error" role="alert" hidden></div>
+  <main class="workspace">
+    <div class="workspace-toolbar">
+      <mdui-tabs id="channel-tabs" value="uart"><mdui-tab value="uart">UART</mdui-tab><mdui-tab value="can">CAN</mdui-tab></mdui-tabs>
+      <div class="board-actions">
+        <mdui-button id="key-button" variant="tonal" disabled aria-label="按住 USER" aria-pressed="false">USER</mdui-button>
+        <mdui-button id="peripherals-button" variant="text">引脚与外设</mdui-button>
+      </div>
+    </div>
+    <section id="console-uart" class="console-content" aria-label="UART 控制台">
+      <div class="console-toolbar">
+        <mdui-select id="uart-endpoint" variant="outlined" label="端口" value="uart1"></mdui-select>
+        <mdui-segmented-button-group id="uart-receive-format" value="text" selects="single" aria-label="接收格式"><mdui-segmented-button value="text">终端</mdui-segmented-button><mdui-segmented-button value="hex">HEX</mdui-segmented-button></mdui-segmented-button-group>
+        <div class="receive-actions"><mdui-checkbox id="uart-scroll" checked>自动滚动</mdui-checkbox><mdui-button id="uart-clear" variant="text">清空</mdui-button></div>
+      </div>
+      <div id="uart-rx" class="receive" aria-label="UART 接收"></div>
+      <div class="receive-footer"><span id="uart-count" class="mono">RX 0 B</span><span id="uart-tx-status" class="mono"></span></div>
+      <form id="uart-form" class="composer">
+        <mdui-text-field id="uart-data" variant="outlined" label="发送内容" rows="1" maxlength="16384"></mdui-text-field>
+        <div class="send-options">
+          <mdui-segmented-button-group id="uart-mode" value="text" selects="single" aria-label="发送格式"><mdui-segmented-button value="text">文本</mdui-segmented-button><mdui-segmented-button value="hex">HEX</mdui-segmented-button></mdui-segmented-button-group>
+          <mdui-select id="uart-newline" variant="outlined" label="换行" value="none"><mdui-menu-item value="none">无换行</mdui-menu-item><mdui-menu-item value="lf">LF</mdui-menu-item><mdui-menu-item value="crlf">CRLF</mdui-menu-item><mdui-menu-item value="cr">CR</mdui-menu-item></mdui-select>
+          <mdui-button id="uart-send" title="发送 (Ctrl+Enter)" type="submit" variant="filled" disabled>发送</mdui-button>
         </div>
-        <mdui-card variant="outlined">
-          <section class="card-content stack" aria-label="USB 连接">
-            <div class="section-heading"><h2>USB</h2><mdui-chip id="usb-status">未启用</mdui-chip></div>
-            <div class="toolbar"><span id="usb-message" class="secondary-text">使用 --usbip 启动实验台以连接本机。</span><mdui-button id="usb-attach" variant="tonal" disabled>连接本机</mdui-button><mdui-button id="usb-detach" variant="outlined" disabled>断开</mdui-button></div>
-            <small>Windows 先安装 usbip-win2；Linux 先加载 vhci_hcd，连接需要 sudo 权限。</small>
-          </section>
-        </mdui-card>
-        <mdui-card variant="outlined" class="channels">
-          <section class="channel-controls" aria-label="通道输入">
-            <mdui-tabs id="channel-tabs" value="uart" full-width>
-              <mdui-tab id="tab-uart" value="uart">UART</mdui-tab><mdui-tab id="tab-can" value="can">CAN</mdui-tab><mdui-tab id="tab-adc" value="adc">ADC1</mdui-tab>
-              <mdui-tab-panel id="panel-uart" slot="panel" value="uart">
-                <form id="uart-form" class="stack">
-                  <div class="form-row"><mdui-select id="uart-endpoint" label="端点" value="uart1"><mdui-menu-item value="uart1">UART1</mdui-menu-item><mdui-menu-item value="uart2">UART2 · RS485</mdui-menu-item><mdui-menu-item value="uart3">UART3 · RS485</mdui-menu-item><mdui-menu-item value="uart5">UART5 · 仅接收</mdui-menu-item><mdui-menu-item value="uart7">UART7</mdui-menu-item><mdui-menu-item value="uart10">UART10</mdui-menu-item></mdui-select><mdui-select id="uart-mode" label="格式" value="text"><mdui-menu-item value="text">UTF-8</mdui-menu-item><mdui-menu-item value="hex">HEX</mdui-menu-item></mdui-select><mdui-select id="uart-newline" label="追加换行" value="none"><mdui-menu-item value="none">无</mdui-menu-item><mdui-menu-item value="lf">LF</mdui-menu-item><mdui-menu-item value="crlf">CRLF</mdui-menu-item><mdui-menu-item value="cr">CR</mdui-menu-item></mdui-select></div>
-                  <mdui-text-field id="uart-data" label="发送内容" rows="3" placeholder="输入要发送的文本" maxlength="16384"></mdui-text-field>
-                  <div class="form-footer"><small>发送到固件 RX · 单次最多 4096 字节</small><mdui-button id="uart-send" type="submit" variant="filled" disabled>发送</mdui-button></div>
-                </form>
-              </mdui-tab-panel>
-              <mdui-tab-panel id="panel-can" slot="panel" value="can">
-                <form id="can-form" class="stack">
-                  <div class="form-row"><mdui-select id="can-endpoint" label="端点" value="can1"><mdui-menu-item value="can1">CAN1</mdui-menu-item><mdui-menu-item value="can2">CAN2</mdui-menu-item><mdui-menu-item value="can3">CAN3</mdui-menu-item></mdui-select><mdui-text-field id="can-id" label="ID" value="0x321" required></mdui-text-field></div>
-                  <div class="form-row"><mdui-text-field id="can-flags" label="Flags" value="0" required helper="1 EXT · 2 RTR · 4 FD · 8 BRS"></mdui-text-field><mdui-text-field id="can-dlc" label="DLC" type="number" min="0" max="15" value="8" required></mdui-text-field></div>
-                  <mdui-text-field id="can-data" label="数据 / HEX" value="41 42 43 44 45 46 47 48" maxlength="191"></mdui-text-field>
-                  <div class="form-footer"><small>标准、扩展及 CAN FD 帧</small><mdui-button id="can-send" type="submit" variant="filled" disabled>发送帧</mdui-button></div>
-                </form>
-              </mdui-tab-panel>
-              <mdui-tab-panel id="panel-adc" slot="panel" value="adc">
-                <form id="adc-form" class="stack">
-                  <div class="form-row"><mdui-select id="adc-channel" label="通道" value="0"></mdui-select><mdui-select id="adc-mode" label="输入类型" value="raw"><mdui-menu-item value="raw">raw16</mdui-menu-item><mdui-menu-item value="voltage_uv">电压 / µV</mdui-menu-item></mdui-select></div>
-                  <mdui-text-field id="adc-value" label="输入值" type="number" min="0" max="65535" value="12345" step="1" required></mdui-text-field>
-                  <div class="form-footer"><small id="adc-hint">输入刺激，非传感器读数 · 运行后可发送</small><mdui-button id="adc-send" type="submit" variant="filled" disabled>施加输入</mdui-button></div>
-                </form>
-              </mdui-tab-panel>
-            </mdui-tabs>
-          </section>
-          <section class="log-panel" aria-labelledby="log-title">
-            <div class="log-toolbar"><h2 id="log-title">通道记录</h2><div class="log-options"><mdui-select id="log-filter" label="记录" value="all"><mdui-menu-item value="all">全部</mdui-menu-item><mdui-menu-item value="uart">UART</mdui-menu-item><mdui-menu-item value="can">CAN</mdui-menu-item><mdui-menu-item value="system">系统</mdui-menu-item></mdui-select><mdui-select id="log-format" label="显示" value="text"><mdui-menu-item value="text">文本</mdui-menu-item><mdui-menu-item value="hex">HEX</mdui-menu-item></mdui-select><mdui-button id="clear-log" variant="text">清空</mdui-button></div></div>
-            <div id="log" class="log mono" role="log" aria-label="串口、CAN 与会话记录" tabindex="0"><p id="log-empty">加载固件后，通道数据将在这里出现。</p></div>
-            <div class="log-footer"><small id="log-count">0 条记录</small><small>UART 轮询采样 · CAN wire 时间</small></div>
-          </section>
-        </mdui-card>
-        <footer class="page-footer"><small>关闭页面后实验继续，直至停止或到达期限。</small></footer>
-      </main>
-    </mdui-layout-main>
-  </mdui-layout>
-  <mdui-snackbar id="notice" closeable aria-live="polite"></mdui-snackbar>
+        <div id="uart-error" class="operation-error" role="alert" hidden></div>
+      </form>
+    </section>
+    <section id="console-can" class="console-content" aria-label="CAN 控制台" hidden>
+      <div class="console-toolbar"><mdui-select id="can-endpoint" variant="outlined" label="端口" value="can1"></mdui-select><div class="receive-actions"><mdui-checkbox id="can-scroll" checked>自动滚动</mdui-checkbox><mdui-button id="can-clear" variant="text">清空</mdui-button></div></div>
+      <div id="can-rx" class="receive" tabindex="0"><table class="can-table mono"><thead><tr><th>时间 / s</th><th>方向</th><th>ID</th><th>类型</th><th>长度</th><th>数据</th></tr></thead><tbody id="can-records"></tbody></table></div>
+      <div class="receive-footer"><span id="can-count" class="mono">0 帧</span></div>
+      <form id="can-form" class="composer">
+        <div class="can-options form-row"><mdui-text-field id="can-id" variant="outlined" label="ID" value="0x321" required></mdui-text-field><mdui-text-field id="can-dlc" variant="outlined" label="DLC" type="number" min="0" max="15" value="8" required></mdui-text-field><div class="can-flags"><mdui-checkbox id="can-ext">EXT</mdui-checkbox><mdui-checkbox id="can-rtr">RTR</mdui-checkbox><mdui-checkbox id="can-fd">FD</mdui-checkbox><mdui-checkbox id="can-brs">BRS</mdui-checkbox></div></div>
+        <div class="form-row"><mdui-text-field id="can-data" variant="outlined" label="数据 / HEX" value="41 42 43 44 45 46 47 48" maxlength="191"></mdui-text-field><mdui-button id="can-send" type="submit" variant="filled" disabled>发送</mdui-button></div>
+        <div id="can-error" class="operation-error" role="alert" hidden></div>
+      </form>
+    </section>
+  </main>
+  <footer class="statusbar">
+    <span id="session-status" aria-live="polite">未启动</span>
+    <span id="virtual-time" class="mono">—</span>
+    <span id="led-observation" class="led-observation"><span id="board-led" class="led-swatch" aria-label="LED 无数据"></span><span id="led-value" class="mono">—</span></span>
+    <span class="vin-observation">VIN <span id="vin-value" class="mono">—</span></span>
+    <span id="usb-status" hidden></span>
+    <span id="observation-status"></span>
+    <span id="connection-status" role="status">连接中</span>
+    <mdui-button id="events-button" variant="text">事件</mdui-button>
+  </footer>
+  <mdui-dialog id="peripherals-dialog" headline="引脚与外设" close-on-overlay-click close-on-esc>
+    <mdui-tabs id="peripheral-tabs" value="gpio"><mdui-tab value="gpio">GPIO</mdui-tab><mdui-tab value="adc">ADC</mdui-tab><mdui-tab value="vin">电源</mdui-tab><mdui-tab value="usb">USB</mdui-tab></mdui-tabs>
+    <div class="peripheral-content">
+      <section id="peripheral-gpio" class="stack">
+        <form id="gpio-form" class="form-row"><mdui-select id="gpio-pin" variant="outlined" label="引脚" value="B0"></mdui-select><mdui-select id="gpio-level" variant="outlined" label="电平" value="0"><mdui-menu-item value="0">0</mdui-menu-item><mdui-menu-item value="1">1</mdui-menu-item></mdui-select><mdui-button id="gpio-send" type="submit" variant="filled" disabled>设置</mdui-button></form>
+        <div id="pin-summary" class="mono secondary-text">—</div>
+      </section>
+      <section id="peripheral-adc" hidden>
+        <form id="adc-form" class="stack"><div class="form-row"><mdui-select id="adc-channel" variant="outlined" label="通道" value="0"></mdui-select><mdui-select id="adc-mode" variant="outlined" label="类型" value="raw"><mdui-menu-item value="raw">raw16</mdui-menu-item><mdui-menu-item value="voltage_uv">µV</mdui-menu-item></mdui-select></div><div class="form-row"><mdui-text-field id="adc-value" variant="outlined" label="输入值" type="number" min="0" max="65535" value="12345" step="1" required></mdui-text-field><mdui-button id="adc-send" type="submit" variant="filled" disabled>设置</mdui-button></div></form>
+      </section>
+      <section id="peripheral-vin" hidden><form id="vin-form" class="form-row"><mdui-text-field id="vin-input" variant="outlined" label="VIN / mV" type="number" min="0" max="4294967295" step="1" value="24000" required></mdui-text-field><mdui-button id="vin-send" type="submit" variant="filled" disabled>设置</mdui-button></form></section>
+      <section id="peripheral-usb" class="stack" hidden><div id="usb-message" class="secondary-text"></div><div class="form-row"><mdui-button id="usb-attach" variant="filled" disabled>连接本机</mdui-button><mdui-button id="usb-detach" variant="outlined" disabled>断开</mdui-button></div></section>
+      <div id="board-error" class="operation-error" role="alert" hidden></div>
+    </div>
+    <mdui-button id="peripheral-close" slot="action" variant="text">关闭</mdui-button>
+  </mdui-dialog>
+  <mdui-dialog id="events-dialog" headline="事件" close-on-overlay-click close-on-esc>
+    <div class="form-row"><span id="gdb-address" class="mono secondary-text"></span><mdui-button id="events-clear" variant="text">清空</mdui-button></div>
+    <div id="event-log" class="event-log mono" role="log" tabindex="0"></div>
+    <mdui-collapse><mdui-collapse-item header="原始快照"><pre id="raw-state" class="mono" tabindex="0">null</pre></mdui-collapse-item></mdui-collapse>
+    <mdui-button id="events-close" slot="action" variant="text">关闭</mdui-button>
+  </mdui-dialog>
+  <mdui-dialog id="settings-dialog" headline="设置" close-on-overlay-click close-on-esc>
+    <div class="settings-content stack">
+      <mdui-text-field id="project-firmware" variant="outlined" label="本地 ELF 路径" helper="Lab 所在电脑的路径；上传文件无法跟随原文件更新。" clearable></mdui-text-field>
+      <mdui-checkbox id="project-watch">ELF 更新后自动重载</mdui-checkbox>
+      <div class="form-row"><mdui-select id="project-startup" variant="outlined" label="启动方式" value="run"><mdui-menu-item value="run">直接运行</mdui-menu-item><mdui-menu-item value="wait_gdb">等待 GDB</mdui-menu-item><mdui-menu-item value="user">按住 USER 启动</mdui-menu-item></mdui-select><mdui-text-field id="project-user-hold" variant="outlined" label="USER / ms" type="number" min="1" step="1" value="1000" hidden></mdui-text-field></div>
+      <mdui-collapse><mdui-collapse-item header="调试与 USB">
+        <div class="stack settings-group">
+          <div class="form-row"><mdui-checkbox id="project-gdb">GDB</mdui-checkbox><mdui-text-field id="project-gdb-port" variant="outlined" label="端口" type="number" min="1" max="65535" value="1234"></mdui-text-field></div>
+          <div class="form-row"><mdui-checkbox id="project-usb">USB/IP</mdui-checkbox><mdui-text-field id="project-usb-address" variant="outlined" label="地址" value="127.0.0.1:3240"></mdui-text-field></div>
+          <div class="form-row"><mdui-select id="ide-format" variant="outlined" label="IDE 配置" value="vscode"><mdui-menu-item value="vscode">VS Code · Cortex-Debug</mdui-menu-item><mdui-menu-item value="clion">CLion · Remote Debug</mdui-menu-item><mdui-menu-item value="gdb">GDB</mdui-menu-item></mdui-select><mdui-button id="ide-download" variant="text">导出</mdui-button></div>
+        </div>
+      </mdui-collapse-item><mdui-collapse-item header="高级" id="advanced-settings">
+        <div class="stack settings-group">
+          <div class="form-row"><mdui-text-field id="project-startup-timeout" variant="outlined" label="启动期限 / s" type="number" min="1" step="1" value="10"></mdui-text-field><mdui-text-field id="project-timeout" variant="outlined" label="运行期限 / s" type="number" min="1" step="1" value="3600"></mdui-text-field></div>
+          <mdui-select id="project-imu" variant="outlined" label="IMU" value="stationary"><mdui-menu-item value="stationary">静止板</mdui-menu-item><mdui-menu-item value="off">关闭</mdui-menu-item></mdui-select>
+          <div id="project-channels" class="channel-settings"></div>
+          <div id="project-path" class="mono secondary-text"></div>
+        </div>
+      </mdui-collapse-item></mdui-collapse>
+      <div id="settings-error" class="operation-error" role="alert" hidden></div>
+    </div>
+    <mdui-button id="settings-cancel" slot="action" variant="text">取消</mdui-button>
+    <mdui-button id="settings-apply" slot="action" variant="filled">完成</mdui-button>
+  </mdui-dialog>
 </body>
 </html>

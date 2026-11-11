@@ -1,7 +1,7 @@
 //! Windows native process tree and reserved loopback stream owner.
 use super::{
-    io_failure, Error, ErrorKind, Failure, ProcessOptions, Result, STARTUP_POLL, STDERR_TAIL,
-    STOP_LIMIT,
+    Error, ErrorKind, Failure, ProcessOptions, Result, STARTUP_POLL, STDERR_TAIL, STOP_LIMIT,
+    check_cancellation, io_failure,
 };
 #[path = "windows_job.rs"]
 mod job;
@@ -18,13 +18,13 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 use tempfile::TempDir;
 use wait_timeout::ChildExt;
 use windows_sys::Win32::System::{
-    Console::{GenerateConsoleCtrlEvent, CTRL_BREAK_EVENT},
+    Console::{CTRL_BREAK_EVENT, GenerateConsoleCtrlEvent},
     Threading::{CREATE_NEW_PROCESS_GROUP, CREATE_SUSPENDED},
 };
 
@@ -64,7 +64,16 @@ fn expand(value: &OsStr, ports: &BTreeMap<String, u16>) -> OsString {
 
 impl NativeProcess {
     pub fn start(options: ProcessOptions) -> Result<Self> {
+        Self::start_cancellable(options, None)
+    }
+
+    /// Borrow the caller's cancellation flag only while acquiring this owner.
+    pub fn start_cancellable(
+        options: ProcessOptions,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Self> {
         options.validate()?;
+        check_cancellation(cancellation)?;
         let started = Instant::now();
         let startup_deadline = (started + options.startup_timeout).min(options.host_deadline);
         let temporary = tempfile::Builder::new()
@@ -120,6 +129,7 @@ impl NativeProcess {
         };
         let setup = (|| -> Result<()> {
             owner.check_with_deadline(startup_deadline)?;
+            check_cancellation(cancellation)?;
             // Register the suspended child before assignment/resume can fail.
             owner.child = Some(
                 command
@@ -137,9 +147,10 @@ impl NativeProcess {
             owner.job_assigned = true;
             job::resume(child).map_err(|error| io_failure("native child resume", error))?;
             for name in options.wait_sockets.as_ref().unwrap_or(&options.sockets) {
-                owner.accept(name, startup_deadline)?;
+                owner.accept(name, startup_deadline, cancellation)?;
             }
             owner.check_with_deadline(options.host_deadline)?;
+            check_cancellation(cancellation)?;
             Ok(())
         })();
         match setup {
@@ -156,12 +167,18 @@ impl NativeProcess {
         self.first.get_or_insert(error).clone()
     }
 
-    fn accept(&mut self, name: &str, deadline: Instant) -> Result<()> {
+    fn accept(
+        &mut self,
+        name: &str,
+        deadline: Instant,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<()> {
         if self.streams.contains_key(name) {
             return Ok(());
         }
         loop {
             self.check()?;
+            check_cancellation(cancellation)?;
             if Instant::now() >= deadline {
                 return Err(Arc::new(Error::new(
                     ErrorKind::Deadline,
@@ -201,7 +218,7 @@ impl NativeProcess {
     pub fn take_stream(&mut self, name: &str) -> Result<TcpStream> {
         self.check()?;
         if !self.streams.contains_key(name) {
-            self.accept(name, self.deadline)?;
+            self.accept(name, self.deadline, None)?;
         }
         Ok(self.streams.remove(name).expect("accepted stream"))
     }
@@ -416,10 +433,16 @@ impl NativeProcess {
                     errors.push(format!("native temporary directory: {error}"));
                 }
             }
-            if self.first.is_none() && !errors.is_empty() {
+            let cleanup_failed = !errors.is_empty();
+            if self.first.is_none() && cleanup_failed {
                 self.latch(Arc::new(Error::new(ErrorKind::Cleanup, errors.remove(0))));
             }
             if let Some(first) = &self.first {
+                if cleanup_failed {
+                    first
+                        .cleanup_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let mut notes = first.notes.lock().unwrap();
                 notes.extend(errors);
                 if let Ok(tail) = tail {

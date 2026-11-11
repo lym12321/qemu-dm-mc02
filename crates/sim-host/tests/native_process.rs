@@ -12,7 +12,11 @@ use std::{
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     process::{Command, Stdio},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    thread,
     time::{Duration, Instant},
 };
 use tempfile::{tempdir, TempDir};
@@ -126,6 +130,7 @@ fn startup_zero_exit_fails_and_retains_only_the_bounded_stderr_tail() {
     let fixture = Fixture::new();
     let error = error(fixture.options("exit0"));
     assert_eq!(error.kind, ErrorKind::Exited);
+    assert!(!error.cleanup_failed());
     assert!(error.message.contains("status 0"));
     let notes = error.notes();
     let tail = notes
@@ -201,6 +206,46 @@ fn startup_and_total_deadlines_cover_spawn_and_reject_regular_files() {
 }
 
 #[test]
+fn cancellation_prevents_spawn_and_interrupts_socket_acquisition_before_deadline() {
+    let fixture = Fixture::new();
+    let cancellation = AtomicBool::new(true);
+    let rejected = NativeProcess::start_cancellable(fixture.options("ready"), Some(&cancellation));
+    let Err(error) = rejected else {
+        panic!("cancelled startup spawned")
+    };
+    assert_eq!(error.kind, ErrorKind::Interrupted);
+    assert!(!fixture.record().exists());
+
+    cancellation.store(false, Ordering::Relaxed);
+    let mut options = fixture.options("regular-file");
+    options.startup_timeout = Duration::from_secs(10);
+    options.host_deadline = Instant::now() + Duration::from_secs(15);
+    let before = Instant::now();
+    let result = thread::scope(|scope| {
+        scope.spawn(|| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while fs::read_to_string(fixture.record())
+                .ok()
+                .is_none_or(|record| record.lines().count() < 3)
+            {
+                assert!(Instant::now() < deadline, "fixture did not spawn");
+                thread::sleep(Duration::from_millis(2));
+            }
+            cancellation.store(true, Ordering::Relaxed);
+        });
+        NativeProcess::start_cancellable(options, Some(&cancellation))
+    });
+    let Err(error) = result else {
+        panic!("cancelled startup succeeded")
+    };
+    assert_eq!(error.kind, ErrorKind::Interrupted);
+    assert!(!error.cleanup_failed(), "{:?}", error.notes());
+    assert!(before.elapsed() < Duration::from_secs(2));
+    let (pid, directory, _, _) = fixture.recorded();
+    gone(pid, &directory);
+}
+
+#[test]
 fn term_resistant_child_is_killed_and_consumer_primary_survives_cleanup_errors() {
     let fixture = Fixture::new();
     let mut owner = start(fixture.options("ignore-term"));
@@ -213,6 +258,7 @@ fn term_resistant_child_is_killed_and_consumer_primary_survives_cleanup_errors()
     assert!(
         before.elapsed() >= Duration::from_millis(900) && before.elapsed() < Duration::from_secs(3)
     );
+    assert!(primary.cleanup_failed());
     assert!(primary
         .notes()
         .iter()

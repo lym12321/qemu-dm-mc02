@@ -2,11 +2,12 @@
 //! original native wire time. This adapter owns no socket, worker or clock.
 
 use crate::{
+    Error, Result,
     can::{CanBus, CanBusOptions, CanCallbacks, CanDelivery, CanFrame, EndpointId},
     endpoints::qemu_can::{QemuCanEndpoint, QemuTimestampMapper},
+    signals::ImuSample,
     step_wire::{AdcInput, AdcVoltage, V1Frame},
     transports::{fixed84::CanStream, stream::StreamTransport},
-    Error, Result,
 };
 #[cfg(unix)]
 use std::os::fd::{AsFd, BorrowedFd};
@@ -30,6 +31,8 @@ fn state(message: &'static str) -> crate::Failure {
 pub enum ChannelData {
     Uart(Vec<u8>),
     Can(CanFrame),
+    /// Native co-sim RESET, stamped by its producer, freezes the input lane.
+    Reset,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelEvent {
@@ -88,8 +91,8 @@ pub struct LabChannels<'a, T: Read + Write> {
     opening_seen: bool,
     opening_reset_seen: bool,
     time_ns: u64,
-    adc_sequence: Option<u64>,
-    adc_time_ns: Option<u64>,
+    input_sequence: Option<u64>,
+    input_time_ns: Option<u64>,
 }
 impl<'a, T: Read + Write> LabChannels<'a, T> {
     pub fn new(
@@ -131,8 +134,8 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
             opening_seen: false,
             opening_reset_seen: false,
             time_ns: 0,
-            adc_sequence: None,
-            adc_time_ns: None,
+            input_sequence: None,
+            input_time_ns: None,
         })
     }
     /// Consume actual opening telemetry before submitting the host RESET. An
@@ -161,6 +164,16 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
         Ok(self.opening_seen)
     }
     pub fn reset(&mut self, timestamp_ns: u64) -> Result<()> {
+        self.reset_input(timestamp_ns)?;
+        for port in &mut self.cans {
+            port.bus.reset(timestamp_ns)?;
+        }
+        self.time_ns = timestamp_ns;
+        Ok(())
+    }
+    /// Explicitly initialize only the shared IMU/ADC lane. The caller owns
+    /// native RESET handling; CAN state and physical stream tails stay intact.
+    pub(super) fn reset_input(&mut self, timestamp_ns: u64) -> Result<()> {
         if self.cosim.is_some() && !self.opening_seen {
             return Err(state("consume the Lab co-sim opening marker before RESET"));
         }
@@ -175,12 +188,8 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
                 },
             )?;
         }
-        for port in &mut self.cans {
-            port.bus.reset(timestamp_ns)?;
-        }
-        self.time_ns = timestamp_ns;
-        self.adc_sequence = Some(1);
-        self.adc_time_ns = Some(timestamp_ns);
+        self.input_sequence = Some(1);
+        self.input_time_ns = Some(timestamp_ns);
         Ok(())
     }
     pub fn send_uart(&mut self, endpoint: &str, data: &[u8]) -> Result<()> {
@@ -221,26 +230,45 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
                 .encode()?,
             ),
         };
-        if timestamp_ns < self.time_ns {
-            return Err(admission("ADC input predates latest Lab service"));
+        self.send_input(kind, payload, timestamp_ns)
+    }
+    /// Supply one sensor-local SI sample through the existing native input lane.
+    /// ODR admission, quantization and retained sample identity belong to BMI088.
+    pub fn send_imu(&mut self, sample: &ImuSample, timestamp_ns: u64) -> Result<()> {
+        let (gyro, accel) = crate::devices::bmi088::imu_to_bmi088_units(sample)
+            .map_err(|_| admission("IMU input must fit finite binary32 sensor units"))?;
+        self.send_input(
+            2,
+            gyro.into_iter()
+                .chain(accel)
+                .flat_map(f32::to_le_bytes)
+                .collect(),
+            timestamp_ns,
+        )
+    }
+    pub(super) fn input_available_at(&self, timestamp_ns: u64) -> Result<bool> {
+        if self.cosim.is_none() {
+            return Err(state("Lab co-sim is not configured"));
         }
-        let stream = self
-            .cosim
-            .as_mut()
-            .ok_or_else(|| state("ADC co-sim is not configured"))?;
         let previous = self
-            .adc_time_ns
-            .ok_or_else(|| state("ADC requires an explicit RESET"))?;
-        if timestamp_ns <= previous {
+            .input_time_ns
+            .ok_or_else(|| state("Lab co-sim input requires an explicit RESET"))?;
+        Ok(timestamp_ns > previous)
+    }
+    fn send_input(&mut self, kind: u16, payload: Vec<u8>, timestamp_ns: u64) -> Result<()> {
+        if timestamp_ns < self.time_ns {
+            return Err(admission("co-sim input predates latest Lab service"));
+        }
+        if !self.input_available_at(timestamp_ns)? {
             return Err(admission(
-                "ADC timestamp must strictly increase after RESET/input",
+                "co-sim timestamp must strictly increase after RESET/input",
             ));
         }
         let sequence = self
-            .adc_sequence
-            .ok_or_else(|| admission("ADC sequence exceeds u64"))?;
+            .input_sequence
+            .ok_or_else(|| admission("co-sim sequence exceeds u64"))?;
         send_v1(
-            stream,
+            self.cosim.as_mut().expect("admitted co-sim input"),
             &V1Frame {
                 kind,
                 sequence,
@@ -248,8 +276,8 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
                 payload,
             },
         )?;
-        self.adc_sequence = sequence.checked_add(1);
-        self.adc_time_ns = Some(timestamp_ns);
+        self.input_sequence = sequence.checked_add(1);
+        self.input_time_ns = Some(timestamp_ns);
         Ok(())
     }
     pub fn service(&mut self, timestamp_ns: u64, flush_uart: bool) -> Result<Vec<ChannelEvent>> {
@@ -295,8 +323,15 @@ impl<'a, T: Read + Write> LabChannels<'a, T> {
         if let Some(stream) = &mut self.cosim {
             stream.read_once()?;
             while let Some(bytes) = stream.next_length_prefixed(V1_HEADER, V1_MAX_BODY)? {
-                if V1Frame::decode_body(&bytes)?.kind == 1 {
-                    self.adc_time_ns = None;
+                let frame = V1Frame::decode_body(&bytes)?;
+                if frame.kind == 1 {
+                    self.input_sequence = None;
+                    self.input_time_ns = None;
+                    events.push(ChannelEvent {
+                        endpoint: "cosim".into(),
+                        timestamp_ns: frame.time_ns,
+                        data: ChannelData::Reset,
+                    });
                 }
             }
             stream.flush()?;

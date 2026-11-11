@@ -638,6 +638,7 @@ fn cancelling_close_retains_failure_and_aborts_its_driver() {
             let error = session.close().await.unwrap_err();
             assert_eq!(error.kind, ErrorKind::State);
             assert!(error.message.contains("cleanup was interrupted"));
+            assert!(error.cleanup_failed());
         },
     ));
 }

@@ -1,0 +1,53 @@
+{
+  "upstream": "https://github.com/xtermjs/xterm.js",
+  "packages": [
+    {
+      "name": "@xterm/xterm",
+      "version": "5.5.0",
+      "license": "MIT",
+      "commit": "9ba6c00a195c95fcf8292a2b9084d91450e5daae",
+      "distribution": {
+        "url": "https://registry.npmjs.org/@xterm/xterm/-/xterm-5.5.0.tgz",
+        "integrity": "sha512-hqJHYaQb5OptNunnyAnkHyM8aCjZ1MEIDTQu1iIbbTD/xops91NB5yq1ZK/dC2JDbVWtF23zUtl9JE2NqwT87A==",
+        "sha256": "bd954fa721872170188cc5d7e83e88db3c83c9a18a4e8d24c2783d26491f59d2"
+      },
+      "files": {
+        "xterm.js": {
+          "upstream_path": "package/lib/xterm.js",
+          "sha256": "1f991ac3b4b283ebf96e60ae23a00a52765dd3a2e46fa6fdda9f1aab032f7495"
+        },
+        "xterm.css": {
+          "upstream_path": "package/css/xterm.css",
+          "sha256": "ba8e6985669488981ccf40c0cefe3aba80722cb6c92de7ad628b0bd717faf2b6"
+        },
+        "LICENSE": {
+          "upstream_path": "package/LICENSE",
+          "sha256": "b569f629d00f2626a8100df2a1798210535621e42164dfd426a6fe5aac7b0ccd"
+        }
+      }
+    },
+    {
+      "name": "@xterm/addon-fit",
+      "version": "0.10.0",
+      "license": "MIT",
+      "commit": "9ba6c00a195c95fcf8292a2b9084d91450e5daae",
+      "distribution": {
+        "url": "https://registry.npmjs.org/@xterm/addon-fit/-/addon-fit-0.10.0.tgz",
+        "integrity": "sha512-UFYkDm4HUahf2lnEyHvio51TNGiLK66mqP2JoATy7hRZeXaGMRDr00JiSF7m63vR5WKATF605yEggJKsw0JpMQ==",
+        "sha256": "917ac44972453d5eed52edc1e50260c76398ce48cf2290c2e60671102bba0b33"
+      },
+      "files": {
+        "addon-fit.js": {
+          "upstream_path": "package/lib/addon-fit.js",
+          "sha256": "bdaefa370b1bfc42ee88d46fe6072400902a4d4b2d45cd93438dda9b23c97089"
+        },
+        "LICENSE-addon-fit": {
+          "upstream_path": "package/LICENSE",
+          "sha256": "e256f01188af527e4d06d21d06fbf785ae9c50d4b328bf03cbe0ba7f0aa4228f"
+        }
+      }
+    }
+  ],
+  "local_changes": "None. Unmodified browser distributions; source maps are not served.",
+  "runtime": "Offline classic browser bundles. No npm, CDN, external fonts or runtime dependency."
+}

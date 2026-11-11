@@ -1,23 +1,23 @@
 //! Loopback HTTP/WebSocket adapter; the session thread owns native execution.
 use super::session::{LabSession, SessionError, SessionOptions};
 use axum::{
+    Json, Router,
     extract::{
+        DefaultBodyLimit, Multipart, Path, Request, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
-        DefaultBodyLimit, Multipart, Request, State,
     },
-    http::{header, HeaderValue, StatusCode},
+    http::{HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
-    Json, Router,
 };
-use futures::{stream::FuturesUnordered, FutureExt, SinkExt, StreamExt};
-use serde_json::{json, Map, Value};
+use futures::{FutureExt, SinkExt, StreamExt, stream::FuturesUnordered};
+use serde_json::{Map, Value, json};
 use sim_core::Error;
 use std::{
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -109,35 +109,64 @@ async fn local_origin(request: Request, next: Next) -> Response {
 async fn state(State(state): State<Arc<WebState>>) -> Json<Value> {
     Json(state.session.state())
 }
+async fn project(State(state): State<Arc<WebState>>) -> Json<Value> {
+    Json(state.session.project_info())
+}
+async fn save_project(
+    State(state): State<Arc<WebState>>,
+    Json(value): Json<Value>,
+) -> std::result::Result<Json<Value>, HttpError> {
+    state.session.save_project(value).map(Json).map_err(bad)
+}
+async fn ide(
+    State(state): State<Arc<WebState>>,
+    Json(value): Json<Value>,
+) -> std::result::Result<Json<Value>, HttpError> {
+    state.session.ide_config(value).map(Json).map_err(bad)
+}
 async fn index() -> impl IntoResponse {
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         include_bytes!("../../../../sim/lab/static/index.html").as_slice(),
     )
 }
-async fn javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_bytes!("../../../../sim/lab/static/app.js").as_slice(),
-    )
-}
-async fn stylesheet() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_bytes!("../../../../sim/lab/static/style.css").as_slice(),
-    )
-}
-async fn material_javascript() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-        include_bytes!("../../../../third_party/material/mdui/mdui.js").as_slice(),
-    )
-}
-async fn material_stylesheet() -> impl IntoResponse {
-    (
-        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-        include_bytes!("../../../../third_party/material/mdui/mdui.css").as_slice(),
-    )
+async fn asset(Path(name): Path<String>) -> Response {
+    let (content_type, bytes): (&str, &[u8]) = match name.as_str() {
+        "app.js" => (
+            "text/javascript",
+            include_bytes!("../../../../sim/lab/static/app.js"),
+        ),
+        "uart-console.js" => (
+            "text/javascript",
+            include_bytes!("../../../../sim/lab/static/uart-console.js"),
+        ),
+        "style.css" => (
+            "text/css",
+            include_bytes!("../../../../sim/lab/static/style.css"),
+        ),
+        "vendor/mdui.js" => (
+            "text/javascript",
+            include_bytes!("../../../../third_party/material/mdui/mdui.js"),
+        ),
+        "vendor/mdui.css" => (
+            "text/css",
+            include_bytes!("../../../../third_party/material/mdui/mdui.css"),
+        ),
+        "vendor/xterm.js" => (
+            "text/javascript",
+            include_bytes!("../../../../third_party/xterm/xterm.js"),
+        ),
+        "vendor/xterm.css" => (
+            "text/css",
+            include_bytes!("../../../../third_party/xterm/xterm.css"),
+        ),
+        "vendor/addon-fit.js" => (
+            "text/javascript",
+            include_bytes!("../../../../third_party/xterm/addon-fit.js"),
+        ),
+        _ => return StatusCode::NOT_FOUND.into_response(),
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
 }
 
 async fn upload(
@@ -283,27 +312,31 @@ impl From<&str> for ReplyError {
 }
 async fn command(state: Arc<WebState>, controller: String, request: Envelope) -> (Value, bool) {
     let is_stop = request.action == "stop";
-    let result: std::result::Result<(), ReplyError> = async {
+    let result: std::result::Result<Value, ReplyError> = async {
         if matches!(request.action.as_str(), "stop" | "restart") {
-            if !request.args.is_empty()
-                || state.session.state()["session_id"] != json!(request.session_id)
+            if (request.action == "stop" && !request.args.is_empty())
+                || (request.action == "restart"
+                    && !request.args.is_empty()
+                    && !(request.args.len() == 1 && request.args.contains_key("config")))
+                || (request.action == "restart"
+                    && state.session.state()["session_id"] != json!(request.session_id))
             {
                 return Err("invalid lifecycle request or stale session".into());
             }
-            state
-                .session
-                .request_stop(request.session_id.as_deref())
-                .await??;
             if request.action == "restart" {
                 state
                     .session
-                    .submit(
-                        "load",
-                        json!({}),
+                    .restart(
+                        Value::Object(request.args),
                         request.session_id.as_deref(),
                         Some(&controller),
                     )
-                    .await??;
+                    .await
+                    .map_err(ReplyError::from)
+            } else {
+                // The exclusive live controller stops this workbench even if
+                // reload has changed generation before its state frame arrives.
+                Ok(state.session.request_stop(None).await??)
             }
         } else {
             state
@@ -314,14 +347,14 @@ async fn command(state: Arc<WebState>, controller: String, request: Envelope) ->
                     request.session_id.as_deref(),
                     Some(&controller),
                 )
-                .await??;
+                .await?
+                .map_err(ReplyError::from)
         }
-        Ok(())
     }
     .await;
     let response = match result {
-        Ok(()) => {
-            json!({"type":"command_result","id":request.id,"session_id":state.session.state()["session_id"],"ok":true,"accepted":true})
+        Ok(value) => {
+            json!({"type":"command_result","id":request.id,"session_id":state.session.state()["session_id"],"ok":true,"accepted":true,"timestamp_ns":value.get("timestamp_ns").cloned().unwrap_or(Value::Null)})
         }
         Err(error) => {
             json!({"type":"command_result","id":request.id,"session_id":request.session_id,"ok":false,"accepted":false,"error":error.message,"notes":error.notes})
@@ -365,8 +398,8 @@ async fn websocket(
     let guard = Arc::new(Mutex::new(Some(guard)));
     let failed = guard.clone();
     Ok(upgrade
-        .max_message_size(16384)
-        .max_frame_size(16384)
+        .max_message_size(320 * 1024)
+        .max_frame_size(320 * 1024)
         .on_failed_upgrade(move |_| {
             failed.lock().unwrap().take();
         })
@@ -409,10 +442,10 @@ async fn socket_loop(socket: WebSocket, controller: Controller) {
                     Message::Close(_) => break,
                     Message::Pong(_) => ping_sent = None,
                     Message::Text(text) => {
-                        let request = envelope(&text).and_then(|request| {
-                            if pending.len() >=64 && (request.action != "stop" || stop_pending) { Err("too many pending requests".into()) } else { Ok(request) }
-                        });
-                        match request {
+                        match envelope(&text) {
+                            Ok(request) if pending.len() >=64 && (request.action != "stop" || stop_pending) => {
+                                if !send_json(&mut sink,json!({"type":"command_result","id":request.id,"ok":false,"accepted":false,"error":"too many pending requests"})).await { break; }
+                            }
                             Ok(request) => {
                                 stop_pending |= request.action == "stop";
                                 pending.push(command(state.clone(),controller.id.clone(),request).boxed());
@@ -471,11 +504,18 @@ pub fn run_web(
     });
     let router = Router::new()
         .route("/", get(index))
-        .route("/app.js", get(javascript))
-        .route("/style.css", get(stylesheet))
-        .route("/vendor/mdui.js", get(material_javascript))
-        .route("/vendor/mdui.css", get(material_stylesheet))
+        .route("/{*asset}", get(asset))
         .route("/api/state", get(self::state))
+        .route(
+            "/api/project",
+            get(project)
+                .post(save_project)
+                .layer(DefaultBodyLimit::max(256 * 1024)),
+        )
+        .route(
+            "/api/ide",
+            post(ide).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/api/firmware", post(upload))
         .route("/api/ws", get(websocket))
         .layer(DefaultBodyLimit::max(UPLOAD_LIMIT + 65536))

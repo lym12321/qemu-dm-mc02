@@ -1,5 +1,5 @@
 //! Console grammar, with no runtime effects or shell expansion.
-use super::{channels::AdcValue, LabInput};
+use super::{BoardCommand, LabInput, channels::AdcValue};
 use crate::{boards, can::CanFrame};
 
 #[derive(Clone, Debug)]
@@ -15,6 +15,31 @@ pub enum Command {
     Quit,
     Vin(u32),
     Inject(LabInput),
+    ReceiveFormat(UartReceiveFormat),
+    Actions,
+    Action(String),
+}
+
+impl Command {
+    pub fn board_command(&self) -> Option<BoardCommand> {
+        Some(match self {
+            Self::UsbAttach => BoardCommand::UsbAttach,
+            Self::UsbDetach => BoardCommand::UsbDetach,
+            Self::Pause => BoardCommand::Pause,
+            Self::Continue => BoardCommand::Resume,
+            Self::Vin(value) => BoardCommand::Vin(*value),
+            Self::Inject(input) => BoardCommand::Input(input.clone()),
+            _ => return None,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UartReceiveFormat {
+    #[default]
+    Escaped,
+    Text,
+    Hex,
 }
 
 // Narrow port of CPython v3.12.3 Lib/shlex.py read_token for
@@ -118,11 +143,32 @@ fn hex_bytes(text: &str) -> Result<Vec<u8>, String> {
             .next()
             .and_then(|ch| ch.to_digit(16).filter(|_| ch.is_ascii()));
         let (Some(hi), Some(lo)) = (hi, lo) else {
-            return Err("invalid CAN frame: HEX requires pairs of hex digits".into());
+            return Err("HEX requires pairs of hex digits".into());
         };
         bytes.push((hi * 16 + lo) as u8);
     }
     Ok(bytes)
+}
+
+/// Decode serial-assistant input without changing payload bytes. The bound
+/// includes the selected line ending and matches the channel admission limit.
+pub fn decode_uart(format: &str, ending: &str, payload: &str) -> Result<Vec<u8>, String> {
+    let mut data = match format {
+        "text" => payload.as_bytes().to_vec(),
+        "hex" => hex_bytes(payload)?,
+        _ => return Err("UART format must be text or hex".into()),
+    };
+    data.extend_from_slice(match ending {
+        "none" => b"",
+        "lf" => b"\n",
+        "crlf" => b"\r\n",
+        "cr" => b"\r",
+        _ => return Err("UART line ending must be none, lf, crlf or cr".into()),
+    });
+    if data.len() > 4096 {
+        return Err("UART payload must be at most 4096 bytes including line ending".into());
+    }
+    Ok(data)
 }
 
 pub fn parse(line: &[u8], uarts: &[String], cans: &[String], adc: bool) -> Result<Command, String> {
@@ -139,6 +185,14 @@ pub fn parse(line: &[u8], uarts: &[String], cans: &[String], adc: bool) -> Resul
         ["pause"] => Command::Pause,
         ["cont"] => Command::Continue,
         ["quit"] => Command::Quit,
+        ["actions"] => Command::Actions,
+        ["action", name] => Command::Action((*name).into()),
+        ["receive-format", format] => Command::ReceiveFormat(match *format {
+            "escaped" => UartReceiveFormat::Escaped,
+            "text" => UartReceiveFormat::Text,
+            "hex" => UartReceiveFormat::Hex,
+            _ => return Err("receive format must be escaped, text or hex".into()),
+        }),
         ["key", value @ ("press" | "release")] => Command::Inject(LabInput::Key(*value == "press")),
         ["gpio", pin, level] => {
             boards::gpio_pin(pin).map_err(|error| error.to_string())?;
@@ -159,6 +213,15 @@ pub fn parse(line: &[u8], uarts: &[String], cans: &[String], adc: bool) -> Resul
             Command::Inject(LabInput::Uart {
                 endpoint: (*port).into(),
                 data,
+            })
+        }
+        ["uart-send", port, format, ending, rest @ ..] if !rest.is_empty() => {
+            if !uarts.iter().any(|name| name == port) {
+                return Err("UART endpoint is not configured".into());
+            }
+            Command::Inject(LabInput::Uart {
+                endpoint: (*port).into(),
+                data: decode_uart(format, ending, &rest.join(" "))?,
             })
         }
         ["can", port, id, flags, dlc, data] => {

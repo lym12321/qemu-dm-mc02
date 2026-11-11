@@ -111,9 +111,17 @@ void Reset_Handler(void)
         }
         if (USART1_ISR & (1u << 5)) {
             uint8_t value = USART1_RDR;
-            uart_text("UART=");
-            uart_char(value);
-            uart_char('\n');
+            if (value == '~') {
+                /* Terminal presentation fixture: erase, home, SGR, cursor,
+                 * carriage return, backspace and erase-to-end-of-line. */
+                uart_text("\033[2J\033[H\033[31mRED\033[0m\n"
+                          "abc\bX\rZ\033[K\033[3;4H"
+                          "\033[38;2;10;20;30mRGB\033[0m");
+            } else {
+                uart_text("UART=");
+                uart_char(value);
+                uart_char('\n');
+            }
         }
         if (ADC1_ISR & (1u << 2)) {
             uint32_t value = ADC1_DR;

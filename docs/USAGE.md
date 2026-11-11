@@ -108,7 +108,11 @@ Cargo 的产品选择如下：
 | `ros2` | 原生 ROS 2 CXX transport |
 | `linux-runtime` | `host-runtime` 加全部上述原生物理/ROS 功能 |
 
-Windows 原生 Lab（MSVC Rust 工具链，原生 QEMU 构建见 Windows CI）：
+Windows 原生 Lab 使用 MSVC Rust 工具链。源码含符号链接，Git for Windows 检出前需启用
+Windows 开发者模式并使用 `git clone -c core.symlinks=true`；已有目录先检查
+`third_party/qapi-rs/qmp/schema/qapi/common.json` 是否为有效链接。
+QEMU 的 MSYS2 MINGW64 依赖与 configure 命令见
+[Windows 构建步骤](../.github/workflows/native-packages.yml)，可在本机执行，无需启动 CI。
 
 ```powershell
 cargo build --release --locked -p sim-host --features windows-lab
@@ -768,10 +772,63 @@ ADC2、ADC网络互连及精确GPIO边沿未支持。
 sim firmware build/student.elf --debug --qmp /tmp/student-qmp.sock
 ```
 
-交互入口复用同一运行环境，默认连接 UART1，按需要增加 CAN 和 ADC：
+### 项目与启动
+
+Web 和交互控制台都可读取 `sim.lab.json`：
 
 ```bash
-sim lab interactive --elf build/student.elf --uart uart1 --can can1 --adc
+sim lab web --project sim.lab.json
+sim lab interactive --project sim.lab.json
+```
+
+Web 首次打开不存在的项目时使用默认配置，在“设置”中点击“保存”才创建文件。网页只能保存启动时指定的
+项目路径；未指定项目时，“完成”只保留本页设置。“设置”中的本地 ELF 路径直接指向编译产物；
+每次“重载”先读取并检查当前 ELF，成功后清理旧进程并启动新固件；文件缺失或尚未写完整时保留当前实验。
+修改设置在下次启动或重载生效；清理失败时不启动替代进程。
+
+Lab 启动时使用独立的 ELF 快照，重新编译或覆盖原文件不影响已加载的固件。
+未启用自动重载时，编译后点击“重载”才会切换到新固件。
+
+最小项目示例：
+
+```json
+{
+  "schema": "sim/lab-project/v1",
+  "firmware": "build/student.elf",
+  "startup": "user",
+  "actions": {
+    "ping": {"action": "uart", "endpoint": "uart1", "format": "text", "ending": "crlf", "data": "ping"},
+    "vin24": {"action": "vin", "millivolts": 24000}
+  }
+}
+```
+
+项目中的固件路径相对项目目录，显式 `--elf` 相对当前终端目录。命令行显式选项覆盖项目值；
+`--uart`、`--can` 分别替换对应端口列表，`--adc=false`、`--no-gdb`、`--no-usbip` 可关闭项目设置。
+省略字段时启用六路 UART、三路 CAN 和 ADC1，启动期限 10 秒、总期限 3600 秒，GDB/USB/IP 关闭。
+IMU 默认使用静止板输入：角速度为零，加速度为传感器局部 +Z 方向的 9.80665 m/s²（1 g）。
+“设置 → 高级 → IMU”可关闭，命令行用 `--imu off`，项目中用 `"imu": "off"`；恢复用 `stationary`。
+这是固定静止输入，尚未接入可拖动的板体姿态；采样随原生虚拟时间和 Lab 轮询推进，暂停时不产生新样本。
+运行中收到原生 RESET 时，Lab 重新初始化 IMU/ADC 输入，并在事件中记录 RESET；暂停状态保持不变。
+这只恢复仿真输入，固件仍需自行重新初始化，应用是否就绪以固件响应为准。
+项目还可保存 `imu`、`user_hold_ms`、`startup_timeout_secs`、`timeout_secs`、`gdb_port`、`usbip` 和通道列表。
+项目 JSON 可定义最多 32 个快捷输入，每个只执行一次按键、GPIO、ADC、UART、CAN 或 VIN 操作，使用交互命令执行。
+
+| `--startup` / 项目 `startup` | 行为 |
+| --- | --- |
+| `run` | 配置完成后运行 |
+| `wait-gdb` / `wait_gdb` | 从复位暂停，需启用 `--gdb-port` / `gdb_port` |
+| `user` | 先按下 USER 再运行，默认经过 1000 ms QEMU 虚拟时间后释放 |
+
+`--user-hold-ms` 调整自动按键时长；暂停期间不计时，手动操作 USER 取消自动保持。
+固件编译为 Debug、按 USER 进入 trobot 应用 Debug、等待 GDB 是三个独立设置；应用状态以固件实际响应为准。
+
+### 交互控制台
+
+不使用项目时保留默认 UART1、总期限 300 秒，按需要增加 CAN 和 ADC：
+
+```bash
+sim lab interactive --elf build/student.elf --uart uart1 --uart uart5 --can can1 --adc
 ```
 
 连接提示只说明 transport 已连接。输入 `help` 查看命令；`state` 显示原生只读 JSON：
@@ -782,18 +839,27 @@ key release
 gpio B0 1
 vin 24000
 uart uart1 "hello world"
+uart-send uart1 text crlf "hello world"
+uart-send uart5 hex none "00 ff c3 a9"
+receive-format hex
 can can1 0x321 0 8 4142434445464748
 adc ch4 voltage_uv 1650000
 adc ch4 raw 12345
 pause
 cont
+actions
+action ping
 quit
 ```
 
-文本支持引号，按 UTF-8 原样发送，不展开 shell。只允许已配置的 UART/CAN/ADC 端点；
+文本支持引号，不展开 shell。`uart-send` 选择 `text|hex` 和 `none|lf|crlf|cr`；
+`receive-format` 选择 `escaped|text|hex`，默认 escaped，text 直接输出原始字节。
+UART2/3 对应 RS485；UART5 只引出板卡 RX，主机可发送给固件，没有固件 TX 输出。
+CAN flags 为 EXT=1、RTR=2、FD=4、BRS=8 的位或值，数据与 DLC 按既有 `CanFrame` 规则校验。
+`actions` 列出项目快捷输入，`action NAME` 执行一次。只允许已配置的 UART/CAN/ADC 端点；
 暂停时 ADC 输入明确拒绝，先 `cont` 再输入。命令错误会显示并继续，真实连接、运行或清理
 错误返回非零。输入使用 pipe 或 TTY，行最多 4096 字节，超长行丢弃到换行；不支持重定向
-普通文件作为 stdin。EOF 和 quit 会清理退出。默认总期限 300 秒，调试可用 `--gdb-port`、
+普通文件作为 stdin。EOF 和 quit 会清理退出。调试可用 `--gdb-port`、
 `--paused` 和 `--qmp`，期限可显式调整。当前不提供交互 reset 或自动 IMU 环境。
 
 Windows PowerShell 使用同一组命令；原生 GDB 调试从暂停启动：
@@ -810,6 +876,21 @@ Windows 使用较短的新绝对路径；该选项的既有 100 字节路径上�
 Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `arm-none-eabi-gdb`
 或 `gdb-multiarch`，可用 `GDB_ARM` 覆盖。它验证数字固件消费者，不代表实板准确度。
 
+### IDE 调试
+
+启用 GDB，并在设置中选择“等待 GDB”，或从终端运行：
+
+```bash
+sim lab web --project sim.lab.json --startup wait-gdb --gdb-port 1234
+sim lab ide --project sim.lab.json --gdb-port 1234 --format vscode > launch.json
+sim lab ide --project sim.lab.json --gdb-port 1234 --format gdb > lab.gdb
+```
+
+VS Code 安装 Cortex-Debug，将导出的配置放入 `.vscode/launch.json`；使用 external server attach。
+CLion 新建 **Remote Debug**，选择 ARM GDB、相同本地 ELF，目标为 `127.0.0.1:1234`；
+`--format clion` 输出对应字段。普通 GDB 可执行 `arm-none-eabi-gdb -x lab.gdb`。
+网页“设置 → 调试与 USB”中选择 IDE 配置后点击“导出”。QEMU 服务由 Lab 管理，IDE 只附着调试。
+
 <a id="web-lab"></a>
 
 ## Web Lab
@@ -818,39 +899,57 @@ Lab smoke 同时验证实际 GDB attach/detach 与第二 QMP monitor；需要 `a
 
 ```bash
 sim lab web
-# 或预选已编译的 HAL 第一课：
-sim lab web --elf build/teaching/Debug/gpio_key.elf
-# 启用原生 GDB，调试期限改为两小时：
-sim lab web --elf build/student.elf --gdb-port 1234 --timeout 7200
+sim lab web --project sim.lab.json --elf build/student.elf
+sim lab web --watch --elf build/student.elf
+sim lab web --project sim.lab.json --startup user --usbip
 ```
 
-打开 `http://127.0.0.1:8765`，选择固件并点击“加载”，初始停在复位处；点击“运行”后
-固件开始执行。“暂停”使用原生 QMP；“停止”完成进程和通道清理后返回。
-“重新加载”清理旧实验，再从新进程的复位状态开始。上传文件最多 64 MiB，
-停止后可替换；文件保留到替换或服务关闭。加载沿用 QEMU 的 ARM ELF/raw BIN 语义，
-文件可读并不表示它适合本板或应用已经就绪。
+打开 `http://127.0.0.1:8765`，点击“打开 ELF”选择固件，再点击“启动”。
+顶部主按钮随状态切换为“暂停”或“继续”；“重载”检查新 ELF、完成旧进程清理后应用当前设置。
+点击后立即显示操作状态和进度条，启动或重载期间可点击“停止”取消。
+选择 ELF 后仍有上传过程；此时可点“加载后启动”，文件加载成功后启动一次。“停止”、上传失败或断线会取消这次启动。
+“运行中”表示仿真器已经运行；trobot 自身的静止校准仍需完成，其状态以固件输出为准。
+上传文件最多 64 MiB，保留到替换或服务关闭。文件可读不表示它适合本板或应用已经就绪。
+
+`--watch` 或“设置 → ELF 更新后自动重载”监视本地 ELF；也可在项目 JSON 中保存 `"watch_elf": true`，
+用 `--no-watch` 临时关闭。内容稳定至少 500 ms 且 ELF 完整可解析后，先清理旧进程，再加载新 ELF。
+缺失、半写入或超过 64 MiB 的文件只显示错误，当前固件继续运行；相同内容不会触发重载。
+这是从复位重新启动固件，RAM 会重置。
+暂停中的实验重载后仍暂停；运行中的实验沿用启动方式。原 GDB 连接会断开，需要重新附着。
+停止实验也停止监视。路径属于运行 Lab 的电脑；上传只保留文件副本，无法监视原始编译产物。
+此选项仅用于 Web Lab。
+
+主界面为全宽 UART/CAN 控制台，各自通过一个端口下拉框切换。USER 支持鼠标按住和键盘操作。
+“引脚与外设”中设置 GPIO、ADC、电源和 USB；底栏显示运行状态、虚拟时间、LED 和 VIN。
+“事件”中查看操作记录和原始快照。启动方式在“设置”中选择，调试、USB/IP、期限和通道配置按需展开。
+当前未随包提供实物板图或精细 3D 模型。
 
 同一服务只允许一个控制页面。关闭页面后实验继续运行，重新打开接回原会话，
-按住的瞬时用户按键会在断开时释放；未收到结果的输入不会自动重发。
+该页面手动按住的 USER 会在断开时释放；自动 USER 启动保持继续由运行时管理。
+未收到结果的输入不会自动重发。
 默认每次实验的 host 总期限为一小时，包含启动和暂停；`--timeout` 可调整，
 `--startup-timeout` 默认 10 秒。`Ctrl-C` 或 TERM 关闭服务并清理实验。
 `--port` 改变本地 HTTP 端口；服务仅绑定回环地址。
 
-页面提供用户按键、LED、VIN、GPIO A–H 检查器，以及 UART1/2/3/5/7/10、CAN1/2/3
-和 ADC1 通道 0–31。UART 支持文本、HEX 和显式追加换行；CAN 使用既有 ID/flags/DLC
-准入；ADC 可输入 raw16 或 0–3300000 µV，暂停时明确拒绝。全部通道由同一 Lab owner
-连接。输入“已接受”表示提交给现有 transport/Fabric；实际固件反应要看后续输出。
+UART 各端口持续采集，默认“终端”使用离线 xterm.js 渲染 UTF-8、ANSI 颜色、清屏、光标移动、退格和回车覆盖。
+切换端口或 HEX 保留各端口的终端状态；HEX 查看原始字节，包括控制序列、NUL 和非 UTF-8 数据。
+LF 显示为换行到行首；新实验或“清空”重置串口视图。终端只显示输出，输入仍通过下方发送框发送。
+发送支持文本/HEX 与无换行/LF/CRLF/CR，“自动滚动”只控制视图跟随；发送记录在后端接受后显示。
+CAN 表格显示时间、方向、ID、类型、长度和数据，发送使用 EXT/RTR/FD/BRS 控件及既有 ID/DLC 校验。
+ADC1 通道 0–31 可输入 raw16 或 0–3300000 µV，暂停时先继续运行。输入接受只表示 transport/Fabric 接受，
+固件是否消费仍看后续响应。
 
 状态和原始 JSON 来自只读 native `board-state`，纳秒时间在浏览器中保留为十进制字符串。
-GPIO 采样电平、ODR、输出掩码分开展示，AF 仅显示复用模式；模型引脚不等同于全部可接线引脚。
-LED 明示 WS2812 DMA 波形或 GPIO latch 近似，ADC 输入值不是固件的转换读数。
+GPIO 页显示选中引脚的模式、采样电平和 ODR，输出掩码可查原始快照；模型引脚不等同于全部可接线引脚。
+LED 色块按原始 RGB 显示，悬停查看 WS2812 DMA 波形或 GPIO latch 近似来源；ADC 输入值不是固件的转换读数。
 UART 时间是轮询样本，CAN 保留 wire 时间；页面刷新不驱动仿真，也不建立全局锁步。
-服务端历史最多保留 4096 条或 1 MiB，页面最多显示 600 条或 256 KiB，省略均可见。
+服务端历史最多保留 4096 条或 1 MiB；页面 UART 每端口保留 256 KiB 原始字节和 1000 行终端滚动历史，CAN 保留 1000 条、事件保留 600 条。
+终端待解析字节上限为 256 KiB；积压超限时显示提示并冻结终端，点击“清空”恢复，HEX 继续采集。
 
-板卡图为原创逻辑示意。当前快照未公开的 IMU、Flash、蜂鸣器等内部状态没有网页读数。
-USB 卡片显示独立的固件枚举和本机连接状态，使用方式见下节。
+当前快照未公开的 IMU、Flash、蜂鸣器等内部状态没有网页读数。
+“引脚与外设 → USB”显示固件枚举和本机连接状态，使用方式见下节。
 当前固件若依赖 IMU 或电机环境，仍需使用已验证的对应 worker 入口；此板卡实验台尚未接入
-物理场景。源码断点与变量继续使用原生 GDB/VS Code；启用 `--gdb-port` 后网页显示连接地址。
+物理场景。源码断点与变量使用上述原生 GDB/IDE 配置。
 
 <a id="usb-host"></a>
 
@@ -862,8 +961,8 @@ USB 卡片显示独立的固件枚举和本机连接状态，使用方式见下�
 .\sim.exe lab web --elf .\trobot.elf --usbip
 ```
 
-Linux 使用 `./sim lab web --elf ./trobot.elf --usbip`。加载、运行固件后，USB 卡片从
-“正在枚举”变为“可连接”；点击“连接本机”，系统即可枚举固件提供的设备。trobot 的
+Linux 使用 `./sim lab web --elf ./trobot.elf --usbip`。启动固件后，在“引脚与外设 → USB”
+等待状态从“枚举中”变为“可连接”，再点击“连接本机”，系统即可枚举固件提供的设备。trobot 的
 `0483:5741` 包含 CDC 串口和 WinUSB 接口，串口工具及现有 trobot 主机工具可连接它。
 描述符、BOS、Microsoft OS 2.0 描述符和数据来自正在运行的固件。
 
@@ -880,8 +979,14 @@ Linux 先安装系统 `usbip`（Ubuntu 通常由对应内核版本的 `linux-too
 权限过期时重新执行 `sudo -v`，再连接。Linux Lab 包使用宿主 GLib、zlib、zstd、libusb、
 libdw、libudev、libnuma、curl 和音频库；完整 Linux 包的原生物理 SDK 是另一种分发范围。
 
-trobot 若通过开机按键进入 Debug，需在固件启动的前 100 ms 保持 USER 按下。
-控制台可以先停在复位处，再输入按键、运行和 USB 连接命令：
+trobot 若通过开机按键进入 Debug，可用 USER 启动模式；默认按住 1 秒虚拟时间，
+是否进入应用 Debug 仍由固件响应确认：
+
+```bash
+sim lab web --elf trobot.elf --startup user --usbip
+```
+
+也可保留手动操作：
 
 ```text
 sim lab interactive --elf trobot.elf --usbip --gdb-port 1234 --paused
@@ -895,8 +1000,7 @@ usb detach
 quit
 ```
 
-在状态变为 `available` 后执行 `usb attach`。网页也可以先聚焦“运行”，再用鼠标按住
-USER 并按 Enter 启动，待启动后松开 USER。“断开”、停止会话或退出 Lab 会卸载本次
+在状态变为 `available` 后执行 `usb attach`。“断开”、停止会话或退出 Lab 会卸载本次
 连接所记录的端口；外部手动连接的端口由调用者负责卸载。若清理失败，Lab 报错并保留原因。
 
 USB/IP 默认仅监听 `127.0.0.1:3240`，可用 `--usbip 127.0.0.1:33240` 改端口。
@@ -1943,6 +2047,59 @@ worker 每次从 co-sim/FDCAN stream 最多读取 4096 字节，返回完整帧�
 本轮或某个历史门通过，不代表所有原生 profile 通过。报告应分别记录命令、退出码、
 环境、ELF SHA、实际 QEMU 路径/版本或能力、诊断与清理状态。缺依赖是 BLOCKED，
 pytest 的 optional skip 不是该层 PASS；没有 Actions 运行记录时不能声称 CI 已通过。
+
+### Windows 固件 tick 与主机性能诊断
+
+`lab_perf` 使用与 Web Lab 相同的原生进程、QMP 和通道生命周期，直接读取 ELF 中的
+32 位 tick 符号，输出 tick、QEMU 虚拟时间、UART 流量及可选的进程/vCPU CPU 时间和 RSS。
+ELF 需保留符号；默认 `xTickCount`、1000 Hz、静止 IMU、全部六路 UART 和三路 CAN。
+固件不同则用 `--tick-symbol`、`--tick-hz` 指定实际值。
+
+在仓库根目录的 PowerShell 中构建，再指定已有原生 Windows QEMU 的实际路径：
+
+```powershell
+cargo build --release --locked -p sim-host --features lab --example lab_perf
+if ($LASTEXITCODE -ne 0) { throw "lab_perf 构建失败" }
+$qemu = 'C:\path\to\bin\qemu-system-arm.exe'
+.\target\release\examples\lab_perf.exe .\tick.elf --qemu $qemu --seconds 12 --host-profile > qemu-host.json
+if ($LASTEXITCODE -ne 0) { throw "诊断失败，请检查 qemu-host.json 和终端错误" }
+```
+
+`--minimal-io` 仅连接 UART1 与同一 IMU/ADC 通道，适合比较闲置端口成本；删去活跃端口会
+改变固件行为，须同时比较启动和流量。`--sync-profile` 启用 QEMU 原生锁统计，
+`--irq-trace` 记录末两秒 SysTick 到期和 IRQ 进入；三者均要求 `--host-profile`。
+锁统计和 IRQ trace 会增加开销，应分别运行并保留无 trace 的基线。
+
+CPU 累积秒数的差值除以主机时间差，得到占用的逻辑 CPU 数；进程总量包含 vCPU，不能相加。
+`qemu_realtime_factor` 接近 1 只说明虚拟时钟推进，固件进度需看 `tick_realtime_factor`。
+`info jit` 在暂停后采集，不计入测量窗口；其容量不代表实际驻留内存。
+`status: measured` 表示采样和清理成功，不表示达到实时性能门。
+
+2026-11-11 用户在 Windows 上用相同 `tick.elf` 做全端口旧版/候选/旧版比较，
+全程 tick 系数依次为 **0.976792 / 0.992818 / 0.986577**，QEMU 虚拟时钟均约 1 倍。
+旧版对应原生分支 `906f2db6eb`，候选为 `8aec0cf69c`；两者都已有高精度等待和 UART
+过期帧处理，候选另修复 HUP-only watch 的空 Winsock `select`。
+旧版末轮有一个约 319 ms 的采样区间只推进 233 ticks；其余日志阶段约 0.992385 倍，
+与候选约 0.992315 倍接近。异常必须保留在总结果中；目前不能证明该 socket 修复稳定提速，
+也不能把该区间直接解释为一次连续线程停顿。约 1.132 GB RSS 的归属仍未定位，
+当时 JIT 仅使用约 7.95 MB、无 flush/invalidation。下一步需要 Windows 调度与调用栈证据。
+
+可在管理员 PowerShell 中用系统 WPR 采集同一运行；WPA 用于检查报告 PID/TID 对应线程的
+调度、CPU 调用栈和等待。采集本身有开销，需保留前面的普通基线：
+
+```powershell
+wpr.exe -start GeneralProfile -filemode
+if ($LASTEXITCODE -ne 0) { throw "WPR 启动失败" }
+try {
+    .\target\release\examples\lab_perf.exe .\tick.elf --qemu $qemu --seconds 12 --host-profile > qemu-scheduling.json
+    if ($LASTEXITCODE -ne 0) { throw "诊断失败" }
+} finally {
+    wpr.exe -stop .\qemu-scheduling.etl
+    if ($LASTEXITCODE -ne 0) { throw "WPR 保存失败" }
+}
+```
+
+### 验证入口
 
 | 层级 | 验证入口 | 证据与限制 |
 | --- | --- | --- |

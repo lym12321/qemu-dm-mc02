@@ -1,4 +1,4 @@
-#![cfg(any(feature = "devices", feature = "machine"))]
+#![cfg(any(feature = "devices", feature = "machine", feature = "lab"))]
 use sim_host::{devices::bmi088::imu_to_bmi088_units, signals::ImuSample};
 
 #[test]
@@ -16,15 +16,19 @@ fn sensor_local_si_preserves_axes_and_proper_acceleration_in_wire_units() {
         ([180., -90., 45.], [1., -2., 0.])
     );
     for value in [f64::NAN, f64::INFINITY, f64::MAX] {
-        assert!(imu_to_bmi088_units(&ImuSample {
-            gyro_rad_s: [value, 0., 0.],
-            ..sample
-        })
-        .is_err());
-        assert!(imu_to_bmi088_units(&ImuSample {
-            accel_m_s2: [0., value, 0.],
-            ..sample
-        })
-        .is_err());
+        assert!(
+            imu_to_bmi088_units(&ImuSample {
+                gyro_rad_s: [value, 0., 0.],
+                ..sample
+            })
+            .is_err()
+        );
+        assert!(
+            imu_to_bmi088_units(&ImuSample {
+                accel_m_s2: [0., value, 0.],
+                ..sample
+            })
+            .is_err()
+        );
     }
 }

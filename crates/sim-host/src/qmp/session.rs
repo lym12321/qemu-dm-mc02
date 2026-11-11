@@ -1,4 +1,4 @@
-use super::{commands::QmpCommand, PreparedCommand};
+use super::{PreparedCommand, commands::QmpCommand};
 use futures::{Future, FutureExt};
 use qapi::futures::{
     QapiService, QmpPendingBatch, QmpPreparedBatch, QmpStreamTokio, QmpSubmitError,
@@ -7,8 +7,8 @@ use serde_json::Value;
 use std::{
     fmt, io,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -41,6 +41,7 @@ pub struct Error {
     pub kind: ErrorKind,
     pub message: String,
     notes: Mutex<Vec<String>>,
+    cleanup_failed: AtomicBool,
     source: Option<Box<dyn std::error::Error + Send + Sync>>,
 }
 
@@ -50,6 +51,7 @@ impl Error {
             kind,
             message: message.into(),
             notes: Mutex::new(Vec::new()),
+            cleanup_failed: AtomicBool::new(false),
             source: None,
         }
     }
@@ -57,6 +59,9 @@ impl Error {
         let mut result = Self::new(ErrorKind::Transport, error.to_string());
         result.source = Some(Box::new(error));
         result
+    }
+    pub fn cleanup_failed(&self) -> bool {
+        self.cleanup_failed.load(Ordering::Relaxed)
     }
     pub fn notes(&self) -> Vec<String> {
         self.notes.lock().unwrap().clone()
@@ -117,7 +122,7 @@ impl CancellationGuard {
 impl Drop for CancellationGuard {
     fn drop(&mut self) {
         if self.armed && (self.closing || !self.state.closed.load(Ordering::Relaxed)) {
-            self.state.fail(Error::new(
+            let error = self.state.fail(Error::new(
                 ErrorKind::State,
                 if self.closing {
                     "QMP cleanup was interrupted"
@@ -125,6 +130,9 @@ impl Drop for CancellationGuard {
                     "QMP in-flight batch was abandoned"
                 },
             ));
+            if self.closing {
+                error.cleanup_failed.store(true, Ordering::Relaxed);
+            }
         }
     }
 }
@@ -398,6 +406,7 @@ impl QmpSession {
                     let first = self
                         .state
                         .fail(Error::new(ErrorKind::Timeout, "QMP close deadline expired"));
+                    first.cleanup_failed.store(true, Ordering::Relaxed);
                     first
                         .notes
                         .lock()

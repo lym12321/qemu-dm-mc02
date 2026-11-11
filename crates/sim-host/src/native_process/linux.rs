@@ -1,15 +1,15 @@
 //! Linux process groups, pidfd exit observation and native Unix sockets.
 use super::{
-    io_failure, Error, ErrorKind, Failure, ProcessOptions, Result, STARTUP_POLL, STDERR_TAIL,
-    STOP_LIMIT,
+    Error, ErrorKind, Failure, ProcessOptions, Result, STARTUP_POLL, STDERR_TAIL, STOP_LIMIT,
+    check_cancellation, io_failure,
 };
 
 use rustix::{
-    event::{poll, PollFd, PollFlags, Timespec},
+    event::{PollFd, PollFlags, Timespec, poll},
     io::Errno,
     process::{
-        kill_process_group, pidfd_open, waitid, Pid, PidfdFlags, Signal, WaitId, WaitIdOptions,
-        WaitIdStatus,
+        Pid, PidfdFlags, Signal, WaitId, WaitIdOptions, WaitIdStatus, kill_process_group,
+        pidfd_open, waitid,
     },
 };
 use std::{
@@ -27,7 +27,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 use tempfile::TempDir;
@@ -129,7 +129,16 @@ fn wait_pidfd(fd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
 
 impl NativeProcess {
     pub fn start(options: ProcessOptions) -> Result<Self> {
+        Self::start_cancellable(options, None)
+    }
+
+    /// Borrow the caller's cancellation flag only while acquiring this owner.
+    pub fn start_cancellable(
+        options: ProcessOptions,
+        cancellation: Option<&AtomicBool>,
+    ) -> Result<Self> {
         options.validate()?;
+        check_cancellation(cancellation)?;
         let temporary = tempfile::Builder::new()
             .prefix("dm-qemu.native.")
             .tempdir_in("/tmp")
@@ -177,6 +186,7 @@ impl NativeProcess {
         };
         let setup = (|| -> Result<()> {
             owner.check()?;
+            check_cancellation(cancellation)?;
             // Register ownership immediately, before any fallible post-spawn work.
             owner.child = Some(
                 command
@@ -191,6 +201,7 @@ impl NativeProcess {
             );
             loop {
                 owner.check()?;
+                check_cancellation(cancellation)?;
                 if Instant::now() >= startup_deadline {
                     return Err(Arc::new(Error::new(
                         ErrorKind::Deadline,
@@ -206,6 +217,7 @@ impl NativeProcess {
                     }
                 }
                 owner.check()?;
+                check_cancellation(cancellation)?;
                 if ready {
                     return Ok(());
                 }
@@ -360,10 +372,16 @@ impl NativeProcess {
                     errors.push(format!("native temporary directory: {error}"));
                 }
             }
-            if self.first.is_none() && !errors.is_empty() {
+            let cleanup_failed = !errors.is_empty();
+            if self.first.is_none() && cleanup_failed {
                 self.latch(Arc::new(Error::new(ErrorKind::Cleanup, errors.remove(0))));
             }
             if let Some(first) = &self.first {
+                if cleanup_failed {
+                    first
+                        .cleanup_failed
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                }
                 let mut notes = first.notes.lock().unwrap();
                 notes.extend(errors);
                 if let Ok(tail) = tail {
