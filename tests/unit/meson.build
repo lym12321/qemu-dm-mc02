@@ -38,6 +38,20 @@ tests = {
   'test-qdist': [],
   'test-qht': [],
   'test-qtree': [],
+  'test-dm-buzzer': [meson.project_source_root() / 'hw/arm/dm_buzzer.c'],
+  'test-dm-ws2812': [meson.project_source_root() / 'hw/arm/dm_ws2812.c'],
+  'test-dm-tim-output': [
+    meson.project_source_root() / 'hw/arm/dm_mc02_tim2.c',
+    'test-dm-digital-stubs.c',
+  ],
+  'test-dm-spi-output': [
+    meson.project_source_root() / 'hw/arm/dm_mc02_spi.c',
+    'test-dm-digital-stubs.c',
+  ],
+  'test-dm-gpio-output': [
+    meson.project_source_root() / 'hw/arm/dm_mc02_gpio.c',
+    'test-dm-gpio-exti-link-vmstate-stubs.c',
+  ],
   'test-bitops': [],
   'test-bitcnt': [],
   'test-qgraph': ['../qtest/libqos/qgraph.c'],

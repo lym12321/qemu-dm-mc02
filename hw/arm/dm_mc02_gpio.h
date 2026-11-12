@@ -1,9 +1,8 @@
 /*
  * First-stage STM32H7 GPIO bank model for the DM-MC02 board.
  *
- * This model intentionally does not contain the alternate-function matrix or
- * electrical drive rules.  An output pin reads back its ODR value through IDR;
- * board/external input values can be injected into input pins explicitly.
+ * The board supplies the selected alternate-function output. GPIO owns mode,
+ * push-pull/open-drain and pull resolution, shared by IDR and observers.
  */
 #ifndef HW_ARM_DM_MC02_GPIO_H
 #define HW_ARM_DM_MC02_GPIO_H
@@ -27,6 +26,9 @@ typedef struct DmMc02GpioBank {
     uint32_t odr;
     uint32_t afr0;
     uint32_t afr1;
+    /* Runtime projection supplied by the selected peripheral, not registers. */
+    uint16_t af_driven;
+    uint16_t af_level;
     DmMc02GpioOdrChanged *odr_changed;
     void *odr_changed_opaque;
 } DmMc02GpioBank;
@@ -39,8 +41,14 @@ void dm_mc02_gpio_set_odr(DmMc02GpioBank *bank, uint32_t value);
 /* Set externally-driven input bits without changing the output latch. */
 void dm_mc02_gpio_set_input(DmMc02GpioBank *bank, uint32_t mask,
                             uint32_t value);
-/* Read-only digital observation.  Sampled levels use the same output-latch
- * projection as IDR; AF/analog and electrical drive remain unmodelled. */
+/* A selected AF producer supplies its current output; no GPIO write callback. */
+void dm_mc02_gpio_set_af_output(DmMc02GpioBank *bank, unsigned pin,
+                                bool driven, bool level);
+/* False denotes an undefined output. Pulls resolve released open-drain pins.
+ * External input values continue to use set_input and IDR. */
+bool dm_mc02_gpio_pin_output(const DmMc02GpioBank *bank, unsigned pin,
+                             bool *level);
+/* Read-only digital observation, using the same projection as IDR. */
 uint16_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank);
 uint16_t dm_mc02_gpio_sample(const DmMc02GpioBank *bank);
 void dm_mc02_gpio_reset(DmMc02GpioBank *bank);

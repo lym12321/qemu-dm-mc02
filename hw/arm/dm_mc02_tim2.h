@@ -4,6 +4,7 @@
 
 #include "exec/memory.h"
 #include "hw/clock.h"
+#include "hw/arm/dm_digital.h"
 #include "migration/vmstate.h"
 #include "qemu/timer.h"
 
@@ -127,7 +128,28 @@ typedef struct DmMc02Tim2 {
     void *event_opaque;
     DmMc02TimChanged *changed;
     void *changed_opaque;
+    /* Optional physical pin consumer. One routed channel per instance.
+     * With a consumer attached, update/compare deadlines are not coalesced. */
+    DmDigitalOutput *output;
+    void *output_opaque;
+    unsigned output_channel;
+    bool output_complementary;
+    bool output_initialized;
+    bool output_driven;
+    bool output_level;
+    QEMUTimer *output_timer;
+    uint64_t next_output_ns;
+    bool dispatching;
+    uint64_t dispatch_ns;
 } DmMc02Tim2;
+
+void dm_mc02_tim2_set_output(DmMc02Tim2 *state, unsigned channel,
+                             bool complementary, DmDigitalOutput *output,
+                             void *opaque);
+void dm_mc02_tim2_cleanup(DmMc02Tim2 *state);
+bool dm_mc02_tim2_output_connected(const DmMc02Tim2 *state);
+/* Changed callbacks use the scheduled event time, even after late dispatch. */
+uint64_t dm_mc02_tim2_event_time(const DmMc02Tim2 *state);
 
 void dm_mc02_tim2_init(DmMc02Tim2 *state, Object *owner,
                        DmMc02TimChanged *changed, void *changed_opaque);

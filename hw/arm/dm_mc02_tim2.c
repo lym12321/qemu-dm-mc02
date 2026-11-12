@@ -4,7 +4,7 @@
  * Register accesses are retained and CNT is derived from QEMU virtual time
  * while CEN is set.  An optional virtual timer reports update flags and
  * interrupts.  PWM output state is evaluated lazily by the observation API;
- * individual output edges are intentionally not scheduled as host events.
+ * a connected pin consumer enables exact timestamped output edges.
  */
 #include "qemu/osdep.h"
 #include "qemu/timer.h"
@@ -74,6 +74,13 @@
 #define TIM_BDTR_SUPPORTED_MASK \
     (TIM_BDTR_DTG_MASK | TIM_BDTR_OSSI | TIM_BDTR_OSSR | \
      TIM_BDTR_BKE | TIM_BDTR_BKP | TIM_BDTR_AOE | TIM_BDTR_MOE)
+
+static void tim2_output_refresh(DmMc02Tim2 *s);
+static uint64_t tim2_now(const DmMc02Tim2 *s)
+{
+    return s->dispatching ? s->dispatch_ns :
+           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
 
 static void tim2_reschedule(DmMc02Tim2 *s);
 static void tim2_schedule_update(DmMc02Tim2 *s, bool preserve_phase);
@@ -466,7 +473,7 @@ static bool tim2_channel_is_output(const DmMc02Tim2 *s, unsigned channel)
 
 static bool tim2_update_required(const DmMc02Tim2 *s)
 {
-    return s->update_callback || s->irq ||
+    return s->output || s->update_callback || s->irq ||
            (s->event_callback &&
             (tim2_master_event_selected(s, DM_MC02_TIM_TRGO,
                                         DM_MC02_TIM_MASTER_UPDATE) ||
@@ -649,7 +656,7 @@ static uint32_t tim2_counter_at(const DmMc02Tim2 *s, uint64_t now)
 
 static uint32_t tim2_counter(const DmMc02Tim2 *s)
 {
-    return tim2_counter_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    return tim2_counter_at(s, tim2_now(s));
 }
 
 static bool tim2_accesses(hwaddr offset, unsigned size, hwaddr reg)
@@ -682,6 +689,9 @@ static uint64_t tim2_qualified_update_period_ns(const DmMc02Tim2 *s)
 
 static unsigned tim2_effective_update_batch(const DmMc02Tim2 *s)
 {
+    if (s->output) {
+        return 1;
+    }
     if (s->event_callback &&
         (tim2_master_event_selected(s, DM_MC02_TIM_TRGO,
                                     DM_MC02_TIM_MASTER_UPDATE) ||
@@ -697,7 +707,7 @@ static uint64_t tim2_remaining_interval_ns(const DmMc02Tim2 *s)
 {
     uint64_t psc = tim2_active_psc_value(s);
     uint64_t counter = tim2_center_aligned(s) ?
-                       tim2_phase_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) :
+                       tim2_phase_at(s, tim2_now(s)) :
                        tim2_load(s, TIM_CNT, 4);
     uint64_t period = tim2_counter_cycle_ticks(s);
     uint64_t remaining;
@@ -751,6 +761,9 @@ static uint64_t tim2_update_interval_ns(DmMc02Tim2 *s)
 
 static unsigned tim2_effective_compare_batch(const DmMc02Tim2 *s)
 {
+    if (s->output) {
+        return 1;
+    }
     /* A coalesced callback can describe a level change, but it cannot encode
      * the alternating edges of toggle-on-match.  Keep all stateful OC modes
      * at one virtual match per callback so the reusable master-event ABI
@@ -899,6 +912,13 @@ static bool tim2_compare_ticks(const DmMc02Tim2 *s, unsigned channel,
     return true;
 }
 
+/* Never schedule a compare before the counter reaches its integer tick. */
+static uint64_t tim2_compare_delay(uint64_t ticks, uint64_t psc, uint64_t hz)
+{
+    __uint128_t ns = ((__uint128_t)ticks * (psc + 1) * 1000000000U + hz - 1) / hz;
+    return ns > INT64_MAX ? UINT64_MAX : MAX((uint64_t)ns, UINT64_C(1));
+}
+
 static uint64_t tim2_compare_delay_ns(const DmMc02Tim2 *s,
                                       unsigned *channel_mask)
 {
@@ -917,7 +937,7 @@ static uint64_t tim2_compare_delay_ns(const DmMc02Tim2 *s,
         return UINT64_MAX;
     }
     counter = tim2_center_aligned(s) ?
-              tim2_phase_at(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)) :
+              tim2_phase_at(s, tim2_now(s)) :
               tim2_counter(s);
     for (unsigned channel = 1; channel <= 4; ++channel) {
         if (!tim2_compare_ticks(s, channel, counter, &ticks)) {
@@ -937,7 +957,7 @@ static uint64_t tim2_compare_delay_ns(const DmMc02Tim2 *s,
     if (ticks > UINT64_MAX / (psc + 1)) {
         return UINT64_MAX;
     }
-    delay = MAX(muldiv64(ticks * (psc + 1), 1000000000U, clock_hz), 1);
+    delay = MAX(tim2_compare_delay(ticks, psc, clock_hz), 1);
     if (mask == 1 && tim2_effective_compare_batch(s) > 1) {
         uint64_t period_ns = tim2_update_period_ns(s);
         uint64_t extra = tim2_saturating_mul(
@@ -997,8 +1017,7 @@ static uint64_t tim2_next_compare_deadline_at(const DmMc02Tim2 *s,
         if (ticks > UINT64_MAX / (psc + 1)) {
             continue;
         }
-        delay = MAX(muldiv64(ticks * (psc + 1), 1000000000U,
-                            clock_hz), UINT64_C(1));
+        delay = tim2_compare_delay(ticks, psc, clock_hz);
         candidate = tim2_add_deadline(base_timestamp, delay);
         if (!candidate) {
             continue;
@@ -1051,8 +1070,7 @@ static uint64_t tim2_next_compare_deadline(const DmMc02Tim2 *s,
         if (ticks > UINT64_MAX / (psc + 1)) {
             continue;
         }
-        delay = MAX(muldiv64(ticks * (psc + 1), 1000000000U,
-                            clock_hz), UINT64_C(1));
+        delay = tim2_compare_delay(ticks, psc, clock_hz);
         candidate = tim2_add_deadline(base_timestamp, delay);
         if (!candidate) {
             continue;
@@ -1067,8 +1085,7 @@ static uint64_t tim2_next_compare_deadline(const DmMc02Tim2 *s,
                 current_ticks > UINT64_MAX / (psc + 1)) {
                 continue;
             }
-            delay = MAX(muldiv64(current_ticks * (psc + 1), 1000000000U,
-                                clock_hz), UINT64_C(1));
+            delay = tim2_compare_delay(current_ticks, psc, clock_hz);
             candidate = tim2_add_deadline(now, delay);
         }
         if (candidate < best) {
@@ -1132,7 +1149,7 @@ static void tim2_schedule_compare(DmMc02Tim2 *s)
         return;
     }
     s->compare_channel_mask = channel_mask;
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tim2_now(s);
     s->next_compare_ns = tim2_add_deadline(now, delay);
     if (!s->next_compare_ns) {
         timer_del(s->compare_timer);
@@ -1190,6 +1207,7 @@ static bool tim2_deliver_compare_event(DmMc02Tim2 *s,
     }
     tim2_store(s, TIM_SR, sr, 4);
     tim2_update_irq(s);
+    tim2_output_refresh(s);
     if (s->compare_callback && (compare_channel_mask & 1u)) {
         s->compare_callback(s->compare_opaque, 1, timestamp_ns);
     }
@@ -1204,12 +1222,12 @@ static bool tim2_deliver_compare_event(DmMc02Tim2 *s,
            (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN);
 }
 
-static void tim2_compare_timer(void *opaque)
+static void tim2_compare_dispatch(void *opaque)
 {
     DmMc02Tim2 *s = opaque;
     uint64_t scheduled_deadline = s->next_compare_ns;
     uint64_t timestamp_ns = scheduled_deadline;
-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t now = tim2_now(s);
     uint64_t period_ns;
     uint64_t missed = 0;
     uint64_t next_event;
@@ -1226,7 +1244,7 @@ static void tim2_compare_timer(void *opaque)
 
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) {
         period_ns = tim2_update_period_ns(s);
-        if (tim2_has_stateful_ocref(s)) {
+        if (s->output || tim2_has_stateful_ocref(s)) {
             uint64_t event_deadline = scheduled_deadline;
             unsigned event_channel_mask = compare_channel_mask;
 
@@ -1246,7 +1264,7 @@ static void tim2_compare_timer(void *opaque)
                     s->next_compare_ns = 0;
                     return;
                 }
-                if (next_deadline > now) {
+                if (s->output || next_deadline > now) {
                     s->compare_channel_mask = event_channel_mask;
                     s->next_compare_ns = next_deadline;
                     timer_mod(s->compare_timer, next_deadline);
@@ -1820,6 +1838,11 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
         *complementary_gate = !*main_gate;
         return true;
     }
+    if (mode <= TIM_OCM_TOGGLE) {
+        *main_gate = (s->ocref_level_mask >> (channel - 1)) & 1;
+        *complementary_gate = !*main_gate;
+        return true;
+    }
     if (mode != TIM_OCM_PWM1 && mode != TIM_OCM_PWM2) {
         return false;
     }
@@ -1830,7 +1853,7 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
     prescaler = (uint64_t)tim2_active_psc_value(s) + 1;
     cycle_ticks = tim2_counter_cycle_ticks(s) * prescaler;
     phase = tim2_phase_clock_cycles(s,
-                                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+                                   tim2_now(s));
     dead_time = tim2_dead_time_cycles(s, NULL);
     ccr = tim2_active_ccr_value(s, channel);
     (void)ccr_offset;
@@ -1969,6 +1992,139 @@ bool dm_mc02_tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
     return true;
 }
 
+static void tim2_output_refresh(DmMc02Tim2 *s)
+{
+    DmMc02TimPwmOutputState output;
+    uint64_t now, hz, period, phase, psc, compare, dead, next = UINT64_MAX;
+    uint64_t targets[6];
+    unsigned count = 0;
+    bool valid, driven, level;
+
+    if (!s->output) {
+        return;
+    }
+    now = tim2_now(s);
+    hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
+    valid = dm_mc02_tim2_get_pwm_output_state(s, s->output_channel, &output);
+    driven = valid && hz && (s->output_complementary ?
+                             output.complementary_enabled :
+                             output.main_enabled);
+    level = driven && (s->output_complementary ?
+                        output.complementary_level : output.main_level);
+    if (!s->output_initialized || driven != s->output_driven ||
+        level != s->output_level) {
+        s->output_initialized = true;
+        s->output_driven = driven;
+        s->output_level = level;
+        s->output(s->output_opaque, now, driven, level);
+    }
+    timer_del(s->output_timer);
+    s->next_output_ns = 0;
+    if (!driven || (tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM1 &&
+                    tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM2)) {
+        return;
+    }
+    psc = (uint64_t)tim2_active_psc_value(s) + 1;
+    period = tim2_counter_cycle_ticks(s) * psc;
+    compare = (uint64_t)tim2_active_ccr_value(s, s->output_channel) * psc;
+    if (!compare || compare >= (tim2_center_aligned(s) ? period / 2 : period)) {
+        return;
+    }
+    phase = tim2_phase_clock_cycles(s, now);
+    dead = output.dead_time_cycles;
+    /* Gate changes at OCREF transitions and the two delayed turn-ons.
+     * Extra candidates are harmless: identical resolved levels are omitted. */
+    targets[count++] = tim2_center_aligned(s) ? period - compare : 0;
+    targets[count++] = compare;
+    targets[count++] = (targets[0] + dead) % period;
+    targets[count++] = (compare + dead) % period;
+    for (unsigned i = 0; i < count; ++i) {
+        uint64_t distance = tim2_phase_distance(phase, targets[i], period);
+        __uint128_t cycles = (__uint128_t)tim2_elapsed_clock_cycles(s, now) +
+                             distance;
+        __uint128_t deadline = s->start_ns +
+            (cycles * UINT64_C(1000000000) + hz - 1) / hz;
+
+        if (deadline > now && deadline <= INT64_MAX) {
+            next = MIN(next, (uint64_t)deadline);
+        }
+    }
+    if (next != UINT64_MAX) {
+        s->next_output_ns = next;
+        timer_mod(s->output_timer, next);
+    }
+}
+
+static void tim2_output_timer(void *opaque)
+{
+    DmMc02Tim2 *s = opaque;
+
+    s->dispatching = true;
+    s->dispatch_ns = s->next_output_ns;
+    tim2_output_refresh(s);
+    s->dispatching = false;
+}
+
+void dm_mc02_tim2_set_output(DmMc02Tim2 *s, unsigned channel,
+                             bool complementary, DmDigitalOutput *output,
+                             void *opaque)
+{
+    if (s->output == output && s->output_channel == channel &&
+        s->output_complementary == complementary && s->output_opaque == opaque) {
+        return;
+    }
+    if (!s->output_timer && output) {
+        s->output_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tim2_output_timer, s);
+    }
+    if (s->output_timer) {
+        timer_del(s->output_timer);
+    }
+    s->output = output;
+    s->output_opaque = opaque;
+    s->output_channel = channel;
+    s->output_complementary = complementary;
+    s->output_initialized = false;
+    s->next_output_ns = 0;
+    s->update_interval_ns = 0;
+    tim2_schedule_compare(s);
+    /* Start at the next actual counter wrap, preserving the current phase. */
+    s->next_update_ns = 0;
+    if (s->output && (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN)) {
+        uint64_t now = tim2_now(s);
+        uint64_t cycle = tim2_counter_cycle_ticks(s);
+        uint64_t counter = tim2_center_aligned(s) ? tim2_phase_at(s, now) :
+                                                  tim2_counter_at(s, now);
+        uint64_t hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
+        uint64_t ticks = cycle - counter % cycle;
+        __uint128_t delay = (__uint128_t)ticks *
+                           (tim2_active_psc_value(s) + UINT64_C(1)) *
+                           UINT64_C(1000000000);
+        if (hz && delay / hz <= INT64_MAX - now) {
+            s->next_update_ns = now + (delay + hz - 1) / hz;
+        }
+    }
+    tim2_schedule_update(s, true);
+    tim2_output_refresh(s);
+}
+
+void dm_mc02_tim2_cleanup(DmMc02Tim2 *s)
+{
+    timer_free(s->update_timer);
+    timer_free(s->compare_timer);
+    timer_free(s->output_timer);
+    s->update_timer = s->compare_timer = s->output_timer = NULL;
+}
+
+bool dm_mc02_tim2_output_connected(const DmMc02Tim2 *s)
+{
+    return s->output != NULL;
+}
+
+uint64_t dm_mc02_tim2_event_time(const DmMc02Tim2 *s)
+{
+    return tim2_now(s);
+}
+
 bool dm_mc02_tim2_get_pwm_state(const DmMc02Tim2 *s, unsigned channel,
                                 bool *enabled, bool *level,
                                 uint64_t *frequency_hz,
@@ -2087,14 +2243,21 @@ static void tim2_generate_update_event(DmMc02Tim2 *s,
     if (s->update_callback) {
         s->update_callback(s->update_opaque);
     }
+    if (active_changed && s->output) {
+        tim2_schedule_compare(s);
+    }
     tim2_emit_master_event(s, output_mask, DM_MC02_TIM_MASTER_UPDATE, true, 1,
                            timestamp_ns);
     tim2_emit_ocref_snapshot(s, ocref_output_masks, old_valid_mask,
                              ocref_old_level_mask, ocref_new_level_mask, 1,
                              timestamp_ns);
+    tim2_output_refresh(s);
+    if (active_changed && s->changed) {
+        s->changed(s->changed_opaque);
+    }
 }
 
-static void tim2_update_timer(void *opaque)
+static void tim2_update_dispatch(void *opaque)
 {
     DmMc02Tim2 *s = opaque;
     uint64_t timestamp_ns = s->next_update_ns;
@@ -2103,7 +2266,7 @@ static void tim2_update_timer(void *opaque)
 
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) {
         if (!timestamp_ns) {
-            timestamp_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            timestamp_ns = tim2_now(s);
         }
         tim2_generate_update_event(s, timestamp_ns, false, output_mask);
     }
@@ -2138,7 +2301,7 @@ static void tim2_schedule_update(DmMc02Tim2 *s, bool preserve_phase)
         return;
     }
     period = interval;
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tim2_now(s);
 
     if (!preserve_phase || !s->next_update_ns) {
         uint64_t delay = preserve_phase ? tim2_remaining_interval_ns(s) :
@@ -2194,7 +2357,7 @@ static void tim2_reschedule_from_count(DmMc02Tim2 *s)
         tim2_schedule_compare(s);
         return;
     }
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tim2_now(s);
     if (!tim2_center_aligned(s) && counter >= period) {
         tim2_store(s, TIM_CNT, counter % period, 4);
     }
@@ -2254,7 +2417,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
     uint32_t latched_counter = 0;
     uint32_t old_rcr = 0;
     uint32_t old_bdtr = 0;
-    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t now = tim2_now(s);
 
     if (offset + size > DM_MC02_TIM2_REGION_SIZE) {
         return;
@@ -2298,6 +2461,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
         } else {
             tim2_reschedule(s);
         }
+        tim2_output_refresh(s);
         if (s->changed) {
             s->changed(s->changed_opaque);
         }
@@ -2309,6 +2473,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
                    tim2_load(s, TIM_SR, sizeof(uint32_t)) & (uint32_t)value,
                    sizeof(uint32_t));
         tim2_update_irq(s);
+        tim2_output_refresh(s);
         if (s->changed) {
             s->changed(s->changed_opaque);
         }
@@ -2342,7 +2507,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
     if (tim2_accesses(offset, size, TIM_EGR) &&
         offset <= TIM_EGR && TIM_EGR < offset + size &&
         ((value >> ((TIM_EGR - offset) * 8)) & TIM_EGR_UG)) {
-        uint64_t timestamp_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        uint64_t timestamp_ns = tim2_now(s);
 
         /* UG is the reset trigger input for MMS=0 and also generates an
          * update event for MMS/MMS2=2.  Keep both outputs independent. */
@@ -2357,12 +2522,12 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
         tim2_reschedule_from_count(s);
     }
     if (running_phase_write) {
-        s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->start_ns = tim2_now(s);
     }
     is_enabled = tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN;
     if (tim2_accesses(offset, size, TIM_CR1) &&
         is_enabled != was_enabled) {
-        s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->start_ns = tim2_now(s);
         tim2_emit_master_event(
             s, tim2_master_output_mask(s, DM_MC02_TIM_MASTER_ENABLE),
             DM_MC02_TIM_MASTER_ENABLE, is_enabled, 1, s->start_ns);
@@ -2435,6 +2600,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
     if (tim2_accesses(offset, size, TIM_DIER)) {
         tim2_update_irq(s);
     }
+    tim2_output_refresh(s);
     if (s->changed) {
         s->changed(s->changed_opaque);
     }
@@ -2448,11 +2614,31 @@ static const MemoryRegionOps tim2_ops = {
     .valid.max_access_size = 4,
 };
 
+static void tim2_update_timer(void *opaque)
+{
+    DmMc02Tim2 *s = opaque;
+    s->dispatching = s->output != NULL;
+    s->dispatch_ns = s->next_update_ns;
+    tim2_update_dispatch(s);
+    tim2_output_refresh(s);
+    s->dispatching = false;
+}
+
+static void tim2_compare_timer(void *opaque)
+{
+    DmMc02Tim2 *s = opaque;
+    s->dispatching = s->output != NULL;
+    s->dispatch_ns = s->next_compare_ns;
+    tim2_compare_dispatch(s);
+    tim2_output_refresh(s);
+    s->dispatching = false;
+}
+
 void dm_mc02_tim2_init(DmMc02Tim2 *s, Object *owner,
                        DmMc02TimChanged *changed, void *changed_opaque)
 {
     memset(s, 0, sizeof(*s));
-    s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->start_ns = tim2_now(s);
     s->break_input_level = true;
     s->update_batch = 1;
     s->compare_batch = 1;
@@ -2474,7 +2660,7 @@ void dm_mc02_tim2_set_clock(DmMc02Tim2 *s, Clock *clock)
         return;
     }
     running = tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN;
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tim2_now(s);
     if (running) {
         counting_down = tim2_counting_down_at(s, now);
     }
@@ -2508,6 +2694,10 @@ void dm_mc02_tim2_set_clock(DmMc02Tim2 *s, Clock *clock)
         tim2_reschedule(s);
     }
     tim2_schedule_compare(s);
+    tim2_output_refresh(s);
+    if (s->changed) {
+        s->changed(s->changed_opaque);
+    }
 }
 
 void dm_mc02_tim2_clock_changed(DmMc02Tim2 *s)
@@ -2519,9 +2709,9 @@ void dm_mc02_tim2_clock_changed(DmMc02Tim2 *s)
     }
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) {
         counting_down = tim2_counting_down_at(
-            s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+            s, tim2_now(s));
         tim2_store(s, TIM_CNT, tim2_counter(s), 4);
-        s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        s->start_ns = tim2_now(s);
         s->start_counting_down = counting_down;
     }
     s->update_interval_ns = 0;
@@ -2564,7 +2754,7 @@ void dm_mc02_tim2_sync_runtime(DmMc02Tim2 *s)
         return;
     }
 
-    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    now = tim2_now(s);
     if (s->update_timer && s->next_update_ns &&
         tim2_update_required(s)) {
         uint64_t deadline = s->next_update_ns;
@@ -2627,7 +2817,7 @@ void dm_mc02_tim2_reset(DmMc02Tim2 *s)
     memset(s->active_ccr, 0, sizeof(s->active_ccr));
     s->active_rcr = 0;
     s->repetition_remaining = 0;
-    s->start_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->start_ns = tim2_now(s);
     s->start_counting_down = false;
     s->next_update_ns = 0;
     s->update_interval_ns = 0;
@@ -2651,6 +2841,7 @@ void dm_mc02_tim2_reset(DmMc02Tim2 *s)
         timer_del(s->compare_timer);
     }
     tim2_set_irq(s, false);
+    tim2_output_refresh(s);
 }
 
 void dm_mc02_tim2_set_update_callback(DmMc02Tim2 *s,
@@ -2734,6 +2925,7 @@ void dm_mc02_tim2_set_break_input(DmMc02Tim2 *s, bool level)
     }
     s->break_input_level = level;
     tim2_refresh_break_state(s, false);
+    tim2_output_refresh(s);
     if (s->changed) {
         s->changed(s->changed_opaque);
     }
@@ -2745,6 +2937,7 @@ void dm_mc02_tim2_set_complementary_supported(DmMc02Tim2 *s, bool supported)
         return;
     }
     s->complementary_supported = supported;
+    tim2_output_refresh(s);
     if (s->changed) {
         s->changed(s->changed_opaque);
     }

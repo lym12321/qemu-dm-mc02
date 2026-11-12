@@ -65,6 +65,10 @@ static const DmMc02BoardProfile dm_mc02_profile = {
     .flash_profile_count = ARRAY_SIZE(dm_mc02_flash_profiles),
     .devices = {
         .led = { 0, 7 },
+        .led_timers = {{ 1, 0, 1, true }, { 2, 1, 2, false },
+                       { 3, 2, 1, true }},
+        .led_timer_count = 3,
+        .led_spi_af = 5,
         .buzzer = { 1, 15 },
         .user_key = { 0, 15 },
         .power_out1 = { 2, 14 },
@@ -82,8 +86,7 @@ static const DmMc02BoardProfile dm_mc02_profile = {
         .buzzer_timer_index = 3,
         .buzzer_channel = 2,
         .buzzer_gpio_af = 2,
-        .ws2812_dma_controller = 1,
-        .ws2812_dma_stream = 6,
+        .tim8_dma_controller = 1,
         .power_gpio_bank = 2,
         .power_vin_adc_channel = 4,
         .power_key_adc_channel = 19,
@@ -202,6 +205,9 @@ static const DmMc02BoardProfile stm32h723_eval_profile = {
     .spi_cs_route_count = ARRAY_SIZE(stm32h723_eval_spi_cs_routes),
     .devices = {
         .led = { 0, 0 },
+        .led_timers = {{ 1, DM_MC02_BOARD_TIMER_COUNT, 1, false }},
+        .led_timer_count = 1,
+        .led_spi_af = DM_MC02_BOARD_PIN_NONE,
         .buzzer = { 1, 0 },
         .user_key = { 0, 13 },
         .power_out1 = { 2, 0 },
@@ -219,8 +225,7 @@ static const DmMc02BoardProfile stm32h723_eval_profile = {
         .buzzer_timer_index = 3,
         .buzzer_channel = 1,
         .buzzer_gpio_af = 1,
-        .ws2812_dma_controller = 1,
-        .ws2812_dma_stream = 0,
+        .tim8_dma_controller = 1,
         .power_gpio_bank = 2,
         .power_vin_adc_channel = 4,
         .power_key_adc_channel = 19,
@@ -593,9 +598,37 @@ bool dm_mc02_board_validate(const DmMc02BoardProfile *board, Error **errp)
                    board->name);
         return false;
     }
-    if (board->devices.ws2812_dma_controller > 1 ||
-        board->devices.ws2812_dma_stream >= DM_MC02_BOARD_DMA_STREAM_COUNT) {
-        error_setg(errp, "board profile '%s' has invalid WS2812 DMA wiring",
+    if (board->devices.led_timer_count >
+        ARRAY_SIZE(board->devices.led_timers) ||
+        (board->devices.led_spi_af > 15 &&
+         board->devices.led_spi_af != DM_MC02_BOARD_PIN_NONE)) {
+        error_setg(errp, "board profile '%s' has invalid LED routes", board->name);
+        return false;
+    }
+    for (unsigned i = 0; i < board->devices.led_timer_count; ++i) {
+        const DmMc02BoardTimerPinRoute *route = &board->devices.led_timers[i];
+        if (route->af > 15 || route->channel < 1 || route->channel > 4 ||
+            (route->timer_index >= board->timer_count &&
+             route->timer_index != DM_MC02_BOARD_TIMER_COUNT) ||
+            route->timer_index == board->devices.buzzer_timer_index ||
+            (route->complementary &&
+             (route->channel > 3 || route->timer_index >= board->timer_count ||
+              !board->timers[route->timer_index].has_complementary_output))) {
+            error_setg(errp, "board profile '%s' has an invalid LED timer route",
+                       board->name);
+            return false;
+        }
+        for (unsigned j = 0; j < i; ++j) {
+            if (board->devices.led_timers[j].af == route->af ||
+                board->devices.led_timers[j].timer_index == route->timer_index) {
+                error_setg(errp, "board profile '%s' repeats an LED timer route",
+                           board->name);
+                return false;
+            }
+        }
+    }
+    if (board->devices.tim8_dma_controller > 1) {
+        error_setg(errp, "board profile '%s' has invalid TIM8 DMA wiring",
                    board->name);
         return false;
     }

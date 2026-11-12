@@ -52,6 +52,14 @@ void dm_mc02_bmi088_spi_link_reset(DmMc02Bmi088SpiLink *link)
     link->selected_mask_snapshot = 0;
 }
 
+void dm_mc02_bmi088_spi_link_reset_bus(DmMc02Bmi088SpiLink *link)
+{
+    dm_mc02_spi_reset(&link->spi);
+    dm_mc02_bmi088_spi_reset(&link->accel_spi);
+    dm_mc02_bmi088_spi_reset(&link->gyro_spi);
+    link->selected_mask_snapshot = 0;
+}
+
 void dm_mc02_bmi088_spi_link_set_consume_callbacks(
     DmMc02Bmi088SpiLink *link, DmMc02Bmi088SpiConsumeFn accel_consume,
     void *accel_opaque, DmMc02Bmi088SpiConsumeFn gyro_consume,

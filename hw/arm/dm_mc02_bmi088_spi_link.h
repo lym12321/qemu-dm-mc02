@@ -24,6 +24,8 @@ void dm_mc02_bmi088_spi_link_init(DmMc02Bmi088SpiLink *link, Object *owner,
                                   const char *name, bool dma_timer);
 void dm_mc02_bmi088_spi_link_cleanup(DmMc02Bmi088SpiLink *link);
 void dm_mc02_bmi088_spi_link_reset(DmMc02Bmi088SpiLink *link);
+/* MCU reset releases CS and resets the SPI controller, retaining powered dies. */
+void dm_mc02_bmi088_spi_link_reset_bus(DmMc02Bmi088SpiLink *link);
 
 void dm_mc02_bmi088_spi_link_set_consume_callbacks(
     DmMc02Bmi088SpiLink *link, DmMc02Bmi088SpiConsumeFn accel_consume,

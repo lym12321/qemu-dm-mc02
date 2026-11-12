@@ -37,6 +37,8 @@ typedef struct DmMc02SocProfile {
     uint32_t calibration_size;
 
     hwaddr spi1_base;
+    unsigned spi1_irq;
+    unsigned spi1_tx_request;
     hwaddr spi2_base;
     hwaddr gpio_base;
     unsigned gpio_bank_count;

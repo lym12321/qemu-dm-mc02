@@ -478,6 +478,67 @@ static uint64_t dm_mc02_pll_output_hz(const DmMc02PwrRcc *state,
                     divm * divp * 8192u);
 }
 
+static uint64_t dm_mc02_per_clock_hz(const DmMc02PwrRcc *state)
+{
+    uint32_t d1ccipr = dm_mc02_reg_load(state->rcc_regs, RCC_D1CCIPR,
+                                        sizeof(uint32_t));
+    switch ((d1ccipr >> 28) & 3u) {
+    case 0:
+        if (!dm_mc02_rcc_oscillator_ready(state, 0)) {
+            return 0;
+        }
+        return DM_MC02_HSI_HZ / dm_mc02_hsi_divider(
+            dm_mc02_reg_load(state->rcc_regs, RCC_CR, sizeof(uint32_t)));
+    case 1:
+        if (!dm_mc02_rcc_oscillator_ready(state, 1)) {
+            return 0;
+        }
+        return DM_MC02_CSI_HZ;
+    case 2:
+        if (!dm_mc02_rcc_oscillator_ready(state, 2)) {
+            return 0;
+        }
+        return DM_MC02_HSE_HZ;
+    default:
+        return 0;
+    }
+}
+
+uint64_t dm_mc02_pwr_rcc_spi123_kernel_clock_hz(const DmMc02PwrRcc *state)
+{
+    unsigned source = (dm_mc02_reg_load(state->rcc_regs, RCC_D2CCIP1R, 4) >> 12) & 7;
+    switch (source) {
+    case 0:
+        return dm_mc02_pll_output_hz(state, RCC_CR_PLL1ON, 4,
+            RCC_PLL1DIVR, RCC_PLL1FRACR, RCC_PLLCFGR_PLL1FRACEN, 16,
+            RCC_PLLCFGR_PLL1DIVQEN);
+    case 1:
+        return dm_mc02_pll_output_hz(state, RCC_CR_PLL2ON, 12,
+            RCC_PLL2DIVR, RCC_PLL2FRACR, RCC_PLLCFGR_PLL2FRACEN, 9,
+            RCC_PLLCFGR_PLL2DIVPEN);
+    case 2:
+        return dm_mc02_pll_output_hz(state, RCC_CR_PLL3ON, 20,
+            RCC_PLL3DIVR, RCC_PLL3FRACR, RCC_PLLCFGR_PLL3FRACEN, 9,
+            RCC_PLLCFGR_PLL3DIVPEN);
+    case 4:
+        return dm_mc02_per_clock_hz(state);
+    default: /* No external I2S_CKIN producer is connected. */
+        return 0;
+    }
+}
+
+bool dm_mc02_pwr_rcc_spi1_reset_asserted(const DmMc02PwrRcc *state)
+{
+    return dm_mc02_reg_load(state->rcc_regs, 0x98, 4) & (1u << 12);
+}
+
+uint64_t dm_mc02_pwr_rcc_spi1_clock_hz(const DmMc02PwrRcc *state)
+{
+    return !dm_mc02_pwr_rcc_spi1_reset_asserted(state) &&
+           (dm_mc02_reg_load(state->rcc_regs, 0xf0, 4) & (1u << 12)) ?
+           dm_mc02_pwr_rcc_spi123_kernel_clock_hz(state) : 0;
+}
+
 uint64_t dm_mc02_pwr_rcc_adc_kernel_clock_hz(const DmMc02PwrRcc *state)
 {
     uint32_t d3ccipr;
@@ -500,30 +561,8 @@ uint64_t dm_mc02_pwr_rcc_adc_kernel_clock_hz(const DmMc02PwrRcc *state)
                                       RCC_PLL3DIVR, RCC_PLL3FRACR,
                                       RCC_PLLCFGR_PLL3FRACEN, 24,
                                       RCC_PLLCFGR_PLL3DIVREN);
-    case 2: { /* CLKP, selected by D1CCIPR.CKPERSEL */
-        uint32_t d1ccipr = dm_mc02_reg_load(state->rcc_regs, RCC_D1CCIPR,
-                                            sizeof(uint32_t));
-        switch ((d1ccipr >> 28) & 3u) {
-        case 0:
-            if (!dm_mc02_rcc_oscillator_ready(state, 0)) {
-                return 0;
-            }
-            return DM_MC02_HSI_HZ / dm_mc02_hsi_divider(
-                dm_mc02_reg_load(state->rcc_regs, RCC_CR, sizeof(uint32_t)));
-        case 1:
-            if (!dm_mc02_rcc_oscillator_ready(state, 1)) {
-                return 0;
-            }
-            return DM_MC02_CSI_HZ;
-        case 2:
-            if (!dm_mc02_rcc_oscillator_ready(state, 2)) {
-                return 0;
-            }
-            return DM_MC02_HSE_HZ;
-        default:
-            return 0;
-        }
-    }
+    case 2: /* CLKP */
+        return dm_mc02_per_clock_hz(state);
     default:
         return 0;
     }
@@ -868,7 +907,8 @@ static void dm_mc02_pwr_rcc_write(void *opaque, hwaddr offset, uint64_t value,
         }
         dm_mc02_rcc_try_switch_system_clock(s);
         if (cpu_clock_dirty || adc_clock_dirty || fdcan_clock_dirty ||
-            uart_clock_dirty) {
+            uart_clock_dirty || (offset < 0xf4 && offset + size > 0xf0) ||
+            (offset < 0x9c && offset + size > 0x98)) {
             dm_mc02_pwr_rcc_notify_clock(s);
         }
     }

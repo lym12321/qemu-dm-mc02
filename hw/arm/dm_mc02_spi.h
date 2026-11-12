@@ -5,6 +5,7 @@
 #include "exec/memory.h"
 #include "hw/arm/dm_mc02_dma.h"
 #include "hw/arm/dm_mc02_spi_target.h"
+#include "hw/arm/dm_digital.h"
 #include "migration/vmstate.h"
 #include "qemu/timer.h"
 
@@ -45,7 +46,39 @@ typedef struct DmMc02Spi {
     unsigned dma_batch_limit;
     DmMc02DmaEndpoint tx_endpoint;
     DmMc02DmaEndpoint rx_endpoint;
+    /* Optional clocked master transmitter. The legacy SSI target path keeps
+     * its synchronous contract when wire_timer is absent. */
+    QEMUTimer *wire_timer;
+    uint64_t kernel_hz;
+    uint64_t wire_origin_ns;
+    uint64_t wire_next_ns;
+    uint64_t wire_available_ns;
+    uint32_t tx_fifo[16];
+    unsigned tx_head;
+    unsigned tx_count;
+    uint32_t shift_value;
+    unsigned shift_bit;
+    unsigned shift_origin_bit;
+    bool shifting;
+    bool mosi_level;
+    bool tx_complete;
+    uint32_t ier;
+    uint32_t timed_rx;
+    qemu_irq irq;
+    DmDigitalOutput *mosi;
+    void *mosi_opaque;
+    DmMc02SpiDmaChannel dma_tx_alternate;
 } DmMc02Spi;
+
+/* Configure before use. The GPIO mux may attach/detach its MOSI consumer
+ * independently of serializer timing. SPI1/2/3 have a 16-byte TX FIFO. */
+void dm_mc02_spi_enable_timing(DmMc02Spi *spi);
+void dm_mc02_spi_set_clock_hz(DmMc02Spi *spi, uint64_t hz);
+void dm_mc02_spi_set_mosi(DmMc02Spi *spi, DmDigitalOutput *output, void *opaque);
+void dm_mc02_spi_set_irq(DmMc02Spi *spi, qemu_irq irq);
+void dm_mc02_spi_set_alternate_tx_dma(DmMc02Spi *spi,
+                                     const DmMc02SpiDmaChannel *channel);
+void dm_mc02_spi_dma_tx_stream_enabled(DmMc02Spi *spi);
 
 void dm_mc02_spi_state_init(DmMc02Spi *spi);
 void dm_mc02_spi_init(DmMc02Spi *spi, Object *owner, const char *name,

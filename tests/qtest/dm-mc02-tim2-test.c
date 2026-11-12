@@ -3,6 +3,7 @@
 #include "qemu/osdep.h"
 #include "libqtest.h"
 #include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qlist.h"
 #include "hw/arm/dm_mc02_tim2.h"
 #include "qemu/bswap.h"
 #include "qemu/sockets.h"
@@ -776,92 +777,145 @@ static void test_tim8_rcr_gates_update_flag_only(void)
     qtest_quit(qts);
 }
 
-static uint32_t ws2812_read_rgb(int socket_fd, uint64_t not_before_ns)
-{
-    uint8_t wire[156];
-    uint8_t length[4];
-
-    for (unsigned frame = 0; frame < 16; ++frame) {
-        uint32_t size;
-
-        g_assert_cmpint(recv(socket_fd, length, sizeof(length), MSG_WAITALL),
-                        ==, sizeof(length));
-        size = ldl_le_p(length);
-        g_assert_cmpuint(size, >=, 28);
-        g_assert_cmpuint(size, <=, sizeof(wire));
-        g_assert_cmpint(recv(socket_fd, wire, size, MSG_WAITALL), ==, size);
-        g_assert_cmphex(ldl_le_p(wire), ==, 0x32434d44);
-        g_assert_cmpuint(lduw_le_p(wire + 4), ==, 1);
-        if (lduw_le_p(wire + 6) == 3 &&
-            ldq_le_p(wire + 20) >= not_before_ns) {
-            g_assert_cmpuint(size, ==, 40);
-            return ldl_le_p(wire + 28);
-        }
-    }
-    g_assert_not_reached();
-}
-
 static void test_ws2812_dma_sram_sources(void)
 {
-    /* RM0468 Rev 3, section 2.1.6, p110: DMA1/2 memory buses reach
-     * internal AXI/SRAM1/SRAM2/SRAM4, but cannot reach ITCM or DTCM.
-     * This checks the board's sampled DMA-buffer telemetry, not DMA cycles. */
-    static const struct {
-        uint32_t address;
-        uint32_t rgb;
-        unsigned transfers;
-        uint32_t expected;
-    } cases[] = {
-        { 0x30000100, 0x12ab34, 72, 0x12ab34 },
-        { 0x2400cde8, 0xab1234, 72, 0xab1234 },
-        { 0x20000100, 0x34ab12, 72, 0 },
-        { 0x2404ffd0, 0x563412, 24, 0x563412 },
-        { 0x2404ffe0, 0x123456, 24, 0 },
-        { 0x30007fd0, 0xabcdef, 24, 0xabcdef },
-        { 0x38000100, 0x123456, 72, 0x123456 },
-    };
-    const uint32_t dma2_s6 = 0x400204a0;
-    struct timeval timeout = { .tv_sec = 2 };
-    int socket_fd;
-    QTestState *qts = qtest_init_with_serial("-machine dm-mc02", &socket_fd);
-
-    g_assert_cmpint(setsockopt(socket_fd, SOL_SOCKET, SO_RCVTIMEO,
-                              &timeout, sizeof(timeout)), ==, 0);
-    g_assert_cmphex(ws2812_read_rgb(socket_fd, 0), ==, 0);
-    for (unsigned test = 0; test < ARRAY_SIZE(cases); ++test) {
+    /* Actual TIM8_CH1N -> PA7 -> DIN, with DMA updating the next preload.
+     * SRAM1, AXI SRAM and SRAM4 are reached by the DMA1/2 memory buses. */
+    static const uint32_t addresses[] = { 0x30000100, 0x24000100, 0x38000100 };
+    for (unsigned test = 0; test < ARRAY_SIZE(addresses); ++test) {
+        QTestState *qts = qtest_init("-machine dm-mc02");
+        uint32_t grb = 0x123456;
         uint8_t waveform[144] = { 0 };
-        uint32_t grb = ((cases[test].rgb >> 8) & 0xff) << 16 |
-                       (cases[test].rgb >> 16) << 8 |
-                       (cases[test].rgb & 0xff);
+        QDict *response, *led;
 
-        for (unsigned bit = 0; bit < 24; ++bit) {
-            stw_le_p(waveform + 2 * bit,
-                     (grb & (1u << (23 - bit))) ? 168 : 84);
+        /* The initial CCR transmits bit23; DMA supplies the following bits. */
+        for (unsigned bit = 1; bit < 24; ++bit) {
+            stw_le_p(waveform + 2 * (bit - 1),
+                     (grb & (1u << (23 - bit))) ? 51 : 26);
         }
-        g_test_message("WS2812 source 0x%08x, %u halfwords",
-                       cases[test].address, cases[test].transfers);
-        qtest_writel(qts, dma2_s6, 0);
-        qtest_memwrite(qts, cases[test].address, waveform,
-                       2 * cases[test].transfers);
-        qtest_writel(qts, dma2_s6 + 4, cases[test].transfers);
-        qtest_writel(qts, dma2_s6 + 12, cases[test].address);
-        qtest_writel(qts, dma2_s6, 1u | (1u << 6) | (1u << 10) |
-                     (1u << 11) | (1u << 13));
-        g_assert_true(qtest_readl(qts, dma2_s6) & 1u);
-        g_assert_cmphex(qtest_readl(qts, dma2_s6 + 12), ==,
-                        cases[test].address);
-        qtest_clock_step(qts, 10000000);
-        g_assert_cmphex(ws2812_read_rgb(socket_fd,
-                        (test + 1) * UINT64_C(10000000)), ==,
-                        cases[test].expected);
+        qtest_memwrite(qts, addresses[test], waveform, sizeof(waveform));
+        qtest_writel(qts, 0x5802000c, 2u << 14); /* pull-down while disabled */
+        qtest_writel(qts, 0x58020020, 3u << 28); /* PA7 AF3 TIM8_CH1N */
+        qtest_writel(qts, 0x58020000, 2u << 14);
+        qtest_writel(qts, TIM8_BASE + 0x18, (6u << 4) | 8u);
+        qtest_writel(qts, TIM8_BASE + 0x20, 12); /* complementary, inverted */
+        qtest_writel(qts, TIM8_BDTR, 1u << 15);
+        qtest_writel(qts, TIM8_ARR, 79); /* 64MHz, 1.25us */
+        qtest_writel(qts, TIM8_CCR1, 26);
+        qtest_writel(qts, TIM8_EGR, 1);
+        qtest_writel(qts, 0x400204a8, TIM8_CCR1);
+        qtest_writel(qts, 0x400204ac, addresses[test]);
+        qtest_writel(qts, 0x400204a4, 72);
+        qtest_writel(qts, 0x40020838, 47);
+        qtest_writel(qts, 0x400204a0, 0x2c41);
+        qtest_writel(qts, TIM8_DIER, 1u << 9);
+        qtest_clock_step(qts, 50000);
+        qtest_writel(qts, TIM8_CR1, 1);
+        qtest_clock_step(qts, 120000); /* includes the DIN reset tail */
+        response = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                            "{'path':'/machine','property':'board-state'}}");
+        led = qdict_get_qdict(qdict_get_qdict(response, "return"), "led");
+        g_assert_cmphex(qdict_get_int(led, "rgb"), ==, 0x341256);
+        g_assert_cmpuint(qdict_get_int(led, "frames"), ==, 1);
+        g_assert_cmpuint(qdict_get_int(led, "errors"), ==, 0);
+        g_assert_cmpuint(qtest_readl(qts, 0x400204a4), ==, 0);
+        qobject_unref(response);
+        qtest_quit(qts);
     }
-    close(socket_fd);
+}
+
+static void test_buzzer_retains_short_tone(void)
+{
+    QTestState *qts = tim2_start();
+    const uint32_t tim12 = 0x40001800;
+    QDict *response, *board, *buzzer;
+    QList *events;
+    const QListEntry *entry;
+    uint64_t start = 0, end = 0;
+    bool heard = false, stopped = false;
+
+    qtest_writel(qts, 0x58020400, 2u << 30); /* PB15 alternate function */
+    qtest_writel(qts, 0x58020424, 2u << 28); /* AF2 TIM12_CH2 */
+    qtest_writel(qts, tim12 + 0x28, 31);   /* 32 MHz / 32 / 500 = 2 kHz */
+    qtest_writel(qts, tim12 + 0x2c, 499);
+    qtest_writel(qts, tim12 + 0x38, 250);
+    qtest_writel(qts, tim12 + 0x18, 6u << 12);
+    qtest_writel(qts, tim12 + 0x20, 1u << 4);
+    qtest_writel(qts, tim12 + 0x14, 1);
+    qtest_writel(qts, tim12, 1);
+    qtest_clock_step(qts, 1000000);
+    qtest_writel(qts, tim12, 0);
+    response = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                        "{'path':'/machine','property':'board-state'}}");
+    board = qdict_get_qdict(response, "return");
+    buzzer = qdict_get_qdict(board, "buzzer");
+    g_assert_cmpuint(qdict_get_int(buzzer, "frequency_hz"), ==, 0);
+    events = qdict_get_qlist(buzzer, "events");
+    QLIST_FOREACH_ENTRY(events, entry) {
+        QDict *event = qobject_to(QDict, qlist_entry_obj(entry));
+        uint64_t time = g_ascii_strtoull(qdict_get_str(event, "timestamp_ns"),
+                                        NULL, 10);
+        if (qdict_get_int(event, "frequency_hz") == 2000) {
+            g_assert_cmpuint(qdict_get_int(event, "duty_permille"), ==, 500);
+            start = time;
+            heard = true;
+        } else if (heard && qdict_get_int(event, "frequency_hz") == 0) {
+            end = time;
+            stopped = true;
+        }
+    }
+    g_assert_true(heard);
+    g_assert_true(stopped);
+    g_assert_cmpuint(end - start, ==, 1000000);
+    qobject_unref(response);
+
+    /* The next tone changes only at the hardware preload transfer. */
+    qtest_writel(qts, tim12 + 0x18, (6u << 12) | (1u << 11));
+    qtest_writel(qts, tim12, 1u | (1u << 7));
+    qtest_writel(qts, tim12 + 0x2c, 249);
+    qtest_writel(qts, tim12 + 0x38, 125);
+    qtest_clock_step(qts, 500000);
+    response = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                        "{'path':'/machine','property':'board-state'}}");
+    buzzer = qdict_get_qdict(qdict_get_qdict(response, "return"), "buzzer");
+    g_assert_cmpuint(qdict_get_int(buzzer, "frequency_hz"), ==, 4000);
+    g_assert_cmpuint(qdict_get_int(buzzer, "duty_permille"), ==, 500);
+    qobject_unref(response);
+    qtest_quit(qts);
+}
+
+static void test_buzzer_gpio_tone(void)
+{
+    QTestState *qts = tim2_start();
+    QDict *response, *buzzer;
+
+    qtest_writel(qts, 0x58020400, 1u << 30); /* PB15 GPIO output */
+    for (unsigned i = 0; i < 4; ++i) {
+        qtest_writel(qts, 0x58020418, 1u << 15);
+        qtest_clock_step(qts, 125000);
+        qtest_writel(qts, 0x58020418, 1u << 31);
+        qtest_clock_step(qts, 375000);
+    }
+    response = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                        "{'path':'/machine','property':'board-state'}}");
+    buzzer = qdict_get_qdict(qdict_get_qdict(response, "return"), "buzzer");
+    g_assert_cmpuint(qdict_get_int(buzzer, "frequency_hz"), ==, 2000);
+    g_assert_cmpuint(qdict_get_int(buzzer, "duty_permille"), ==, 250);
+    qobject_unref(response);
+    qtest_clock_step(qts, 1000000); /* static low ends the inferred tone */
+    response = qtest_qmp(qts, "{'execute':'qom-get','arguments':"
+                        "{'path':'/machine','property':'board-state'}}");
+    buzzer = qdict_get_qdict(qdict_get_qdict(response, "return"), "buzzer");
+    g_assert_cmpuint(qdict_get_int(buzzer, "frequency_hz"), ==, 0);
+    qobject_unref(response);
     qtest_quit(qts);
 }
 
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-mc02/tim12/buzzer-short-tone", test_buzzer_retains_short_tone);
+    g_test_add_func("/dm-mc02/buzzer/gpio-tone", test_buzzer_gpio_tone);
     g_test_add_func("/dm-mc02/ws2812/dma-sram-sources",
                     test_ws2812_dma_sram_sources);
     g_test_add_func("/dm-mc02/tim2/counter-freezes-disabled",

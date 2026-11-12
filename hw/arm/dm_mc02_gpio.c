@@ -1,9 +1,8 @@
 /*
  * Minimal STM32H7 GPIO bank implementation used by DM-MC02.
  *
- * There is deliberately no alternate-function matrix or electrical drive
- * model in this first stage; board inputs are injected explicitly by the
- * machine/fixture layer.
+ * The selected AF comes from the board's route. Electrical mode and pulls
+ * are resolved here; board inputs are injected by the machine/fixture layer.
  */
 #include "qemu/osdep.h"
 #include "hw/arm/dm_mc02_gpio.h"
@@ -32,9 +31,46 @@ uint16_t dm_mc02_gpio_output_mask(const DmMc02GpioBank *bank)
 
 uint16_t dm_mc02_gpio_sample(const DmMc02GpioBank *bank)
 {
-    uint16_t outputs = dm_mc02_gpio_output_mask(bank);
+    uint16_t value = bank->idr;
 
-    return (bank->idr & ~outputs) | (bank->odr & outputs);
+    for (unsigned pin = 0; pin < 16; ++pin) {
+        bool level;
+        if (dm_mc02_gpio_pin_output(bank, pin, &level)) {
+            value = (value & ~(1u << pin)) | ((unsigned)level << pin);
+        }
+    }
+    return value;
+}
+
+void dm_mc02_gpio_set_af_output(DmMc02GpioBank *bank, unsigned pin,
+                                bool driven, bool level)
+{
+    uint16_t mask = 1u << pin;
+    bank->af_driven = (bank->af_driven & ~mask) | (driven ? mask : 0);
+    bank->af_level = (bank->af_level & ~mask) | (level ? mask : 0);
+}
+
+bool dm_mc02_gpio_pin_output(const DmMc02GpioBank *bank, unsigned pin,
+                             bool *level)
+{
+    unsigned mode = (bank->moder >> (pin * 2)) & 3;
+    unsigned pull = (bank->pupdr >> (pin * 2)) & 3;
+    uint16_t mask = 1u << pin;
+    bool driven = mode == 1 || (mode == 2 && (bank->af_driven & mask));
+    bool high = (mode == 1 ? bank->odr : bank->af_level) & mask;
+
+    if (mode == 0 || mode == 3) {
+        return false;
+    }
+    if (driven && (!(bank->otyper & mask) || !high)) {
+        *level = high;
+        return true;
+    }
+    if (pull == 1 || pull == 2) {
+        *level = pull == 1;
+        return true;
+    }
+    return false;
 }
 
 static bool gpio_lane(hwaddr offset, unsigned size, hwaddr reg)
@@ -173,7 +209,8 @@ static void dm_mc02_gpio_write(void *opaque, hwaddr offset, uint64_t value,
                 }
                 *target = next;
                 if (reg == GPIO_MODER || reg == GPIO_AFR0 ||
-                    reg == GPIO_AFR1) {
+                    reg == GPIO_AFR1 || reg == GPIO_OTYPER ||
+                    reg == GPIO_PUPDR) {
                     config_changed = old_value != next;
                 }
             }
@@ -239,5 +276,7 @@ void dm_mc02_gpio_reset(DmMc02GpioBank *bank)
     bank->odr = 0;
     bank->afr0 = 0;
     bank->afr1 = 0;
+    bank->af_driven = 0;
+    bank->af_level = 0;
     dm_mc02_gpio_notify_changed(bank);
 }

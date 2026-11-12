@@ -237,7 +237,7 @@ static void test_board_state_gpio_key_and_time(void)
     assert_gpio_bank(state, "B", 0x1e4, 0x0f, 2, 0x12);
     assert_gpio_bank(state, "A", 0x4000, 0x8080, 0x80, 0x80);
     assert_gpio_bank(state, "H", 0, 0, 0, 0);
-    assert_led(state, "A7", 0xffffff, 255, "gpio-latch");
+    assert_led(state, "A7", 0, 0, "ws2812-din");
     assert_key(state, "A15", false, 1);
     initial_time = qdict_get_int(state, "timestamp_ns");
     g_assert_cmphex(qtest_readl(qts, GPIOB_BASE + GPIO_IDR), ==, 0x0f);
@@ -299,7 +299,7 @@ static void test_board_state_profile_aliases(void)
     state = board_state(qts);
     g_assert_cmpstr(qdict_get_str(state, "board"), ==, "STM32H723-EVAL");
     assert_gpio_bank(state, "A", 1, 0x2001, 1, 1);
-    assert_led(state, "A0", 0xffffff, 255, "gpio-latch");
+    assert_led(state, "A0", 0, 0, "ws2812-din");
     assert_key(state, "A13", false, 1);
     qobject_unref(state);
 
@@ -316,95 +316,106 @@ static void test_board_state_profile_aliases(void)
 
 static void test_board_state_ws2812_observation(void)
 {
-    /* Literal GRB, MSB-first halfword waveforms from the existing board
-     * fixture's 168/84 duty values.  These expectations do not invoke the
-     * production encoder/decoder.  AXI SRAM is DMA-visible in RM0468 §2.1.6. */
-    static const uint16_t red[] = {
-         84,  84,  84,  84,  84,  84,  84,  84,
-        168, 168, 168, 168, 168, 168, 168, 168,
-         84,  84,  84,  84,  84,  84,  84,  84,
-    };
-    static const uint16_t green[] = {
-        168, 168, 168, 168, 168, 168, 168, 168,
-         84,  84,  84,  84,  84,  84,  84,  84,
-         84,  84,  84,  84,  84,  84,  84,  84,
-    };
     QTestState *qts = qtest_init("-machine dm-mc02");
-    QDict *state;
-    uint8_t before[sizeof(red)];
-    uint8_t after[sizeof(red)];
-    int64_t time;
-    uint32_t remaining;
+    QDict *state, *again;
 
-    for (unsigned i = 0; i < ARRAY_SIZE(red); ++i) {
-        qtest_writew(qts, AXI_WAVEFORM + 2 * i, red[i]);
-    }
-    qtest_writel(qts, DMA2_S6PAR, 0x40010400);
+    /* Buffer edits and static GPIO levels are not WS2812 frames. */
     qtest_writel(qts, DMA2_S6M0AR, AXI_WAVEFORM);
     qtest_writel(qts, DMA2_S6NDTR, 24);
-    /* EN, MINC, 16-bit peripheral/memory widths; no DMA request is fired. */
     qtest_writel(qts, DMA2_S6CR, 0x2c41);
-    qtest_memread(qts, AXI_WAVEFORM, before, sizeof(before));
+    qtest_writel(qts, GPIOA_BASE + GPIO_MODER, 1u << 14);
+    qtest_writel(qts, GPIOA_BASE + GPIO_ODR, 0x80);
+    qtest_clock_step(qts, 100000);
     state = board_state(qts);
-    assert_led(state, "A7", 0xff0000, 255, "ws2812-dma");
-    time = qdict_get_int(state, "timestamp_ns");
+    assert_led(state, "A7", 0, 0, "ws2812-din");
     qobject_unref(state);
-    qtest_memread(qts, AXI_WAVEFORM, after, sizeof(after));
-    g_assert_cmpmem(before, sizeof(before), after, sizeof(after));
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6CR), ==, 0x2c41);
+    qtest_writel(qts, GPIOA_BASE + GPIO_ODR, 0);
+    qtest_clock_step(qts, 50000);
+    /* Independent Worldsemi timing literals, GRB 00 12 34 => RGB12 00 34. */
+    for (int bit = 23; bit >= 0; --bit) {
+        unsigned high_ns = (0x001234 & (1u << bit)) ? 800 : 400;
+        qtest_writel(qts, GPIOA_BASE + 0x18, 0x80);
+        qtest_clock_step(qts, high_ns);
+        qtest_writel(qts, GPIOA_BASE + 0x18, 0x800000);
+        qtest_clock_step(qts, 1250 - high_ns);
+    }
+    state = board_state(qts);
+    assert_led(state, "A7", 0, 0, "ws2812-din");
+    qobject_unref(state);
+    qtest_clock_step(qts, 50000);
+    state = board_state(qts);
+    assert_led(state, "A7", 0x120034, 0x34, "ws2812-din");
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+    again = board_state(qts);
+    g_assert_true(qobject_is_equal(QOBJECT(state), QOBJECT(again)));
+    qobject_unref(again);
+    qobject_unref(state);
     g_assert_cmphex(qtest_readl(qts, DMA2_S6NDTR), ==, 24);
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6PAR), ==, 0x40010400);
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6M0AR), ==, AXI_WAVEFORM);
-
-    /* A same-time RAM update must be observed without a cache refresh,
-     * register rewrite or DMA beat.  The getter remains an observer. */
-    for (unsigned i = 0; i < ARRAY_SIZE(green); ++i) {
-        qtest_writew(qts, AXI_WAVEFORM + 2 * i, green[i]);
-    }
-    qtest_memread(qts, AXI_WAVEFORM, before, sizeof(before));
-    state = board_state(qts);
-    assert_led(state, "A7", 0x00ff00, 255, "ws2812-dma");
-    g_assert_cmpint(qdict_get_int(state, "timestamp_ns"), ==, time);
-    qobject_unref(state);
-    qtest_memread(qts, AXI_WAVEFORM, after, sizeof(after));
-    g_assert_cmpmem(before, sizeof(before), after, sizeof(after));
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6NDTR), ==, 24);
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6CR), ==, 0x2c41);
-
-    /* RM0468 DMA_SxNDTR is the remaining count, not the buffer length.
-     * Run the real TIM8/DMAMUX circular request path into the reset tail;
-     * the same first LED must still be observable with fewer than 24 left. */
-    qtest_writel(qts, DMA2_S6CR, 0);
-    for (unsigned i = 24; i < 72; ++i) {
-        qtest_writew(qts, AXI_WAVEFORM + 2 * i, 0);
-    }
-    qtest_writel(qts, DMA2_S6PAR, 0x40010434); /* TIM8_CCR1 */
-    qtest_writel(qts, DMA2_S6NDTR, 72);
-    qtest_writel(qts, 0x40020838, 47); /* DMAMUX1 channel 14: TIM8_CH1 */
-    qtest_writel(qts, DMA2_S6CR, 0x2d41); /* CIRC */
-    qtest_writel(qts, 0x40010428, 63); /* TIM8_PSC: 1 MHz */
-    qtest_writel(qts, 0x4001042c, 999); /* TIM8_ARR */
-    qtest_writel(qts, 0x40010434, 84); /* TIM8_CCR1 */
-    qtest_writel(qts, 0x4001040c, 1u << 9); /* CC1DE */
-    qtest_writel(qts, 0x40010400, 1); /* CEN */
-    remaining = 72;
-    for (unsigned step = 0; remaining >= 24 && step < 100; ++step) {
-        qtest_clock_step(qts, 1000000);
-        remaining = qtest_readl(qts, DMA2_S6NDTR);
-    }
-    g_assert_cmpuint(remaining, >, 0);
-    g_assert_cmpuint(remaining, <, 24);
-    g_test_message("circular WS2812 remaining=%u", remaining);
-    state = board_state(qts);
-    assert_led(state, "A7", 0x00ff00, 255, "ws2812-dma");
-    qobject_unref(state);
-    g_assert_cmphex(qtest_readl(qts, DMA2_S6NDTR), ==, remaining);
     qtest_quit(qts);
+}
+
+static void test_board_state_ws2812_spi(void)
+{
+    const uint32_t spi = 0x40013000;
+    const uint32_t grb = 0x12ab34;
+    for (unsigned controller = 0; controller < 2; ++controller) {
+        unsigned stream = controller ? 5 : 3;
+        uint32_t dma = 0x40020010 + controller * 0x400 + stream * 0x18;
+        uint8_t bytes[40] = { 0 };
+        QTestState *qts = qtest_init("-machine dm-mc02");
+        QDict *state;
+
+        /* At 4MHz: 11000 -> H500/L750ns, 11100 -> H750/L500ns.
+         * Packing crosses SPI frame boundaries; DIN alone owns decoding. */
+        for (unsigned bit = 0; bit < 24; ++bit) {
+            unsigned symbol = (grb & (1u << (23 - bit))) ? 28 : 24;
+            for (unsigned j = 0; j < 5; ++j) {
+                unsigned index = bit * 5 + j;
+                bytes[index / 8] |= ((symbol >> (4 - j)) & 1) << (7 - index % 8);
+            }
+        }
+        qtest_memwrite(qts, AXI_WAVEFORM, bytes, sizeof(bytes));
+        qtest_writel(qts, GPIOA_BASE + 0xc, 2u << 14);
+        qtest_writel(qts, GPIOA_BASE + 0x20, 5u << 28); /* SPI1 MOSI AF5 */
+        qtest_writel(qts, GPIOA_BASE, 2u << 14);
+        qtest_writel(qts, 0x580244f0, 1u << 12); /* SPI1EN */
+        qtest_writel(qts, spi + 8, 7 | (3u << 28) | (1u << 15));
+        qtest_writel(qts, spi + 12, (1u << 22) | (1u << 17) | (1u << 26));
+        qtest_writel(qts, spi + 4, sizeof(bytes));
+        qtest_writel(qts, spi + 0x10, 8); /* EOTIE */
+        qtest_writel(qts, 0xe000e104, 8); /* NVIC SPI1 IRQ35 */
+        qtest_writel(qts, dma + 8, spi + 0x20);
+        qtest_writel(qts, dma + 12, AXI_WAVEFORM);
+        qtest_writel(qts, dma + 4, sizeof(bytes));
+        qtest_writel(qts, 0x40020800 + (controller * 8 + stream) * 4, 38);
+        qtest_writel(qts, dma, 1 | (1u << 6) | (1u << 10));
+        qtest_writel(qts, spi, 1 | (1u << 9));
+        /* Reset PLL1Q is unavailable. No synthetic clock or early EOT. */
+        qtest_clock_step(qts, 60000);
+        g_assert_cmpuint(qtest_readl(qts, dma + 4), ==, sizeof(bytes));
+        g_assert_false(qtest_readl(qts, spi + 0x14) & 8);
+        qtest_writel(qts, 0x58024450, 4u << 12); /* per_ck = HSI64, MBR /16 */
+        qtest_clock_step(qts, 100000);
+        state = board_state(qts);
+        assert_led(state, "A7", 0xab1234, 0xab, "ws2812-din");
+        g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+        g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+        qobject_unref(state);
+        g_assert_cmpuint(qtest_readl(qts, dma + 4), ==, 0);
+        g_assert_true(qtest_readl(qts, spi + 0x14) & 8);
+        g_assert_true(qtest_readl(qts, 0xe000e204) & 8);
+        /* RCC reset clears the real peripheral and deasserts its IRQ. */
+        qtest_writel(qts, 0x58024498, 1u << 12);
+        g_assert_cmphex(qtest_readl(qts, spi), ==, 0);
+        g_assert_cmphex(qtest_readl(qts, spi + 8), ==, 0x00070007);
+        qtest_quit(qts);
+    }
 }
 
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-mc02/board-state/ws2812-spi", test_board_state_ws2812_spi);
     if (qtest_has_machine("mps2-an500")) {
         g_test_add_func("/armv7m/nvic/configured-priority-width",
                         test_native_nvic_configured_width);

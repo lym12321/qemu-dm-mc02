@@ -19,6 +19,12 @@ static void reset_asserted(void *opaque)
     (*count)++;
 }
 
+static void reset_released(void *opaque)
+{
+    unsigned *count = opaque;
+    count[1]++;
+}
+
 static void set_nrst(DmMc02ResetInput *state, int level)
 {
     qemu_set_irq(qdev_get_gpio_in_named(DEVICE(state), "NRST", 0), level);
@@ -28,26 +34,30 @@ static void test_active_low_assertion_is_edge_triggered(void)
 {
     DmMc02ResetInput *state =
         DM_MC02_RESET_INPUT(object_new(TYPE_DM_MC02_RESET_INPUT));
-    unsigned assertions = 0;
+    unsigned counts[2] = {0};
 
-    dm_mc02_reset_input_set_callback(state, reset_asserted, &assertions);
+    dm_mc02_reset_input_set_callback(state, reset_asserted, counts);
+    dm_mc02_reset_input_set_release_callback(state, reset_released);
     g_assert_true(state->nrst_high);
 
     set_nrst(state, 1);
     set_nrst(state, 0);
-    g_assert_cmpuint(assertions, ==, 1);
+    g_assert_cmpuint(counts[0], ==, 1);
+    g_assert_cmpuint(counts[1], ==, 0);
     g_assert_false(state->nrst_high);
 
     /* A held-low external input is not a stream of reset requests. */
     set_nrst(state, 0);
     dm_mc02_reset_input_reset(state);
     set_nrst(state, 0);
-    g_assert_cmpuint(assertions, ==, 1);
+    g_assert_cmpuint(counts[0], ==, 1);
     g_assert_false(state->nrst_high);
 
     set_nrst(state, 1);
+    set_nrst(state, 1);
+    g_assert_cmpuint(counts[1], ==, 1);
     set_nrst(state, 0);
-    g_assert_cmpuint(assertions, ==, 2);
+    g_assert_cmpuint(counts[0], ==, 2);
 
     object_unref(OBJECT(state));
 }

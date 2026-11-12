@@ -14,6 +14,7 @@ struct DmMc02ResetInput {
 
     bool nrst_high;
     DmMc02ResetInputAsserted *asserted;
+    DmMc02ResetInputAsserted *released;
     void *asserted_opaque;
 };
 
@@ -22,5 +23,7 @@ void dm_mc02_reset_input_set_callback(DmMc02ResetInput *state,
                                        DmMc02ResetInputAsserted *callback,
                                        void *opaque);
 void dm_mc02_reset_input_reset(DmMc02ResetInput *state);
+void dm_mc02_reset_input_set_release_callback(DmMc02ResetInput *state,
+                                             DmMc02ResetInputAsserted *callback);
 
 #endif

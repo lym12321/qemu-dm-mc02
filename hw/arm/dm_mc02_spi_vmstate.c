@@ -3,11 +3,19 @@
 #include "hw/arm/dm_mc02_spi.h"
 #include "migration/vmstate.h"
 
+static int dm_mc02_spi_pre_save(void *opaque)
+{
+    const DmMc02Spi *state = opaque;
+    /* v1 describes the synchronous SSI path. A timed FIFO/serializer needs
+     * its own format before it can participate in a saved component. */
+    return state->wire_timer ? -ENOTSUP : 0;
+}
+
 static int dm_mc02_spi_post_load(void *opaque, int version_id)
 {
     DmMc02Spi *state = opaque;
 
-    if (version_id != 1 ||
+    if (state->wire_timer || version_id != 1 ||
         state->transfer_remaining > UINT16_MAX ||
         state->dma_tx_next_ns > INT64_MAX) {
         return -EINVAL;
@@ -37,6 +45,7 @@ const VMStateDescription vmstate_dm_mc02_spi_raw = {
     .name = "dm-mc02-spi-raw",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = dm_mc02_spi_pre_save,
     .fields = vmstate_dm_mc02_spi_fields,
 };
 
@@ -44,6 +53,7 @@ static const VMStateDescription vmstate_dm_mc02_spi = {
     .name = "dm-mc02-spi",
     .version_id = 1,
     .minimum_version_id = 1,
+    .pre_save = dm_mc02_spi_pre_save,
     .post_load = dm_mc02_spi_post_load,
     .fields = vmstate_dm_mc02_spi_fields,
 };

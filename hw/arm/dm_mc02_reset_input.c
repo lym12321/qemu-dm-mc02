@@ -18,7 +18,15 @@ static void dm_mc02_reset_input_set(void *opaque, int line, int level)
      * keeping the line low must not queue an unbounded stream of resets. */
     if (was_high && !state->nrst_high && state->asserted) {
         state->asserted(state->asserted_opaque);
+    } else if (!was_high && state->nrst_high && state->released) {
+        state->released(state->asserted_opaque);
     }
+}
+
+void dm_mc02_reset_input_set_release_callback(DmMc02ResetInput *state,
+                                             DmMc02ResetInputAsserted *callback)
+{
+    state->released = callback;
 }
 
 void dm_mc02_reset_input_set_callback(DmMc02ResetInput *state,

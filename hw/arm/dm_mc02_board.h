@@ -61,10 +61,21 @@ typedef struct DmMc02BoardFlashProfile {
     bool memory_mapped;
 } DmMc02BoardFlashProfile;
 
+typedef struct DmMc02BoardTimerPinRoute {
+    unsigned af;
+    /* DM_MC02_BOARD_TIMER_COUNT selects the separate TIM2 instance. */
+    unsigned timer_index;
+    unsigned channel;
+    bool complementary;
+} DmMc02BoardTimerPinRoute;
+
 /* Board-side devices and their MCU-facing pins.  The chip models consume
  * generic masks/indices; only this profile names physical board signals. */
 typedef struct DmMc02BoardDeviceWiring {
     DmMc02BoardPin led;
+    DmMc02BoardTimerPinRoute led_timers[3];
+    unsigned led_timer_count;
+    unsigned led_spi_af;
     DmMc02BoardPin buzzer;
     DmMc02BoardPin user_key;
     DmMc02BoardPin power_out1;
@@ -82,8 +93,7 @@ typedef struct DmMc02BoardDeviceWiring {
     unsigned buzzer_timer_index;
     unsigned buzzer_channel;
     unsigned buzzer_gpio_af;
-    unsigned ws2812_dma_controller;
-    unsigned ws2812_dma_stream;
+    unsigned tim8_dma_controller;
     unsigned power_gpio_bank;
     unsigned power_vin_adc_channel;
     unsigned power_key_adc_channel;

@@ -103,6 +103,10 @@ uint64_t dm_mc02_pwr_rcc_apb2_timer_clock_hz(const DmMc02PwrRcc *state);
 /* H723 D2CCIP1R.FDCANSEL-selected kernel clock.  The source has no
  * additional divider: 00=HSE, 01=PLL1Q, 10=PLL2Q, 11=unavailable. */
 uint64_t dm_mc02_pwr_rcc_fdcan_kernel_clock_hz(const DmMc02PwrRcc *state);
+/* D2CCIP1R.SPI123SEL: PLL1Q, PLL2P, PLL3P, I2S_CKIN, per_ck. */
+uint64_t dm_mc02_pwr_rcc_spi123_kernel_clock_hz(const DmMc02PwrRcc *state);
+uint64_t dm_mc02_pwr_rcc_spi1_clock_hz(const DmMc02PwrRcc *state);
+bool dm_mc02_pwr_rcc_spi1_reset_asserted(const DmMc02PwrRcc *state);
 
 /* H723 D2CCIP2R-selected USART kernel clocks.  USART1/6/10 use the
  * USART16 group; USART2/3/UART4/5/7/8 use USART234578. */

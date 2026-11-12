@@ -3,7 +3,7 @@
  *
  * M1/M2 model the Cortex-M7 execution core, the STM32H723 memory map, the
  * polled subset of SPI2 needed to exercise the two BMI088 dies, and the
- * board-specific DMA/WS2812 observation path. The rest of the H723 peripheral
+ * board-specific pin routing and WS2812 DIN decoder. The rest of the H723 peripheral
  * matrix remains separate milestones.
  */
 #include "qemu/osdep.h"
@@ -17,6 +17,7 @@
 #include "qapi/qapi-commands-run-state.h"
 #include "qapi/qapi-visit-run-state.h"
 #include "qapi/qmp/qdict.h"
+#include "qapi/qmp/qlist.h"
 #include "qapi/qmp/qnum.h"
 #include "qom/qom-qobject.h"
 #include "exec/address-spaces.h"
@@ -36,6 +37,9 @@
 #include "hw/arm/dm_mc02_exti.h"
 #include "hw/arm/dm_mc02_pwr_rcc.h"
 #include "hw/arm/dm_mc02_reset_input.h"
+#include "hw/arm/dm_buzzer.h"
+#include "hw/arm/dm_ws2812.h"
+#include "target/arm/arm-powerctl.h"
 #include "hw/arm/dm_mc02_uart.h"
 #include "hw/arm/dm_mc02_fdcan.h"
 #include "hw/arm/dm_mc02_adc.h"
@@ -97,14 +101,8 @@
 #define DM_MC02_DMA_CR_MSIZE_SHIFT 13
 #define DM_MC02_DMA_SIZE_16       1u
 
-#define DM_MC02_WS2812_BITS       24
-#define DM_MC02_WS2812_FIRST_BITS 24
 #define DM_MC02_WS2812_TOTAL_BITS 72
-#define DM_MC02_WS2812_HIGH       168
-#define DM_MC02_WS2812_LOW        84
 #define DM_MC02_WS2812_APPROX_BATCH (DM_MC02_WS2812_TOTAL_BITS * 100)
-#define DM_MC02_WS2812_THRESHOLD  ((DM_MC02_WS2812_HIGH + \
-                                   DM_MC02_WS2812_LOW) / 2)
 
 typedef struct DmMc02MachineState DmMc02MachineState;
 
@@ -159,12 +157,15 @@ struct DmMc02MachineState {
     int32_t iwdg_lsi_error_ppm;
     DmMc02PwrRcc pwr_rcc;
     DmMc02ResetInput reset_input;
+    bool pin_reset_pending;
+    DmBuzzer buzzer;
+    QEMUTimer *buzzer_timer;
     qemu_irq sysresetreq_irq;
     DmMc02Bmi088SpiLink bmi_spi_link;
     DmMc02Spi spi1_state;
     QEMUTimer *ws2812_timer;
-    uint32_t ws2812_led_rgb;
-    bool ws2812_dirty;
+    DmWs2812 ws2812;
+    bool ws2812_powered;
     Clock *sysclk;
     Clock *apb1_timerclk;
     Clock *apb2_timerclk;
@@ -495,6 +496,10 @@ static void dm_mc02_apply_gpio_inputs(DmMc02MachineState *s);
 static void dm_mc02_reset_spi_cs(DmMc02MachineState *s);
 static void dm_mc02_apply_power_state(DmMc02MachineState *s);
 static void dm_mc02_apply_mcu_power_state(DmMc02MachineState *s);
+static void dm_mc02_buzzer_capture(DmMc02MachineState *s);
+static void dm_mc02_buzzer_route(DmMc02MachineState *s);
+static void dm_mc02_led_route(DmMc02MachineState *s);
+static void dm_mc02_led_sample(DmMc02MachineState *s, uint64_t timestamp_ns);
 
 static void dm_mc02_power_brownout(void *opaque)
 {
@@ -519,7 +524,39 @@ static void dm_mc02_pin_reset(void *opaque)
     /* The external pin is the producer; latch the cause before QEMU consumes
      * the reset request, just like the watchdog and brownout boundaries. */
     dm_mc02_pwr_rcc_note_pin_reset(&s->pwr_rcc);
+    s->pin_reset_pending = true;
     qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
+}
+
+static void dm_mc02_pin_reset_released(void *opaque)
+{
+    if (!first_cpu) {
+        return;
+    }
+    ARMCPU *cpu = ARM_CPU(first_cpu);
+
+    /* The normal machine reset already reset NVIC and peripherals. Resume at
+     * the architectural reset vector, using ARM's native power-state owner. */
+    if (cpu->power_state == PSCI_OFF) {
+        arm_set_cpu_on_and_reset(cpu->mp_affinity);
+    }
+}
+
+static void dm_mc02_cpu_work_complete(CPUState *cpu, run_on_cpu_data data)
+{
+    /* Drain the preceding native CPU-off work before another pin command. */
+}
+
+static bool dm_mc02_get_reset_key(Object *obj, Error **errp)
+{
+    return !DM_MC02_MACHINE(obj)->reset_input.nrst_high;
+}
+
+static void dm_mc02_set_reset_key(Object *obj, bool pressed, Error **errp)
+{
+    DmMc02MachineState *s = DM_MC02_MACHINE(obj);
+    qemu_set_irq(qdev_get_gpio_in_named(DEVICE(&s->reset_input), "NRST", 0),
+                 !pressed);
 }
 
 static void dm_mc02_software_reset(void *opaque, int line, int level)
@@ -790,6 +827,7 @@ static void dm_mc02_apply_power_state(DmMc02MachineState *s)
         return;
     }
     system_5v_good = dm_mc02_power_get_system_5v_good(&s->power);
+    dm_mc02_led_sample(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
     for (size_t i = 0; i < s->initialized_fdcan_count; ++i) {
         dm_mc02_fdcan_set_powered(&s->fdcan[i], system_5v_good);
     }
@@ -1595,6 +1633,8 @@ static void dm_mc02_machine_instance_init(Object *obj)
                              dm_mc02_set_cosim_motor_loopback);
     object_property_add_bool(obj, "buzzer-enabled",
                              dm_mc02_get_buzzer_enabled, NULL);
+    object_property_add_bool(obj, "reset-key", dm_mc02_get_reset_key,
+                              dm_mc02_set_reset_key);
     object_property_add_bool(obj, "buzzer-level",
                              dm_mc02_get_buzzer_level, NULL);
     object_property_add_str(obj, "buzzer-frequency-hz",
@@ -1630,6 +1670,9 @@ static void dm_mc02_dma_stream_enabled(void *opaque, unsigned stream,
 
     if (!(control & DM_MC02_DMA_CR_EN)) {
         return;
+    }
+    if ((control & (3u << 6)) == DM_MC02_DMA_CR_DIR_M2P) {
+        dm_mc02_spi_dma_tx_stream_enabled(&s->spi1_state);
     }
     if ((control & (3u << 6)) == DM_MC02_DMA_CR_DIR_M2P &&
         s->bmi_spi_link.spi.dma_tx.dma == &s->dma_subsystem.dma[0] &&
@@ -1676,6 +1719,9 @@ static void dm_mc02_uart_dma2_stream_enabled(void *opaque, unsigned stream,
     if (!(control & DM_MC02_DMA_CR_EN)) {
         return;
     }
+    if ((control & (3u << 6)) == DM_MC02_DMA_CR_DIR_M2P) {
+        dm_mc02_spi_dma_tx_stream_enabled(&s->spi1_state);
+    }
     if ((control & (3u << 6)) == DM_MC02_DMA_CR_DIR_M2P &&
         s->bmi_spi_link.spi.dma_tx.dma == &s->dma_subsystem.dma[1] &&
         stream == s->bmi_spi_link.spi.dma_tx.stream &&
@@ -1709,7 +1755,8 @@ static void dm_mc02_tim8_update(void *opaque)
     DmMc02Tim2 *timer = &s->tim_aux[timer_index];
     uint32_t psc = timer->regs[0x28 / sizeof(uint32_t)] & 0xffff;
     uint32_t arr = timer->regs[0x2c / sizeof(uint32_t)];
-    unsigned batch = (!s->accurate_timing && psc == 0 && arr == 299) ?
+    unsigned batch = (!s->accurate_timing && !dm_mc02_tim2_output_connected(timer) &&
+                      psc == 0 && arr == 299) ?
                      DM_MC02_WS2812_APPROX_BATCH : 1;
 
     if (dm_mc02_tim2_get_update_batch(timer) != batch) {
@@ -1724,11 +1771,12 @@ static void dm_mc02_tim8_compare(void *opaque, unsigned events,
     const DmMc02BoardDeviceWiring *devices = &s->board->devices;
     DmMc02Tim2 *timer = &s->tim_aux[devices->tim8_index];
     DmMc02Dma *ws_dma = dm_mc02_board_dma(s,
-                                           devices->ws2812_dma_controller);
+                                           devices->tim8_dma_controller);
     uint32_t dier = timer->regs[0x0c / sizeof(uint32_t)];
     uint32_t psc = timer->regs[0x28 / sizeof(uint32_t)] & 0xffff;
     uint32_t arr = timer->regs[0x2c / sizeof(uint32_t)];
-    unsigned batch = (!s->accurate_timing && psc == 0 && arr == 299) ?
+    unsigned batch = (!s->accurate_timing && !dm_mc02_tim2_output_connected(timer) &&
+                      psc == 0 && arr == 299) ?
                      DM_MC02_WS2812_APPROX_BATCH : 1;
 
     (void)timestamp_ns;
@@ -1739,7 +1787,7 @@ static void dm_mc02_tim8_compare(void *opaque, unsigned events,
      * write; the approximate path keeps the final sampled CCR1 value while
      * using the DMA layer's shared state machine for NDTR/IRQ semantics. */
     if ((dier & DM_MC02_TIM8_DIER_CC1DE) && ws_dma) {
-        if (s->accurate_timing) {
+        if (s->accurate_timing || dm_mc02_tim2_output_connected(timer)) {
             (void)dm_mc02_dma_request_batch(
                 ws_dma, &s->dma_subsystem.dmamux[0], s->board->tim8_request,
                 s->board->tim8_ccr1, events ? events : batch);
@@ -1855,9 +1903,6 @@ static void dm_mc02_refresh_board_outputs(DmMc02MachineState *s,
                                                 selected_mask);
         }
     }
-    if (signals.led_dirty) {
-        s->ws2812_dirty = true;
-    }
     for (size_t i = 0; i < s->initialized_uart_count; ++i) {
         const DmMc02Rs485Signal *signal = &signals.rs485[i];
         DmMc02UartDeMode mode;
@@ -1885,7 +1930,90 @@ static void dm_mc02_timer_changed(void *opaque)
 {
     DmMc02MachineState *s = opaque;
 
+    dm_mc02_buzzer_capture(s);
     dm_mc02_cosim_link_notify_telemetry(&s->cosim);
+}
+
+static void dm_mc02_led_sample(DmMc02MachineState *s, uint64_t timestamp_ns)
+{
+    DmMc02BoardPin pin;
+    bool level = false, driven, powered;
+    uint64_t deadline, frames;
+
+    if (!s->ws2812_timer || !s->gpio_ready) {
+        return;
+    }
+    pin = s->board->devices.led;
+    powered = dm_mc02_power_get_system_5v_good(&s->power);
+    if (powered != s->ws2812_powered) {
+        dm_ws2812_reset(&s->ws2812, timestamp_ns);
+        s->ws2812_powered = powered;
+        dm_mc02_cosim_link_notify_telemetry(&s->cosim);
+    }
+    driven = powered && dm_mc02_gpio_pin_output(
+        &s->gpio_exti.gpio[pin.bank], pin.pin, &level);
+    frames = s->ws2812.frames;
+    dm_ws2812_level(&s->ws2812, timestamp_ns, driven, level);
+    deadline = dm_ws2812_deadline(&s->ws2812);
+    if (deadline) {
+        timer_mod(s->ws2812_timer, deadline);
+    } else {
+        timer_del(s->ws2812_timer);
+    }
+    if (frames != s->ws2812.frames) {
+        dm_mc02_cosim_link_notify_telemetry(&s->cosim);
+    }
+}
+
+static void dm_mc02_led_output(void *opaque, uint64_t timestamp_ns,
+                                bool driven, bool level)
+{
+    DmMc02MachineState *s = opaque;
+    DmMc02BoardPin pin = s->board->devices.led;
+
+    dm_mc02_gpio_set_af_output(&s->gpio_exti.gpio[pin.bank], pin.pin,
+                                driven, level);
+    dm_mc02_led_sample(s, timestamp_ns);
+}
+
+static void dm_mc02_led_route(DmMc02MachineState *s)
+{
+    const DmMc02BoardDeviceWiring *devices;
+    DmMc02GpioBank *gpio;
+    unsigned pin, mode, af;
+
+    if (!s->ws2812_timer || !s->gpio_ready) {
+        return;
+    }
+    devices = &s->board->devices;
+    pin = devices->led.pin;
+    gpio = &s->gpio_exti.gpio[devices->led.bank];
+    mode = (gpio->moder >> (pin * 2)) & 3;
+    af = ((pin < 8 ? gpio->afr0 : gpio->afr1) >> ((pin % 8) * 4)) & 15;
+    dm_mc02_gpio_set_af_output(gpio, pin, false, false);
+    for (unsigned i = 0; i < devices->led_timer_count; ++i) {
+        const DmMc02BoardTimerPinRoute *route = &devices->led_timers[i];
+        DmMc02Tim2 *timer = route->timer_index == DM_MC02_BOARD_TIMER_COUNT ?
+                           &s->tim2 : &s->tim_aux[route->timer_index];
+        bool selected = mode == 2 && af == route->af;
+
+        dm_mc02_tim2_set_output(timer, route->channel, route->complementary,
+                                 selected ? dm_mc02_led_output : NULL, s);
+        if (selected) {
+            DmMc02TimPwmOutputState output;
+            if (dm_mc02_tim2_get_pwm_output_state(timer, route->channel,
+                                                  &output)) {
+                dm_mc02_gpio_set_af_output(gpio, pin,
+                    route->complementary ? output.complementary_enabled :
+                                           output.main_enabled,
+                    route->complementary ? output.complementary_level :
+                                           output.main_level);
+            }
+        }
+    }
+    dm_mc02_spi_set_mosi(&s->spi1_state,
+        mode == 2 && af == devices->led_spi_af ? dm_mc02_led_output : NULL, s);
+    dm_mc02_led_sample(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
 }
 
 static void dm_mc02_gpio_odr_changed(void *opaque, unsigned bank,
@@ -1898,6 +2026,8 @@ static void dm_mc02_gpio_odr_changed(void *opaque, unsigned bank,
     }
     (void)odr;
     dm_mc02_refresh_board_outputs(s, bank);
+    dm_mc02_led_route(s);
+    dm_mc02_buzzer_route(s);
 }
 
 /*
@@ -1968,6 +2098,65 @@ static bool dm_mc02_get_buzzer_enabled(Object *obj, Error **errp)
     (void)errp;
     dm_mc02_buzzer_observe(s, &enabled, NULL, NULL, NULL);
     return enabled;
+}
+
+static void dm_mc02_buzzer_capture(DmMc02MachineState *s)
+{
+    bool enabled;
+    uint64_t frequency;
+    uint32_t duty;
+
+    if (!s->gpio_ready || !s->buzzer_timer) {
+        return;
+    }
+    const DmMc02BoardDeviceWiring *devices = &s->board->devices;
+    DmMc02GpioBank *gpio = &s->gpio_exti.gpio[devices->buzzer.bank];
+    unsigned mode = (gpio->moder >> (devices->buzzer.pin * 2)) & 3;
+    uint64_t now = dm_mc02_tim2_event_time(&s->tim_aux[devices->buzzer_timer_index]);
+    if (mode == 1) {
+        bool level = false;
+        bool driven = dm_mc02_gpio_pin_output(gpio, devices->buzzer.pin, &level);
+        dm_buzzer_pin(&s->buzzer, now, driven, level);
+    } else {
+        dm_buzzer_pin_disconnect(&s->buzzer);
+        dm_mc02_buzzer_observe(s, &enabled, NULL, &frequency, &duty);
+        dm_buzzer_observe(&s->buzzer, now, enabled, frequency, duty);
+    }
+    if (s->buzzer.pin.deadline_ns) {
+        timer_mod(s->buzzer_timer, s->buzzer.pin.deadline_ns);
+    } else {
+        timer_del(s->buzzer_timer);
+    }
+}
+
+static void dm_mc02_buzzer_expire(void *opaque)
+{
+    DmMc02MachineState *s = opaque;
+    dm_buzzer_pin_advance(&s->buzzer, s->buzzer.pin.deadline_ns);
+}
+
+static void dm_mc02_buzzer_output(void *opaque, uint64_t timestamp_ns,
+                                   bool driven, bool level)
+{
+    DmMc02MachineState *s = opaque;
+    DmMc02BoardPin pin = s->board->devices.buzzer;
+    dm_mc02_gpio_set_af_output(&s->gpio_exti.gpio[pin.bank], pin.pin, driven, level);
+    dm_mc02_buzzer_capture(s);
+}
+
+static void dm_mc02_buzzer_route(DmMc02MachineState *s)
+{
+    if (!s->buzzer_timer || !s->gpio_ready) { return; }
+    const DmMc02BoardDeviceWiring *devices = &s->board->devices;
+    unsigned pin = devices->buzzer.pin;
+    DmMc02GpioBank *gpio = &s->gpio_exti.gpio[devices->buzzer.bank];
+    unsigned mode = (gpio->moder >> (pin * 2)) & 3;
+    unsigned af = ((pin < 8 ? gpio->afr0 : gpio->afr1) >> ((pin % 8) * 4)) & 15;
+    bool selected = mode == 2 && af == devices->buzzer_gpio_af;
+    if (!selected) { dm_mc02_gpio_set_af_output(gpio, pin, false, false); }
+    dm_mc02_tim2_set_output(&s->tim_aux[devices->buzzer_timer_index],
+        devices->buzzer_channel, false, selected ? dm_mc02_buzzer_output : NULL, s);
+    dm_mc02_buzzer_capture(s);
 }
 
 static bool dm_mc02_get_buzzer_level(Object *obj, Error **errp)
@@ -2341,6 +2530,12 @@ static void dm_mc02_clock_changed(void *opaque, uint64_t hz)
     uint64_t apb1_timer_hz;
     uint64_t apb2_timer_hz;
 
+    if (dm_mc02_pwr_rcc_spi1_reset_asserted(&s->pwr_rcc)) {
+        dm_mc02_spi_reset(&s->spi1_state);
+    }
+    dm_mc02_spi_set_clock_hz(&s->spi1_state,
+                            dm_mc02_pwr_rcc_spi1_clock_hz(&s->pwr_rcc));
+
     /* ADC uses the independent board PLL2P path, not CPU PLL1.  The RCC
      * model returns the compatibility default until the guest configures
      * PLL2, then computes PLL2P and the board's ADC /64 prescaler. */
@@ -2363,18 +2558,18 @@ static void dm_mc02_clock_changed(void *opaque, uint64_t hz)
     if (clock_set_hz(s->uart234578_kernelclk, usart234578_hz)) {
         clock_propagate(s->uart234578_kernelclk);
     }
-    /* First snapshot every running counter while the old clock is still
-     * visible.  This preserves phase across a live RCC change.  The timer
-     * callback also reschedules its next deadline, so doing this before
-     * changing the APB timer clocks would leave the first post-switch period
-     * based on the old frequency.  Re-run the cheap reschedule-only path
-     * below after updating the clock. */
-    dm_mc02_tim2_clock_changed(&s->tim2);
-    for (size_t i = 0; i < s->initialized_timer_count; ++i) {
-        dm_mc02_tim2_clock_changed(&s->tim_aux[i]);
-    }
     apb1_timer_hz = dm_mc02_pwr_rcc_apb1_timer_clock_hz(&s->pwr_rcc);
     apb2_timer_hz = dm_mc02_pwr_rcc_apb2_timer_clock_hz(&s->pwr_rcc);
+    bool apb1_changed = clock_get_hz(s->apb1_timerclk) != apb1_timer_hz;
+    bool apb2_changed = clock_get_hz(s->apb2_timerclk) != apb2_timer_hz;
+    /* Only a changed clock re-anchors a timer. Selecting SPI's independent
+     * root must not disturb an ongoing PWM waveform. */
+    if (apb1_changed) { dm_mc02_tim2_clock_changed(&s->tim2); }
+    for (size_t i = 0; i < s->initialized_timer_count; ++i) {
+        bool changed = s->board->timers[i].clock_domain ==
+                       DM_MC02_BOARD_TIMER_CLOCK_APB2 ? apb2_changed : apb1_changed;
+        if (changed) { dm_mc02_tim2_clock_changed(&s->tim_aux[i]); }
+    }
     s->apb1_timer_clock_hz = apb1_timer_hz;
     s->apb2_timer_clock_hz = apb2_timer_hz;
     /* ST LL_APB3_GRP1_PERIPH_WWDG1: WWDG1 uses PCLK3, without TIMPRE.
@@ -2387,13 +2582,15 @@ static void dm_mc02_clock_changed(void *opaque, uint64_t hz)
      * previous frequency. */
     clock_set_hz(s->apb1_timerclk, apb1_timer_hz);
     clock_set_hz(s->apb2_timerclk, apb2_timer_hz);
-    dm_mc02_tim2_set_clock(&s->tim2, s->apb1_timerclk);
+    if (apb1_changed) { dm_mc02_tim2_set_clock(&s->tim2, s->apb1_timerclk); }
     for (size_t i = 0; i < s->initialized_timer_count; ++i) {
         Clock *timer_clock = s->board->timers[i].clock_domain ==
                              DM_MC02_BOARD_TIMER_CLOCK_APB2 ?
                              s->apb2_timerclk : s->apb1_timerclk;
 
-        dm_mc02_tim2_set_clock(&s->tim_aux[i], timer_clock);
+        bool changed = s->board->timers[i].clock_domain ==
+                       DM_MC02_BOARD_TIMER_CLOCK_APB2 ? apb2_changed : apb1_changed;
+        if (changed) { dm_mc02_tim2_set_clock(&s->tim_aux[i], timer_clock); }
     }
     if (clock_set_hz(s->sysclk, hz)) {
         clock_propagate(s->sysclk);
@@ -2437,6 +2634,7 @@ static void dm_mc02_adc_common_clock_changed(void *opaque, uint32_t ccr)
 static void dm_mc02_machine_reset(void *opaque)
 {
     DmMc02MachineState *s = opaque;
+    bool pin_reset = s->pin_reset_pending || !s->reset_input.nrst_high;
     DmMc02BoardGpioPowerReset board_reset = {
         .gpio = s->gpio_exti.gpio,
         .gpio_count = ARRAY_SIZE(s->gpio_exti.gpio),
@@ -2483,7 +2681,11 @@ static void dm_mc02_machine_reset(void *opaque)
     dm_mc02_board_reset_gpio_power(&board_reset);
     dm_mc02_soc_memory_reset_fdcan_msg_ram(&s->soc_memory);
 
-    dm_mc02_bmi088_spi_link_reset(&s->bmi_spi_link);
+    if (pin_reset) {
+        dm_mc02_bmi088_spi_link_reset_bus(&s->bmi_spi_link);
+    } else {
+        dm_mc02_bmi088_spi_link_reset(&s->bmi_spi_link);
+    }
     dm_mc02_spi_reset(&s->spi1_state);
     dm_mc02_bmi088_signal_set_rng(
         &s->bmi_spi_link.gyro.signal, s->imu_seed ^ UINT32_C(0x9e3779b9));
@@ -2502,103 +2704,25 @@ static void dm_mc02_machine_reset(void *opaque)
     dm_mc02_reset_input_reset(&s->reset_input);
     dm_mc02_usb_reset(&s->usb_hs);
 
-    s->ws2812_led_rgb = 0;
-    s->ws2812_dirty = true;
     if (s->ws2812_timer) {
-        timer_del(s->ws2812_timer);
-        if (s->cosim.enabled) {
-            timer_mod(s->ws2812_timer,
-                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * 1000 * 1000);
+        if (!s->pin_reset_pending) {
+            dm_ws2812_reset(&s->ws2812, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
+        timer_del(s->ws2812_timer);
+        dm_mc02_led_route(s);
     }
     dm_mc02_cosim_link_reset(&s->cosim);
+    dm_buzzer_reset(&s->buzzer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    if (s->buzzer_timer) {
+        timer_del(s->buzzer_timer);
+        dm_mc02_buzzer_route(s);
+    }
     s->cosim_motor_loopback_steps = 0;
-}
-
-static uint32_t dm_mc02_dma_reg(const DmMc02Dma *dma, hwaddr offset)
-{
-    return ldl_le_p(dma->regs + offset);
-}
-
-static uint8_t dm_mc02_ws2812_byte(const uint8_t *waveform,
-                                   unsigned bit_offset)
-{
-    uint8_t value = 0;
-
-    for (unsigned bit = 0; bit < 8; ++bit) {
-        uint16_t duty = lduw_le_p(waveform + 2 * (bit_offset + bit));
-
-        value = (uint8_t)((value << 1) |
-                          (duty >= DM_MC02_WS2812_THRESHOLD ? 1 : 0));
+    s->pin_reset_pending = false;
+    if (!s->reset_input.nrst_high) {
+        arm_set_cpu_off(ARM_CPU(first_cpu)->mp_affinity);
+        run_on_cpu(first_cpu, dm_mc02_cpu_work_complete, RUN_ON_CPU_NULL);
     }
-    return value;
-}
-
-/*
- * Observe the buffer owned by the board profile's WS2812 DMA stream.  The DMA
- * engine does not call into this routine: firmware may update the memory
- * while all DMA registers remain unchanged, so the machine samples it from a
- * low-rate virtual timer and lets the co-sim link's existing value de-duper
- * suppress unchanged telemetry.
- */
-static bool dm_mc02_ws2812_decode(const DmMc02MachineState *s,
-                                  uint32_t *first_rgb,
-                                  uint32_t *first_brightness)
-{
-    const DmMc02BoardDeviceWiring *devices = &s->board->devices;
-    const DmMc02Dma *ws_dma =
-        devices->ws2812_dma_controller < ARRAY_SIZE(s->dma_subsystem.dma) ?
-        &s->dma_subsystem.dma[devices->ws2812_dma_controller] : NULL;
-    const hwaddr stream = DM_MC02_DMA_STREAM_BASE +
-                          devices->ws2812_dma_stream *
-                          DM_MC02_DMA_STREAM_STRIDE;
-    uint32_t cr;
-    uint32_t transfers;
-    dma_addr_t m0ar;
-    uint8_t waveform[DM_MC02_WS2812_TOTAL_BITS * 2] = { 0 };
-    uint8_t green, red, blue;
-    size_t transfer_bytes;
-    MemTxResult result;
-
-    if (!ws_dma) {
-        return false;
-    }
-    cr = dm_mc02_dma_reg(ws_dma, stream + DM_MC02_DMA_SxCR);
-    transfers = dm_mc02_dma_transfer_length(ws_dma,
-                                           devices->ws2812_dma_stream);
-    m0ar = dm_mc02_dma_reg(ws_dma, stream + DM_MC02_DMA_SxM0AR);
-
-    /* The current board buffer is exactly 72 half-word transfers.  Permit a
-     * shorter transfer only when it still contains one complete LED, which
-     * is useful while firmware is bringing the stream up. NDTR counts down
-     * during transmission; it does not change the configured buffer span. */
-    if (!(cr & DM_MC02_DMA_CR_EN) || !(cr & DM_MC02_DMA_CR_MINC) ||
-        ((cr >> DM_MC02_DMA_CR_PSIZE_SHIFT) & 3u) != DM_MC02_DMA_SIZE_16 ||
-        ((cr >> DM_MC02_DMA_CR_MSIZE_SHIFT) & 3u) != DM_MC02_DMA_SIZE_16 ||
-        transfers < DM_MC02_WS2812_FIRST_BITS ||
-        transfers > DM_MC02_WS2812_TOTAL_BITS ||
-        (m0ar & 1u)) {
-        return false;
-    }
-
-    transfer_bytes = (size_t)transfers * sizeof(uint16_t);
-    if (!dm_mc02_soc_dma_sram_range_valid(s->board->soc, m0ar,
-                                         transfer_bytes)) {
-        return false;
-    }
-    result = dma_memory_read(&address_space_memory, m0ar, waveform,
-                             transfer_bytes, MEMTXATTRS_UNSPECIFIED);
-    if (result != MEMTX_OK) {
-        return false;
-    }
-
-    green = dm_mc02_ws2812_byte(waveform, 0);
-    red = dm_mc02_ws2812_byte(waveform, 8);
-    blue = dm_mc02_ws2812_byte(waveform, 16);
-    *first_rgb = ((uint32_t)red << 16) | ((uint32_t)green << 8) | blue;
-    *first_brightness = MAX(((*first_rgb >> 16) & 0xff),
-                            MAX((*first_rgb >> 8) & 0xff, *first_rgb & 0xff));
-    return true;
 }
 
 static void dm_mc02_get_fdcan_tx_state(Object *obj, Visitor *v,
@@ -2781,7 +2905,6 @@ static void dm_mc02_get_board_state(Object *obj, Visitor *v,
     uint32_t rgb, brightness;
     char pin[5];
     QObject *result;
-    bool decoded;
 
     if (!s->board || !s->gpio_ready) {
         error_setg(errp, "board-state is available after machine initialization");
@@ -2807,20 +2930,20 @@ static void dm_mc02_get_board_state(Object *obj, Visitor *v,
     }
     qdict_put(state, "gpio", gpio);
 
-    /* Reuse the existing board waveform observation without touching its
-     * telemetry cache, timers, DMA cursor, IRQs or guest memory. */
-    decoded = dm_mc02_ws2812_decode(s, &rgb, &brightness);
-    if (!decoded) {
-        rgb = dm_mc02_board_pin_high(s, devices->led) ? 0xffffff : 0;
-        brightness = rgb ? 255 : 0;
-    }
+    rgb = s->ws2812.rgb;
+    brightness = MAX((rgb >> 16) & 255, MAX((rgb >> 8) & 255, rgb & 255));
     led = qdict_new();
     snprintf(pin, sizeof(pin), "%c%u", 'A' + devices->led.bank,
              devices->led.pin);
     qdict_put_str(led, "pin", pin);
     qdict_put_int(led, "rgb", rgb);
     qdict_put_int(led, "brightness", brightness);
-    qdict_put_str(led, "source", decoded ? "ws2812-dma" : "gpio-latch");
+    qdict_put_str(led, "source", "ws2812-din");
+    qdict_put_str(led, "timing_profile", "worldsemi-ws2812b-classic");
+    qdict_put_bool(led, "powered", s->ws2812_powered);
+    qdict_put_int(led, "frames", s->ws2812.frames);
+    qdict_put_int(led, "errors", s->ws2812.errors);
+    qdict_put_int(led, "latched_ns", s->ws2812.frame_ns);
     qdict_put(state, "led", led);
 
     key = qdict_new();
@@ -2832,6 +2955,41 @@ static void dm_mc02_get_board_state(Object *obj, Visitor *v,
                   (dm_mc02_gpio_sample(&s->gpio_exti.gpio[devices->user_key.bank])
                    >> devices->user_key.pin) & 1);
     qdict_put(state, "key", key);
+    {
+        QDict *reset = qdict_new();
+        qdict_put_str(reset, "pin", "NRST");
+        qdict_put_bool(reset, "pressed", !s->reset_input.nrst_high);
+        qdict_put(state, "reset", reset);
+    }
+
+    /* Retained events are read-only; short tones survive snapshot polling.
+     * Readers detect overwritten history using the monotonically numbered
+     * entries within each generation. */
+    {
+        QDict *buzzer = qdict_new();
+        QList *events = qlist_new();
+        g_autofree char *generation = g_strdup_printf("%" PRIu64,
+                                                      s->buzzer.generation);
+        uint64_t first = s->buzzer.sequence > DM_BUZZER_EVENTS ?
+                         s->buzzer.sequence - DM_BUZZER_EVENTS + 1 : 1;
+        qdict_put_str(buzzer, "generation", generation);
+        qdict_put_int(buzzer, "frequency_hz", s->buzzer.frequency_hz);
+        qdict_put_int(buzzer, "duty_permille", s->buzzer.duty_permille);
+        for (uint64_t i = first; i <= s->buzzer.sequence; ++i) {
+            const DmBuzzerEvent *event = dm_buzzer_event(&s->buzzer, i);
+            QDict *value = qdict_new();
+            g_autofree char *seq = g_strdup_printf("%" PRIu64, i);
+            g_autofree char *time = g_strdup_printf("%" PRIu64,
+                                                   event->timestamp_ns);
+            qdict_put_str(value, "sequence", seq);
+            qdict_put_str(value, "timestamp_ns", time);
+            qdict_put_int(value, "frequency_hz", event->frequency_hz);
+            qdict_put_int(value, "duty_permille", event->duty_permille);
+            qlist_append(events, value);
+        }
+        qdict_put(buzzer, "events", events);
+        qdict_put(state, "buzzer", buzzer);
+    }
 
     result = QOBJECT(state);
     visit_type_any(v, name, &result, errp);
@@ -2841,11 +2999,12 @@ static void dm_mc02_get_board_state(Object *obj, Visitor *v,
 static void dm_mc02_ws2812_refresh(void *opaque)
 {
     DmMc02MachineState *s = opaque;
-    int64_t next = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * 1000 * 1000;
+    uint64_t deadline = dm_ws2812_deadline(&s->ws2812);
 
-    s->ws2812_dirty = true;
-    dm_mc02_cosim_link_notify_telemetry(&s->cosim);
-    timer_mod(s->ws2812_timer, next);
+    if (deadline) {
+        dm_ws2812_advance(&s->ws2812, deadline);
+        dm_mc02_cosim_link_notify_telemetry(&s->cosim);
+    }
 }
 
 static void dm_mc02_cosim_telemetry(void *opaque,
@@ -2853,23 +3012,10 @@ static void dm_mc02_cosim_telemetry(void *opaque,
 {
     DmMc02MachineState *s = opaque;
     const DmMc02BoardDeviceWiring *devices = &s->board->devices;
-    bool led_active = dm_mc02_board_pin_high(s, devices->led);
     bool buzzer_enabled;
     uint64_t buzzer_frequency_hz;
     uint32_t buzzer_duty_permille;
-    uint32_t led_rgb;
-    uint32_t led_brightness;
-
-    if (s->ws2812_dirty) {
-        if (dm_mc02_ws2812_decode(s, &led_rgb, &led_brightness)) {
-            s->ws2812_led_rgb = led_rgb;
-        } else {
-            /* PA7 remains useful during early GPIO-only bring-up. */
-            s->ws2812_led_rgb = led_active ? UINT32_C(0xffffff) : 0;
-        }
-        s->ws2812_dirty = false;
-    }
-    telemetry->led_rgb = s->ws2812_led_rgb;
+    telemetry->led_rgb = s->ws2812.rgb;
     telemetry->led_brightness = MAX((telemetry->led_rgb >> 16) & 0xff,
                                     MAX((telemetry->led_rgb >> 8) & 0xff,
                                         telemetry->led_rgb & 0xff));
@@ -3282,6 +3428,21 @@ static void dm_mc02_init(MachineState *machine)
     memory_region_add_subregion(system_memory, soc->spi2_base,
                                 &s->bmi_spi_link.spi.iomem);
     dm_mc02_spi_init(&s->spi1_state, OBJECT(machine), "dm-mc02.spi1", false);
+    dm_mc02_spi_enable_timing(&s->spi1_state);
+    dm_mc02_spi_set_dma_channels(&s->spi1_state,
+        &(DmMc02SpiDmaChannel) {
+            .dma = &s->dma_subsystem.dma[0],
+            .dmamux = &s->dma_subsystem.dmamux[0],
+            .request_id = soc->spi1_tx_request,
+            .peripheral_addr = soc->spi1_base + DM_MC02_SPI_TXDR,
+        }, NULL);
+    dm_mc02_spi_set_alternate_tx_dma(&s->spi1_state,
+        &(DmMc02SpiDmaChannel) {
+            .dma = &s->dma_subsystem.dma[1],
+            .dmamux = &s->dma_subsystem.dmamux[0],
+            .request_id = soc->spi1_tx_request,
+            .peripheral_addr = soc->spi1_base + DM_MC02_SPI_TXDR,
+        });
     memory_region_add_subregion(system_memory, soc->spi1_base,
                                 &s->spi1_state.iomem);
     static const char * const gpio_names[DM_MC02_GPIO_BANKS] = {
@@ -3312,6 +3473,8 @@ static void dm_mc02_init(MachineState *machine)
     dm_mc02_pwr_rcc_init(&s->pwr_rcc, OBJECT(machine));
     dm_mc02_reset_input_set_callback(&s->reset_input,
                                      dm_mc02_pin_reset, s);
+    dm_mc02_reset_input_set_release_callback(&s->reset_input,
+                                             dm_mc02_pin_reset_released);
     sysbus_realize(SYS_BUS_DEVICE(&s->reset_input), &error_fatal);
     dm_mc02_power_set_brownout_callback(&s->power,
                                         dm_mc02_power_brownout, s);
@@ -3345,6 +3508,7 @@ static void dm_mc02_init(MachineState *machine)
     object_property_set_link(OBJECT(armv7m), "memory",
                              OBJECT(system_memory), &error_abort);
     sysbus_realize_and_unref(SYS_BUS_DEVICE(armv7m), &error_fatal);
+    dm_mc02_spi_set_irq(&s->spi1_state, qdev_get_gpio_in(armv7m, soc->spi1_irq));
 
     /* OCTOSPI is initialized after a real QOM Device parent exists so its
      * reusable SSI adapter can attach the independent dm-w25q64 peripheral to
@@ -3450,14 +3614,12 @@ static void dm_mc02_init(MachineState *machine)
     s->flash_shutdown_notifier.notify = dm_mc02_persist_flash;
     qemu_register_shutdown_notifier(&s->flash_shutdown_notifier);
 
-    /* Firmware writes the WS2812 buffer without touching a QEMU-visible
-     * register, so periodically observe it in virtual time. */
     s->ws2812_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
                                    dm_mc02_ws2812_refresh, s);
-    if (s->cosim.enabled) {
-        timer_mod(s->ws2812_timer,
-                  qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 10 * 1000 * 1000);
-    }
+    s->buzzer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dm_mc02_buzzer_expire, s);
+    dm_ws2812_reset(&s->ws2812, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    dm_mc02_led_route(s);
+    dm_mc02_buzzer_route(s);
     qemu_register_reset(dm_mc02_machine_reset, s);
 }
 
@@ -3478,11 +3640,10 @@ static void dm_mc02_finalize(Object *obj)
     timer_free(s->iwdg1.update_timer);
     timer_free(s->wwdg1.timer);
     timer_free(s->ws2812_timer);
-    timer_free(s->tim2.update_timer);
-    timer_free(s->tim2.compare_timer);
+    timer_free(s->buzzer_timer);
+    dm_mc02_tim2_cleanup(&s->tim2);
     for (size_t i = 0; i < s->initialized_timer_count; ++i) {
-        timer_free(s->tim_aux[i].update_timer);
-        timer_free(s->tim_aux[i].compare_timer);
+        dm_mc02_tim2_cleanup(&s->tim_aux[i]);
     }
     dm_mc02_cosim_link_cleanup(&s->cosim);
     if (s->sysresetreq_irq) {

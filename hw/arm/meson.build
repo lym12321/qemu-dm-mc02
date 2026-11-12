@@ -5,7 +5,7 @@ arm_ss.add(when: 'CONFIG_STM32H723', if_true: [
   meson.project_source_root() / 'cosim' / 'dm_nor_flash_persistence.c',
 ])
 arm_ss.add(when: 'CONFIG_DM_MC02', if_true: [
-  files('dm_mc02.c', 'dm_mc02_board.c', 'dm_mc02_board_reset.c', 'dm_mc02_cosim_link.c', 'dm_mc02_power.c', 'dm_mc02_power_vmstate.c', 'dm_mc02_fdcan.c', 'dm_mc02_fdcan_vmstate.c', 'dm_mc02_fdcan_msg_ram_link_vmstate.c', 'dm_mc02_usb.c', 'dm_mc02_bmi088_signal.c', 'dm_mc02_bmi088.c', 'dm_mc02_bmi088_vmstate.c', 'dm_mc02_bmi088_spi.c', 'dm_mc02_bmi088_spi_vmstate.c', 'dm_mc02_bmi088_spi_link.c', 'dm_mc02_bmi088_spi_link_vmstate.c', 'dm_mc02_reset_input.c'),
+  files('dm_mc02.c', 'dm_buzzer.c', 'dm_ws2812.c', 'dm_mc02_board.c', 'dm_mc02_board_reset.c', 'dm_mc02_cosim_link.c', 'dm_mc02_power.c', 'dm_mc02_power_vmstate.c', 'dm_mc02_fdcan.c', 'dm_mc02_fdcan_vmstate.c', 'dm_mc02_fdcan_msg_ram_link_vmstate.c', 'dm_mc02_usb.c', 'dm_mc02_bmi088_signal.c', 'dm_mc02_bmi088.c', 'dm_mc02_bmi088_vmstate.c', 'dm_mc02_bmi088_spi.c', 'dm_mc02_bmi088_spi_vmstate.c', 'dm_mc02_bmi088_spi_link.c', 'dm_mc02_bmi088_spi_link_vmstate.c', 'dm_mc02_reset_input.c'),
   meson.project_source_root() / 'cosim' / 'dm_mc02_wire.c',
   meson.project_source_root() / 'cosim' / 'dm_mc02_v2_wire.c',
   meson.project_source_root() / 'cosim' / 'dm_mc02_v2_payload.c',
