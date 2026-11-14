@@ -342,10 +342,18 @@ static void test_board_state_ws2812_observation(void)
     state = board_state(qts);
     assert_led(state, "A7", 0, 0, "ws2812-din");
     qobject_unref(state);
-    qtest_clock_step(qts, 50000);
+    /* Last zero fell 850ns before the loop ended. An earlier scheduled check
+     * must rearm, not latch early or require another GPIO edge. */
+    qtest_clock_step(qts, 49149);
+    state = board_state(qts);
+    assert_led(state, "A7", 0, 0, "ws2812-din");
+    qobject_unref(state);
+    qtest_clock_step(qts, 1);
     state = board_state(qts);
     assert_led(state, "A7", 0x120034, 0x34, "ws2812-din");
     g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "latched_ns"),
+                     ==, qdict_get_int(state, "timestamp_ns"));
     again = board_state(qts);
     g_assert_true(qobject_is_equal(QOBJECT(state), QOBJECT(again)));
     qobject_unref(again);
@@ -358,49 +366,66 @@ static void test_board_state_ws2812_spi(void)
 {
     const uint32_t spi = 0x40013000;
     const uint32_t grb = 0x12ab34;
-    for (unsigned controller = 0; controller < 2; ++controller) {
+    for (unsigned variant = 0; variant < 4; ++variant) {
+        unsigned controller = variant / 2;
+        unsigned symbol_bits = variant % 2 ? 10 : 5;
+        unsigned zero_high = variant % 2 ? 3 : 2;
+        unsigned one_high = variant % 2 ? 6 : 3;
+        unsigned mbr = variant % 2 ? 2 : 3;
+        unsigned byte_count = variant % 2 ? 110 : 55;
         unsigned stream = controller ? 5 : 3;
         uint32_t dma = 0x40020010 + controller * 0x400 + stream * 0x18;
-        uint8_t bytes[40] = { 0 };
+        uint8_t bytes[110] = { 0 };
         QTestState *qts = qtest_init("-machine dm-mc02");
         QDict *state;
 
-        /* At 4MHz: 11000 -> H500/L750ns, 11100 -> H750/L500ns.
-         * Packing crosses SPI frame boundaries; DIN alone owns decoding. */
-        for (unsigned bit = 0; bit < 24; ++bit) {
-            unsigned symbol = (grb & (1u << (23 - bit))) ? 28 : 24;
-            for (unsigned j = 0; j < 5; ++j) {
-                unsigned index = bit * 5 + j;
-                bytes[index / 8] |= ((symbol >> (4 - j)) & 1) << (7 - index % 8);
+        /* Two independent encodings cross SPI byte boundaries:
+         * 4MHz: 11000/11100; 8MHz: 1110000000/1111110000.
+         * A second white pixel keeps DIN active beyond the first 50us check. */
+        for (unsigned bit = 0; bit < 48; ++bit) {
+            unsigned high = (bit >= 24 || (grb & (1u << (23 - bit)))) ?
+                            one_high : zero_high;
+            for (unsigned j = 0; j < high; ++j) {
+                unsigned index = bit * symbol_bits + j;
+                bytes[index / 8] |= 1u << (7 - index % 8);
             }
         }
-        qtest_memwrite(qts, AXI_WAVEFORM, bytes, sizeof(bytes));
+        qtest_memwrite(qts, AXI_WAVEFORM, bytes, byte_count);
         qtest_writel(qts, GPIOA_BASE + 0xc, 2u << 14);
         qtest_writel(qts, GPIOA_BASE + 0x20, 5u << 28); /* SPI1 MOSI AF5 */
         qtest_writel(qts, GPIOA_BASE, 2u << 14);
         qtest_writel(qts, 0x580244f0, 1u << 12); /* SPI1EN */
-        qtest_writel(qts, spi + 8, 7 | (3u << 28) | (1u << 15));
+        qtest_writel(qts, spi + 8, 7 | (mbr << 28) | (1u << 15));
         qtest_writel(qts, spi + 12, (1u << 22) | (1u << 17) | (1u << 26));
-        qtest_writel(qts, spi + 4, sizeof(bytes));
+        qtest_writel(qts, spi + 4, byte_count);
         qtest_writel(qts, spi + 0x10, 8); /* EOTIE */
         qtest_writel(qts, 0xe000e104, 8); /* NVIC SPI1 IRQ35 */
         qtest_writel(qts, dma + 8, spi + 0x20);
         qtest_writel(qts, dma + 12, AXI_WAVEFORM);
-        qtest_writel(qts, dma + 4, sizeof(bytes));
+        qtest_writel(qts, dma + 4, byte_count);
         qtest_writel(qts, 0x40020800 + (controller * 8 + stream) * 4, 38);
         qtest_writel(qts, dma, 1 | (1u << 6) | (1u << 10));
         qtest_writel(qts, spi, 1 | (1u << 9));
         /* Reset PLL1Q is unavailable. No synthetic clock or early EOT. */
         qtest_clock_step(qts, 60000);
-        g_assert_cmpuint(qtest_readl(qts, dma + 4), ==, sizeof(bytes));
+        g_assert_cmpuint(qtest_readl(qts, dma + 4), ==, byte_count);
         g_assert_false(qtest_readl(qts, spi + 0x14) & 8);
-        qtest_writel(qts, 0x58024450, 4u << 12); /* per_ck = HSI64, MBR /16 */
-        qtest_clock_step(qts, 100000);
+        qtest_writel(qts, 0x58024450, 4u << 12); /* per_ck = HSI64 */
+        qtest_clock_step(qts, 10000);
+        qtest_writel(qts, GPIOA_BASE + 0x18, 1); /* Other pin, same AF route. */
+        qtest_writel(qts, GPIOB_BASE + GPIO_ODR, 1); /* Unrelated bank. */
+        qtest_clock_step(qts, 99499);
+        state = board_state(qts);
+        assert_led(state, "A7", 0, 0, "ws2812-din");
+        qobject_unref(state);
+        qtest_clock_step(qts, 1); /* Last fall at 119500ns + reset low 50000ns. */
         state = board_state(qts);
         assert_led(state, "A7", 0xab1234, 0xab, "ws2812-din");
         g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
         g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+        g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "latched_ns"), ==, 169500);
         qobject_unref(state);
+        qtest_clock_step(qts, 1000);
         g_assert_cmpuint(qtest_readl(qts, dma + 4), ==, 0);
         g_assert_true(qtest_readl(qts, spi + 0x14) & 8);
         g_assert_true(qtest_readl(qts, 0xe000e204) & 8);

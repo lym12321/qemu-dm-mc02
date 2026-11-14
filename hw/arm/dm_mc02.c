@@ -101,9 +101,6 @@
 #define DM_MC02_DMA_CR_MSIZE_SHIFT 13
 #define DM_MC02_DMA_SIZE_16       1u
 
-#define DM_MC02_WS2812_TOTAL_BITS 72
-#define DM_MC02_WS2812_APPROX_BATCH (DM_MC02_WS2812_TOTAL_BITS * 100)
-
 typedef struct DmMc02MachineState DmMc02MachineState;
 
 typedef struct DmMc02TimerEventContext {
@@ -164,6 +161,8 @@ struct DmMc02MachineState {
     DmMc02Bmi088SpiLink bmi_spi_link;
     DmMc02Spi spi1_state;
     QEMUTimer *ws2812_timer;
+    uint64_t ws2812_wakeup_ns;
+    unsigned led_mux;
     DmWs2812 ws2812;
     bool ws2812_powered;
     Clock *sysclk;
@@ -1114,16 +1113,6 @@ static void dm_mc02_set_accurate_timing(Object *obj, bool enabled,
 
     (void)errp;
     s->accurate_timing = enabled;
-    if (s->board && s->board->devices.tim8_index < s->initialized_timer_count &&
-        s->tim_aux[s->board->devices.tim8_index].update_timer) {
-        dm_mc02_tim2_set_update_batch(
-                                      &s->tim_aux[s->board->devices.tim8_index],
-                                      enabled ? 1 :
-                                      DM_MC02_WS2812_APPROX_BATCH);
-        dm_mc02_tim2_set_compare_batch(
-            &s->tim_aux[s->board->devices.tim8_index], enabled ? 1 :
-            DM_MC02_WS2812_APPROX_BATCH);
-    }
 }
 
 static bool dm_mc02_set_noise(Object *obj, const char *value, bool accel,
@@ -1748,53 +1737,28 @@ static void dm_mc02_uart_dma2_stream_enabled(void *opaque, unsigned stream,
     }
 }
 
-static void dm_mc02_tim8_update(void *opaque)
-{
-    DmMc02MachineState *s = opaque;
-    unsigned timer_index = s->board->devices.tim8_index;
-    DmMc02Tim2 *timer = &s->tim_aux[timer_index];
-    uint32_t psc = timer->regs[0x28 / sizeof(uint32_t)] & 0xffff;
-    uint32_t arr = timer->regs[0x2c / sizeof(uint32_t)];
-    unsigned batch = (!s->accurate_timing && !dm_mc02_tim2_output_connected(timer) &&
-                      psc == 0 && arr == 299) ?
-                     DM_MC02_WS2812_APPROX_BATCH : 1;
-
-    if (dm_mc02_tim2_get_update_batch(timer) != batch) {
-        dm_mc02_tim2_set_update_batch(timer, batch);
-    }
-}
-
 static void dm_mc02_tim8_compare(void *opaque, unsigned events,
                                   uint64_t timestamp_ns)
 {
     DmMc02MachineState *s = opaque;
     const DmMc02BoardDeviceWiring *devices = &s->board->devices;
     DmMc02Tim2 *timer = &s->tim_aux[devices->tim8_index];
-    DmMc02Dma *ws_dma = dm_mc02_board_dma(s,
-                                           devices->tim8_dma_controller);
+    DmMc02Dma *dma = dm_mc02_board_dma(s, devices->tim8_dma_controller);
     uint32_t dier = timer->regs[0x0c / sizeof(uint32_t)];
-    uint32_t psc = timer->regs[0x28 / sizeof(uint32_t)] & 0xffff;
-    uint32_t arr = timer->regs[0x2c / sizeof(uint32_t)];
-    unsigned batch = (!s->accurate_timing && !dm_mc02_tim2_output_connected(timer) &&
-                      psc == 0 && arr == 299) ?
-                     DM_MC02_WS2812_APPROX_BATCH : 1;
 
     (void)timestamp_ns;
-    if (dm_mc02_tim2_get_compare_batch(timer) != batch) {
-        dm_mc02_tim2_set_compare_batch(timer, batch);
-    }
     /* CC1DE is a compare request.  The accurate path retains every endpoint
      * write; the approximate path keeps the final sampled CCR1 value while
      * using the DMA layer's shared state machine for NDTR/IRQ semantics. */
-    if ((dier & DM_MC02_TIM8_DIER_CC1DE) && ws_dma) {
+    if ((dier & DM_MC02_TIM8_DIER_CC1DE) && dma) {
         if (s->accurate_timing || dm_mc02_tim2_output_connected(timer)) {
             (void)dm_mc02_dma_request_batch(
-                ws_dma, &s->dma_subsystem.dmamux[0], s->board->tim8_request,
-                s->board->tim8_ccr1, events ? events : batch);
+                dma, &s->dma_subsystem.dmamux[0], s->board->tim8_request,
+                s->board->tim8_ccr1, events ? events : 1);
         } else {
             (void)dm_mc02_dma_request_batch_coalesced(
-                ws_dma, &s->dma_subsystem.dmamux[0], s->board->tim8_request,
-                s->board->tim8_ccr1, events ? events : batch);
+                dma, &s->dma_subsystem.dmamux[0], s->board->tim8_request,
+                s->board->tim8_ccr1, events ? events : 1);
         }
     }
 }
@@ -1934,11 +1898,23 @@ static void dm_mc02_timer_changed(void *opaque)
     dm_mc02_cosim_link_notify_telemetry(&s->cosim);
 }
 
+static void dm_mc02_led_arm(DmMc02MachineState *s)
+{
+    uint64_t deadline = dm_ws2812_deadline(&s->ws2812);
+
+    /* Keep an earlier check across intervening pulses. Its callback rechecks
+     * DIN before latching, so edges need not cancel/reinsert a QEMU timer. */
+    if (deadline && !s->ws2812_wakeup_ns) {
+        s->ws2812_wakeup_ns = deadline;
+        timer_mod(s->ws2812_timer, deadline);
+    }
+}
+
 static void dm_mc02_led_sample(DmMc02MachineState *s, uint64_t timestamp_ns)
 {
     DmMc02BoardPin pin;
     bool level = false, driven, powered;
-    uint64_t deadline, frames;
+    uint64_t frames;
 
     if (!s->ws2812_timer || !s->gpio_ready) {
         return;
@@ -1954,12 +1930,7 @@ static void dm_mc02_led_sample(DmMc02MachineState *s, uint64_t timestamp_ns)
         &s->gpio_exti.gpio[pin.bank], pin.pin, &level);
     frames = s->ws2812.frames;
     dm_ws2812_level(&s->ws2812, timestamp_ns, driven, level);
-    deadline = dm_ws2812_deadline(&s->ws2812);
-    if (deadline) {
-        timer_mod(s->ws2812_timer, deadline);
-    } else {
-        timer_del(s->ws2812_timer);
-    }
+    dm_mc02_led_arm(s);
     if (frames != s->ws2812.frames) {
         dm_mc02_cosim_link_notify_telemetry(&s->cosim);
     }
@@ -1990,6 +1961,11 @@ static void dm_mc02_led_route(DmMc02MachineState *s)
     gpio = &s->gpio_exti.gpio[devices->led.bank];
     mode = (gpio->moder >> (pin * 2)) & 3;
     af = ((pin < 8 ? gpio->afr0 : gpio->afr1) >> ((pin % 8) * 4)) & 15;
+    if (s->led_mux == (mode | af << 2)) {
+        dm_mc02_led_sample(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        return;
+    }
+    s->led_mux = mode | af << 2;
     dm_mc02_gpio_set_af_output(gpio, pin, false, false);
     for (unsigned i = 0; i < devices->led_timer_count; ++i) {
         const DmMc02BoardTimerPinRoute *route = &devices->led_timers[i];
@@ -2026,7 +2002,9 @@ static void dm_mc02_gpio_odr_changed(void *opaque, unsigned bank,
     }
     (void)odr;
     dm_mc02_refresh_board_outputs(s, bank);
-    dm_mc02_led_route(s);
+    if (bank == s->board->devices.led.bank) {
+        dm_mc02_led_route(s);
+    }
     dm_mc02_buzzer_route(s);
 }
 
@@ -2709,6 +2687,8 @@ static void dm_mc02_machine_reset(void *opaque)
             dm_ws2812_reset(&s->ws2812, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
         }
         timer_del(s->ws2812_timer);
+        s->ws2812_wakeup_ns = 0;
+        s->led_mux = UINT_MAX;
         dm_mc02_led_route(s);
     }
     dm_mc02_cosim_link_reset(&s->cosim);
@@ -3000,9 +2980,17 @@ static void dm_mc02_ws2812_refresh(void *opaque)
 {
     DmMc02MachineState *s = opaque;
     uint64_t deadline = dm_ws2812_deadline(&s->ws2812);
+    uint64_t wakeup_ns = s->ws2812_wakeup_ns;
+    uint64_t frames = s->ws2812.frames;
 
-    if (deadline) {
+    s->ws2812_wakeup_ns = 0;
+    /* Use the scheduled check time even if host dispatch is late: other
+     * producers may still have earlier virtual edges queued. */
+    if (deadline && deadline <= wakeup_ns) {
         dm_ws2812_advance(&s->ws2812, deadline);
+    }
+    dm_mc02_led_arm(s);
+    if (s->ws2812.frames != frames) {
         dm_mc02_cosim_link_notify_telemetry(&s->cosim);
     }
 }
@@ -3175,8 +3163,6 @@ static void dm_mc02_init(MachineState *machine)
             &s->timer_event_context[i]);
         s->initialized_timer_count++;
     }
-    dm_mc02_tim2_set_update_callback(
-        &s->tim_aux[board->devices.tim8_index], dm_mc02_tim8_update, s);
     dm_mc02_tim2_set_compare_callback(
         &s->tim_aux[board->devices.tim8_index], dm_mc02_tim8_compare, s);
 
@@ -3618,6 +3604,7 @@ static void dm_mc02_init(MachineState *machine)
                                    dm_mc02_ws2812_refresh, s);
     s->buzzer_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, dm_mc02_buzzer_expire, s);
     dm_ws2812_reset(&s->ws2812, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    s->led_mux = UINT_MAX;
     dm_mc02_led_route(s);
     dm_mc02_buzzer_route(s);
     qemu_register_reset(dm_mc02_machine_reset, s);

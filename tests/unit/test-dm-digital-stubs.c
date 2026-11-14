@@ -7,6 +7,10 @@
 
 static QEMUTimer *timers[16];
 static int64_t now_ns;
+static unsigned dispatches;
+
+unsigned dm_test_clock_dispatches(void);
+unsigned dm_test_clock_dispatches(void) { return dispatches; }
 
 int64_t qemu_clock_get_ns(QEMUClockType type)
 {
@@ -32,6 +36,7 @@ void dm_test_clock_reset(void)
 {
     memset(timers, 0, sizeof(timers));
     now_ns = 0;
+    dispatches = 0;
 }
 
 /* Late dispatch leaves the clock at target while delivering sorted deadlines. */
@@ -48,6 +53,7 @@ void dm_test_clock(int64_t target, bool late)
         if (!first) { now_ns = target; return; }
         if (!late) { now_ns = first->expire_time; }
         timer_del(first);
+        dispatches++;
         first->cb(first->opaque);
     }
     g_error("digital producer failed to advance its timer");

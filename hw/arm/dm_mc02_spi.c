@@ -586,6 +586,32 @@ static uint64_t spi_wire_delay(const DmMc02Spi *s, unsigned half_cycles)
     return denominator ? (numerator + denominator - 1) / denominator : 0;
 }
 
+static unsigned spi_wire_half(const DmMc02Spi *s, unsigned bit)
+{
+    return 2 * bit + (bit < spi_wire_bits(s) && (s->cfg2 & SPI_CFG2_CPHA) ? 1 : 0);
+}
+
+static bool spi_wire_bit(const DmMc02Spi *s, unsigned bit)
+{
+    unsigned position = s->cfg2 & SPI_CFG2_LSBFRST ? bit :
+                        spi_wire_bits(s) - 1 - bit;
+
+    return (s->shift_value >> position) & 1;
+}
+
+/* MOSI is constant between transitions. Keep the frame-completion event even
+ * for an entirely constant frame: it owns RX, FIFO refill, DMA and EOT. */
+static void spi_wire_schedule(DmMc02Spi *s)
+{
+    while (s->shift_bit < spi_wire_bits(s) &&
+           spi_wire_bit(s, s->shift_bit) == s->mosi_level) {
+        s->shift_bit++;
+    }
+    s->wire_next_ns = s->wire_origin_ns + spi_wire_delay(s,
+        spi_wire_half(s, s->shift_bit) - s->shift_origin_half);
+    timer_mod(s->wire_timer, s->wire_next_ns);
+}
+
 static uint32_t spi_wire_status(const DmMc02Spi *s)
 {
     unsigned capacity = 16 / spi_wire_slot(s);
@@ -691,11 +717,9 @@ static void spi_wire_kick(DmMc02Spi *s, uint64_t timestamp_ns)
         s->tx_head = (s->tx_head + 1) % 16;
         s->tx_count--;
         s->shifting = true;
-        s->shift_bit = s->shift_origin_bit = 0;
+        s->shift_bit = s->shift_origin_half = 0;
         s->wire_origin_ns = MAX(timestamp_ns, s->wire_available_ns);
-        s->wire_next_ns = s->wire_origin_ns +
-            spi_wire_delay(s, !!(s->cfg2 & SPI_CFG2_CPHA));
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        spi_wire_schedule(s);
         spi_wire_fill(s, timestamp_ns);
     }
     if ((s->cr2 & SPI_CR2_TSIZE_MASK) &&
@@ -727,15 +751,10 @@ static void spi_wire_tick(void *opaque)
         s->wire_available_ns = timestamp_ns + spi_wire_delay(s, 2 * ((s->cfg2 >> 4) & 15));
         spi_wire_kick(s, timestamp_ns);
     } else {
-        unsigned position = s->cfg2 & SPI_CFG2_LSBFRST ? s->shift_bit :
-                            bits - 1 - s->shift_bit;
-        s->mosi_level = (s->shift_value >> position) & 1;
+        s->mosi_level = spi_wire_bit(s, s->shift_bit);
         spi_wire_output(s, timestamp_ns);
         s->shift_bit++;
-        s->wire_next_ns = s->wire_origin_ns + spi_wire_delay(s,
-            2 * (s->shift_bit - s->shift_origin_bit) +
-            (s->shift_bit < bits && (s->cfg2 & SPI_CFG2_CPHA) ? 1 : 0));
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        spi_wire_schedule(s);
     }
     spi_wire_irq(s);
 }
@@ -753,18 +772,27 @@ void dm_mc02_spi_set_clock_hz(DmMc02Spi *s, uint64_t hz)
 {
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (hz == s->kernel_hz) { return; }
+    if (s->wire_timer && s->shifting && s->kernel_hz) {
+        /* Recover the first outstanding bit inside a coalesced constant run.
+         * At most one frame is inspected; no future bit is consumed here. */
+        unsigned bit = s->shift_origin_half / 2;
+        while (bit < s->shift_bit &&
+               s->wire_origin_ns + spi_wire_delay(s,
+                   spi_wire_half(s, bit) - s->shift_origin_half) <= now) {
+            bit++;
+        }
+        s->shift_bit = bit;
+    }
     s->kernel_hz = hz;
     if (!s->wire_timer) { return; }
     if (!hz) {
         timer_del(s->wire_timer);
         s->wire_next_ns = 0;
     } else if (s->shifting) {
-        s->wire_origin_ns = now;
-        s->shift_origin_bit = s->shift_bit;
-        s->wire_next_ns = now + spi_wire_delay(s, 2);
         /* Resume the outstanding bit after one new clock period. */
-        s->wire_origin_ns = s->wire_next_ns;
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        s->shift_origin_half = spi_wire_half(s, s->shift_bit);
+        s->wire_origin_ns = now + spi_wire_delay(s, 2);
+        spi_wire_schedule(s);
     } else {
         spi_wire_kick(s, now);
     }
@@ -772,6 +800,9 @@ void dm_mc02_spi_set_clock_hz(DmMc02Spi *s, uint64_t hz)
 
 void dm_mc02_spi_set_mosi(DmMc02Spi *s, DmDigitalOutput *output, void *opaque)
 {
+    if (s->mosi == output && s->mosi_opaque == opaque) {
+        return;
+    }
     s->mosi = output;
     s->mosi_opaque = opaque;
     spi_wire_output(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));

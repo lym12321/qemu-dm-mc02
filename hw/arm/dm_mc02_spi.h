@@ -57,8 +57,9 @@ typedef struct DmMc02Spi {
     unsigned tx_head;
     unsigned tx_count;
     uint32_t shift_value;
+    /* Next MOSI transition (or frame end), relative to a half-cycle origin. */
     unsigned shift_bit;
-    unsigned shift_origin_bit;
+    unsigned shift_origin_half;
     bool shifting;
     bool mosi_level;
     bool tx_complete;
