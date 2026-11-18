@@ -98,6 +98,13 @@ edges before resolving the new electrical state. Unrelated GPIO banks do not
 recheck the LED or buzzer routes. The LED reuses one pending reset check across
 pulses. Timer/DMA events retain scheduled timestamps through GPIO writes.
 
+SPI schedules MOSI transitions and frame completions, coalescing adjacent
+equal bits while preserving their duration. FIFO/DMA/EOT keep their frame
+boundaries. GPIO writes reuse the selected pin route until its mux changes.
+The LED keeps one pending reset check across pulses and rechecks the actual
+low interval at that check's virtual deadline. TIM8 uses the timer's generic
+event path for all PSC/ARR values.
+
 `led.source=ws2812-din` includes `timing_profile`, `frames`, `errors`,
 `latched_ns` and `powered`. The `worldsemi-ws2812b-classic` reference profile
 uses the [Worldsemi WS2812B sheet](https://cdn-shop.adafruit.com/datasheets/WS2812B.pdf):

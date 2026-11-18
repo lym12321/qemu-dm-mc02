@@ -102,9 +102,6 @@
 #define DM_MC02_DMA_CR_MSIZE_SHIFT 13
 #define DM_MC02_DMA_SIZE_16       1u
 
-#define DM_MC02_WS2812_TOTAL_BITS 72
-#define DM_MC02_WS2812_APPROX_BATCH (DM_MC02_WS2812_TOTAL_BITS * 100)
-
 typedef struct DmMc02MachineState DmMc02MachineState;
 
 typedef struct DmMc02TimerEventContext {
@@ -1284,16 +1281,6 @@ static void dm_mc02_set_accurate_timing(Object *obj, bool enabled,
 
     (void)errp;
     s->accurate_timing = enabled;
-    if (s->board && s->board->devices.tim8_index < s->initialized_timer_count &&
-        s->tim_aux[s->board->devices.tim8_index].update_timer) {
-        dm_mc02_tim2_set_update_batch(
-                                      &s->tim_aux[s->board->devices.tim8_index],
-                                      enabled ? 1 :
-                                      DM_MC02_WS2812_APPROX_BATCH);
-        dm_mc02_tim2_set_compare_batch(
-            &s->tim_aux[s->board->devices.tim8_index], enabled ? 1 :
-            DM_MC02_WS2812_APPROX_BATCH);
-    }
 }
 
 static bool dm_mc02_set_noise(Object *obj, const char *value, bool accel,
