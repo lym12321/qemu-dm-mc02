@@ -7,10 +7,17 @@
 
 static QEMUTimer *timers[16];
 static int64_t now_ns;
+static int64_t clock_read_step_ns;
+static unsigned dispatches;
+
+unsigned dm_test_clock_dispatches(void);
+unsigned dm_test_clock_dispatches(void) { return dispatches; }
 
 int64_t qemu_clock_get_ns(QEMUClockType type)
 {
-    return now_ns;
+    int64_t value = now_ns;
+    now_ns += clock_read_step_ns;
+    return value;
 }
 
 void timer_init_full(QEMUTimer *t, QEMUTimerListGroup *group,
@@ -26,12 +33,20 @@ void timer_init_full(QEMUTimer *t, QEMUTimerListGroup *group,
 
 void timer_mod(QEMUTimer *t, int64_t deadline) { t->expire_time = deadline; }
 void timer_del(QEMUTimer *t) { t->expire_time = -1; }
+bool timer_pending(QEMUTimer *t) { return t->expire_time >= 0; }
+uint64_t timer_expire_time_ns(QEMUTimer *t) { return t->expire_time; }
+void dm_test_clock_set(int64_t target);
+void dm_test_clock_set(int64_t target) { now_ns = target; }
+void dm_test_clock_read_step(int64_t step);
+void dm_test_clock_read_step(int64_t step) { clock_read_step_ns = step; }
 void dm_test_clock(int64_t target, bool late);
 void dm_test_clock_reset(void);
 void dm_test_clock_reset(void)
 {
     memset(timers, 0, sizeof(timers));
     now_ns = 0;
+    clock_read_step_ns = 0;
+    dispatches = 0;
 }
 
 /* Late dispatch leaves the clock at target while delivering sorted deadlines. */
@@ -48,6 +63,7 @@ void dm_test_clock(int64_t target, bool late)
         if (!first) { now_ns = target; return; }
         if (!late) { now_ns = first->expire_time; }
         timer_del(first);
+        dispatches++;
         first->cb(first->opaque);
     }
     g_error("digital producer failed to advance its timer");
@@ -60,7 +76,13 @@ void memory_region_init_io(MemoryRegion *mr, Object *owner,
     mr->ops = ops; mr->opaque = opaque;
 }
 
+void (*dm_test_irq)(qemu_irq irq, int level);
+
 void qemu_set_irq(qemu_irq irq, int level)
 {
-    g_assert_null(irq);
+    if (dm_test_irq) {
+        dm_test_irq(irq, level);
+    } else {
+        g_assert_null(irq);
+    }
 }

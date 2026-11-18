@@ -9,6 +9,18 @@ void dm_ws2812_reset(DmWs2812 *s, uint64_t timestamp_ns)
     *s = (DmWs2812) { .last_ns = timestamp_ns, .edge_ns = timestamp_ns };
 }
 
+void dm_ws2812_resync(DmWs2812 *s, uint64_t timestamp_ns)
+{
+    s->last_ns = timestamp_ns;
+    s->edge_ns = timestamp_ns;
+    s->bits = 0;
+    s->count = 0;
+    s->known = false;
+    s->high = false;
+    s->bad = false;
+    s->synchronized = false;
+}
+
 static void malformed(DmWs2812 *s)
 {
     if (!s->bad) {
@@ -19,7 +31,7 @@ static void malformed(DmWs2812 *s)
 
 uint64_t dm_ws2812_deadline(const DmWs2812 *s)
 {
-    return s->driven && !s->high &&
+    return s->known && !s->high &&
            (!s->synchronized || s->count || s->bad) &&
            s->edge_ns <= INT64_MAX - RESET_NS ? s->edge_ns + RESET_NS : 0;
 }
@@ -48,52 +60,38 @@ void dm_ws2812_advance(DmWs2812 *s, uint64_t timestamp_ns)
     s->bits = 0;
     s->count = 0;
     s->bad = false;
-    s->complete_low = false;
     s->synchronized = true;
 }
 
 void dm_ws2812_level(DmWs2812 *s, uint64_t timestamp_ns,
-                     bool driven, bool high)
+                     bool known, bool high)
 {
-    uint64_t duration;
-
     if (timestamp_ns < s->last_ns) {
         malformed(s);
         return;
     }
     dm_ws2812_advance(s, timestamp_ns);
-    if (s->driven == driven && (!driven || s->high == high)) {
+    if (s->known == known && (!known || s->high == high)) {
         return;
     }
-    if (!driven || !s->driven) {
+    if (!known || !s->known) {
         if (s->count || s->high) {
             malformed(s);
         }
         s->synchronized = false;
-    } else if (s->synchronized && !s->bad) {
-        duration = timestamp_ns - s->edge_ns;
-        if (!high && s->count < 24) {
-            bool zero = duration >= 250 && duration <= 550;
-            bool one = duration >= 650 && duration <= 950;
+    } else if (!high && s->synchronized && !s->bad && s->count < 24) {
+        uint64_t duration = timestamp_ns - s->edge_ns;
+        bool zero = duration >= 250 && duration <= 550;
+        bool one = duration >= 650 && duration <= 950;
 
-            if (!zero && !one) {
-                malformed(s);
-            } else {
-                s->last_bit = one;
-                s->bits = (s->bits << 1) | one;
-                s->count++;
-            }
-        } else if (high && s->count && !s->complete_low) {
-            uint64_t minimum = s->last_bit ? 300 : 700;
-            uint64_t maximum = s->last_bit ? 600 : 1000;
-
-            if (duration < minimum || duration > maximum) {
-                malformed(s);
-            }
-            s->complete_low = s->count == 24;
+        if (!zero && !one) {
+            malformed(s);
+        } else {
+            s->bits = (s->bits << 1) | one;
+            s->count++;
         }
     }
-    s->driven = driven;
+    s->known = known;
     s->high = high;
     s->edge_ns = timestamp_ns;
 }

@@ -3521,7 +3521,7 @@ DEFHEADING(Character device options:)
 DEF("chardev", HAS_ARG, QEMU_OPTION_chardev,
     "-chardev help\n"
     "-chardev null,id=id[,mux=on|off][,logfile=PATH][,logappend=on|off]\n"
-    "-chardev socket,id=id[,host=host],port=port[,to=to][,ipv4=on|off][,ipv6=on|off][,nodelay=on|off]\n"
+    "-chardev socket,id=id[,host=host],port=port[,to=to][,ipv4=on|off][,ipv6=on|off][,nodelay=on|off][,write-buffer=on|off]\n"
     "         [,server=on|off][,wait=on|off][,telnet=on|off][,websocket=on|off][,reconnect=seconds][,mux=on|off]\n"
     "         [,logfile=PATH][,logappend=on|off][,tls-creds=ID][,tls-authz=ID] (tcp)\n"
     "-chardev socket,id=id,path=path[,server=on|off][,wait=on|off][,telnet=on|off][,websocket=on|off][,reconnect=seconds]\n"
@@ -3635,7 +3635,7 @@ The available backends are:
     A void device. This device will not emit any data, and will drop any
     data it receives. The null backend does not take any options.
 
-``-chardev socket,id=id[,TCP options or unix options][,server=on|off][,wait=on|off][,telnet=on|off][,websocket=on|off][,reconnect=seconds][,tls-creds=id][,tls-authz=id]``
+``-chardev socket,id=id[,TCP options or unix options][,server=on|off][,wait=on|off][,telnet=on|off][,websocket=on|off][,reconnect=seconds][,tls-creds=id][,tls-authz=id][,write-buffer=on|off]``
     Create a two-way stream socket, which can be either a TCP or a unix
     socket. A unix socket will be created if ``path`` is specified.
     Behaviour is undefined if TCP options are specified for a unix
@@ -3651,6 +3651,16 @@ The available backends are:
 
     ``websocket=on|off`` specifies that the socket uses WebSocket protocol for
     communication.
+
+    ``write-buffer=on`` batches completed output bytes in a 16 KiB host
+    buffer. A write succeeds when this buffer accepts the bytes; it does
+    not wait for the peer to receive them. The first queued byte schedules
+    a flush after 1 ms of host time, subject to host scheduling and socket
+    backpressure. Output continues while the guest is paused. A full buffer
+    applies normal short-write or would-block backpressure. Unsent bytes
+    are discarded on disconnection or device removal and are never replayed
+    to a new connection. This option defaults to ``off`` and is available
+    only for plain TCP sockets, without TLS, telnet, or WebSocket framing.
 
     ``reconnect`` sets the timeout for reconnecting on non-server
     sockets when the remote end goes away. qemu will delay this many
@@ -4645,15 +4655,19 @@ SRST
 ERST
 
 DEF("icount", HAS_ARG, QEMU_OPTION_icount, \
-    "-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
-    "                enable virtual instruction counter with 2^N clock ticks per\n" \
-    "                instruction, enable aligning the host and virtual clocks\n" \
+    "-icount [shift=N|auto|ns-per-insn=N][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=<filename>[,rrsnapshot=<snapshot>]]\n" \
+    "                enable virtual instruction counter with 2^N ns (shift) or\n" \
+    "                N ns (ns-per-insn) per instruction, align virtual clocks\n" \
     "                or disable real time cpu sleeping, and optionally enable\n" \
     "                record-and-replay mode\n", QEMU_ARCH_ALL)
 SRST
-``-icount [shift=N|auto][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
-    Enable virtual instruction counter. The virtual cpu will execute one
-    instruction every 2^N ns of virtual time. If ``auto`` is specified
+``-icount [shift=N|auto|ns-per-insn=N][,align=on|off][,sleep=on|off][,rr=record|replay,rrfile=filename[,rrsnapshot=snapshot]]``
+    Enable virtual instruction counter. With ``shift=N`` (0 through 10),
+    the virtual CPU executes one instruction every 2^N ns of virtual time.
+    Alternatively, ``ns-per-insn=N`` selects an integer from 1 through 1024
+    ns per instruction, including non-power-of-two values. The two options
+    are mutually exclusive. The shorthand ``-icount N`` still means
+    ``shift=N``. If ``shift=auto`` is specified
     then the virtual cpu speed will be automatically adjusted to keep
     virtual time within a few seconds of real time.
 
@@ -4663,20 +4677,31 @@ SRST
     number of instructions executed often has little or no correlation
     with actual performance.
 
+    For example, ``-accel tcg,thread=single -icount
+    ns-per-insn=20,align=on,sleep=on`` assigns 20 ns to each instruction
+    (50 million instructions per virtual second). Timer deadlines are
+    rounded up to whole instructions, so a running CPU can reach a deadline
+    up to N-1 ns late. The fixed-scale conversion stops with an error if
+    the signed 64-bit nanosecond range is exceeded. Snapshots made with
+    ``ns-per-insn`` must be loaded with the same ``ns-per-insn``, ``sleep``
+    and ``align`` settings; snapshots
+    made with ``shift`` retain their existing format.
+
     When the virtual cpu is sleeping, the virtual time will advance at
-    default speed unless ``sleep=on`` is specified. With
-    ``sleep=on``, the virtual time will jump to the next timer
+    default speed unless ``sleep=off`` is specified. With
+    ``sleep=off``, the virtual time will jump to the next timer
     deadline instantly whenever the virtual cpu goes to sleep mode and
     will not advance if no timer is enabled. This behavior gives
     deterministic execution times from the guest point of view.
-    The default if icount is enabled is ``sleep=off``.
-    ``sleep=on`` cannot be used together with either ``shift=auto``
+    The default if icount is enabled is ``sleep=on``.
+    ``sleep=off`` cannot be used together with either ``shift=auto``
     or ``align=on``.
 
     ``align=on`` will activate the delay algorithm which will try to
     synchronise the host clock and the virtual clock. The goal is to
-    have a guest running at the real frequency imposed by the shift
-    option. Whenever the guest clock is behind the host clock and if
+    keep the guest near the host clock at the configured instruction rate.
+    Alignment delays a guest that runs ahead; it cannot accelerate one
+    that falls behind. Whenever the guest clock is behind the host clock and if
     ``align=on`` is specified then we print a message to the user to
     inform about the delay. Currently this option does not work when
     ``shift`` is ``auto``. Note: The sync algorithm will work for those
@@ -4689,6 +4714,9 @@ SRST
     enabled. The ``rrfile=`` option must also be provided to
     specify the path to the replay log. In record mode data is written
     to this file, and in replay mode it is read back.
+    ``ns-per-insn`` cannot be combined with ``rr`` because the replay log
+    format does not record this instruction scale. Use the existing
+    ``shift`` modes for record/replay.
     If the ``rrsnapshot`` option is given then it specifies a VM snapshot
     name. In record mode, a new VM snapshot with the given name is created
     at the start of execution recording. In replay mode this option

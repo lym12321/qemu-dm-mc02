@@ -21,7 +21,7 @@ void cpu_timers_init(void);
  * icount enablement state:
  *
  * 0 = Disabled - Do not count executed instructions.
- * 1 = Enabled - Fixed conversion of insn to ns via "shift" option
+ * 1 = Enabled - Fixed conversion via "shift" or "ns-per-insn"
  * 2 = Enabled - Runtime adaptive algorithm to compute shift
  */
 #ifdef CONFIG_TCG
@@ -43,20 +43,20 @@ int64_t icount_get_raw(void);
 /* return the virtual CPU time in ns, based on the instruction counter. */
 int64_t icount_get(void);
 /*
- * convert an instruction counter value to ns, based on the icount shift.
- * This shift is set as a fixed value with the icount "shift" option
- * (precise mode), or it is constantly approximated and corrected at
- * runtime in adaptive mode.
+ * Convert an instruction counter value to ns. Fixed mode uses 2^shift or
+ * ns-per-insn ns per instruction. Adaptive mode adjusts shift at runtime.
+ * The ns-per-insn conversion reports a fatal error rather than wrapping
+ * virtual time if the signed 64-bit nanosecond range is exceeded.
  */
 int64_t icount_to_ns(int64_t icount);
 
-/* configure the icount options, including "shift" */
+/* Configure icount, including the mutually exclusive shift/ns-per-insn. */
 void icount_configure(QemuOpts *opts, Error **errp);
 
 /* Fixed single-threaded 1 ns instructions and deterministic idle warp. */
 bool icount_has_exact_ns_deadlines(void);
 
-/* used by tcg vcpu thread to calc icount budget */
+/* Round a nanosecond deadline up to the next whole instruction budget. */
 int64_t icount_round(int64_t count);
 
 /* if the CPUs are idle, start accounting real time to virtual clock. */

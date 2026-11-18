@@ -46,7 +46,8 @@ void file_start_outgoing_migration(MigrationState *s,
 
     trace_migration_file_outgoing(filename);
 
-    fioc = qio_channel_file_new_path(filename, O_CREAT | O_WRONLY | O_TRUNC,
+    fioc = qio_channel_file_new_path(filename,
+                                     O_CREAT | O_WRONLY | O_TRUNC | O_BINARY,
                                      0600, errp);
     if (!fioc) {
         return;
@@ -78,7 +79,7 @@ void file_start_incoming_migration(FileMigrationArgs *file_args, Error **errp)
 
     trace_migration_file_incoming(filename);
 
-    fioc = qio_channel_file_new_path(filename, O_RDONLY, 0, errp);
+    fioc = qio_channel_file_new_path(filename, O_RDONLY | O_BINARY, 0, errp);
     if (!fioc) {
         return;
     }

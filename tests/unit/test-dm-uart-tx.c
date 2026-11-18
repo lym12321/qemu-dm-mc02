@@ -14,6 +14,7 @@
 #define CR1 0x00
 #define BRR 0x0c
 #define ISR 0x1c
+#define RDR 0x24
 #define TDR 0x28
 #define TC (1u << 6)
 
@@ -56,7 +57,7 @@ bool dm_mc02_dma_request_endpoint_batch(DmMc02Dma *s,
 typedef struct Capture {
     Chardev parent;
     uint8_t bytes[8192];
-    unsigned length, calls;
+    unsigned length, calls, accept_calls;
     int results[4];
     unsigned result_count;
 } Capture;
@@ -86,9 +87,17 @@ static int capture_write(Chardev *chr, const uint8_t *bytes, int length)
     return result;
 }
 
+static void capture_accept_input(Chardev *chr)
+{
+    Capture *c = (Capture *)chr;
+
+    c->accept_calls++;
+}
+
 static void capture_class_init(ObjectClass *klass, void *data)
 {
     CHARDEV_CLASS(klass)->chr_write = capture_write;
+    CHARDEV_CLASS(klass)->chr_accept_input = capture_accept_input;
 }
 
 static const TypeInfo capture_type = {
@@ -220,6 +229,81 @@ static void test_short_write_wrap(Fixture *f, const void *data)
     assert_complete(f, true);
 }
 
+static void test_unchanged_power(Fixture *f, const void *data)
+{
+    const uint8_t bytes[] = {0x12, 0x34};
+    unsigned accept_calls;
+    uint64_t deadline;
+
+    dm_mc02_uart_set_rs485(&f->uart, true, true);
+    dm_mc02_uart_set_de_mode(&f->uart, DM_MC02_UART_DE_MANUAL_GPIO);
+    dm_mc02_uart_set_de(&f->uart, true);
+    put_bytes(f, bytes, sizeof(bytes));
+    deadline = f->uart.tx_next_ns;
+    accept_calls = f->capture->accept_calls;
+
+    /* The board reapplies the rail on writes to unrelated pins in its bank.
+     * An unchanged rail must not resume the chardev and wake its I/O thread. */
+    for (unsigned i = 0; i < 32; i++) {
+        dm_mc02_uart_set_powered(&f->uart, true);
+    }
+    g_assert_cmpuint(f->capture->accept_calls, ==, accept_calls);
+    g_assert_cmpuint(f->uart.tx_next_ns, ==, deadline);
+    advance(2 * FRAME_NS);
+    g_assert_cmpmem(f->capture->bytes, f->capture->length,
+                    bytes, sizeof(bytes));
+    assert_complete(f, true);
+}
+
+static void test_power_cycle(Fixture *f, const void *data)
+{
+    const uint8_t old_byte = 0xa5, new_byte = 0x5a;
+    unsigned accept_calls;
+    uint32_t received;
+
+    dm_mc02_uart_set_rs485(&f->uart, true, true);
+    dm_mc02_uart_set_de_mode(&f->uart, DM_MC02_UART_DE_MANUAL_GPIO);
+    dm_mc02_uart_set_de(&f->uart, true);
+    write_reg(f, CR1, (1u << 2) | (1u << 3) | (1u << 6));
+    put_bytes(f, &old_byte, 1);
+    qemu_chr_be_write(CHARDEV(f->capture), &old_byte, 1);
+    g_assert_cmpuint(f->uart.tx_fifo_len, ==, 1);
+    g_assert_cmpuint(f->uart.rx_wire_len, ==, 1);
+    accept_calls = f->capture->accept_calls;
+
+    dm_mc02_uart_set_powered(&f->uart, false);
+    g_assert_cmpuint(f->capture->accept_calls, ==, accept_calls + 1);
+    g_assert_cmpuint(f->uart.tx_fifo_len, ==, 0);
+    g_assert_cmpuint(f->uart.rx_wire_len, ==, 0);
+    g_assert_cmpuint(f->uart.rx_fifo_len, ==, 0);
+    g_assert_false(timer_pending(f->uart.tx_timer));
+    g_assert_false(timer_pending(f->uart.rx_timer));
+    g_assert_cmpint(qemu_chr_be_can_write(CHARDEV(f->capture)), ==, 0);
+    dm_mc02_uart_set_powered(&f->uart, false);
+    g_assert_cmpuint(f->capture->accept_calls, ==, accept_calls + 1);
+
+    /* A peripheral reset preserves the externally supplied rail state. */
+    dm_mc02_uart_reset(&f->uart);
+    g_assert_false(f->uart.transceiver_powered);
+    dm_mc02_uart_set_powered(&f->uart, false);
+    g_assert_cmpuint(f->capture->accept_calls, ==, accept_calls + 1);
+    write_reg(f, BRR, 32);
+    write_reg(f, CR1, (1u << 2) | (1u << 3) | (1u << 6));
+    dm_mc02_uart_set_de(&f->uart, true);
+    accept_calls = f->capture->accept_calls;
+
+    dm_mc02_uart_set_powered(&f->uart, true);
+    g_assert_cmpuint(f->capture->accept_calls, ==, accept_calls + 1);
+    g_assert_cmpint(qemu_chr_be_can_write(CHARDEV(f->capture)), >, 0);
+    put_bytes(f, &new_byte, 1);
+    qemu_chr_be_write(CHARDEV(f->capture), &new_byte, 1);
+    advance(FRAME_NS);
+    g_assert_cmpmem(f->capture->bytes, f->capture->length, &new_byte, 1);
+    received = f->uart.iomem.ops->read(f->uart.iomem.opaque, RDR, 4);
+    g_assert_cmpuint(received, ==, new_byte);
+    assert_complete(f, true);
+}
+
 int main(int argc, char **argv)
 {
     module_call_init(MODULE_INIT_QOM);
@@ -233,5 +317,9 @@ int main(int argc, char **argv)
                setup, test_new_ingress, teardown);
     g_test_add("/dm-uart-tx/short-write-wrap", Fixture, NULL,
                setup, test_short_write_wrap, teardown);
+    g_test_add("/dm-uart-tx/unchanged-power", Fixture, NULL,
+               setup, test_unchanged_power, teardown);
+    g_test_add("/dm-uart-tx/power-cycle", Fixture, NULL,
+               setup, test_power_cycle, teardown);
     return g_test_run();
 }

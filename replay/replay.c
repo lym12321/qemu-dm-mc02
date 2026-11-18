@@ -295,6 +295,10 @@ void replay_configure(QemuOpts *opts)
     if (!rr) {
         /* Just enabling icount */
         goto out;
+    } else if (qemu_opt_get(opts, "ns-per-insn")) {
+        /* Reject before opening/truncating a log with no scale metadata. */
+        error_report("icount: ns-per-insn does not support record/replay");
+        exit(1);
     } else if (!strcmp(rr, "record")) {
         mode = REPLAY_MODE_RECORD;
     } else if (!strcmp(rr, "replay")) {

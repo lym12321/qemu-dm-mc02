@@ -416,6 +416,31 @@ static void test_io_channel_watch_until(GMainContext *context,
     g_assert_cmpuint(*calls, ==, expected);
 }
 
+static gboolean test_io_channel_watch_timeout(gpointer opaque)
+{
+    bool *expired = opaque;
+
+    *expired = true;
+    return G_SOURCE_REMOVE;
+}
+
+static void test_io_channel_watch_until_blocking(GMainContext *context,
+                                               unsigned int *calls,
+                                               unsigned int expected)
+{
+    bool expired = false;
+    GSource *timeout = g_timeout_source_new(5000);
+
+    g_source_set_callback(timeout, test_io_channel_watch_timeout, &expired, NULL);
+    g_source_attach(timeout, context);
+    while (*calls < expected && !expired) {
+        g_main_context_iteration(context, true);
+    }
+    g_source_destroy(timeout);
+    g_source_unref(timeout);
+    g_assert_cmpuint(*calls, ==, expected);
+}
+
 static void test_io_channel_win32_level_watch(void)
 {
     SocketAddress listen_addr = {
@@ -457,7 +482,7 @@ static void test_io_channel_win32_level_watch(void)
     g_source_set_callback(writer, (GSourceFunc)test_io_channel_watch_write,
                           &writes, NULL);
     g_source_attach(writer, context);
-    test_io_channel_watch_until(context, &writes, 2);
+    test_io_channel_watch_until_blocking(context, &writes, 2);
     g_source_unref(writer);
 
     object_unref(OBJECT(src));
@@ -486,8 +511,6 @@ static void test_io_channel_win32_priority_watch(void)
     test_io_channel_setup_sync(&listen_addr, &connect_addr, &srv, &src, &dst);
     qio_channel_set_blocking(src, false, &error_abort);
     qio_channel_set_blocking(dst, false, &error_abort);
-    g_assert_cmpint(qio_channel_write(src, "abc", 3, &error_abort), ==, 3);
-
     low = qio_channel_create_watch(dst, G_IO_IN);
     g_source_set_callback(low, (GSourceFunc)test_io_channel_watch_read,
                           &level, NULL);
@@ -497,6 +520,11 @@ static void test_io_channel_win32_priority_watch(void)
     g_source_set_callback(high, (GSourceFunc)test_io_channel_watch_remove,
                           &high_calls, NULL);
     g_source_attach(high, context);
+    /* Establish both watches as idle before only one HANDLE is signalled. */
+    for (unsigned int i = 0; i < 10; i++) {
+        g_main_context_iteration(context, false);
+    }
+    g_assert_cmpint(qio_channel_write(src, "abc", 3, &error_abort), ==, 3);
 
     test_io_channel_watch_until(context, &high_calls, 1);
     g_assert_cmpuint(level.calls, ==, 0);
@@ -509,6 +537,145 @@ static void test_io_channel_win32_priority_watch(void)
     object_unref(OBJECT(src));
     object_unref(OBJECT(dst));
     object_unref(OBJECT(srv));
+    g_main_context_unref(context);
+    g_free(connect_addr.u.inet.port);
+}
+
+static gboolean test_io_channel_watch_drain(QIOChannel *ioc,
+                                           GIOCondition condition,
+                                           gpointer opaque)
+{
+    unsigned int *calls = opaque;
+    char byte;
+    ssize_t ret;
+
+    g_assert_true(condition & G_IO_IN);
+    ret = qio_channel_read(ioc, &byte, 1, &error_abort);
+    g_assert_cmpint(ret, >=, 0);
+    ++*calls;
+    return ret != 0;
+}
+
+static void test_io_channel_win32_idle_watch(void)
+{
+    SocketAddress listen_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    SocketAddress connect_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    QIOChannel *src, *dst, *srv;
+    GMainContext *context = g_main_context_new();
+    GSource *reader, *hup;
+    unsigned int calls = 0;
+
+    test_io_channel_setup_sync(&listen_addr, &connect_addr, &srv, &src, &dst);
+    qio_channel_set_blocking(src, false, &error_abort);
+    qio_channel_set_blocking(dst, false, &error_abort);
+    hup = qio_channel_create_watch(dst, G_IO_HUP);
+    g_source_attach(hup, context);
+    reader = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_callback(reader, (GSourceFunc)test_io_channel_watch_drain,
+                          &calls, NULL);
+    g_source_attach(reader, context);
+
+    /* Drain, become idle, then wake again while the HUP watch still exists. */
+    g_assert_cmpint(qio_channel_write(src, "abc", 3, &error_abort), ==, 3);
+    test_io_channel_watch_until(context, &calls, 3);
+    for (unsigned int i = 0; i < 10; i++) {
+        g_assert_false(g_main_context_iteration(context, false));
+    }
+    g_assert_cmpint(qio_channel_write(src, "d", 1, &error_abort), ==, 1);
+    test_io_channel_watch_until(context, &calls, 4);
+    g_source_destroy(reader);
+    g_source_unref(reader);
+
+    /* Rewatch an idle socket, then deliver EOF through the new watch. */
+    reader = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_callback(reader, (GSourceFunc)test_io_channel_watch_drain,
+                          &calls, NULL);
+    g_source_attach(reader, context);
+    for (unsigned int i = 0; i < 10; i++) {
+        g_assert_false(g_main_context_iteration(context, false));
+    }
+    qio_channel_shutdown(src, QIO_CHANNEL_SHUTDOWN_WRITE, &error_abort);
+    qio_channel_close(src, &error_abort);
+    test_io_channel_watch_until(context, &calls, 5);
+    g_source_unref(reader);
+    g_source_destroy(hup);
+    g_source_unref(hup);
+    object_unref(OBJECT(src));
+    object_unref(OBJECT(dst));
+    object_unref(OBJECT(srv));
+    g_main_context_unref(context);
+    g_free(connect_addr.u.inet.port);
+}
+
+static void test_io_channel_watch_aio_read(void *opaque)
+{
+    /* Leave data for the GSource; this callback is not dispatched here. */
+    g_assert_not_reached();
+}
+
+static void test_io_channel_win32_watch_transition(const void *opaque)
+{
+    SocketAddress listen_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    SocketAddress connect_addr = {
+        .type = SOCKET_ADDRESS_TYPE_INET,
+        .u.inet = { .host = (char *)"127.0.0.1" },
+    };
+    QIOChannel *src, *dst, *srv;
+    GMainContext *context = g_main_context_new();
+    bool use_aio = GPOINTER_TO_INT(opaque);
+    AioContext *aio = use_aio ? aio_context_new(&error_abort) : NULL;
+    GSource *reader;
+    unsigned int calls = 0;
+
+    test_io_channel_setup_sync(&listen_addr, &connect_addr, &srv, &src, &dst);
+    qio_channel_set_blocking(src, false, &error_abort);
+    qio_channel_set_blocking(dst, false, &error_abort);
+    reader = qio_channel_create_watch(dst, G_IO_IN);
+    g_source_set_callback(reader, (GSourceFunc)test_io_channel_watch_drain,
+                          &calls, NULL);
+    g_source_attach(reader, context);
+    for (unsigned int i = 0; i < 10; i++) {
+        g_assert_false(g_main_context_iteration(context, false));
+    }
+
+    if (use_aio) {
+        /* This direct API redirects WSAEventSelect without read_ctx fields. */
+        qio_channel_set_aio_fd_handler(dst, aio, test_io_channel_watch_aio_read,
+                                       aio, NULL, NULL);
+    } else {
+        /* A synchronous operation temporarily disables WSAEventSelect. */
+        qio_channel_set_blocking(dst, true, &error_abort);
+        qio_channel_set_blocking(dst, false, &error_abort);
+    }
+    g_assert_cmpint(qio_channel_write(src, "a", 1, &error_abort), ==, 1);
+    test_io_channel_watch_until(context, &calls, 1);
+    if (use_aio) {
+        qio_channel_set_aio_fd_handler(dst, aio, NULL, aio, NULL, NULL);
+    }
+    /* Removing AIO or returning to nonblocking does not restore the HANDLE. */
+    for (unsigned int i = 0; i < 10; i++) {
+        g_assert_false(g_main_context_iteration(context, false));
+    }
+    g_assert_cmpint(qio_channel_write(src, "b", 1, &error_abort), ==, 1);
+    test_io_channel_watch_until(context, &calls, 2);
+
+    g_source_destroy(reader);
+    g_source_unref(reader);
+    object_unref(OBJECT(src));
+    object_unref(OBJECT(dst));
+    object_unref(OBJECT(srv));
+    if (aio) {
+        aio_context_unref(aio);
+    }
     g_main_context_unref(context);
     g_free(connect_addr.u.inet.port);
 }
@@ -769,6 +936,14 @@ int main(int argc, char **argv)
                         test_io_channel_win32_level_watch);
         g_test_add_func("/io/channel/socket/win32-priority-watch",
                         test_io_channel_win32_priority_watch);
+        g_test_add_func("/io/channel/socket/win32-idle-watch",
+                        test_io_channel_win32_idle_watch);
+        g_test_add_data_func("/io/channel/socket/win32-aio-watch",
+                             GINT_TO_POINTER(true),
+                             test_io_channel_win32_watch_transition);
+        g_test_add_data_func("/io/channel/socket/win32-blocking-watch",
+                             GINT_TO_POINTER(false),
+                             test_io_channel_win32_watch_transition);
 #endif
     }
     if (has_ipv6) {

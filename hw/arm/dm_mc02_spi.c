@@ -36,6 +36,7 @@ static void spi_wire_output(DmMc02Spi *s, uint64_t timestamp_ns);
 static bool spi_wire_enqueue(DmMc02Spi *s, uint32_t value, unsigned size);
 static uint32_t spi_wire_status(const DmMc02Spi *s);
 static uint64_t spi_wire_delay(const DmMc02Spi *s, unsigned half_cycles);
+static void spi_wire_sync(DmMc02Spi *s, uint64_t timestamp_ns);
 
 static uint32_t dm_mc02_spi_dma_reg(const DmMc02Dma *dma, hwaddr offset)
 {
@@ -235,6 +236,9 @@ static uint64_t dm_mc02_spi_read(void *opaque, hwaddr offset, unsigned size)
 {
     DmMc02Spi *s = opaque;
 
+    if (s->wire_timer) {
+        spi_wire_sync(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
     switch (offset) {
     case SPI_CR1:
         return s->cr1;
@@ -279,6 +283,8 @@ static void dm_mc02_spi_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (s->wire_timer) {
         uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+        spi_wire_sync(s, now);
         switch (offset) {
         case SPI_CR1: {
             uint32_t previous = s->cr1;
@@ -405,6 +411,8 @@ static const MemoryRegionOps dm_mc02_spi_ops = {
 void dm_mc02_spi_state_init(DmMc02Spi *spi)
 {
     memset(spi, 0, sizeof(*spi));
+    spi->tx_fifo_bytes = 16;
+    spi->max_frame_bits = 32;
     spi->dma_endpoint_enabled = true;
     spi->dma_batch_limit = DM_MC02_SPI_DMA_BATCH_MAX;
     spi->tx_endpoint.write = dm_mc02_spi_dma_endpoint_write;
@@ -571,6 +579,13 @@ static unsigned spi_wire_bits(const DmMc02Spi *s)
     return (s->cfg1 & 31) + 1;
 }
 
+static bool spi_wire_frame_valid(const DmMc02Spi *s)
+{
+    unsigned bits = spi_wire_bits(s);
+
+    return bits >= 4 && bits <= s->max_frame_bits;
+}
+
 static unsigned spi_wire_slot(const DmMc02Spi *s)
 {
     unsigned bits = spi_wire_bits(s);
@@ -586,11 +601,38 @@ static uint64_t spi_wire_delay(const DmMc02Spi *s, unsigned half_cycles)
     return denominator ? (numerator + denominator - 1) / denominator : 0;
 }
 
+static unsigned spi_wire_half(const DmMc02Spi *s, unsigned bit)
+{
+    return 2 * bit + (bit < spi_wire_bits(s) && (s->cfg2 & SPI_CFG2_CPHA) ? 1 : 0);
+}
+
+static bool spi_wire_bit(const DmMc02Spi *s, unsigned bit)
+{
+    unsigned position = s->cfg2 & SPI_CFG2_LSBFRST ? bit :
+                        spi_wire_bits(s) - 1 - bit;
+
+    return (s->shift_value >> position) & 1;
+}
+
+/* A constant MOSI run needs no intermediate callbacks. Frame completion is
+ * still scheduled: it owns RX, FIFO refill, DMA and EOT independently of the
+ * number of transitions, including entirely constant frames. */
+static void spi_wire_schedule(DmMc02Spi *s)
+{
+    while (s->shift_bit < spi_wire_bits(s) &&
+           spi_wire_bit(s, s->shift_bit) == s->mosi_level) {
+        s->shift_bit++;
+    }
+    s->wire_next_ns = s->wire_origin_ns + spi_wire_delay(s,
+        spi_wire_half(s, s->shift_bit) - s->shift_origin_half);
+    timer_mod(s->wire_timer, s->wire_next_ns);
+}
+
 static uint32_t spi_wire_status(const DmMc02Spi *s)
 {
-    unsigned capacity = 16 / spi_wire_slot(s);
+    unsigned capacity = s->tx_fifo_bytes / spi_wire_slot(s);
     unsigned threshold = ((s->cfg1 >> 5) & 15) + 1;
-    bool txp = (s->cr1 & SPI_CR1_SPE) &&
+    bool txp = spi_wire_frame_valid(s) && (s->cr1 & SPI_CR1_SPE) &&
                s->tx_count + threshold <= capacity;
 
     return (txp ? SPI_SR_TXP : 0) | (s->rx_valid ? SPI_SR_RXP : 0) |
@@ -621,8 +663,8 @@ static bool spi_wire_enqueue(DmMc02Spi *s, uint32_t value, unsigned size)
     unsigned slot = spi_wire_slot(s);
     unsigned count = size / slot;
 
-    if (spi_wire_bits(s) < 4 || !count || size % slot ||
-        s->tx_count + count > 16 / slot) {
+    if (!spi_wire_frame_valid(s) || !count || size % slot ||
+        s->tx_count + count > s->tx_fifo_bytes / slot) {
         return false;
     }
     for (unsigned i = 0; i < count; ++i) {
@@ -640,7 +682,7 @@ static DmMc02DmaEndpointResult spi_wire_dma_write(
     if (size != 1 && size != 2 && size != 4) {
         return DM_MC02_DMA_ENDPOINT_ERROR;
     }
-    if (size < spi_wire_slot(s) || spi_wire_bits(s) < 4) {
+    if (size < spi_wire_slot(s) || !spi_wire_frame_valid(s)) {
         return DM_MC02_DMA_ENDPOINT_ERROR;
     }
     value = size == 1 ? data[0] : size == 2 ? lduw_le_p(data) : ldl_le_p(data);
@@ -656,7 +698,9 @@ static void spi_wire_fill(DmMc02Spi *s, uint64_t timestamp_ns)
         return;
     }
     s->dma_request_active = true;
-    for (unsigned beat = 0; beat < 16 && (spi_wire_status(s) & SPI_SR_TXP); ++beat) {
+    for (unsigned beat = 0;
+         beat < s->tx_fifo_bytes && (spi_wire_status(s) & SPI_SR_TXP);
+         ++beat) {
         bool moved = false;
         if ((s->cr2 & SPI_CR2_TSIZE_MASK) &&
             s->tx_count + s->shifting >= s->transfer_remaining) {
@@ -682,7 +726,7 @@ static void spi_wire_kick(DmMc02Spi *s, uint64_t timestamp_ns)
         (s->cr1 & (SPI_CR1_SPE | SPI_CR1_CSTART)) !=
                   (SPI_CR1_SPE | SPI_CR1_CSTART) ||
         !(s->cfg2 & SPI_CFG2_MASTER) || (s->cfg2 & (7u << 19)) ||
-        spi_wire_bits(s) < 4) {
+        !spi_wire_frame_valid(s)) {
         return;
     }
     spi_wire_fill(s, timestamp_ns);
@@ -691,11 +735,9 @@ static void spi_wire_kick(DmMc02Spi *s, uint64_t timestamp_ns)
         s->tx_head = (s->tx_head + 1) % 16;
         s->tx_count--;
         s->shifting = true;
-        s->shift_bit = s->shift_origin_bit = 0;
+        s->shift_bit = s->shift_origin_half = 0;
         s->wire_origin_ns = MAX(timestamp_ns, s->wire_available_ns);
-        s->wire_next_ns = s->wire_origin_ns +
-            spi_wire_delay(s, !!(s->cfg2 & SPI_CFG2_CPHA));
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        spi_wire_schedule(s);
         spi_wire_fill(s, timestamp_ns);
     }
     if ((s->cr2 & SPI_CR2_TSIZE_MASK) &&
@@ -727,17 +769,38 @@ static void spi_wire_tick(void *opaque)
         s->wire_available_ns = timestamp_ns + spi_wire_delay(s, 2 * ((s->cfg2 >> 4) & 15));
         spi_wire_kick(s, timestamp_ns);
     } else {
-        unsigned position = s->cfg2 & SPI_CFG2_LSBFRST ? s->shift_bit :
-                            bits - 1 - s->shift_bit;
-        s->mosi_level = (s->shift_value >> position) & 1;
+        s->mosi_level = spi_wire_bit(s, s->shift_bit);
         spi_wire_output(s, timestamp_ns);
         s->shift_bit++;
-        s->wire_next_ns = s->wire_origin_ns + spi_wire_delay(s,
-            2 * (s->shift_bit - s->shift_origin_bit) +
-            (s->shift_bit < bits && (s->cfg2 & SPI_CFG2_CPHA) ? 1 : 0));
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        spi_wire_schedule(s);
     }
     spi_wire_irq(s);
+}
+
+static void spi_wire_sync(DmMc02Spi *s, uint64_t timestamp_ns)
+{
+    /* CPU MMIO can run before the IO thread dispatches overdue timers. Advance
+     * the wire before observing TXP or changing the FIFO/registers, so a late
+     * write cannot supply data to an earlier empty FIFO. Use one entry-time
+     * sample; callbacks retain their original peripheral-clock deadlines. */
+    while (s->wire_timer && timer_pending(s->wire_timer) && s->shifting &&
+           s->wire_next_ns <= timestamp_ns) {
+        timer_del(s->wire_timer);
+        spi_wire_tick(s);
+    }
+}
+
+void dm_mc02_spi_set_capabilities(DmMc02Spi *s, unsigned fifo_bytes,
+                                   unsigned max_frame_bits)
+{
+    /* Hardware composition, not a writable guest or migration property. */
+    g_assert(s && !s->wire_timer);
+    g_assert(fifo_bytes > 0 && fifo_bytes <= G_N_ELEMENTS(s->tx_fifo));
+    g_assert(max_frame_bits >= 4 && max_frame_bits <= 32);
+    g_assert(fifo_bytes >= (max_frame_bits <= 8 ? 1 :
+                           max_frame_bits <= 16 ? 2 : 4));
+    s->tx_fifo_bytes = fifo_bytes;
+    s->max_frame_bits = max_frame_bits;
 }
 
 void dm_mc02_spi_enable_timing(DmMc02Spi *s)
@@ -753,18 +816,29 @@ void dm_mc02_spi_set_clock_hz(DmMc02Spi *s, uint64_t hz)
 {
     uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     if (hz == s->kernel_hz) { return; }
+    spi_wire_sync(s, now);
+    if (s->wire_timer && s->shifting && s->kernel_hz) {
+        /* After delivering old-clock edges, recover the first outstanding
+         * bit inside the remaining constant run. Inspect this frame only;
+         * later FIFO data are not consumed before their scheduled time. */
+        unsigned bit = s->shift_origin_half / 2;
+        while (bit < s->shift_bit &&
+               s->wire_origin_ns + spi_wire_delay(s,
+                   spi_wire_half(s, bit) - s->shift_origin_half) <= now) {
+            bit++;
+        }
+        s->shift_bit = bit;
+    }
     s->kernel_hz = hz;
     if (!s->wire_timer) { return; }
     if (!hz) {
         timer_del(s->wire_timer);
         s->wire_next_ns = 0;
     } else if (s->shifting) {
-        s->wire_origin_ns = now;
-        s->shift_origin_bit = s->shift_bit;
-        s->wire_next_ns = now + spi_wire_delay(s, 2);
         /* Resume the outstanding bit after one new clock period. */
-        s->wire_origin_ns = s->wire_next_ns;
-        timer_mod(s->wire_timer, s->wire_next_ns);
+        s->shift_origin_half = spi_wire_half(s, s->shift_bit);
+        s->wire_origin_ns = now + spi_wire_delay(s, 2);
+        spi_wire_schedule(s);
     } else {
         spi_wire_kick(s, now);
     }
@@ -772,9 +846,25 @@ void dm_mc02_spi_set_clock_hz(DmMc02Spi *s, uint64_t hz)
 
 void dm_mc02_spi_set_mosi(DmMc02Spi *s, DmDigitalOutput *output, void *opaque)
 {
+    if (s->mosi == output && s->mosi_opaque == opaque) {
+        return;
+    }
     s->mosi = output;
     s->mosi_opaque = opaque;
     spi_wire_output(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
+void dm_mc02_spi_sync_mosi(DmMc02Spi *s, uint64_t timestamp_ns)
+{
+    DmDigitalOutput *output = s->mosi;
+    void *opaque = s->mosi_opaque;
+
+    while (output && s->mosi == output && s->mosi_opaque == opaque &&
+           s->wire_timer && timer_pending(s->wire_timer) &&
+           s->shifting && s->wire_next_ns <= timestamp_ns) {
+        timer_del(s->wire_timer);
+        spi_wire_tick(s);
+    }
 }
 
 void dm_mc02_spi_set_irq(DmMc02Spi *s, qemu_irq irq)

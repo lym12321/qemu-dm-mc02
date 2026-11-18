@@ -157,6 +157,47 @@ static bool icount_shift_state_needed(void *opaque)
     return icount_enabled() == 2;
 }
 
+static bool icount_ns_per_insn_state_needed(void *opaque)
+{
+    TimersState *s = opaque;
+
+    return s->icount_ns_per_insn != 0;
+}
+
+static int timers_pre_load(void *opaque)
+{
+    TimersState *s = opaque;
+
+    s->icount_ns_per_insn_loaded = false;
+    return 0;
+}
+
+static int icount_ns_per_insn_post_load(void *opaque, int version_id)
+{
+    TimersState *s = opaque;
+
+    s->icount_ns_per_insn_loaded = true;
+    return 0;
+}
+
+/* The new scale subsection precedes every optional legacy timer subsection. */
+static int icount_validate_scale(void *opaque)
+{
+    TimersState *s = opaque;
+
+    if (s->icount_ns_per_insn && !s->icount_ns_per_insn_loaded) {
+        error_report("icount: snapshot has no ns-per-insn configuration; "
+                     "load it with its original shift configuration");
+        return -EINVAL;
+    }
+    return 0;
+}
+
+static int timers_post_load(void *opaque, int version_id)
+{
+    return icount_validate_scale(opaque);
+}
+
 /*
  * Subsection for warp timer migration is optional, because may not be created
  */
@@ -165,6 +206,7 @@ static const VMStateDescription icount_vmstate_warp_timer = {
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = warp_timer_state_needed,
+    .pre_load = icount_validate_scale,
     .fields = (VMStateField[]) {
         VMSTATE_INT64(vm_clock_warp_start, TimersState),
         VMSTATE_TIMER_PTR(icount_warp_timer, TimersState),
@@ -177,6 +219,7 @@ static const VMStateDescription icount_vmstate_adjust_timers = {
     .version_id = 1,
     .minimum_version_id = 1,
     .needed = adjust_timers_state_needed,
+    .pre_load = icount_validate_scale,
     .fields = (VMStateField[]) {
         VMSTATE_TIMER_PTR(icount_rt_timer, TimersState),
         VMSTATE_TIMER_PTR(icount_vm_timer, TimersState),
@@ -189,9 +232,26 @@ static const VMStateDescription icount_vmstate_shift = {
     .version_id = 2,
     .minimum_version_id = 2,
     .needed = icount_shift_state_needed,
+    .pre_load = icount_validate_scale,
     .fields = (VMStateField[]) {
         VMSTATE_INT16(icount_time_shift, TimersState),
         VMSTATE_INT64(last_delta, TimersState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+/* Fixed legacy shift snapshots retain their existing byte layout. */
+static const VMStateDescription icount_vmstate_ns_per_insn = {
+    .name = "timer/icount/ns-per-insn",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = icount_ns_per_insn_state_needed,
+    .post_load = icount_ns_per_insn_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_UINT16_EQUAL(icount_ns_per_insn, TimersState,
+                             "icount ns-per-insn configuration differs"),
+        VMSTATE_UINT8_EQUAL(icount_ns_per_insn_flags, TimersState,
+                            "icount sleep/align configuration differs"),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -210,6 +270,7 @@ static const VMStateDescription icount_vmstate_timers = {
         VMSTATE_END_OF_LIST()
     },
     .subsections = (const VMStateDescription * []) {
+        &icount_vmstate_ns_per_insn,
         &icount_vmstate_warp_timer,
         &icount_vmstate_adjust_timers,
         &icount_vmstate_shift,
@@ -221,6 +282,8 @@ static const VMStateDescription vmstate_timers = {
     .name = "timer",
     .version_id = 2,
     .minimum_version_id = 1,
+    .pre_load = timers_pre_load,
+    .post_load = timers_post_load,
     .fields = (VMStateField[]) {
         VMSTATE_INT64(cpu_ticks_offset, TimersState),
         VMSTATE_UNUSED(8),
@@ -245,6 +308,15 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
     }
 
     if (qemu_in_vcpu_thread()) {
+        /* A timer callback runs before the next budget is
+         * computed. Do not turn its own rearm into a redundant RR-loop exit.
+         * Guest MMIO runs outside this scope and must still force an exit. */
+        if (icount_enabled() == 1 && replay_mode == REPLAY_MODE_NONE &&
+            first_cpu && !CPU_NEXT(first_cpu) &&
+            !qatomic_read(&current_cpu->running) &&
+            qemu_clock_in_main_loop_timer_callback(QEMU_CLOCK_VIRTUAL)) {
+            return;
+        }
         /*
          * A CPU is currently running; kick it back out to the
          * tcg_cpu_exec() loop so it will recalculate its

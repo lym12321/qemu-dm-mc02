@@ -88,6 +88,10 @@ struct QIOChannel {
     bool follow_coroutine_ctx;
 #ifdef _WIN32
     HANDLE event; /* For use with GSource on Win32 */
+    /* Socket GSource notification ownership; accessed atomically. */
+    unsigned int event_watch_count;
+    unsigned int event_watch_generation;
+    bool event_poll_disabled;
 #endif
 };
 

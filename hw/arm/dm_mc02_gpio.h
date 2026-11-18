@@ -12,8 +12,17 @@
 
 #include <stdint.h>
 
+/* Complete pending peripheral events before software observes or changes
+ * GPIO registers. Runtime wiring is preserved by reset and state loading. */
+typedef void DmMc02GpioBeforeAccess(void *opaque);
+
 typedef void DmMc02GpioOdrChanged(void *opaque, unsigned bank_index,
                                   uint32_t odr);
+/* Run old-pad peripheral edges before a GPIO configuration write takes
+ * effect. This optional composition hook receives complete register words. */
+typedef void DmMc02GpioConfigChanging(void *opaque, unsigned bank_index,
+                                      hwaddr reg, uint32_t old_value,
+                                      uint32_t new_value);
 
 typedef struct DmMc02GpioBank {
     MemoryRegion iomem;
@@ -31,6 +40,10 @@ typedef struct DmMc02GpioBank {
     uint16_t af_level;
     DmMc02GpioOdrChanged *odr_changed;
     void *odr_changed_opaque;
+    DmMc02GpioConfigChanging *config_changing;
+    void *config_changing_opaque;
+    DmMc02GpioBeforeAccess *before_access;
+    void *before_access_opaque;
 } DmMc02GpioBank;
 
 void dm_mc02_gpio_init(DmMc02GpioBank *bank, Object *owner,

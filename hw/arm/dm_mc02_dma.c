@@ -16,6 +16,7 @@
  * when request lines compete.  Bus-level timing remains outside this slice.
  */
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "exec/address-spaces.h"
 #include "hw/arm/dm_mc02_dma.h"
 #include "hw/arm/dm_mc02_dma_endpoint.h"
@@ -127,6 +128,14 @@ static uint32_t dm_mc02_dma_load(const uint8_t *regs, hwaddr offset,
 {
     uint32_t value = 0;
 
+    switch (size) {
+    case 1:
+        return regs[offset];
+    case 2:
+        return lduw_le_p(regs + offset);
+    case 4:
+        return ldl_le_p(regs + offset);
+    }
     for (unsigned i = 0; i < size; ++i) {
         value |= (uint32_t)regs[offset + i] << (i * 8);
     }
@@ -136,9 +145,34 @@ static uint32_t dm_mc02_dma_load(const uint8_t *regs, hwaddr offset,
 static void dm_mc02_dma_store(uint8_t *regs, hwaddr offset, uint64_t value,
                               unsigned size)
 {
+    switch (size) {
+    case 1:
+        regs[offset] = value;
+        return;
+    case 2:
+        stw_le_p(regs + offset, value);
+        return;
+    case 4:
+        stl_le_p(regs + offset, value);
+        return;
+    }
     for (unsigned i = 0; i < size; ++i) {
         regs[offset + i] = value >> (i * 8);
     }
+}
+
+static void dm_mc02_dma_store_par(DmMc02Dma *s, unsigned stream,
+                                  uint32_t cr, dma_addr_t address)
+{
+    hwaddr reg = dm_mc02_dma_stream_base(stream) + DMA_SxPAR;
+
+    /* Without a captured reload count, PINC routing follows the live PAR.
+     * Internal transfers must invalidate negative lookups as it advances. */
+    if ((cr & DMA_CR_PINC) && !s->reload_ndtr[stream] &&
+        dm_mc02_dma_load(s->regs, reg, 4) != (uint32_t)address) {
+        s->request_cache_valid = false;
+    }
+    dm_mc02_dma_store(s->regs, reg, address, 4);
 }
 
 static void dm_mc02_dma_update_irq(DmMc02Dma *s, unsigned stream)
@@ -155,17 +189,22 @@ static void dm_mc02_dma_update_irq(DmMc02Dma *s, unsigned stream)
         return;
     }
 
-    base = dm_mc02_dma_stream_base(stream);
     status = stream < 4 ? DMA_LISR : DMA_HISR;
     shift = dm_mc02_dma_flag_shift(stream);
-    cr = dm_mc02_dma_load(s->regs, base + DMA_SxCR, 4);
-    fcr = dm_mc02_dma_load(s->regs, base + DMA_SxFCR, 4);
-    flags = dm_mc02_dma_load(s->regs, status, 4) >> shift;
-    pending = ((flags & DMA_FLAG_DMEIF) && (cr & DMA_CR_DMEIE)) ||
-              ((flags & DMA_FLAG_FEIF) && (fcr & DMA_FCR_FEIE)) ||
-              ((flags & DMA_FLAG_TCIF) && (cr & DMA_CR_TCIE)) ||
-              ((flags & DMA_FLAG_HTIF) && (cr & DMA_CR_HTIE)) ||
-              ((flags & DMA_FLAG_TEIF) && (cr & DMA_CR_TEIE));
+    flags = (dm_mc02_dma_load(s->regs, status, 4) >> shift) & DMA_FLAG_MASK;
+    pending = false;
+    /* Most requests finish between HT/TC boundaries with no status flag.
+     * Their IRQ is low regardless of the control-register gates. */
+    if (flags) {
+        base = dm_mc02_dma_stream_base(stream);
+        cr = dm_mc02_dma_load(s->regs, base + DMA_SxCR, 4);
+        fcr = dm_mc02_dma_load(s->regs, base + DMA_SxFCR, 4);
+        pending = ((flags & DMA_FLAG_DMEIF) && (cr & DMA_CR_DMEIE)) ||
+                  ((flags & DMA_FLAG_FEIF) && (fcr & DMA_FCR_FEIE)) ||
+                  ((flags & DMA_FLAG_TCIF) && (cr & DMA_CR_TCIE)) ||
+                  ((flags & DMA_FLAG_HTIF) && (cr & DMA_CR_HTIE)) ||
+                  ((flags & DMA_FLAG_TEIF) && (cr & DMA_CR_TEIE));
+    }
 
     if (!s->stream_irq_level_valid[stream] ||
         s->stream_irq_level[stream] != pending) {
@@ -327,6 +366,9 @@ static void dm_mc02_dma_capture_reload(DmMc02Dma *s, unsigned stream)
         return;
     }
 
+    /* PINC request matching uses this captured PAR while reload_ndtr is
+     * nonzero. NDTR writes can replace it without a CR or PAR write. */
+    s->request_cache_valid = false;
     base = dm_mc02_dma_stream_base(stream);
     count = dm_mc02_dma_load(s->regs, base + DMA_SxNDTR, 4) & 0xffff;
     s->reload_ndtr[stream] = count;
@@ -361,8 +403,7 @@ static bool dm_mc02_dma_reload_circular(DmMc02Dma *s, unsigned stream,
     }
 
     base = dm_mc02_dma_stream_base(stream);
-    dm_mc02_dma_store(s->regs, base + DMA_SxPAR,
-                      s->reload_par[stream], 4);
+    dm_mc02_dma_store_par(s, stream, cr, s->reload_par[stream]);
     if (allow_dbm && (cr & DMA_CR_DBM)) {
         /* CT identifies the buffer that will be active after this transfer.
          * The just-finished target remains available to software while the
@@ -444,7 +485,7 @@ static bool dm_mc02_dma_m2m(DmMc02Dma *s, unsigned stream)
         dm_mc02_dma_maybe_set_half(s, stream, count, count - i - 1);
     }
 
-    dm_mc02_dma_store(s->regs, base + DMA_SxPAR, source, 4);
+    dm_mc02_dma_store_par(s, stream, cr, source);
     dm_mc02_dma_store_active_m0ar(s, stream, cr, dest);
     if (!dm_mc02_dma_reload_circular(s, stream, cr, false)) {
         dm_mc02_dma_store(s->regs, base + DMA_SxNDTR, 0, 4);
@@ -640,7 +681,7 @@ static bool dm_mc02_dma_request_fifo(DmMc02Dma *s, unsigned stream,
     if (memory_to_peripheral) {
         count--;
     }
-    dm_mc02_dma_store(s->regs, base + DMA_SxPAR, par, 4);
+    dm_mc02_dma_store_par(s, stream, cr, par);
     dm_mc02_dma_store_active_m0ar(s, stream, cr, memory);
     dm_mc02_dma_store(s->regs, base + DMA_SxNDTR, count, 4);
     dm_mc02_dma_maybe_set_half(s, stream, initial_count, count);
@@ -655,6 +696,34 @@ static bool dm_mc02_dma_request_fifo(DmMc02Dma *s, unsigned stream,
         dm_mc02_dma_set_status(s, stream, DMA_FLAG_TCIF);
     }
     return true;
+}
+
+static MemTxResult dm_mc02_dma_read_direct(dma_addr_t addr, uint8_t *data,
+                                           unsigned width)
+{
+#ifdef CONFIG_FUZZ
+    /* The generic read path supplies the DMA fuzz callback. */
+    return dma_memory_read(&address_space_memory, addr, data, width,
+                           MEMTXATTRS_UNSPECIFIED);
+#else
+    dma_barrier(&address_space_memory, DMA_DIRECTION_TO_DEVICE);
+    /* Constant lengths select QEMU's inline RAM read path. Translation is
+     * still performed for every beat; MMIO and reads crossing a region use
+     * the same flatview_read_continue() path as dma_memory_read(). */
+    switch (width) {
+    case 1:
+        return address_space_read(&address_space_memory, addr,
+                                  MEMTXATTRS_UNSPECIFIED, data, 1);
+    case 2:
+        return address_space_read(&address_space_memory, addr,
+                                  MEMTXATTRS_UNSPECIFIED, data, 2);
+    case 4:
+        return address_space_read(&address_space_memory, addr,
+                                  MEMTXATTRS_UNSPECIFIED, data, 4);
+    default:
+        g_assert_not_reached();
+    }
+#endif
 }
 
 static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
@@ -672,8 +741,7 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
     dma_addr_t dest;
     unsigned source_width;
     unsigned dest_width;
-    uint8_t source_data[sizeof(uint32_t)] = { 0 };
-    uint8_t dest_data[sizeof(uint32_t)] = { 0 };
+    uint8_t data[sizeof(uint32_t)] = { 0 };
     bool source_reserved = false;
     MemTxResult result;
 
@@ -717,14 +785,12 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
     }
 
     if ((cr & DMA_CR_DIR_MASK) == DMA_CR_DIR_M2P) {
-        result = dma_memory_read(&address_space_memory, source, source_data,
-                                 source_width, MEMTXATTRS_UNSPECIFIED);
+        result = dm_mc02_dma_read_direct(source, data, source_width);
         if (result == MEMTX_OK) {
-            memcpy(dest_data, source_data, MIN(source_width, dest_width));
             if (endpoint) {
                 DmMc02DmaEndpointResult endpoint_result =
                     dm_mc02_dma_endpoint_transfer_result(
-                        endpoint, true, dest_data, dest_width, timestamp_ns);
+                        endpoint, true, data, dest_width, timestamp_ns);
 
                 if (endpoint_result == DM_MC02_DMA_ENDPOINT_RETRY) {
                     return false;
@@ -733,7 +799,7 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
                          MEMTX_OK : MEMTX_ERROR;
             } else {
                 result = dma_memory_write(&address_space_memory, dest,
-                                          dest_data, dest_width,
+                                          data, dest_width,
                                           MEMTXATTRS_UNSPECIFIED);
             }
         }
@@ -741,7 +807,7 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
         if (endpoint) {
             DmMc02DmaEndpointResult endpoint_result =
                 dm_mc02_dma_endpoint_read_prepare_result(
-                    endpoint, source_data, source_width, timestamp_ns);
+                    endpoint, data, source_width, timestamp_ns);
 
             if (endpoint_result == DM_MC02_DMA_ENDPOINT_RETRY) {
                 return false;
@@ -752,13 +818,10 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
             result = endpoint_result == DM_MC02_DMA_ENDPOINT_ACCEPTED ?
                      MEMTX_OK : MEMTX_ERROR;
         } else {
-            result = dma_memory_read(&address_space_memory, source,
-                                     source_data, source_width,
-                                     MEMTXATTRS_UNSPECIFIED);
+            result = dm_mc02_dma_read_direct(source, data, source_width);
         }
         if (result == MEMTX_OK) {
-            memcpy(dest_data, source_data, MIN(source_width, dest_width));
-            result = dma_memory_write(&address_space_memory, dest, dest_data,
+            result = dma_memory_write(&address_space_memory, dest, data,
                                       dest_width, MEMTXATTRS_UNSPECIFIED);
             if (source_reserved) {
                 if (result == MEMTX_OK) {
@@ -785,7 +848,7 @@ static bool dm_mc02_dma_request_stream(DmMc02Dma *s, unsigned stream,
         m0ar += memory_width;
     }
     count--;
-    dm_mc02_dma_store(s->regs, base + DMA_SxPAR, par, 4);
+    dm_mc02_dma_store_par(s, stream, cr, par);
     dm_mc02_dma_store_active_m0ar(s, stream, cr, m0ar);
     dm_mc02_dma_store(s->regs, base + DMA_SxNDTR, count, 4);
     /* HTIF records the transfer event regardless of HTIE; HTIE is consumed
@@ -844,22 +907,15 @@ static bool dm_mc02_dma_request_selected(DmMc02Dma *s, unsigned stream,
 {
     hwaddr base = dm_mc02_dma_stream_base(stream);
     uint32_t cr = dm_mc02_dma_load(s->regs, base + DMA_SxCR, 4);
-    dma_addr_t transfer_endpoint = peripheral_addr;
+    dma_addr_t transfer_endpoint =
+        dm_mc02_dma_load(s->regs, base + DMA_SxPAR, 4);
     const DmMc02DmaEndpoint *transfer_callback = endpoint;
 
-    /* The request source identifies a fixed peripheral endpoint, while PAR
-     * is the live cursor for peripheral-increment transfers.  Keep the
-     * endpoint argument for normal streams and use the cursor only for PINC;
-     * request matching has already checked the captured configuration base. */
-    if (cr & DMA_CR_PINC) {
-        transfer_endpoint = dm_mc02_dma_load(s->regs, base + DMA_SxPAR, 4);
-        /* An endpoint represents one fixed peripheral register.  Once PINC
-         * moves PAR away from that register, use the ordinary MMIO path so
-         * the request still completes with the correct address side effect,
-         * but do not deliver an unrelated address to the device callback. */
-        if (transfer_endpoint != peripheral_addr) {
-            transfer_callback = NULL;
-        }
+    /* DMAMUX selects a request line, not a destination address. Always use
+     * configured PAR for the beat. An explicit callback represents one fixed
+     * register and must not receive a different address after PINC advances. */
+    if (transfer_endpoint != peripheral_addr) {
+        transfer_callback = NULL;
     }
 
     return dm_mc02_dma_request_stream(
@@ -870,18 +926,21 @@ static bool dm_mc02_dma_request_selected(DmMc02Dma *s, unsigned stream,
         timestamp_ns);
 }
 
-/* PAR is a live transfer cursor when PINC is set.  Peripheral request sources
- * identify the configured endpoint, not the cursor after the previous beat;
- * use the captured base for routing while request_stream() still uses the
- * live PAR for the actual address-space access. */
-static bool dm_mc02_dma_stream_endpoint_matches(const DmMc02Dma *s,
+/* Plain M2P MMIO requests select a stream by DMAMUX alone. Fixed endpoint
+ * callbacks and P2M sources retain their configured endpoint guard; PINC
+ * matches the captured base while transfers still use the live PAR cursor. */
+static bool dm_mc02_dma_stream_request_matches(const DmMc02Dma *s,
                                                 unsigned stream,
-                                                hwaddr peripheral_addr)
+                                                hwaddr peripheral_addr,
+                                                bool has_endpoint)
 {
     hwaddr base = dm_mc02_dma_stream_base(stream);
     uint32_t cr = dm_mc02_dma_load(s->regs, base + DMA_SxCR, 4);
     hwaddr endpoint = dm_mc02_dma_load(s->regs, base + DMA_SxPAR, 4);
 
+    if (!has_endpoint && (cr & DMA_CR_DIR_MASK) == DMA_CR_DIR_M2P) {
+        return true;
+    }
     if (cr & DMA_CR_PINC) {
         endpoint = s->reload_ndtr[stream] ? s->reload_par[stream] : endpoint;
     }
@@ -897,8 +956,10 @@ static bool dm_mc02_dma_request_internal(
     uint8_t cached_mask = 0;
 
     if (state->request_cache_valid &&
+        state->request_cache_dmamux == dmamux &&
         state->request_cache_generation == dmamux->generation &&
         state->request_cache_seen[requested] &&
+        state->request_cache_has_endpoint[requested] == (endpoint != NULL) &&
         state->request_cache_peripheral_addr[requested] == peripheral_addr) {
         cached_mask = state->request_stream_mask[requested];
         if (!cached_mask) {
@@ -913,8 +974,9 @@ static bool dm_mc02_dma_request_internal(
                 (dm_mc02_dma_load(dmamux->regs,
                                   channel * DMAMUX_CXCR_STRIDE, 4) &
                  DMAMUX_REQ_ID_MASK) == requested &&
-                dm_mc02_dma_stream_endpoint_matches(state, stream,
-                                                     peripheral_addr)) {
+                dm_mc02_dma_stream_request_matches(state, stream,
+                                                     peripheral_addr,
+                                                     endpoint != NULL)) {
                 bool moved = dm_mc02_dma_request_selected(
                     state, stream, peripheral_addr, endpoint, timestamp_ns);
 
@@ -944,8 +1006,8 @@ static bool dm_mc02_dma_request_internal(
                 mux = dm_mc02_dma_load(dmamux->regs,
                                        channel * DMAMUX_CXCR_STRIDE, 4);
                 if ((mux & DMAMUX_REQ_ID_MASK) != requested ||
-                    !dm_mc02_dma_stream_endpoint_matches(
-                        state, stream, peripheral_addr)) {
+                    !dm_mc02_dma_stream_request_matches(
+                        state, stream, peripheral_addr, endpoint != NULL)) {
                     valid = false;
                     break;
                 }
@@ -971,18 +1033,20 @@ static bool dm_mc02_dma_request_internal(
 
 scan_request:
     if (!state->request_cache_valid ||
+        state->request_cache_dmamux != dmamux ||
         state->request_cache_generation != dmamux->generation) {
         memset(state->request_stream_mask, 0,
                sizeof(state->request_stream_mask));
         memset(state->request_cache_seen, 0, sizeof(state->request_cache_seen));
+        state->request_cache_dmamux = dmamux;
         state->request_cache_generation = dmamux->generation;
         state->request_cache_valid = true;
     }
 
     /* STM32H7 maps DMA1 Stream N to DMAMUX1 channel N and DMA2 Stream N to
      * DMAMUX1 channel N+8.  Looking up the request ID in the channel register
-     * keeps endpoint selection out of the DMA engine; the board passes the
-     * expected PAR as an additional narrow-slice guard. */
+     * routes the request independently of ordinary M2P destination PAR.
+     * Explicit callbacks and P2M sources retain fixed-endpoint matching. */
     uint8_t stream_mask = 0;
 
     for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
@@ -996,14 +1060,16 @@ scan_request:
                                channel * DMAMUX_CXCR_STRIDE, 4);
 
         if ((mux & DMAMUX_REQ_ID_MASK) != requested ||
-            !dm_mc02_dma_stream_endpoint_matches(state, stream,
-                                                  peripheral_addr)) {
+            !dm_mc02_dma_stream_request_matches(state, stream,
+                                                 peripheral_addr,
+                                                 endpoint != NULL)) {
             continue;
         }
         stream_mask |= 1u << stream;
     }
     state->request_stream_mask[requested] = stream_mask;
     state->request_cache_seen[requested] = 1;
+    state->request_cache_has_endpoint[requested] = endpoint != NULL;
     state->request_cache_peripheral_addr[requested] = peripheral_addr;
 
     /* Requests are raised by peripheral MMIO events rather than by the DMA
@@ -1028,6 +1094,20 @@ bool dm_mc02_dma_request(DmMc02Dma *state, const DmMc02Dmamux *dmamux,
                                         peripheral_addr, NULL, 0);
 }
 
+bool dm_mc02_dma_request_at(DmMc02Dma *state, const DmMc02Dmamux *dmamux,
+                            uint32_t request_id, hwaddr peripheral_addr,
+                            uint64_t timestamp_ns)
+{
+    DmMc02EventTime *context = state ? state->event_time : NULL;
+    DmMc02EventTime saved = dm_mc02_event_time_enter(context, timestamp_ns);
+    bool moved = dm_mc02_dma_request_internal(state, dmamux, request_id,
+                                               peripheral_addr, NULL,
+                                               timestamp_ns);
+
+    dm_mc02_event_time_leave(context, saved);
+    return moved;
+}
+
 bool dm_mc02_dma_request_endpoint(
     DmMc02Dma *state, const DmMc02Dmamux *dmamux, uint32_t request_id,
     hwaddr peripheral_addr, const DmMc02DmaEndpoint *endpoint,
@@ -1047,7 +1127,8 @@ static bool dm_mc02_dma_batch_stream_matches(const DmMc02Dma *state,
                                              const DmMc02Dmamux *dmamux,
                                              unsigned stream,
                                              uint32_t requested,
-                                             hwaddr peripheral_addr)
+                                             hwaddr peripheral_addr,
+                                             bool has_endpoint)
 {
     unsigned channel = stream + state->dmamux_channel_offset;
 
@@ -1057,8 +1138,8 @@ static bool dm_mc02_dma_batch_stream_matches(const DmMc02Dma *state,
     return (dm_mc02_dma_load(dmamux->regs,
                              channel * DMAMUX_CXCR_STRIDE, 4) &
             DMAMUX_REQ_ID_MASK) == requested &&
-           dm_mc02_dma_stream_endpoint_matches(state, stream,
-                                                peripheral_addr);
+           dm_mc02_dma_stream_request_matches(state, stream,
+                                               peripheral_addr, has_endpoint);
 }
 
 static bool dm_mc02_dma_request_batch_internal(
@@ -1079,7 +1160,8 @@ static bool dm_mc02_dma_request_batch_internal(
      * path remains available when each event must expose its own IRQ edge. */
     for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
         if (dm_mc02_dma_batch_stream_matches(state, dmamux, stream,
-                                             requested, peripheral_addr)) {
+                                             requested, peripheral_addr,
+                                             endpoint != NULL)) {
             stream_mask |= 1u << stream;
         }
     }
@@ -1098,10 +1180,7 @@ static bool dm_mc02_dma_request_batch_internal(
         }
         bool item_moved = dm_mc02_dma_request_selected(
             state, stream,
-            endpoint ? peripheral_addr :
-            dm_mc02_dma_load(state->regs,
-                             dm_mc02_dma_stream_base(stream) + DMA_SxPAR, 4),
-            endpoint, timestamp_ns);
+            peripheral_addr, endpoint, timestamp_ns);
 
         if (!item_moved) {
             /* RETRY is deliberately caller-driven.  Do not spin on a
@@ -1131,6 +1210,20 @@ bool dm_mc02_dma_request_batch(DmMc02Dma *state,
     return dm_mc02_dma_request_batch_internal(state, dmamux, request_id,
                                               peripheral_addr, NULL, 0,
                                               items);
+}
+
+bool dm_mc02_dma_request_batch_at(DmMc02Dma *state,
+                                  const DmMc02Dmamux *dmamux,
+                                  uint32_t request_id, hwaddr peripheral_addr,
+                                  uint64_t timestamp_ns, unsigned items)
+{
+    DmMc02EventTime *context = state ? state->event_time : NULL;
+    DmMc02EventTime saved = dm_mc02_event_time_enter(context, timestamp_ns);
+    bool moved = dm_mc02_dma_request_batch_internal(
+        state, dmamux, request_id, peripheral_addr, NULL, timestamp_ns, items);
+
+    dm_mc02_event_time_leave(context, saved);
+    return moved;
 }
 
 bool dm_mc02_dma_request_endpoint_batch(
@@ -1167,6 +1260,7 @@ static bool dm_mc02_dma_request_batch_coalesced_one(
      * expose additional per-beat state which must retain the exact path. */
     if (!(cr & DMA_CR_EN) || (cr & DMA_CR_DBM) ||
         (cr & DMA_CR_DIR_MASK) != DMA_CR_DIR_M2P ||
+        dm_mc02_dma_load(s->regs, base + DMA_SxPAR, 4) != peripheral_addr ||
         (cr & DMA_CR_PINC) || !items || !count ||
         (dm_mc02_dma_load(s->regs, base + DMA_SxFCR, 4) & DMA_FCR_DMDIS) ||
         !peripheral_width || peripheral_width != memory_width) {
@@ -1236,7 +1330,8 @@ bool dm_mc02_dma_request_batch_coalesced(DmMc02Dma *state,
     }
     for (unsigned stream = 0; stream < DMA_STREAM_COUNT; ++stream) {
         if (dm_mc02_dma_batch_stream_matches(state, dmamux, stream,
-                                             requested, peripheral_addr)) {
+                                             requested, peripheral_addr,
+                                             false)) {
             stream_mask |= 1u << stream;
         }
     }
@@ -1340,8 +1435,7 @@ bool dm_mc02_dma_advance_stream(DmMc02Dma *s, unsigned stream,
             if (cr & DMA_CR_PINC) {
                 uint32_t par = dm_mc02_dma_load(s->regs,
                                                  base + DMA_SxPAR, 4);
-                dm_mc02_dma_store(s->regs, base + DMA_SxPAR,
-                                  par + peripheral_width, 4);
+                dm_mc02_dma_store_par(s, stream, cr, par + peripheral_width);
             }
             ndtr--;
             dm_mc02_dma_store(s->regs, base + DMA_SxNDTR, ndtr, 4);
@@ -1386,8 +1480,8 @@ bool dm_mc02_dma_advance_stream(DmMc02Dma *s, unsigned stream,
 
         if (cr & DMA_CR_PINC) {
             uint32_t par = dm_mc02_dma_load(s->regs, base + DMA_SxPAR, 4);
-            dm_mc02_dma_store(s->regs, base + DMA_SxPAR,
-                              par + count * peripheral_width, 4);
+            dm_mc02_dma_store_par(s, stream, cr,
+                                   par + count * peripheral_width);
         }
         if (cr & DMA_CR_MINC) {
             hwaddr maddr = dm_mc02_dma_active_m0ar(s, stream, cr);
@@ -1429,7 +1523,8 @@ static void dm_mc02_dma_maybe_run(DmMc02Dma *s, hwaddr offset)
     }
 }
 
-static uint64_t dm_mc02_dma_read(void *opaque, hwaddr offset, unsigned size)
+static uint64_t dm_mc02_dma_read_registers(void *opaque, hwaddr offset,
+                                            unsigned size)
 {
     DmMc02Dma *s = opaque;
     uint32_t value;
@@ -1452,8 +1547,8 @@ static uint64_t dm_mc02_dma_read(void *opaque, hwaddr offset, unsigned size)
     return value;
 }
 
-static void dm_mc02_dma_write(void *opaque, hwaddr offset, uint64_t value,
-                              unsigned size)
+static void dm_mc02_dma_write_registers(void *opaque, hwaddr offset,
+                                        uint64_t value, unsigned size)
 {
     DmMc02Dma *s = opaque;
     uint32_t old_cr = 0;
@@ -1609,6 +1704,30 @@ static void dm_mc02_dma_write(void *opaque, hwaddr offset, uint64_t value,
     }
 }
 
+static uint64_t dm_mc02_dma_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DmMc02Dma *s = opaque;
+
+    if (s->before_access) {
+        s->before_access(s->mmio_hook_opaque);
+    }
+    return dm_mc02_dma_read_registers(s, offset, size);
+}
+
+static void dm_mc02_dma_write(void *opaque, hwaddr offset, uint64_t value,
+                              unsigned size)
+{
+    DmMc02Dma *s = opaque;
+
+    if (s->before_access) {
+        s->before_access(s->mmio_hook_opaque);
+    }
+    dm_mc02_dma_write_registers(s, offset, value, size);
+    if (s->after_write) {
+        s->after_write(s->mmio_hook_opaque);
+    }
+}
+
 static const MemoryRegionOps dm_mc02_dma_ops = {
     .read = dm_mc02_dma_read,
     .write = dm_mc02_dma_write,
@@ -1617,8 +1736,8 @@ static const MemoryRegionOps dm_mc02_dma_ops = {
     .valid.max_access_size = 4,
 };
 
-static uint64_t dm_mc02_dmamux_read(void *opaque, hwaddr offset,
-                                    unsigned size)
+static uint64_t dm_mc02_dmamux_read_registers(void *opaque, hwaddr offset,
+                                             unsigned size)
 {
     DmMc02Dmamux *s = opaque;
 
@@ -1628,8 +1747,8 @@ static uint64_t dm_mc02_dmamux_read(void *opaque, hwaddr offset,
     return dm_mc02_dma_load(s->regs, offset, size);
 }
 
-static void dm_mc02_dmamux_write(void *opaque, hwaddr offset, uint64_t value,
-                                 unsigned size)
+static void dm_mc02_dmamux_write_registers(void *opaque, hwaddr offset,
+                                          uint64_t value, unsigned size)
 {
     DmMc02Dmamux *s = opaque;
 
@@ -1638,6 +1757,30 @@ static void dm_mc02_dmamux_write(void *opaque, hwaddr offset, uint64_t value,
     }
     dm_mc02_dma_store(s->regs, offset, value, size);
     s->generation++;
+}
+
+static uint64_t dm_mc02_dmamux_read(void *opaque, hwaddr offset, unsigned size)
+{
+    DmMc02Dmamux *s = opaque;
+
+    if (s->before_access) {
+        s->before_access(s->mmio_hook_opaque);
+    }
+    return dm_mc02_dmamux_read_registers(s, offset, size);
+}
+
+static void dm_mc02_dmamux_write(void *opaque, hwaddr offset, uint64_t value,
+                                 unsigned size)
+{
+    DmMc02Dmamux *s = opaque;
+
+    if (s->before_access) {
+        s->before_access(s->mmio_hook_opaque);
+    }
+    dm_mc02_dmamux_write_registers(s, offset, value, size);
+    if (s->after_write) {
+        s->after_write(s->mmio_hook_opaque);
+    }
 }
 
 static const MemoryRegionOps dm_mc02_dmamux_ops = {
@@ -1672,11 +1815,14 @@ void dm_mc02_dma_reset(DmMc02Dma *s)
     memset(s->cursor_m1ar, 0, sizeof(s->cursor_m1ar));
     memset(s->request_stream_mask, 0, sizeof(s->request_stream_mask));
     memset(s->request_cache_seen, 0, sizeof(s->request_cache_seen));
+    memset(s->request_cache_has_endpoint, 0,
+           sizeof(s->request_cache_has_endpoint));
     memset(s->request_cache_peripheral_addr, 0,
            sizeof(s->request_cache_peripheral_addr));
     memset(s->stream_irq_level, 0, sizeof(s->stream_irq_level));
     memset(s->stream_irq_level_valid, 0,
            sizeof(s->stream_irq_level_valid));
+    s->request_cache_dmamux = NULL;
     s->request_cache_generation = 0;
     s->request_cache_valid = false;
     dm_mc02_dma_update_irqs(s);
@@ -1716,8 +1862,11 @@ void dm_mc02_dma_sync_runtime(DmMc02Dma *s)
      * destination wiring and DMAMUX generation. */
     memset(s->request_stream_mask, 0, sizeof(s->request_stream_mask));
     memset(s->request_cache_seen, 0, sizeof(s->request_cache_seen));
+    memset(s->request_cache_has_endpoint, 0,
+           sizeof(s->request_cache_has_endpoint));
     memset(s->request_cache_peripheral_addr, 0,
            sizeof(s->request_cache_peripheral_addr));
+    s->request_cache_dmamux = NULL;
     s->request_cache_generation = 0;
     s->request_cache_valid = false;
 
@@ -1743,6 +1892,29 @@ void dm_mc02_dma_set_stream_enabled_callback(DmMc02Dma *state,
 {
     state->stream_enabled = callback;
     state->stream_enabled_opaque = opaque;
+}
+
+void dm_mc02_dma_set_event_time(DmMc02Dma *state, DmMc02EventTime *context)
+{
+    state->event_time = context;
+}
+
+void dm_mc02_dma_set_mmio_hooks(DmMc02Dma *state,
+                                DmMc02DmaMmioHook *before_access,
+                                DmMc02DmaMmioHook *after_write, void *opaque)
+{
+    state->before_access = before_access;
+    state->after_write = after_write;
+    state->mmio_hook_opaque = opaque;
+}
+
+void dm_mc02_dmamux_set_mmio_hooks(DmMc02Dmamux *state,
+                                   DmMc02DmaMmioHook *before_access,
+                                   DmMc02DmaMmioHook *after_write, void *opaque)
+{
+    state->before_access = before_access;
+    state->after_write = after_write;
+    state->mmio_hook_opaque = opaque;
 }
 
 void dm_mc02_dma_set_dmamux_channel_offset(DmMc02Dma *state,

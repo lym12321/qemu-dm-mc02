@@ -103,15 +103,200 @@ static void tcp_chr_accept(QIONetListener *listener,
 static int tcp_chr_read_poll(void *opaque);
 static void tcp_chr_disconnect_locked(Chardev *chr);
 
+#define TCP_WRITE_BUFFER_SIZE (16 * 1024)
+#define TCP_WRITE_BUFFER_DELAY_MS 1
+
+static gboolean tcp_chr_write_buffer_ready(void *opaque);
+
+typedef struct TCPWriteWatch {
+    GSource parent;
+    /* Only the dispatching thread mutates this after source publication. */
+    GSource *child;
+} TCPWriteWatch;
+
+/* All buffered-output state and sources use chr_write_lock. */
+static void tcp_chr_write_source_clear(GSource **source)
+{
+    if (*source) {
+        g_source_destroy(*source);
+        g_source_unref(*source);
+        *source = NULL;
+    }
+}
+
+static gboolean tcp_chr_write_child_ready(QIOChannel *ioc,
+                                          GIOCondition cond, void *opaque)
+{
+    return G_SOURCE_CONTINUE;
+}
+
+static void tcp_chr_write_watch_arm(GSource *source, QIOChannel *ioc)
+{
+    TCPWriteWatch *watch = (TCPWriteWatch *)source;
+
+    g_source_set_ready_time(source, -1);
+    if (!watch->child) {
+        watch->child = qio_channel_create_watch(
+            ioc, G_IO_OUT | G_IO_HUP | G_IO_ERR);
+        g_source_set_callback(watch->child,
+                              (GSourceFunc)tcp_chr_write_child_ready, NULL, NULL);
+        g_source_add_child_source(source, watch->child);
+        /* Keep our own reference: destruction from another thread may remove
+         * the child while this source is deferring a contended dispatch. */
+    }
+}
+
+static gboolean tcp_chr_write_watch_dispatch(GSource *source,
+                                             GSourceFunc callback,
+                                             void *opaque)
+{
+    return callback(opaque);
+}
+
+static void tcp_chr_write_watch_finalize(GSource *source)
+{
+    TCPWriteWatch *watch = (TCPWriteWatch *)source;
+
+    tcp_chr_write_source_clear(&watch->child);
+}
+
+static GSourceFuncs tcp_chr_write_watch_funcs = {
+    .dispatch = tcp_chr_write_watch_dispatch,
+    .finalize = tcp_chr_write_watch_finalize,
+};
+
+static void tcp_chr_write_buffer_wait(SocketChardev *s)
+{
+    Chardev *chr = CHARDEV(s);
+
+    if (!s->write_watch) {
+        s->write_watch = g_source_new(&tcp_chr_write_watch_funcs,
+                                      sizeof(TCPWriteWatch));
+        tcp_chr_write_watch_arm(s->write_watch, s->ioc);
+        g_source_set_callback(s->write_watch, tcp_chr_write_buffer_ready,
+                              s, NULL);
+        g_source_attach(s->write_watch, chr->gcontext);
+    }
+}
+
+static void tcp_chr_write_buffer_flush(SocketChardev *s)
+{
+    tcp_chr_write_source_clear(&s->write_timer);
+    while (s->write_len) {
+        size_t contiguous = MIN(s->write_len,
+                                TCP_WRITE_BUFFER_SIZE - s->write_head);
+        ssize_t written = qio_channel_write(s->ioc,
+                                            (char *)s->write_buf + s->write_head,
+                                            contiguous, NULL);
+
+        if (written == QIO_CHANNEL_ERR_BLOCK) {
+            tcp_chr_write_buffer_wait(s);
+            return;
+        }
+        if (written <= 0) {
+            tcp_chr_disconnect_locked(CHARDEV(s));
+            return;
+        }
+        s->write_head = (s->write_head + written) % TCP_WRITE_BUFFER_SIZE;
+        s->write_len -= written;
+    }
+    s->write_head = 0;
+    tcp_chr_write_source_clear(&s->write_watch);
+}
+
+static gboolean tcp_chr_write_buffer_ready(void *opaque)
+{
+    SocketChardev *s = opaque;
+    Chardev *chr = CHARDEV(s);
+    GSource *source = g_main_current_source();
+    TCPWriteWatch *watch = (TCPWriteWatch *)source;
+    bool pending = false;
+
+    if (qemu_mutex_trylock(&chr->chr_write_lock)) {
+        /* write_all may yield a coroutine while retaining this mutex. Never
+         * block its event loop or spin on an always-writable socket. Only
+         * this source's private state is touched without chr_write_lock. */
+        tcp_chr_write_source_clear(&watch->child);
+        g_source_set_ready_time(source, g_get_monotonic_time() +
+                                TCP_WRITE_BUFFER_DELAY_MS * 1000);
+        return G_SOURCE_CONTINUE;
+    }
+    /* A context change may have replaced a source waiting for this lock. */
+    if (source == s->write_watch) {
+        tcp_chr_write_watch_arm(source, s->ioc);
+        tcp_chr_write_buffer_flush(s);
+        pending = s->write_watch != NULL;
+    }
+    qemu_mutex_unlock(&chr->chr_write_lock);
+    return pending;
+}
+
+static gboolean tcp_chr_write_buffer_timeout(void *opaque)
+{
+    SocketChardev *s = opaque;
+    Chardev *chr = CHARDEV(s);
+
+    if (qemu_mutex_trylock(&chr->chr_write_lock)) {
+        /* A continuing timeout retries after 1 ms without blocking the loop. */
+        return G_SOURCE_CONTINUE;
+    }
+    if (g_main_current_source() == s->write_timer) {
+        tcp_chr_write_buffer_flush(s);
+    }
+    qemu_mutex_unlock(&chr->chr_write_lock);
+    return G_SOURCE_REMOVE;
+}
+
+static void tcp_chr_write_buffer_schedule(SocketChardev *s)
+{
+    if (!s->write_timer && !s->write_watch) {
+        s->write_timer = qemu_chr_timeout_add_ms(
+            CHARDEV(s), TCP_WRITE_BUFFER_DELAY_MS,
+            tcp_chr_write_buffer_timeout, s);
+        g_source_set_name(s->write_timer, "chardev-socket-write-buffer");
+    }
+}
+
+static int tcp_chr_write_buffered(SocketChardev *s,
+                                  const uint8_t *buf, int len)
+{
+    size_t accepted, tail, contiguous;
+
+    if (s->write_len == TCP_WRITE_BUFFER_SIZE) {
+        /* Also lets synchronous write_all callers make forward progress. */
+        tcp_chr_write_buffer_flush(s);
+        if (s->state != TCP_CHARDEV_STATE_CONNECTED) {
+            errno = EIO;
+            return -1;
+        }
+    }
+    accepted = MIN((size_t)len, TCP_WRITE_BUFFER_SIZE - s->write_len);
+    if (!accepted) {
+        errno = EAGAIN;
+        return -1;
+    }
+    tail = (s->write_head + s->write_len) % TCP_WRITE_BUFFER_SIZE;
+    contiguous = MIN(accepted, TCP_WRITE_BUFFER_SIZE - tail);
+    memcpy(s->write_buf + tail, buf, contiguous);
+    memcpy(s->write_buf, buf + contiguous, accepted - contiguous);
+    s->write_len += accepted;
+    tcp_chr_write_buffer_schedule(s);
+    return accepted;
+}
+
 /* Called with chr_write_lock held.  */
 static int tcp_chr_write(Chardev *chr, const uint8_t *buf, int len)
 {
     SocketChardev *s = SOCKET_CHARDEV(chr);
 
     if (s->state == TCP_CHARDEV_STATE_CONNECTED) {
-        int ret =  io_channel_send_full(s->ioc, buf, len,
-                                        s->write_msgfds,
-                                        s->write_msgfds_num);
+        int ret;
+
+        if (s->write_buffer) {
+            return tcp_chr_write_buffered(s, buf, len);
+        }
+        ret = io_channel_send_full(s->ioc, buf, len,
+                                    s->write_msgfds, s->write_msgfds_num);
 
         /* free the written msgfds in any cases
          * other than ret < 0 && errno == EAGAIN
@@ -358,6 +543,11 @@ static void tcp_chr_free_connection(Chardev *chr)
     SocketChardev *s = SOCKET_CHARDEV(chr);
     int i;
 
+    tcp_chr_write_source_clear(&s->write_timer);
+    tcp_chr_write_source_clear(&s->write_watch);
+    /* A fresh peer must never receive an old connection's pending suffix. */
+    s->write_head = s->write_len = 0;
+
     if (s->read_msgfds_num) {
         for (i = 0; i < s->read_msgfds_num; i++) {
             close(s->read_msgfds[i]);
@@ -527,6 +717,17 @@ static int tcp_chr_sync_read(Chardev *chr, const uint8_t *buf, int len)
     int size;
     int saved_errno;
 
+    if (s->write_buffer) {
+        qemu_mutex_lock(&chr->chr_write_lock);
+        tcp_chr_write_buffer_flush(s);
+        if (s->write_len) {
+            qemu_mutex_unlock(&chr->chr_write_lock);
+            errno = EAGAIN;
+            return -1;
+        }
+        qemu_mutex_unlock(&chr->chr_write_lock);
+    }
+
     if (s->state != TCP_CHARDEV_STATE_CONNECTED) {
         return 0;
     }
@@ -627,6 +828,23 @@ static void tcp_chr_telnet_destroy(SocketChardev *s)
 static void tcp_chr_update_read_handler(Chardev *chr)
 {
     SocketChardev *s = SOCKET_CHARDEV(chr);
+
+    /* CLOSED is emitted with chr_write_lock held. Its handler may reconfigure
+     * the frontend; all output sources are already gone in that state. */
+    if (s->write_buffer && s->state == TCP_CHARDEV_STATE_CONNECTED) {
+        qemu_mutex_lock(&chr->chr_write_lock);
+        if (s->write_timer) {
+            int64_t deadline = g_source_get_ready_time(s->write_timer);
+
+            tcp_chr_write_source_clear(&s->write_timer);
+            tcp_chr_write_buffer_schedule(s);
+            g_source_set_ready_time(s->write_timer, deadline);
+        } else if (s->write_watch) {
+            tcp_chr_write_source_clear(&s->write_watch);
+            tcp_chr_write_buffer_wait(s);
+        }
+        qemu_mutex_unlock(&chr->chr_write_lock);
+    }
 
     if (s->listener && s->state == TCP_CHARDEV_STATE_DISCONNECTED) {
         /*
@@ -1066,6 +1284,7 @@ static void char_socket_finalize(Object *obj)
 
     tcp_chr_free_connection(chr);
     tcp_chr_reconn_timer_cancel(s);
+    g_free(s->write_buf);
     qapi_free_SocketAddress(s->addr);
     tcp_chr_telnet_destroy(s);
     g_free(s->telnet_init);
@@ -1251,6 +1470,15 @@ static bool qmp_chardev_validate_socket(ChardevSocket *sock,
                                         SocketAddress *addr,
                                         Error **errp)
 {
+    if (sock->has_write_buffer && sock->write_buffer &&
+        (addr->type != SOCKET_ADDRESS_TYPE_INET || sock->tls_creds ||
+         (sock->has_telnet && sock->telnet) ||
+         (sock->has_tn3270 && sock->tn3270) ||
+         (sock->has_websocket && sock->websocket))) {
+        error_setg(errp, "'write-buffer' requires a plain TCP socket");
+        return false;
+    }
+
     /* Validate any options which have a dependency on address type */
     switch (addr->type) {
     case SOCKET_ADDRESS_TYPE_FD:
@@ -1344,6 +1572,7 @@ static void qmp_chardev_open_socket(Chardev *chr,
     s->is_tn3270 = is_tn3270;
     s->is_websock = is_websock;
     s->do_nodelay = do_nodelay;
+    s->write_buffer = sock->has_write_buffer && sock->write_buffer;
     if (sock->tls_creds) {
         Object *creds;
         creds = object_resolve_path_component(
@@ -1376,6 +1605,9 @@ static void qmp_chardev_open_socket(Chardev *chr,
 
     if (!qmp_chardev_validate_socket(sock, addr, errp)) {
         return;
+    }
+    if (s->write_buffer) {
+        s->write_buf = g_malloc(TCP_WRITE_BUFFER_SIZE);
     }
 
     qemu_chr_set_feature(chr, QEMU_CHAR_FEATURE_RECONNECTABLE);
@@ -1453,6 +1685,8 @@ static void qemu_chr_parse_socket(QemuOpts *opts, ChardevBackend *backend,
     sock->nodelay =
         !qemu_opt_get_bool(opts, "delay", true) ||
         qemu_opt_get_bool(opts, "nodelay", false);
+    sock->has_write_buffer = qemu_opt_get(opts, "write-buffer");
+    sock->write_buffer = qemu_opt_get_bool(opts, "write-buffer", false);
 
     /*
      * We have different default to QMP for 'server', hence

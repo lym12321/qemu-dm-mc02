@@ -1172,7 +1172,9 @@ void dm_mc02_uart_sync_runtime(DmMc02Uart *s)
 
 void dm_mc02_uart_set_powered(DmMc02Uart *s, bool powered)
 {
-    if (!s) {
+    /* Board GPIO updates can reapply the same shared rail on unrelated pin
+     * changes. Only a rail transition changes UART queues or RX capacity. */
+    if (!s || s->transceiver_powered == powered) {
         return;
     }
     s->transceiver_powered = powered;

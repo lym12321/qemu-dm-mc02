@@ -50,33 +50,49 @@
 #define EXECUTION_SENTINEL    0xa55a5aa5u
 #define EXECUTION_ICOUNT      "shift=0,align=off,sleep=off"
 
-static QTestState *execution_start_image(const char *machine,
-                                         const uint8_t *image, size_t size,
-                                         const char *extra_args)
+static QTestState *execution_start_image_with_icount(const char *machine,
+                                                     const uint8_t *image,
+                                                     size_t size,
+                                                     const char *icount,
+                                                     const char *extra_args)
 {
     g_autofree char *path = NULL;
     g_autofree char *quoted_path = NULL;
     QTestState *qts;
     int fd;
 
-    fd = g_file_open_tmp("dm-qemu.vtime-XXXXXX", &path, NULL);
+    fd = g_file_open_tmp("dm-qemu.vtime image-XXXXXX", &path, NULL);
     g_assert_cmpint(fd, >=, 0);
     g_assert_cmpint(write(fd, image, size), ==, size);
     g_assert_cmpint(close(fd), ==, 0);
+#ifdef _WIN32
+    /* libqtest uses CreateProcess, which does not interpret shell quotes. */
+    quoted_path = g_strdup_printf("\"%s\"", path);
+#else
     quoted_path = g_shell_quote(path);
+#endif
     qts = qtest_initf("-machine %s -nodefaults -accel tcg,thread=single "
-                      "-S -icount " EXECUTION_ICOUNT " -kernel %s %s",
-                      machine, quoted_path, extra_args ?: "");
+                      "-S -icount %s -kernel %s %s",
+                      machine, icount, quoted_path, extra_args ?: "");
     g_assert_cmpint(g_unlink(path), ==, 0);
     return qts;
+}
+
+static QTestState *execution_start_image(const char *machine,
+                                         const uint8_t *image, size_t size,
+                                         const char *extra_args)
+{
+    return execution_start_image_with_icount(machine, image, size,
+                                              EXECUTION_ICOUNT, extra_args);
 }
 
 /*
  * These native TCG cases use the qtest memory channel, never its dummy CPU or
  * clock_step. Upstream libqtest appends -accel qtest as a fallback; the
- * explicit first TCG accelerator must execute this guest. Fixed shift=0 is
- * one ns per
- * instruction, not a Cortex-M cycle timing claim (docs/devel/tcg-icount.rst).
+ * explicit first TCG accelerator must execute this guest. Accelerator setup
+ * stops at the first successful -accel, and rejects icount if TCG is not the
+ * selected accelerator. Fixed shift=0 is one ns per instruction, not a
+ * Cortex-M cycle timing claim (docs/devel/tcg-icount.rst).
  *
  * The literals below are independent Thumb instructions and Cortex-M vectors:
  * busy: ldr r0, counter; movs r1, #0; str r1, [r0]; then four-instruction
@@ -328,6 +344,8 @@ static void test_execution_reject_profiles(void)
         "-machine dm-mc02 -S -accel tcg,thread=single "
             "-icount shift=1,align=off,sleep=off",
         "-machine dm-mc02 -S -accel tcg,thread=single "
+            "-icount ns-per-insn=20,align=off,sleep=off",
+        "-machine dm-mc02 -S -accel tcg,thread=single "
             "-icount shift=0,align=off,sleep=on",
         "-machine dm-mc02 -S -accel tcg,thread=single "
             "-icount shift=0,align=on,sleep=on",
@@ -365,6 +383,214 @@ static void test_execution_reject_profiles(void)
         qobject_unref(before);
         qtest_quit(qts);
     }
+}
+
+static void test_icount_ns_per_insn(void)
+{
+    static const unsigned scales[] = { 1, 20, 1024 };
+    uint8_t image[0x14c] = { 0 };
+
+    /*
+     * Two native SysTick current-value reads separated by 125 instructions.
+     * With an 8 MHz SysTick clock, their difference is exactly scale ticks.
+     * The sample is taken by the guest; host polling only retrieves its RAM.
+     */
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    for (unsigned i = 0; i < 130; i++) {
+        stw_le_p(image + 0x40 + 2 * i, 0xbf00); /* nop */
+    }
+    stw_le_p(image + 0x40, 0x4840); /* ldr r0, [pc, #256] -> 0x144 */
+    stw_le_p(image + 0x42, 0x4941); /* ldr r1, [pc, #260] -> 0x148 */
+    stw_le_p(image + 0x44, 0x6802); /* instruction 2: ldr r2, [r0] */
+    stw_le_p(image + 0x46, 0x600a); /* str r2, [r1] */
+    stw_le_p(image + 0x13e, 0x6802); /* instruction 127: ldr r2, [r0] */
+    stw_le_p(image + 0x140, 0x604a); /* str r2, [r1, #4] */
+    stw_le_p(image + 0x142, 0xe7fe); /* b . */
+    stl_le_p(image + 0x144, SYST_CVR);
+    stl_le_p(image + 0x148, EXECUTION_COUNTER);
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(scales); i++) {
+        g_autofree char *icount = g_strdup_printf(
+            "ns-per-insn=%u,align=off,sleep=off", scales[i]);
+        QTestState *qts = execution_start_image_with_icount(
+            "dm-mc02", image, sizeof(image), icount, NULL);
+        int64_t deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+        uint32_t first, second;
+
+        qtest_writel(qts, EXECUTION_COUNTER, EXECUTION_SENTINEL);
+        qtest_writel(qts, EXECUTION_COUNTER + 4, EXECUTION_SENTINEL);
+        qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8); /* 64 MHz / 8 */
+        qtest_writel(qts, SYST_RVR, 0xffffff);
+        qtest_writel(qts, SYST_CVR, 0);
+        qtest_writel(qts, SYST_CSR, SYST_CSR_ENABLE | SYST_CSR_CLKSOURCE);
+        if (scales[i] == 1) {
+            /* The alias retains exact 1 ns execution, including odd targets. */
+            execution_run_to(qts, 128);
+            g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER + 4), ==,
+                            EXECUTION_SENTINEL);
+            execution_run_to(qts, 129);
+        } else {
+            qtest_qmp_assert_success(qts, "{'execute':'cont'}");
+            while (qtest_readl(qts, EXECUTION_COUNTER + 4) ==
+                   EXECUTION_SENTINEL) {
+                g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+            }
+            qtest_qmp_assert_success(qts, "{'execute':'stop'}");
+        }
+        first = qtest_readl(qts, EXECUTION_COUNTER);
+        second = qtest_readl(qts, EXECUTION_COUNTER + 4);
+        g_assert_cmphex(first, <=, 0xffffff);
+        g_assert_cmphex(second, <=, 0xffffff);
+        if (scales[i] == 1) {
+            /* CVR stays zero until the first 125 ns tick loads RELOAD. */
+            g_assert_cmphex(first, ==, 0);
+            g_assert_cmphex(second, ==, 0xffffff);
+        }
+        /* SysTick wraps at RELOAD + 1, not at the host uint32_t width. */
+        g_assert_cmpuint((first - second) & 0xffffff, ==, scales[i]);
+        qtest_quit(qts);
+    }
+}
+
+static void check_icount_invalid(const char *option, const char *message)
+{
+    g_autofree char *dump_path = NULL;
+    g_autofree char *err = NULL;
+    int status, fd = g_file_open_tmp("dm-qemu.icount-XXXXXX", &dump_path, NULL);
+    const char *argv[] = {
+        g_getenv("QTEST_QEMU_BINARY"), "-machine", "none", "-display", "none",
+        "-accel", "tcg,thread=single", "-icount", option,
+        "-dump-vmstate", dump_path, NULL,
+    };
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(close(fd), ==, 0);
+    /* Also exit after configuration if an invalid option is accepted. */
+    g_assert_true(g_spawn_sync(NULL, (char **)argv, NULL, 0, NULL, NULL,
+                               NULL, &err, &status, NULL));
+    g_assert_cmpint(status, !=, 0);
+    g_assert_nonnull(strstr(err, message));
+    g_assert_cmpint(g_unlink(dump_path), ==, 0);
+}
+
+static void test_icount_invalid_options(void)
+{
+    static const char *values[] = {
+        "", "0", "-1", "1025", "1.5", "20junk", "auto",
+        "18446744073709551616",
+    };
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(values); i++) {
+        g_autofree char *option = g_strdup_printf("ns-per-insn=%s", values[i]);
+
+        check_icount_invalid(option, "ns-per-insn must be an integer");
+    }
+    check_icount_invalid("shift=4,ns-per-insn=20", "mutually exclusive");
+    check_icount_invalid("shift=auto,ns-per-insn=20", "mutually exclusive");
+    check_icount_invalid("ns-per-insn=20,align=on,sleep=off", "incompatible");
+    check_icount_invalid("shift=auto,align=on",
+                         "shift=auto and align=on are incompatible");
+    check_icount_invalid("shift=auto,sleep=off",
+                         "shift=auto and sleep=off are incompatible");
+}
+
+static void test_icount_replay_rejected(void)
+{
+    g_autofree char *path = NULL;
+    g_autofree char *contents = NULL;
+    int fd = g_file_open_tmp("dm-qemu.replay-XXXXXX", &path, NULL);
+    const char *modes[] = { "record", "replay" };
+
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(close(fd), ==, 0);
+    g_assert_true(g_file_set_contents(path, "existing replay log", -1, NULL));
+    for (unsigned i = 0; i < G_N_ELEMENTS(modes); i++) {
+        g_autofree char *option = g_strdup_printf(
+            "ns-per-insn=20,rr=%s,rrfile=%s", modes[i], path);
+
+        check_icount_invalid(option, "does not support record/replay");
+    }
+    g_assert_true(g_file_get_contents(path, &contents, NULL, NULL));
+    g_assert_cmpstr(contents, ==, "existing replay log");
+    g_assert_cmpint(g_unlink(path), ==, 0);
+}
+
+typedef struct IcountMigrationCase {
+    const char *name;
+    const char *source;
+    const char *destination;
+    const char *error;
+} IcountMigrationCase;
+
+static void icount_wait_migration(QTestState *qts)
+{
+    int64_t deadline = g_get_monotonic_time() + 10 * G_TIME_SPAN_SECOND;
+
+    for (;;) {
+        QDict *reply = qtest_qmp(qts, "{'execute':'query-migrate'}");
+        QDict *result = qdict_get_qdict(reply, "return");
+        const char *status = qdict_get_try_str(result, "status");
+        bool completed = g_strcmp0(status, "completed") == 0;
+
+        g_assert_cmpstr(status, !=, "failed");
+        qobject_unref(reply);
+        if (completed) {
+            return;
+        }
+        g_assert_cmpint(g_get_monotonic_time(), <, deadline);
+    }
+}
+
+static void test_icount_migration(gconstpointer opaque)
+{
+    const IcountMigrationCase *test = opaque;
+    g_autofree char *path = NULL;
+    g_autofree char *uri = NULL;
+    QTestState *qts;
+    int fd;
+
+    if (test->error && !g_test_subprocess()) {
+        g_autofree char *pattern = g_strdup_printf("*%s*", test->error);
+
+        g_test_trap_subprocess(NULL, 20 * G_USEC_PER_SEC, 0);
+        g_test_trap_assert_passed();
+        g_test_trap_assert_stderr(pattern);
+        return;
+    }
+
+    fd = g_file_open_tmp("dm-qemu.icount migration-XXXXXX", &path, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    g_assert_cmpint(close(fd), ==, 0);
+    /* QMP's %s encodes the URI as JSON, including spaces and backslashes. */
+    uri = g_strdup_printf("file:%s", path);
+    qts = qtest_initf("-machine mps2-an500 -nodefaults -accel tcg,thread=single "
+                      "-S %s", test->source);
+    qtest_writel(qts, EXECUTION_COUNTER, EXECUTION_SENTINEL);
+    /* Exercise Windows text-mode newline translation and EOF handling. */
+    qtest_writel(qts, EXECUTION_COUNTER + 4, 0x1a0d0a00);
+    qtest_qmp_assert_success(qts, "{'execute':'migrate',"
+                            "'arguments':{'uri':%s}}", uri);
+    icount_wait_migration(qts);
+    qtest_quit(qts);
+
+    qts = qtest_initf("-machine mps2-an500 -nodefaults -accel tcg,thread=single "
+                      "-S -incoming defer %s", test->destination);
+    if (test->error) {
+        qtest_set_expected_status(qts, EXIT_FAILURE);
+        qtest_qmp_send(qts, "{'execute':'migrate-incoming',"
+                       "'arguments':{'uri':%s}}", uri);
+        qtest_wait_qemu(qts);
+    } else {
+        qtest_qmp_assert_success(qts, "{'execute':'migrate-incoming',"
+                                "'arguments':{'uri':%s}}", uri);
+        icount_wait_migration(qts);
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==,
+                        EXECUTION_SENTINEL);
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER + 4), ==, 0x1a0d0a00);
+    }
+    qtest_quit(qts);
+    g_assert_cmpint(g_unlink(path), ==, 0);
 }
 
 static void test_execution_reject_targets(void)
@@ -521,6 +747,114 @@ static void test_execution_mmio_read_clear(void)
     }
 }
 
+static void test_execution_mmio_hot_read_clear(void)
+{
+    static const struct {
+        int64_t target;
+        uint32_t current, previous;
+    } cuts[] = {
+        { 1105, 5, 5 },             /* before the first hot CSR read */
+        { 1106, 5, 5 },             /* after read, before result store */
+        { 1107, 0x10005, 5 },
+        { 1110, 0x10005, 0x10005 }, /* before the next read at the same PC */
+        { 1111, 0x10005, 0x10005 }, /* after read, before result store */
+        { 1112, 5, 0x10005 },
+    };
+    uint8_t image[0x58] = { 0 };
+
+    /*
+     * Warm the same CSR load before starting SysTick. Reads execute at
+     * instruction 5 + 5*k, with the previous result saved one instruction
+     * before the read and the new result saved one instruction after it.
+     * At 102 ns, start an 8 MHz SysTick with RELOAD=7: COUNTFLAG is set at
+     * 1102 ns. The hot reads at 1105/1110 must observe set/clear exactly once.
+     */
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    stw_le_p(image + 0x40, 0x4803); /* 0: ldr r0, [pc, #12] -> 0x50 */
+    stw_le_p(image + 0x42, 0x4904); /* 1: ldr r1, [pc, #16] -> 0x54 */
+    stw_le_p(image + 0x44, 0x2200); /* 2: movs r2, #0 */
+    stw_le_p(image + 0x46, 0xbf00); /* 3: loop: nop */
+    stw_le_p(image + 0x48, 0x604a); /* 4: str r2, [r1, #4] */
+    stw_le_p(image + 0x4a, 0x6802); /* 5: ldr r2, [r0] */
+    stw_le_p(image + 0x4c, 0x600a); /* 6: str r2, [r1] */
+    stw_le_p(image + 0x4e, 0xe7fa); /* 7: b loop */
+    stl_le_p(image + 0x50, SYST_CSR);
+    stl_le_p(image + 0x54, EXECUTION_COUNTER);
+
+    for (unsigned split = 0; split < 2; split++) {
+        QTestState *qts = execution_start_image("dm-mc02", image,
+                                               sizeof(image), NULL);
+
+        g_test_message("Hot MMIO reads: %s execution",
+                       split ? "split" : "continuous");
+        qtest_writel(qts, SYST_CSR, SYST_CSR_CLKSOURCE);
+        execution_run_to(qts, 102);
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER), ==, 4);
+        g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER + 4), ==, 4);
+
+        qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8);
+        qtest_writel(qts, SYST_RVR, 7);
+        qtest_writel(qts, SYST_CVR, 0);
+        qtest_writel(qts, SYST_CSR, SYST_CSR_ENABLE | SYST_CSR_CLKSOURCE);
+        for (unsigned i = split ? 0 : G_N_ELEMENTS(cuts) - 1;
+             i < G_N_ELEMENTS(cuts); i++) {
+            execution_run_to(qts, cuts[i].target);
+            execution_assert_stable(qts, cuts[i].target, cuts[i].current);
+            /* Host reads only guest RAM, preserving CSR's read-clear effect. */
+            g_assert_cmphex(qtest_readl(qts, EXECUTION_COUNTER + 4), ==,
+                            cuts[i].previous);
+        }
+        qtest_quit(qts);
+    }
+}
+
+static void test_execution_mmio_dynamic_address_smc(void)
+{
+    const uint64_t code_addr = 0x20000100;
+    const uint64_t source_addr = 0x20000200;
+    const uint64_t result_addr = 0x20000204;
+    const uint64_t ram_addr = 0x20000208;
+    uint8_t image[8] = { 0 };
+    uint8_t code[0x20] = { 0 };
+    QTestState *qts;
+
+    /* The same LDR alternates between MMIO and RAM, then its code changes. */
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, code_addr | 1);
+    stw_le_p(code, 0x4805);        /* ldr r0, [pc, #20] -> 0x118 */
+    stw_le_p(code + 2, 0x4906);    /* ldr r1, [pc, #24] -> 0x11c */
+    stw_le_p(code + 4, 0x6802);    /* loop: ldr r2, [r0] */
+    stw_le_p(code + 6, 0x6813);    /* ldr r3, [r2] */
+    stw_le_p(code + 8, 0x600b);    /* str r3, [r1] */
+    stw_le_p(code + 10, 0xe7fb);   /* b loop */
+    stl_le_p(code + 0x18, source_addr);
+    stl_le_p(code + 0x1c, result_addr);
+
+    qts = execution_start_image("dm-mc02", image, sizeof(image), NULL);
+    qtest_memwrite(qts, code_addr, code, sizeof(code));
+    qtest_writel(qts, SYST_RVR, 0x123456);
+    qtest_writel(qts, ram_addr, 0xfeed1234);
+    qtest_writel(qts, source_addr, SYST_RVR);
+    execution_run_to(qts, 100);
+    g_assert_cmphex(qtest_readl(qts, result_addr), ==, 0x123456);
+
+    qtest_writel(qts, source_addr, ram_addr);
+    execution_run_to(qts, 200);
+    g_assert_cmphex(qtest_readl(qts, result_addr), ==, 0xfeed1234);
+    qtest_writel(qts, source_addr, SYST_RVR);
+    execution_run_to(qts, 300);
+    g_assert_cmphex(qtest_readl(qts, result_addr), ==, 0x123456);
+
+    qtest_writew(qts, code_addr + 6, 0x232a); /* movs r3, #42 */
+    execution_run_to(qts, 400);
+    g_assert_cmphex(qtest_readl(qts, result_addr), ==, 42);
+    qtest_writew(qts, code_addr + 6, 0x6813); /* restore ldr r3, [r2] */
+    execution_run_to(qts, 500);
+    g_assert_cmphex(qtest_readl(qts, result_addr), ==, 0x123456);
+    qtest_quit(qts);
+}
+
 static void test_execution_can_snapshot_compat(void)
 {
     QTestState *qts = execution_guest("dm-mc02", 0x08000000, false,
@@ -634,6 +968,76 @@ static void test_execution_wfi_systick(void)
     execution_assert_stable(qts, 1000, 1);
     execution_run_to(qts, 1009);
     execution_assert_stable(qts, 1009, 2);
+    qtest_quit(qts);
+}
+
+static void test_execution_masked_irq_wfi(void)
+{
+    uint8_t image[0x78] = { 0 };
+    QTestState *qts;
+    uint32_t loops;
+
+    stl_le_p(image, 0x20002000);
+    stl_le_p(image + 4, 0x08000041);
+    stl_le_p(image + 15 * 4, 0x08000061);
+
+    /*
+     * PRIMASK blocks handler entry, but a pending SysTick still wakes WFI.
+     * Count returns from WFI until the host releases the gate at counter+8.
+     */
+    stw_le_p(image + 0x40, 0xb672); /* cpsid i */
+    stw_le_p(image + 0x42, 0x480b); /* ldr r0, [pc, #44] -> 0x70 */
+    stw_le_p(image + 0x44, 0x2100); /* movs r1, #0 */
+    stw_le_p(image + 0x46, 0xbf30); /* wfi */
+    stw_le_p(image + 0x48, 0x3101); /* adds r1, #1 */
+    stw_le_p(image + 0x4a, 0x6001); /* str r1, [r0] */
+    stw_le_p(image + 0x4c, 0x6882); /* ldr r2, [r0, #8] */
+    stw_le_p(image + 0x4e, 0x2a00); /* cmp r2, #0 */
+    stw_le_p(image + 0x50, 0xd0f9); /* beq 0x46 */
+    stw_le_p(image + 0x52, 0xb662); /* cpsie i */
+    stw_le_p(image + 0x54, 0xe7fe); /* b 0x54 */
+
+    stw_le_p(image + 0x60, 0x4804); /* ldr r0, [pc, #16] -> 0x74 */
+    stw_le_p(image + 0x62, 0x6801); /* ldr r1, [r0] */
+    stw_le_p(image + 0x64, 0x3101); /* adds r1, #1 */
+    stw_le_p(image + 0x66, 0x6001); /* str r1, [r0] */
+    stw_le_p(image + 0x68, 0x4770); /* bx lr */
+    stl_le_p(image + 0x70, EXECUTION_COUNTER);
+    stl_le_p(image + 0x74, EXECUTION_COUNTER + 4);
+
+    qts = execution_start_image("dm-mc02", image, sizeof(image), NULL);
+    qtest_writel(qts, EXECUTION_COUNTER, 0);
+    qtest_writel(qts, EXECUTION_COUNTER + 4, 0);
+    qtest_writel(qts, EXECUTION_COUNTER + 8, 0);
+    qtest_writel(qts, RCC_BASE + 0x18, 0xau << 8); /* 8 MHz SysTick. */
+    qtest_writel(qts, SYST_RVR, 7); /* IRQs at 1000 ns, 2000 ns, ... */
+    qtest_writel(qts, SYST_CVR, 0);
+    qtest_writel(qts, SYST_CSR,
+                 SYST_CSR_ENABLE | SYST_CSR_TICKINT | SYST_CSR_CLKSOURCE);
+
+    execution_run_to(qts, 999);
+    execution_assert_stable(qts, 999, 0);
+    g_assert_cmpuint(qtest_readl(qts, EXECUTION_COUNTER + 4), ==, 0);
+    g_assert_false(qtest_readl(qts, SCB_ICSR) & SCB_ICSR_PENDSTSET);
+
+    execution_run_to(qts, 1000);
+    execution_assert_stable(qts, 1000, 0);
+    g_assert_true(qtest_readl(qts, SCB_ICSR) & SCB_ICSR_PENDSTSET);
+
+    execution_run_to(qts, 1050);
+    loops = qtest_readl(qts, EXECUTION_COUNTER);
+    g_assert_cmpuint(loops, >, 1);
+    execution_assert_stable(qts, 1050, loops);
+    g_assert_cmpuint(qtest_readl(qts, EXECUTION_COUNTER + 4), ==, 0);
+    g_assert_true(qtest_readl(qts, SCB_ICSR) & SCB_ICSR_PENDSTSET);
+
+    /* Deliver the original pending IRQ after unmasking, before the next tick. */
+    qtest_writel(qts, EXECUTION_COUNTER + 8, 1);
+    execution_run_to(qts, 1100);
+    loops = qtest_readl(qts, EXECUTION_COUNTER);
+    execution_assert_stable(qts, 1100, loops);
+    g_assert_cmpuint(qtest_readl(qts, EXECUTION_COUNTER + 4), ==, 1);
+    g_assert_false(qtest_readl(qts, SCB_ICSR) & SCB_ICSR_PENDSTSET);
     qtest_quit(qts);
 }
 
@@ -1990,6 +2394,86 @@ static void test_external_irq_and_systick_virtual_time(void)
     qtest_quit(qts);
 }
 
+static void nvic_pulse_external_irq(QTestState *qts, unsigned irq)
+{
+    qtest_set_irq_in(qts, "/machine/armv7m", NULL, irq, 1);
+    qtest_set_irq_in(qts, "/machine/armv7m", NULL, irq, 0);
+}
+
+static void nvic_assert_vectpending(QTestState *qts, unsigned exception)
+{
+    g_assert_cmpuint((qtest_readl(qts, SCB_ICSR) >> 12) & 0x1ff, ==, exception);
+}
+
+static void test_external_irq_arbitration(void)
+{
+    enum { IRQ_LOW = 3, IRQ_HIGH = 4, IRQ_DISABLED = 5 };
+    static const struct {
+        const char *name;
+        uint8_t low_prio, high_prio;
+        unsigned first_irq, expected_irq;
+    } cases[] = {
+        { "better subpriority arrives last", 0x60, 0x50, IRQ_LOW, IRQ_HIGH },
+        { "better subpriority arrives first", 0x60, 0x50, IRQ_HIGH, IRQ_HIGH },
+        { "equal priority, smaller IRQ arrives last",
+          0x50, 0x50, IRQ_HIGH, IRQ_LOW },
+        { "equal priority, smaller IRQ arrives first",
+          0x50, 0x50, IRQ_LOW, IRQ_LOW },
+    };
+    QTestState *qts = qtest_init("-machine dm-mc02");
+    uint32_t enabled_mask = (1u << IRQ_LOW) | (1u << IRQ_HIGH);
+    uint32_t disabled_mask = 1u << IRQ_DISABLED;
+
+    /*
+     * PRIGROUP=5 splits the four implemented priority bits into two group
+     * and two subpriority bits. Both 0x50 and 0x60 have group priority 0x40;
+     * arbitration must still prefer raw priority 0x50 over 0x60.
+     * The qtest accelerator leaves the CPU stopped, so it cannot acknowledge
+     * a winner between input edges and our architected register reads.
+     */
+    qtest_writel(qts, SCB_AIRCR, SCB_AIRCR_VECTKEY | (5u << 8));
+    g_assert_cmphex(qtest_readl(qts, SCB_AIRCR) & (7u << 8), ==, 5u << 8);
+    qtest_writel(qts, NVIC_ISER0, enabled_mask);
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(cases); i++) {
+        unsigned second_irq = cases[i].first_irq == IRQ_LOW ?
+                              IRQ_HIGH : IRQ_LOW;
+
+        g_test_message("NVIC arbitration: %s", cases[i].name);
+        qtest_writel(qts, NVIC_ICPR0, enabled_mask);
+        nvic_assert_vectpending(qts, 0);
+        qtest_writeb(qts, NVIC_IPR0 + IRQ_LOW, cases[i].low_prio);
+        qtest_writeb(qts, NVIC_IPR0 + IRQ_HIGH, cases[i].high_prio);
+
+        /* Input edges exercise set_pending; ISPR writes use another path. */
+        nvic_pulse_external_irq(qts, cases[i].first_irq);
+        nvic_assert_vectpending(qts, 16 + cases[i].first_irq);
+        nvic_pulse_external_irq(qts, second_irq);
+        g_assert_cmphex(qtest_readl(qts, NVIC_ISPR0) & enabled_mask, ==,
+                        enabled_mask);
+        nvic_assert_vectpending(qts, 16 + cases[i].expected_irq);
+    }
+
+    /* A higher-priority disabled IRQ latches pending without replacing the
+     * enabled winner. Enabling it must recompute from that pending state. */
+    qtest_writel(qts, NVIC_ICPR0, enabled_mask);
+    qtest_writeb(qts, NVIC_IPR0 + IRQ_DISABLED, 0x10);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISER0) & disabled_mask, ==, 0);
+    nvic_pulse_external_irq(qts, IRQ_HIGH);
+    nvic_assert_vectpending(qts, 16 + IRQ_HIGH);
+    nvic_pulse_external_irq(qts, IRQ_DISABLED);
+    g_assert_cmphex(qtest_readl(qts, NVIC_ISPR0) & disabled_mask, ==,
+                    disabled_mask);
+    nvic_assert_vectpending(qts, 16 + IRQ_HIGH);
+    qtest_writel(qts, NVIC_ISER0, disabled_mask);
+    nvic_assert_vectpending(qts, 16 + IRQ_DISABLED);
+    qtest_writel(qts, NVIC_ICER0, disabled_mask);
+    nvic_assert_vectpending(qts, 16 + IRQ_HIGH);
+    qtest_writel(qts, NVIC_ICPR0, enabled_mask | disabled_mask);
+    nvic_assert_vectpending(qts, 0);
+    qtest_quit(qts);
+}
+
 static void test_d1_clock_chain(void)
 {
     QTestState *qts = qtest_init("-machine dm-mc02");
@@ -2180,7 +2664,37 @@ static void test_external_nrst_latches_pin_reason(void)
 
 int main(int argc, char **argv)
 {
+    static const IcountMigrationCase migrations[] = {
+        { "matching-scale", "-icount ns-per-insn=20", "-icount ns-per-insn=20" },
+        { "changed-scale", "-icount ns-per-insn=20", "-icount ns-per-insn=21",
+          "icount ns-per-insn configuration differs" },
+        { "changed-sleep", "-icount ns-per-insn=20",
+          "-icount ns-per-insn=20,sleep=off",
+          "icount sleep/align configuration differs" },
+        { "changed-align", "-icount ns-per-insn=20",
+          "-icount ns-per-insn=20,align=on",
+          "icount sleep/align configuration differs" },
+        { "scale-to-shift", "-icount ns-per-insn=20", "-icount shift=4",
+          "icount ns-per-insn configuration differs" },
+        { "shift-to-scale", "-icount shift=4", "-icount ns-per-insn=20",
+          "snapshot has no ns-per-insn configuration" },
+        { "host-to-scale", "", "-icount ns-per-insn=20",
+          "snapshot has no ns-per-insn configuration" },
+        { "auto-to-scale", "-icount shift=auto", "-icount ns-per-insn=20",
+          "snapshot has no ns-per-insn configuration" },
+        { "legacy-shift", "-icount shift=4", "-icount shift=4" },
+    };
+
     g_test_init(&argc, &argv, NULL);
+    g_test_add_func("/dm-mc02/icount/ns-per-insn", test_icount_ns_per_insn);
+    g_test_add_func("/dm-mc02/icount/invalid-options", test_icount_invalid_options);
+    g_test_add_func("/dm-mc02/icount/replay-rejected", test_icount_replay_rejected);
+    for (unsigned i = 0; i < G_N_ELEMENTS(migrations); i++) {
+        g_autofree char *name = g_strdup_printf("/dm-mc02/icount/migration/%s",
+                                               migrations[i].name);
+
+        g_test_add_data_func(name, &migrations[i], test_icount_migration);
+    }
     g_test_add_func("/dm-mc02/virtual-execution/reject-profiles",
                     test_execution_reject_profiles);
     g_test_add_func("/dm-mc02/virtual-execution/reject-targets",
@@ -2189,10 +2703,16 @@ int main(int argc, char **argv)
                     test_execution_busy_guest);
     g_test_add_func("/dm-mc02/virtual-execution/mmio-read-clear",
                     test_execution_mmio_read_clear);
+    g_test_add_func("/dm-mc02/virtual-execution/mmio-hot-read-clear",
+                    test_execution_mmio_hot_read_clear);
+    g_test_add_func("/dm-mc02/virtual-execution/mmio-dynamic-address-smc",
+                    test_execution_mmio_dynamic_address_smc);
     g_test_add_func("/dm-mc02/virtual-execution/can-snapshot-compat",
                     test_execution_can_snapshot_compat);
     g_test_add_func("/dm-mc02/virtual-execution/wfi-systick",
                     test_execution_wfi_systick);
+    g_test_add_func("/dm-mc02/virtual-execution/masked-irq-wfi",
+                    test_execution_masked_irq_wfi);
     g_test_add_func("/dm-mc02/virtual-execution/cancel-reentry",
                     test_execution_cancel_and_reentry);
 #ifndef _WIN32
@@ -2213,6 +2733,8 @@ int main(int argc, char **argv)
                     test_armv7m_children_and_irq_width);
     g_test_add_func("/dm-mc02/armv7m/external-irq-and-systick-time",
                     test_external_irq_and_systick_virtual_time);
+    g_test_add_func("/dm-mc02/armv7m/external-irq-arbitration",
+                    test_external_irq_arbitration);
     g_test_add_func("/dm-mc02/armv7m/d1-clock-chain", test_d1_clock_chain);
     g_test_add_func("/dm-mc02/armv7m/gpio-exti-reaches-native-nvic",
                     test_gpio_exti_reaches_native_nvic);

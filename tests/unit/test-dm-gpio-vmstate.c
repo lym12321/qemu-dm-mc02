@@ -23,7 +23,12 @@ static QEMUFile *open_test_file(bool write)
     g_assert_cmpint(fd, >=, 0);
     g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
     if (write) {
+#ifdef _WIN32
+        /* This fixture does not link the block driver's ftruncate wrapper. */
+        g_assert_cmpint(_chsize_s(fd, 0), ==, 0);
+#else
         g_assert_cmpint(ftruncate(fd, 0), ==, 0);
+#endif
     }
     ioc = QIO_CHANNEL(qio_channel_file_new_fd(fd));
     file = write ? qemu_file_new_output(ioc) : qemu_file_new_input(ioc);
@@ -42,6 +47,11 @@ static void odr_changed(void *opaque, unsigned bank_index, uint32_t odr)
     (*count)++;
     callback_bank = bank_index;
     callback_odr = odr;
+}
+
+static void before_access(void *opaque)
+{
+    (*(int *)opaque)++;
 }
 
 static void save_state(const DmMc02GpioBank *state)
@@ -71,6 +81,7 @@ static void test_round_trip_restores_registers_and_notifies(void)
 {
     DmMc02GpioBank source;
     DmMc02GpioBank restored;
+    int access_count = 0;
 
     memset(&source, 0, sizeof(source));
     source.bank_index = 3;
@@ -91,6 +102,8 @@ static void test_round_trip_restores_registers_and_notifies(void)
     callback_odr = 0;
     restored.odr_changed = odr_changed;
     restored.odr_changed_opaque = &callback_count;
+    restored.before_access = before_access;
+    restored.before_access_opaque = &access_count;
 
     g_assert_cmpint(load_state(&restored), ==, 0);
     g_assert_cmpuint(restored.bank_index, ==, 11);
@@ -105,6 +118,9 @@ static void test_round_trip_restores_registers_and_notifies(void)
     g_assert_cmpint(callback_count, ==, 1);
     g_assert_cmpuint(callback_bank, ==, 11);
     g_assert_cmpuint(callback_odr, ==, source.odr);
+    g_assert_true(restored.before_access == before_access);
+    g_assert_true(restored.before_access_opaque == &access_count);
+    g_assert_cmpint(access_count, ==, 0);
 }
 
 static void test_rejects_truncated_state_without_notification(void)

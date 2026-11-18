@@ -98,7 +98,8 @@ void qmp_x_run_to_virtual_time(int64_t target_ns, Error **errp)
     if (qtest_enabled() || !icount_has_exact_ns_deadlines() ||
         !first_cpu || CPU_NEXT(first_cpu) || replay_mode != REPLAY_MODE_NONE) {
         error_setg(errp, "Virtual execution requires one STTCG CPU, "
-                   "icount shift=0,align=off,sleep=off and no replay");
+                   "icount shift=0 or ns-per-insn=1, "
+                   "align=off,sleep=off and no replay");
         return;
     }
     if (execution.state == VIRTUAL_EXECUTION_STATE_RUNNING ||

@@ -107,6 +107,11 @@ uint64_t dm_mc02_pwr_rcc_fdcan_kernel_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_spi123_kernel_clock_hz(const DmMc02PwrRcc *state);
 uint64_t dm_mc02_pwr_rcc_spi1_clock_hz(const DmMc02PwrRcc *state);
 bool dm_mc02_pwr_rcc_spi1_reset_asserted(const DmMc02PwrRcc *state);
+/* H723 D3CCIPR.SPI6SEL: PCLK4, PLL2Q, PLL3Q, HSI, CSI, HSE.
+ * clock_hz also applies the APB4 enable and reset gates. */
+uint64_t dm_mc02_pwr_rcc_spi6_kernel_clock_hz(const DmMc02PwrRcc *state);
+uint64_t dm_mc02_pwr_rcc_spi6_clock_hz(const DmMc02PwrRcc *state);
+bool dm_mc02_pwr_rcc_spi6_reset_asserted(const DmMc02PwrRcc *state);
 
 /* H723 D2CCIP2R-selected USART kernel clocks.  USART1/6/10 use the
  * USART16 group; USART2/3/UART4/5/7/8 use USART234578. */

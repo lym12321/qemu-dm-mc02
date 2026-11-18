@@ -20,6 +20,7 @@
 
 #include "qemu/osdep.h"
 #include "io/channel-watch.h"
+#include "qemu/atomic.h"
 
 typedef struct QIOChannelFDSource QIOChannelFDSource;
 struct QIOChannelFDSource {
@@ -38,6 +39,8 @@ struct QIOChannelSocketSource {
     QIOChannel *ioc;
     SOCKET socket;
     int revents;
+    unsigned int generation;
+    bool first_check;
     GIOCondition condition;
 };
 
@@ -98,11 +101,18 @@ qio_channel_fd_source_finalize(GSource *source)
 
 #ifdef CONFIG_WIN32
 static gboolean
-qio_channel_socket_source_prepare(GSource *source G_GNUC_UNUSED,
-                                  gint *timeout)
+qio_channel_socket_source_prepare(GSource *source, gint *timeout)
 {
-    *timeout = -1;
+    QIOChannelSocketSource *ssource = (QIOChannelSocketSource *)source;
 
+    if (!(ssource->condition & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
+        *timeout = -1;
+        return FALSE;
+    }
+    /* Check existing level readiness before sleeping for another edge. */
+    *timeout = (ssource->first_check || ssource->revents ||
+                ssource->generation !=
+                qatomic_read(&ssource->ioc->event_watch_generation)) ? 0 : -1;
     return FALSE;
 }
 
@@ -118,11 +128,29 @@ qio_channel_socket_source_check(GSource *source)
     QIOChannelSocketSource *ssource = (QIOChannelSocketSource *)source;
     fd_set rfds, wfds, xfds;
     int ret;
+    unsigned int generation;
 
     /* A HUP-only watch has no select interest; Winsock rejects empty sets. */
     if (!(ssource->condition & (G_IO_IN | G_IO_OUT | G_IO_PRI))) {
         return 0;
     }
+
+    generation = qatomic_read(&ssource->ioc->event_watch_generation);
+    /*
+     * WSAEventSelect is edge notification, whereas a GSource is level ready.
+     * Keep probing until a previously ready socket becomes idle. A shared
+     * auto-reset HANDLE can wake only one watcher, so only use it to skip
+     * idle probes when this is the sole effective watcher. A topology change
+     * forces a probe in case a removed watcher consumed the notification.
+     */
+    if (!ssource->first_check && !ssource->revents &&
+        !ssource->fd.revents && ssource->generation == generation &&
+        qatomic_read(&ssource->ioc->event_watch_count) == 1 &&
+        !qatomic_read(&ssource->ioc->event_poll_disabled)) {
+        return FALSE;
+    }
+    ssource->first_check = false;
+    ssource->generation = generation;
 
     FD_ZERO(&rfds);
     FD_ZERO(&wfds);
@@ -173,6 +201,10 @@ qio_channel_socket_source_finalize(GSource *source)
 {
     QIOChannelSocketSource *ssource = (QIOChannelSocketSource *)source;
 
+    if (ssource->condition & (G_IO_IN | G_IO_OUT | G_IO_PRI)) {
+        qatomic_dec(&ssource->ioc->event_watch_count);
+        qatomic_inc(&ssource->ioc->event_watch_generation);
+    }
     object_unref(OBJECT(ssource->ioc));
 }
 
@@ -284,10 +316,6 @@ GSource *qio_channel_create_socket_watch(QIOChannel *ioc,
     GSource *source;
     QIOChannelSocketSource *ssource;
 
-    qemu_socket_select(sockfd, ioc->event,
-                       FD_READ | FD_ACCEPT | FD_CLOSE |
-                       FD_CONNECT | FD_WRITE | FD_OOB, NULL);
-
     source = g_source_new(&qio_channel_socket_source_funcs,
                           sizeof(QIOChannelSocketSource));
     ssource = (QIOChannelSocketSource *)source;
@@ -298,13 +326,32 @@ GSource *qio_channel_create_socket_watch(QIOChannel *ioc,
     ssource->condition = condition;
     ssource->socket = _get_osfhandle(sockfd);
     ssource->revents = 0;
+    ssource->first_check = true;
 
-    ssource->fd.fd = (gintptr)ioc->event;
-    ssource->fd.events = G_IO_IN;
-
-    g_source_add_poll(source, &ssource->fd);
+    /* HUP-only watches have no select interest and must not steal wakeups. */
+    if (condition & (G_IO_IN | G_IO_OUT | G_IO_PRI)) {
+        qatomic_inc(&ioc->event_watch_count);
+        if (!qemu_socket_select(sockfd, ioc->event,
+                                FD_READ | FD_ACCEPT | FD_CLOSE |
+                                FD_CONNECT | FD_WRITE | FD_OOB, NULL)) {
+            qio_channel_socket_watch_use_polling(ioc);
+        }
+        qatomic_inc(&ioc->event_watch_generation);
+        ssource->fd.fd = (gintptr)ioc->event;
+        ssource->fd.events = G_IO_IN;
+        g_source_add_poll(source, &ssource->fd);
+    } else {
+        ssource->first_check = false;
+        ssource->generation = qatomic_read(&ioc->event_watch_generation);
+    }
 
     return source;
+}
+
+void qio_channel_socket_watch_use_polling(QIOChannel *ioc)
+{
+    /* AIO or blocking mode can remove this channel's event association. */
+    qatomic_set(&ioc->event_poll_disabled, true);
 }
 #else
 GSource *qio_channel_create_socket_watch(QIOChannel *ioc,

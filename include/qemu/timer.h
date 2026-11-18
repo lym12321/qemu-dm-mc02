@@ -201,13 +201,33 @@ int64_t qemu_clock_deadline_ns_all(QEMUClockType type, int attr_mask);
 QEMUTimerList *qemu_clock_get_main_loop_timerlist(QEMUClockType type);
 
 /**
- * qemu_clock_nofify:
+ * qemu_clock_notify:
  * @type: the clock type
  *
- * Call the notifier callback connected with the default timer
- * list linked to the clock, or qemu_notify() if none.
+ * Notify every timer list linked to the clock.
  */
 void qemu_clock_notify(QEMUClockType type);
+
+/**
+ * qemu_clock_notify_expired:
+ * @type: the clock type
+ * @exclude: timer list being serviced by the caller, or NULL
+ *
+ * Notify only lists with expired timers. The caller must hold BQL, which
+ * protects the clock's timer lists. Rearming a timer still notifies its list
+ * independently, so a concurrently inserted earlier deadline is not lost.
+ */
+void qemu_clock_notify_expired(QEMUClockType type, QEMUTimerList *exclude);
+
+/**
+ * qemu_clock_in_main_loop_timer_callback:
+ * @type: the clock type
+ *
+ * Return whether this thread's innermost timer callback belongs to the
+ * main-loop timer list for @type. Other threads and guest MMIO are outside
+ * this scope. Nested callbacks restore the previous scope on return.
+ */
+bool qemu_clock_in_main_loop_timer_callback(QEMUClockType type);
 
 /**
  * qemu_clock_enable:
@@ -817,11 +837,16 @@ extern int64_t clock_start;
    an infinite recursion! */
 #ifdef _WIN32
 extern int64_t clock_freq;
+extern uint32_t clock_ns_per_tick;
 
 static inline int64_t get_clock(void)
 {
     LARGE_INTEGER ti;
     QueryPerformanceCounter(&ti);
+    if (clock_ns_per_tick) {
+        /* Match muldiv64's unsigned input and low-64-bit result on overflow. */
+        return (uint64_t)ti.QuadPart * clock_ns_per_tick;
+    }
     return muldiv64(ti.QuadPart, NANOSECONDS_PER_SECOND, clock_freq);
 }
 

@@ -53,12 +53,16 @@ typedef struct DmMc02Spi {
     uint64_t wire_origin_ns;
     uint64_t wire_next_ns;
     uint64_t wire_available_ns;
+    /* Instance capabilities, configured before timing and retained on reset. */
+    unsigned tx_fifo_bytes;
+    unsigned max_frame_bits;
     uint32_t tx_fifo[16];
     unsigned tx_head;
     unsigned tx_count;
     uint32_t shift_value;
+    /* Next MOSI transition (or frame end), relative to a half-cycle origin. */
     unsigned shift_bit;
-    unsigned shift_origin_bit;
+    unsigned shift_origin_half;
     bool shifting;
     bool mosi_level;
     bool tx_complete;
@@ -70,11 +74,16 @@ typedef struct DmMc02Spi {
     DmMc02SpiDmaChannel dma_tx_alternate;
 } DmMc02Spi;
 
-/* Configure before use. The GPIO mux may attach/detach its MOSI consumer
- * independently of serializer timing. SPI1/2/3 have a 16-byte TX FIFO. */
+/* Set after state_init and before enable_timing. Defaults preserve SPI1/2/3:
+ * 16-byte FIFO and 4..32-bit frames; SPI4/5/6 use 8 bytes and 4..16 bits. */
+void dm_mc02_spi_set_capabilities(DmMc02Spi *spi, unsigned fifo_bytes,
+                                   unsigned max_frame_bits);
+/* The GPIO mux may attach/detach its MOSI consumer independently of timing. */
 void dm_mc02_spi_enable_timing(DmMc02Spi *spi);
 void dm_mc02_spi_set_clock_hz(DmMc02Spi *spi, uint64_t hz);
 void dm_mc02_spi_set_mosi(DmMc02Spi *spi, DmDigitalOutput *output, void *opaque);
+/* Deliver pending MOSI bits through timestamp_ns before its pad changes. */
+void dm_mc02_spi_sync_mosi(DmMc02Spi *spi, uint64_t timestamp_ns);
 void dm_mc02_spi_set_irq(DmMc02Spi *spi, qemu_irq irq);
 void dm_mc02_spi_set_alternate_tx_dma(DmMc02Spi *spi,
                                      const DmMc02SpiDmaChannel *channel);

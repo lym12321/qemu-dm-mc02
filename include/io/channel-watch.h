@@ -65,6 +65,11 @@ GSource *qio_channel_create_socket_watch(QIOChannel *ioc,
                                          int fd,
                                          GIOCondition condition);
 
+#ifdef CONFIG_WIN32
+/* Call before an API disables or redirects the socket's WSAEventSelect. */
+void qio_channel_socket_watch_use_polling(QIOChannel *ioc);
+#endif
+
 /**
  * qio_channel_create_fd_pair_watch:
  * @ioc: the channel object

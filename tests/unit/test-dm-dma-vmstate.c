@@ -131,6 +131,7 @@ static void test_round_trip_restores_live_state_and_reprojects_runtime(void)
 {
     DmMc02Dma source;
     DmMc02Dma restored;
+    DmMc02EventTime context = { 0 };
     IrqCapture capture = { 0 };
     qemu_irq irq;
 
@@ -140,6 +141,7 @@ static void test_round_trip_restores_live_state_and_reprojects_runtime(void)
     memset(&restored, 0, sizeof(restored));
     irq = qemu_allocate_irq(capture_irq, &capture, 0);
     prepare_runtime(&restored, irq);
+    dm_mc02_dma_set_event_time(&restored, &context);
     g_assert_cmpint(load_state(&restored), ==, 0);
 
     g_assert_cmpmem(restored.regs, sizeof(restored.regs), source.regs,
@@ -164,6 +166,7 @@ static void test_round_trip_restores_live_state_and_reprojects_runtime(void)
                     source.fifo_length, sizeof(source.fifo_length));
 
     g_assert_cmpuint(restored.dmamux_channel_offset, ==, 8);
+    g_assert_true(restored.event_time == &context);
     g_assert_true(restored.stream_irq[0] == irq);
     g_assert_false(restored.request_cache_valid);
     g_assert_cmpuint(restored.request_cache_generation, ==, 0);

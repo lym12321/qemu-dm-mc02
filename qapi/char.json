@@ -265,6 +265,14 @@
 #
 # @nodelay: set TCP_NODELAY socket option (default: false)
 #
+# @write-buffer: batch output in a 16 KiB host buffer (default: false).
+#     A successful write accepts bytes into this buffer. The first byte
+#     schedules a flush after 1 ms of host time, subject to host scheduling
+#     and socket backpressure, including while the guest is paused. A full
+#     buffer applies normal short-write or would-block backpressure. Unsent
+#     bytes are discarded on disconnect or removal and never replayed to a
+#     new connection. Available for plain TCP sockets only.
+#
 # @telnet: enable telnet protocol on server sockets (default: false)
 #
 # @tn3270: enable tn3270 protocol on server sockets (default: false)
@@ -286,6 +294,7 @@
             '*server': 'bool',
             '*wait': 'bool',
             '*nodelay': 'bool',
+            '*write-buffer': 'bool',
             '*telnet': 'bool',
             '*tn3270': 'bool',
             '*websocket': 'bool',

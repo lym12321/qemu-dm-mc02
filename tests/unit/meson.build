@@ -28,6 +28,8 @@ tests = {
   'test-div128': [],
   'test-shift128': [],
   'test-mul64': [],
+  'test-icount-conversion': [],
+  'test-timer-notify': [],
   # all code tested by test-int128 is inside int128.h
   'test-int128': [],
   'rcutorture': [],
@@ -557,7 +559,8 @@ if have_system
     endif
 
     tests += {
-      'test-qdev-global-props': [qom, hwcore]
+      'test-qdev-global-props': [qom, hwcore],
+      'test-char-socket-buffer': [qom, io, chardev]
     }
   endif
 endif

@@ -110,6 +110,13 @@ static uint32_t gpio_register_value(const DmMc02GpioBank *bank, hwaddr reg)
     }
 }
 
+static void dm_mc02_gpio_before_access(DmMc02GpioBank *bank)
+{
+    if (bank->before_access) {
+        bank->before_access(bank->before_access_opaque);
+    }
+}
+
 static uint64_t dm_mc02_gpio_read(void *opaque, hwaddr offset,
                                   unsigned size)
 {
@@ -119,6 +126,7 @@ static uint64_t dm_mc02_gpio_read(void *opaque, hwaddr offset,
         GPIO_IDR, GPIO_ODR, GPIO_AFR0, GPIO_AFR1,
     };
 
+    dm_mc02_gpio_before_access(bank);
     for (unsigned i = 0; i < ARRAY_SIZE(registers); ++i) {
         hwaddr reg = registers[i];
 
@@ -145,13 +153,16 @@ static void dm_mc02_gpio_write(void *opaque, hwaddr offset, uint64_t value,
                                unsigned size)
 {
     DmMc02GpioBank *bank = opaque;
-    uint32_t old_odr = bank->odr;
+    uint32_t old_odr;
     bool config_changed = false;
 
     static const hwaddr registers[] = {
         GPIO_MODER, GPIO_OTYPER, GPIO_OSPEEDR, GPIO_PUPDR,
         GPIO_ODR, GPIO_BSRR, GPIO_AFR0, GPIO_AFR1,
     };
+
+    dm_mc02_gpio_before_access(bank);
+    old_odr = bank->odr;
     for (unsigned i = 0; i < ARRAY_SIZE(registers); ++i) {
         hwaddr reg = registers[i];
 
@@ -207,12 +218,17 @@ static void dm_mc02_gpio_write(void *opaque, hwaddr offset, uint64_t value,
                 if (reg == GPIO_OTYPER || reg == GPIO_ODR) {
                     next &= 0xffff;
                 }
-                *target = next;
                 if (reg == GPIO_MODER || reg == GPIO_AFR0 ||
                     reg == GPIO_AFR1 || reg == GPIO_OTYPER ||
                     reg == GPIO_PUPDR) {
                     config_changed = old_value != next;
                 }
+                if (config_changed && bank->config_changing) {
+                    bank->config_changing(bank->config_changing_opaque,
+                                          bank->bank_index, reg,
+                                          old_value, next);
+                }
+                *target = next;
             }
             break;
         }
@@ -245,6 +261,7 @@ void dm_mc02_gpio_init(DmMc02GpioBank *bank, Object *owner,
 
 void dm_mc02_gpio_set_odr(DmMc02GpioBank *bank, uint32_t value)
 {
+    dm_mc02_gpio_before_access(bank);
     if (bank->odr != (value & 0xffff)) {
         bank->odr = value & 0xffff;
         dm_mc02_gpio_notify_changed(bank);

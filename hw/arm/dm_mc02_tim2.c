@@ -7,6 +7,7 @@
  * a connected pin consumer enables exact timestamped output edges.
  */
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "qemu/timer.h"
 #include "hw/irq.h"
 #include "hw/arm/dm_mc02_tim2.h"
@@ -76,10 +77,75 @@
      TIM_BDTR_BKE | TIM_BDTR_BKP | TIM_BDTR_AOE | TIM_BDTR_MOE)
 
 static void tim2_output_refresh(DmMc02Tim2 *s);
+static bool tim2_output_sample(DmMc02Tim2 *s,
+                                DmMc02TimPwmOutputState *output);
+
 static uint64_t tim2_now(const DmMc02Tim2 *s)
 {
     return s->dispatching ? s->dispatch_ns :
            qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+}
+
+static unsigned tim2_master_selection(const DmMc02Tim2 *s,
+                                      DmMc02TimMasterOutput output);
+
+static bool tim2_window_enabled(const DmMc02Tim2 *s)
+{
+    if (!s->event_window_ns || (!s->output && !s->compare_precise)) {
+        return false;
+    }
+    /* A downstream device may schedule work between consecutive master
+     * events (for example an ADC conversion). This local replay cannot
+     * interleave that device's timers, so retain exact global deadlines.
+     * RESET and ENABLE are synchronous state changes, not periodic routes. */
+    if (s->event_callback &&
+        (tim2_master_selection(s, DM_MC02_TIM_TRGO) >= 2 ||
+         (s->mms2_supported &&
+          tim2_master_selection(s, DM_MC02_TIM_TRGO2) >= 2))) {
+        return false;
+    }
+    return !s->window_allowed || s->window_allowed(s->window_allowed_opaque);
+}
+
+static uint64_t tim2_queue_deadline(const DmMc02Tim2 *s, uint64_t deadline)
+{
+    uint64_t remainder, extra;
+
+    if (!tim2_window_enabled(s)) {
+        return deadline;
+    }
+    remainder = deadline % s->event_window_ns;
+    extra = remainder ? s->event_window_ns - remainder : 0;
+    return deadline <= INT64_MAX - extra ? deadline + extra : deadline;
+}
+
+static void tim2_timer_mod(DmMc02Tim2 *s, QEMUTimer *timer, uint64_t deadline)
+{
+    timer_mod(timer, tim2_queue_deadline(s, deadline));
+}
+
+static void tim2_sync_events(DmMc02Tim2 *s, uint64_t timestamp_ns,
+                             unsigned budget);
+
+static bool tim2_dispatch_window(DmMc02Tim2 *s, QEMUTimer *timer,
+                                  uint64_t deadline)
+{
+    if (!tim2_window_enabled(s) || s->syncing_output) {
+        return false;
+    }
+    /* The outer queue already popped this entry. Restore its pending marker
+     * so the internal merger includes it in chronological order. */
+    tim2_timer_mod(s, timer, deadline);
+    tim2_sync_events(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), 4096);
+    return true;
+}
+
+static void tim2_window_sync_before_access(DmMc02Tim2 *s)
+{
+    if (s->event_window_ns && (s->output || s->compare_precise) &&
+        !s->dispatching && !s->syncing_output) {
+        dm_mc02_tim2_sync_output(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    }
 }
 
 static void tim2_reschedule(DmMc02Tim2 *s);
@@ -233,6 +299,7 @@ static uint32_t tim2_dead_time_cycles(const DmMc02Tim2 *s,
 static uint64_t tim2_elapsed_clock_cycles(const DmMc02Tim2 *s, uint64_t now)
 {
     uint64_t clock_hz;
+    __uint128_t product;
 
     if (!s || now < s->start_ns) {
         return 0;
@@ -241,18 +308,36 @@ static uint64_t tim2_elapsed_clock_cycles(const DmMc02Tim2 *s, uint64_t now)
     if (!clock_hz) {
         return 0;
     }
-    return (uint64_t)(((__uint128_t)(now - s->start_ns) * clock_hz) /
-                      UINT64_C(1000000000));
+    product = (__uint128_t)(now - s->start_ns) * clock_hz;
+    if (product <= UINT64_MAX) {
+        return (uint64_t)product / UINT64_C(1000000000);
+    }
+    if (clock_hz <= UINT32_MAX) {
+        /* Keep ordinary MCU clocks on native arithmetic after a long run.
+         * Splitting whole seconds preserves floor division and avoids a
+         * performance boundary when elapsed_ns * hz exceeds 64 bits. */
+        uint64_t elapsed = now - s->start_ns;
+
+        return (elapsed / UINT64_C(1000000000)) * clock_hz +
+               ((elapsed % UINT64_C(1000000000)) * clock_hz) /
+               UINT64_C(1000000000);
+    }
+    return product / UINT64_C(1000000000);
 }
 
-static uint64_t tim2_phase_clock_cycles(const DmMc02Tim2 *s, uint64_t now)
+static uint64_t tim2_phase_clock_cycles(const DmMc02Tim2 *s, uint64_t now,
+                                        uint64_t *elapsed_cycles)
 {
     uint64_t counter_cycle_ticks;
     uint64_t prescaler;
     uint64_t period_cycles;
     uint64_t initial;
+    uint64_t elapsed;
     __uint128_t phase;
 
+    if (elapsed_cycles) {
+        *elapsed_cycles = 0;
+    }
     if (!s) {
         return 0;
     }
@@ -271,8 +356,15 @@ static uint64_t tim2_phase_clock_cycles(const DmMc02Tim2 *s, uint64_t now)
     } else {
         initial %= counter_cycle_ticks;
     }
-    phase = (__uint128_t)initial * prescaler +
-            tim2_elapsed_clock_cycles(s, now);
+    elapsed = tim2_elapsed_clock_cycles(s, now);
+    if (elapsed_cycles) {
+        *elapsed_cycles = elapsed;
+    }
+    initial *= prescaler;
+    if (elapsed <= UINT64_MAX - initial) {
+        return (initial + elapsed) % period_cycles;
+    }
+    phase = (__uint128_t)initial + elapsed;
     return (uint64_t)(phase % period_cycles);
 }
 
@@ -322,6 +414,7 @@ static void tim2_refresh_break_state(DmMc02Tim2 *s, bool update_event)
         s->break_latched = true;
         if (bdtr & TIM_BDTR_MOE) {
             tim2_store(s, TIM_BDTR, bdtr & ~TIM_BDTR_MOE, 4);
+            s->output_sample_valid = false;
         }
         return;
     }
@@ -329,6 +422,7 @@ static void tim2_refresh_break_state(DmMc02Tim2 *s, bool update_event)
         s->break_latched = false;
     } else if (update_event && s->break_latched && (bdtr & TIM_BDTR_AOE)) {
         tim2_store(s, TIM_BDTR, bdtr | TIM_BDTR_MOE, 4);
+        s->output_sample_valid = false;
         s->break_latched = false;
     }
 }
@@ -355,14 +449,36 @@ static void tim2_update_irq(DmMc02Tim2 *s)
                     ((dier & TIM_DIER_CC4IE) && (sr & TIM_SR_CC4IF)));
 }
 
+/* Reasserting an already-latched flag cannot change the level-sensitive
+ * IRQ. DIER/SR writes, IRQ connection, reset and restore project that level
+ * independently, so event callbacks need no repeated register write or IRQ
+ * calculation when every requested bit is already set. */
+static void tim2_raise_flags(DmMc02Tim2 *s, uint32_t flags)
+{
+    uint32_t sr = tim2_load(s, TIM_SR, 4);
+
+    if ((sr & flags) != flags) {
+        tim2_store(s, TIM_SR, sr | flags, 4);
+        tim2_update_irq(s);
+    }
+}
+
 static uint32_t tim2_load(const DmMc02Tim2 *s, hwaddr offset,
                           unsigned size)
 {
+    const uint8_t *data = (const uint8_t *)s->regs + offset;
     uint32_t value = 0;
 
+    /* Internal register reads use whole words; preserve byte-lane and
+     * unaligned MMIO semantics without rebuilding each word byte by byte. */
+    if (size == 4) {
+        return ldl_le_p(data);
+    }
+    if (size == 2) {
+        return lduw_le_p(data);
+    }
     for (unsigned i = 0; i < size; ++i) {
-        value |= ((uint32_t)((const uint8_t *)s->regs)[offset + i]) <<
-                 (i * 8);
+        value |= (uint32_t)data[i] << (i * 8);
     }
     return value;
 }
@@ -370,8 +486,18 @@ static uint32_t tim2_load(const DmMc02Tim2 *s, hwaddr offset,
 static void tim2_store(DmMc02Tim2 *s, hwaddr offset, uint64_t value,
                        unsigned size)
 {
+    uint8_t *data = (uint8_t *)s->regs + offset;
+
+    if (size == 4) {
+        stl_le_p(data, value);
+        return;
+    }
+    if (size == 2) {
+        stw_le_p(data, value);
+        return;
+    }
     for (unsigned i = 0; i < size; ++i) {
-        ((uint8_t *)s->regs)[offset + i] = value >> (i * 8);
+        data[i] = value >> (i * 8);
     }
 }
 
@@ -473,7 +599,7 @@ static bool tim2_channel_is_output(const DmMc02Tim2 *s, unsigned channel)
 
 static bool tim2_update_required(const DmMc02Tim2 *s)
 {
-    return s->output || s->update_callback || s->irq ||
+    return s->output || s->compare_precise || s->update_callback || s->irq ||
            (s->event_callback &&
             (tim2_master_event_selected(s, DM_MC02_TIM_TRGO,
                                         DM_MC02_TIM_MASTER_UPDATE) ||
@@ -563,14 +689,9 @@ static uint64_t tim2_counter_cycle_ticks(const DmMc02Tim2 *s)
 
 static uint64_t tim2_elapsed_ticks(const DmMc02Tim2 *s, uint64_t now)
 {
-    uint64_t clock_hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
     uint64_t psc = tim2_active_psc_value(s);
 
-    if (!clock_hz || now < s->start_ns) {
-        return 0;
-    }
-    return muldiv64(now - s->start_ns, clock_hz, 1000000000ULL) /
-           (psc + 1);
+    return tim2_elapsed_clock_cycles(s, now) / (psc + 1);
 }
 
 /* Return the position within one timer cycle.  Edge-aligned mode uses the
@@ -689,7 +810,7 @@ static uint64_t tim2_qualified_update_period_ns(const DmMc02Tim2 *s)
 
 static unsigned tim2_effective_update_batch(const DmMc02Tim2 *s)
 {
-    if (s->output) {
+    if (s->output || s->compare_precise) {
         return 1;
     }
     if (s->event_callback &&
@@ -761,7 +882,7 @@ static uint64_t tim2_update_interval_ns(DmMc02Tim2 *s)
 
 static unsigned tim2_effective_compare_batch(const DmMc02Tim2 *s)
 {
-    if (s->output) {
+    if (s->output || s->compare_precise) {
         return 1;
     }
     /* A coalesced callback can describe a level change, but it cannot encode
@@ -915,7 +1036,13 @@ static bool tim2_compare_ticks(const DmMc02Tim2 *s, unsigned channel,
 /* Never schedule a compare before the counter reaches its integer tick. */
 static uint64_t tim2_compare_delay(uint64_t ticks, uint64_t psc, uint64_t hz)
 {
-    __uint128_t ns = ((__uint128_t)ticks * (psc + 1) * 1000000000U + hz - 1) / hz;
+    __uint128_t ns = (__uint128_t)ticks * (psc + 1) * 1000000000U + hz - 1;
+
+    if (ns <= UINT64_MAX) {
+        ns = (uint64_t)ns / hz;
+    } else {
+        ns /= hz;
+    }
     return ns > INT64_MAX ? UINT64_MAX : MAX((uint64_t)ns, UINT64_C(1));
 }
 
@@ -992,7 +1119,6 @@ static uint64_t tim2_next_compare_deadline_at(const DmMc02Tim2 *s,
 {
     uint64_t psc = tim2_active_psc_value(s);
     uint64_t period = tim2_counter_cycle_ticks(s);
-    uint64_t period_ns = tim2_update_period_ns(s);
     uint64_t clock_hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
     uint64_t counter;
     uint64_t best = UINT64_MAX;
@@ -1001,7 +1127,7 @@ static uint64_t tim2_next_compare_deadline_at(const DmMc02Tim2 *s,
     if (channel_mask) {
         *channel_mask = 0;
     }
-    if (!period_ns || !period || !clock_hz) {
+    if (!period || !clock_hz) {
         return 0;
     }
     counter = tim2_center_aligned(s) ? tim2_phase_at(s, base_timestamp) :
@@ -1128,35 +1254,81 @@ static uint64_t tim2_compare_next_event(uint64_t deadline, uint64_t now,
     return tim2_add_deadline(deadline, advance);
 }
 
+static void tim2_queue_compare(DmMc02Tim2 *s)
+{
+    if (!s->compare_timer) {
+        return;
+    }
+    s->compare_owned_by_update = s->next_compare_ns &&
+        (s->output || s->compare_precise) &&
+        ((s->next_compare_ns == s->next_update_ns &&
+          timer_pending(s->update_timer)) ||
+         (s->dispatching_update && s->next_compare_ns == s->dispatch_ns));
+    if (!s->next_compare_ns || s->compare_owned_by_update) {
+        if (timer_pending(s->compare_timer)) {
+            timer_del(s->compare_timer);
+        }
+    } else if (!timer_pending(s->compare_timer) ||
+               timer_expire_time_ns(s->compare_timer) !=
+               tim2_queue_deadline(s, s->next_compare_ns)) {
+        tim2_timer_mod(s, s->compare_timer, s->next_compare_ns);
+    }
+}
+
 static void tim2_schedule_compare(DmMc02Tim2 *s)
 {
     uint64_t now;
     uint64_t delay;
     unsigned channel_mask = 0;
 
+    s->compare_period_ns = 0;
+    s->compare_period_mask = 0;
+
     if (!s->compare_timer || !tim2_compare_required(s) ||
         !(tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN)) {
-        if (s->compare_timer) {
-            timer_del(s->compare_timer);
-        }
         s->next_compare_ns = 0;
+        tim2_queue_compare(s);
         return;
     }
     delay = tim2_compare_delay_ns(s, &channel_mask);
     if (delay == UINT64_MAX) {
-        timer_del(s->compare_timer);
         s->next_compare_ns = 0;
+        tim2_queue_compare(s);
         return;
     }
     s->compare_channel_mask = channel_mask;
+    if (!tim2_center_aligned(s)) {
+        unsigned eligible = 0;
+
+        for (unsigned channel = 1; channel <= 4; ++channel) {
+            if (tim2_compare_channel_required(s, channel) &&
+                tim2_active_ccr_value(s, channel) <= s->active_arr) {
+                eligible |= 1u << (channel - 1);
+            }
+        }
+        if (is_power_of_2(eligible)) {
+            if (!s->counter_period_cached) {
+                uint64_t hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
+                __uint128_t ns = (__uint128_t)tim2_counter_cycle_ticks(s) *
+                                 (tim2_active_psc_value(s) + UINT64_C(1)) *
+                                 UINT64_C(1000000000);
+
+                s->counter_period_exact_ns = hz && ns / hz <= INT64_MAX &&
+                    ns % hz == 0 ? ns / hz : 0;
+                s->counter_period_cached = true;
+            }
+            s->compare_period_ns = s->counter_period_exact_ns;
+            s->compare_period_mask = eligible;
+        }
+    }
     now = tim2_now(s);
     s->next_compare_ns = tim2_add_deadline(now, delay);
     if (!s->next_compare_ns) {
-        timer_del(s->compare_timer);
         s->next_compare_ns = 0;
+        tim2_queue_compare(s);
         return;
     }
-    timer_mod(s->compare_timer, s->next_compare_ns);
+    tim2_queue_compare(s);
 }
 
 /* Deliver one compare deadline without coalescing it.  Stateful OCREF modes
@@ -1172,7 +1344,6 @@ static bool tim2_deliver_compare_event(DmMc02Tim2 *s,
     uint8_t ocref_valid_mask;
     uint8_t ocref_old_level_mask;
     uint8_t ocref_new_level_mask;
-    uint32_t sr;
 
     if (!s || !(tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN)) {
         return false;
@@ -1192,22 +1363,10 @@ static bool tim2_deliver_compare_event(DmMc02Tim2 *s,
                                  &ocref_old_level_mask,
                                  &ocref_new_level_mask);
 
-    sr = tim2_load(s, TIM_SR, 4);
-    if (compare_channel_mask & 1u) {
-        sr |= TIM_SR_CC1IF;
-    }
-    if (compare_channel_mask & 2u) {
-        sr |= TIM_SR_CC2IF;
-    }
-    if (compare_channel_mask & 4u) {
-        sr |= TIM_SR_CC3IF;
-    }
-    if (compare_channel_mask & 8u) {
-        sr |= TIM_SR_CC4IF;
-    }
-    tim2_store(s, TIM_SR, sr, 4);
-    tim2_update_irq(s);
-    tim2_output_refresh(s);
+    tim2_raise_flags(s, (compare_channel_mask & 0xfu) << 1);
+    /* Publish the edge before the compare consumer (for example DMA).
+     * Its writes can change the next edge; schedule that only afterwards. */
+    tim2_output_sample(s, NULL);
     if (s->compare_callback && (compare_channel_mask & 1u)) {
         s->compare_callback(s->compare_opaque, 1, timestamp_ns);
     }
@@ -1243,8 +1402,7 @@ static void tim2_compare_dispatch(void *opaque)
     uint8_t ocref_new_level_mask;
 
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) {
-        period_ns = tim2_update_period_ns(s);
-        if (s->output || tim2_has_stateful_ocref(s)) {
+        if (s->output || s->compare_precise || tim2_has_stateful_ocref(s)) {
             uint64_t event_deadline = scheduled_deadline;
             unsigned event_channel_mask = compare_channel_mask;
 
@@ -1257,22 +1415,34 @@ static void tim2_compare_dispatch(void *opaque)
                                                 scheduled_deadline)) {
                     return;
                 }
-                next_deadline = tim2_next_compare_deadline_at(
-                    s, event_deadline, &event_channel_mask);
+                /* A single channel with an integral cycle has the same
+                 * deadline delta after every match. Configuration/preload
+                 * changes rebuild this cache through schedule_compare().
+                 * The consumer above still runs and reads DMA on every
+                 * event before this next deadline is selected. */
+                if (s->compare_period_ns &&
+                    event_channel_mask == s->compare_period_mask) {
+                    next_deadline = tim2_add_deadline(event_deadline,
+                                                      s->compare_period_ns);
+                } else {
+                    next_deadline = tim2_next_compare_deadline_at(
+                        s, event_deadline, &event_channel_mask);
+                }
                 if (!next_deadline) {
-                    timer_del(s->compare_timer);
                     s->next_compare_ns = 0;
+                    tim2_queue_compare(s);
                     return;
                 }
-                if (s->output || next_deadline > now) {
+                if (s->output || s->compare_precise || next_deadline > now) {
                     s->compare_channel_mask = event_channel_mask;
                     s->next_compare_ns = next_deadline;
-                    timer_mod(s->compare_timer, next_deadline);
+                    tim2_queue_compare(s);
                     return;
                 }
                 event_deadline = next_deadline;
             }
         }
+        period_ns = tim2_update_period_ns(s);
         /* Snapshot routing before the compare callback.  The callback is
          * allowed to update CCR/CR2, but those writes affect the next event,
          * not the event already being delivered. */
@@ -1320,22 +1490,7 @@ static void tim2_compare_dispatch(void *opaque)
             events = event_count > UINT_MAX ? UINT_MAX :
                      (unsigned)event_count;
         }
-        uint32_t sr = tim2_load(s, TIM_SR, 4);
-
-        if (compare_channel_mask & 1u) {
-            sr |= TIM_SR_CC1IF;
-        }
-        if (compare_channel_mask & 2u) {
-            sr |= TIM_SR_CC2IF;
-        }
-        if (compare_channel_mask & 4u) {
-            sr |= TIM_SR_CC3IF;
-        }
-        if (compare_channel_mask & 8u) {
-            sr |= TIM_SR_CC4IF;
-        }
-        tim2_store(s, TIM_SR, sr, 4);
-        tim2_update_irq(s);
+        tim2_raise_flags(s, (compare_channel_mask & 0xfu) << 1);
         if (s->compare_callback && (compare_channel_mask & 1u)) {
             s->compare_callback(s->compare_opaque, events, timestamp_ns);
         }
@@ -1370,10 +1525,10 @@ static void tim2_compare_dispatch(void *opaque)
             }
             if (next_deadline) {
                 s->next_compare_ns = next_deadline;
-                timer_mod(s->compare_timer, next_deadline);
+                tim2_queue_compare(s);
             } else {
-                timer_del(s->compare_timer);
                 s->next_compare_ns = 0;
+                tim2_queue_compare(s);
             }
         }
         /* The count is delivered in one bounded callback.  Consumers that
@@ -1441,6 +1596,31 @@ static bool tim2_channel_preload_enabled(const DmMc02Tim2 *s,
     return (tim2_load(s, ccmr, 4) & (1u << preload_shift)) != 0;
 }
 
+static void tim2_refresh_pending_preloads(DmMc02Tim2 *s)
+{
+    unsigned pending = 0;
+
+    for (unsigned channel = 1; channel <= 4; ++channel) {
+        if (tim2_channel_preload_enabled(s, channel) &&
+            s->active_ccr[channel - 1] !=
+                tim2_load(s, TIM_CCR1 + 4 * (channel - 1), 4)) {
+            pending |= 1u << (channel - 1);
+        }
+    }
+    if (s->active_psc != (tim2_load(s, TIM_PSC, 4) & 0xffffu)) {
+        pending |= 1u << 4;
+    }
+    if ((tim2_load(s, TIM_CR1, 4) & TIM_CR1_ARPE) &&
+        s->active_arr != tim2_load(s, TIM_ARR, 4)) {
+        pending |= 1u << 5;
+    }
+    if (s->repetition_supported &&
+        s->active_rcr != (tim2_load(s, TIM_RCR, 4) & 0xffffu)) {
+        pending |= 1u << 6;
+    }
+    s->preload_pending_mask = pending;
+}
+
 /* Transfer the CPU-visible shadow configuration at an update event. */
 static bool tim2_transfer_preloads(DmMc02Tim2 *s)
 {
@@ -1449,15 +1629,22 @@ static bool tim2_transfer_preloads(DmMc02Tim2 *s)
     uint32_t shadow_arr;
     uint32_t shadow_rcr;
 
+    if (!s->preload_pending_mask) {
+        return false;
+    }
+    s->preload_pending_mask = 0;
+
     shadow_psc = tim2_load(s, TIM_PSC, 4) & 0xffffu;
     if (s->active_psc != shadow_psc) {
         s->active_psc = shadow_psc;
+        s->counter_period_cached = false;
         changed = true;
     }
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_ARPE) {
         shadow_arr = tim2_load(s, TIM_ARR, 4);
         if (s->active_arr != shadow_arr) {
             s->active_arr = shadow_arr;
+            s->counter_period_cached = false;
             changed = true;
         }
     }
@@ -1488,6 +1675,8 @@ static bool tim2_transfer_preloads(DmMc02Tim2 *s)
     }
     if (changed) {
         s->update_interval_ns = 0;
+        s->compare_period_ns = 0;
+        s->output_sample_valid = false;
     }
     return changed;
 }
@@ -1509,6 +1698,7 @@ static bool tim2_update_active_from_write(DmMc02Tim2 *s, hwaddr offset,
 
         if (s->active_psc != value) {
             s->active_psc = value;
+            s->counter_period_cached = false;
             changed = true;
         }
     }
@@ -1529,6 +1719,7 @@ static bool tim2_update_active_from_write(DmMc02Tim2 *s, hwaddr offset,
 
         if (s->active_arr != value) {
             s->active_arr = value;
+            s->counter_period_cached = false;
             changed = true;
         }
     }
@@ -1558,6 +1749,7 @@ static bool tim2_update_active_from_write(DmMc02Tim2 *s, hwaddr offset,
     }
     if (changed) {
         s->update_interval_ns = 0;
+        s->compare_period_ns = 0;
     }
     return changed;
 }
@@ -1702,6 +1894,7 @@ static void tim2_snapshot_ocref_compare(DmMc02Tim2 *s,
             continue;
         }
         mode = tim2_ocref_mode(s, channel);
+        routed = ((output_masks >> ((channel - 1) * 2)) & 3u) != 0;
         if (tim2_ocref_stateful_mode(mode)) {
             old_level = (s->ocref_level_mask & channel_bit) != 0;
             switch (mode) {
@@ -1719,6 +1912,18 @@ static void tim2_snapshot_ocref_compare(DmMc02Tim2 *s,
                 new_level = old_level;
                 break;
             }
+        } else if (!routed) {
+            /* Unrouted PWM/forced channels still maintain OCREF for a later
+             * frozen-mode write, but have no old/new edge consumer. */
+            if (mode == TIM_OCM_PWM1 || mode == TIM_OCM_FORCE_INACTIVE) {
+                new_level = false;
+            } else if (mode == TIM_OCM_PWM2 || mode == TIM_OCM_FORCE_ACTIVE) {
+                new_level = true;
+            } else if (mode == TIM_OCM_FROZEN) {
+                new_level = (s->ocref_level_mask & channel_bit) != 0;
+            } else {
+                continue;
+            }
         } else if (!tim2_ocref_level_at_counter(
                        s, channel,
                        tim2_center_aligned(s) ?
@@ -1730,7 +1935,6 @@ static void tim2_snapshot_ocref_compare(DmMc02Tim2 *s,
             continue;
         }
         tim2_set_ocref_level(s, channel, new_level);
-        routed = ((output_masks >> ((channel - 1) * 2)) & 3u) != 0;
         if (!routed) {
             continue;
         }
@@ -1747,7 +1951,7 @@ static void tim2_emit_ocref_snapshot(DmMc02Tim2 *s, uint16_t output_masks,
                                      unsigned event_count,
                                      uint64_t timestamp_ns)
 {
-    if (!s || !event_count) {
+    if (!s || !event_count || !output_masks || !valid_mask) {
         return;
     }
     for (unsigned channel = 1; channel <= 4; ++channel) {
@@ -1800,7 +2004,9 @@ static void tim2_refresh_ocref_state(DmMc02Tim2 *s, unsigned channel)
 /* Evaluate the two internal dead-time-generator gates.  The calculation is
  * phase based, so a high-rate PWM does not require a host timer per edge. */
 static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
-                                 bool *main_gate, bool *complementary_gate)
+                                 bool *main_gate, bool *complementary_gate,
+                                 uint64_t *phase_cycles,
+                                 uint64_t *elapsed_cycles)
 {
     hwaddr ccmr;
     hwaddr ccr_offset;
@@ -1818,6 +2024,7 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
     uint64_t since;
     uint64_t high_ticks;
     bool high;
+    bool complementary_pair;
     unsigned mode;
 
     if (!s || !main_gate || !complementary_gate ||
@@ -1830,17 +2037,22 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
         return false;
     }
     mode = tim2_decode_ocref_mode(s, ccmr_value, ocm_shift);
+    /* RM0468 Table 351: a lone OCx or OCxN follows OCxREF (then its
+     * polarity).  Inversion and dead time apply only with both enables set.
+     * In particular PWMN alone must keep CCR=0 low for a WS2812 reset. */
+    complementary_pair = s->complementary_supported && channel <= 3 &&
+        (tim2_load(s, TIM_CCER, 4) & (5u << ccer_shift)) ==
+        (5u << ccer_shift);
     if (mode == TIM_OCM_FORCE_INACTIVE || mode == TIM_OCM_FORCE_ACTIVE) {
         /* Forced OCREF has no transition for the dead-time generator to
-         * delay.  Keep the complementary gate as the logical inverse so
-         * both output-stage enables remain observable. */
+         * delay. The single/pair routing rule still applies. */
         *main_gate = mode == TIM_OCM_FORCE_ACTIVE;
-        *complementary_gate = !*main_gate;
+        *complementary_gate = complementary_pair ? !*main_gate : *main_gate;
         return true;
     }
     if (mode <= TIM_OCM_TOGGLE) {
         *main_gate = (s->ocref_level_mask >> (channel - 1)) & 1;
-        *complementary_gate = !*main_gate;
+        *complementary_gate = complementary_pair ? !*main_gate : *main_gate;
         return true;
     }
     if (mode != TIM_OCM_PWM1 && mode != TIM_OCM_PWM2) {
@@ -1852,9 +2064,6 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
     arr = tim2_active_arr_value(s);
     prescaler = (uint64_t)tim2_active_psc_value(s) + 1;
     cycle_ticks = tim2_counter_cycle_ticks(s) * prescaler;
-    phase = tim2_phase_clock_cycles(s,
-                                   tim2_now(s));
-    dead_time = tim2_dead_time_cycles(s, NULL);
     ccr = tim2_active_ccr_value(s, channel);
     (void)ccr_offset;
     (void)ccer_shift;
@@ -1869,9 +2078,10 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
             high = compare == 0 ? mode == TIM_OCM_PWM2 :
                    mode == TIM_OCM_PWM1;
             *main_gate = high;
-            *complementary_gate = !high;
+            *complementary_gate = complementary_pair ? !high : high;
             return true;
         }
+        phase = tim2_phase_clock_cycles(s, tim2_now(s), elapsed_cycles);
         high_ticks = compare * prescaler;
         cycle_ticks = center_arr * 2 * prescaler;
         if (mode == TIM_OCM_PWM1) {
@@ -1905,9 +2115,10 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
             high = compare_ticks == 0 ? mode == TIM_OCM_PWM2 :
                    mode == TIM_OCM_PWM1;
             *main_gate = high;
-            *complementary_gate = !high;
+            *complementary_gate = complementary_pair ? !high : high;
             return true;
         }
+        phase = tim2_phase_clock_cycles(s, tim2_now(s), elapsed_cycles);
         high_start = 0;
         high_end = compare_ticks * prescaler;
         if (mode == TIM_OCM_PWM1) {
@@ -1925,16 +2136,25 @@ static bool tim2_pwm_gate_levels(const DmMc02Tim2 *s, unsigned channel,
                                         cycle_ticks - high_end + phase;
         }
     }
+    if (phase_cycles) {
+        *phase_cycles = phase;
+    }
+    dead_time = complementary_pair ? tim2_dead_time_cycles(s, NULL) : 0;
     if (high) {
         *main_gate = since >= dead_time;
     } else {
         *complementary_gate = since >= dead_time;
     }
+    if (!complementary_pair) {
+        *complementary_gate = *main_gate;
+    }
     return true;
 }
 
-bool dm_mc02_tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
-                                       DmMc02TimPwmOutputState *output)
+static bool tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
+                                       DmMc02TimPwmOutputState *output,
+                                       uint64_t *phase_cycles,
+                                       uint64_t *elapsed_cycles)
 {
     hwaddr ccmr;
     hwaddr ccr_offset;
@@ -1966,7 +2186,8 @@ bool dm_mc02_tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
     bdtr = tim2_load(s, TIM_BDTR, 4);
     (void)ccr_offset;
     if (!tim2_pwm_gate_levels(s, channel, &main_gate,
-                              &complementary_gate)) {
+                              &complementary_gate, phase_cycles,
+                              elapsed_cycles)) {
         return false;
     }
     dead_time_cycles = tim2_dead_time_cycles(s, &dead_time_ticks);
@@ -1992,25 +2213,60 @@ bool dm_mc02_tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
     return true;
 }
 
-static void tim2_output_refresh(DmMc02Tim2 *s)
+bool dm_mc02_tim2_get_pwm_output_state(const DmMc02Tim2 *s, unsigned channel,
+                                       DmMc02TimPwmOutputState *output)
 {
-    DmMc02TimPwmOutputState output;
-    uint64_t now, hz, period, phase, psc, compare, dead, next = UINT64_MAX;
-    uint64_t targets[6];
-    unsigned count = 0;
+    return tim2_get_pwm_output_state(s, channel, output, NULL, NULL);
+}
+
+static bool tim2_output_sample(DmMc02Tim2 *s,
+                                DmMc02TimPwmOutputState *output)
+{
+    DmMc02TimPwmOutputState local;
+    uint64_t now, hz;
+    uint64_t phase_cycles = 0, elapsed_cycles = 0;
     bool valid, driven, level;
 
     if (!s->output) {
-        return;
+        return false;
+    }
+    if (!output) {
+        output = &local;
     }
     now = tim2_now(s);
+    if (s->output_sample_valid &&
+        (s->output_sample_static ||
+         (s->dispatching && s->output_sample_ns == now))) {
+        if (output != &local) {
+            *output = s->output_sample;
+        }
+        return s->output_driven;
+    }
     hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
-    valid = dm_mc02_tim2_get_pwm_output_state(s, s->output_channel, &output);
+    valid = tim2_get_pwm_output_state(s, s->output_channel, output,
+                                      &phase_cycles, &elapsed_cycles);
     driven = valid && hz && (s->output_complementary ?
-                             output.complementary_enabled :
-                             output.main_enabled);
+                             output->complementary_enabled :
+                             output->main_enabled);
     level = driven && (s->output_complementary ?
-                        output.complementary_level : output.main_level);
+                        output->complementary_level : output->main_level);
+    s->output_sample = *output;
+    s->output_sample_phase_cycles = phase_cycles;
+    s->output_sample_elapsed_cycles = elapsed_cycles;
+    s->output_sample_ns = now;
+    {
+        unsigned mode = tim2_ocref_mode(s, s->output_channel);
+        uint64_t ccr = tim2_active_ccr_value(s, s->output_channel);
+        uint64_t limit = tim2_center_aligned(s) ? s->active_arr :
+                         (uint64_t)s->active_arr + 1;
+
+        /* A static reference has no elapsed-time dependency. Register,
+         * preload, break and clock changes invalidate the sampled stage. */
+        s->output_sample_static = valid &&
+            (mode == TIM_OCM_PWM1 || mode == TIM_OCM_PWM2) &&
+            (!ccr || ccr >= limit);
+    }
+    s->output_sample_valid = s->dispatching || s->output_sample_static;
     if (!s->output_initialized || driven != s->output_driven ||
         level != s->output_level) {
         s->output_initialized = true;
@@ -2018,47 +2274,112 @@ static void tim2_output_refresh(DmMc02Tim2 *s)
         s->output_level = level;
         s->output(s->output_opaque, now, driven, level);
     }
-    timer_del(s->output_timer);
-    s->next_output_ns = 0;
-    if (!driven || (tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM1 &&
-                    tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM2)) {
+    /* An output consumer may reconfigure the stage synchronously. Keep the
+     * returned stage paired with the phase from the resulting nested sample. */
+    if (output != &local) {
+        *output = s->output_sample;
+    }
+    return s->output_driven;
+}
+
+static void tim2_output_schedule(DmMc02Tim2 *s, uint64_t next)
+{
+    /* Both event wrappers sample the pin at their saved virtual deadline.
+     * A matching hardware event therefore already owns this wakeup. */
+    if (next && ((s->next_update_ns == next &&
+                  timer_pending(s->update_timer)) ||
+                 (s->next_compare_ns == next &&
+                  (timer_pending(s->compare_timer) ||
+                   s->compare_owned_by_update)))) {
+        next = 0;
+    }
+    if (!next) {
+        s->next_output_ns = 0;
+        if (timer_pending(s->output_timer)) {
+            timer_del(s->output_timer);
+        }
+    } else if (s->next_output_ns != next ||
+               !timer_pending(s->output_timer) ||
+               timer_expire_time_ns(s->output_timer) !=
+               tim2_queue_deadline(s, next)) {
+        s->next_output_ns = next;
+        tim2_timer_mod(s, s->output_timer, next);
+    }
+}
+
+static void tim2_output_refresh(DmMc02Tim2 *s)
+{
+    DmMc02TimPwmOutputState output;
+    uint64_t now, hz, period, phase, elapsed, psc, compare, dead;
+    uint64_t targets[4], distance = UINT64_MAX;
+    __uint128_t cycles, deadline;
+    unsigned count = 0;
+    bool driven;
+
+    if (!s->output) {
         return;
     }
+    driven = tim2_output_sample(s, &output);
+    if (!s->output) {
+        return;
+    }
+    if (s->output_sample_valid && s->output_sample_static) {
+        tim2_output_schedule(s, 0);
+        return;
+    }
+    if (!driven || (tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM1 &&
+                    tim2_ocref_mode(s, s->output_channel) != TIM_OCM_PWM2)) {
+        tim2_output_schedule(s, 0);
+        return;
+    }
+    now = tim2_now(s);
+    hz = s->clock ? clock_get_hz(s->clock) : TIM2_CLOCK_HZ;
     psc = (uint64_t)tim2_active_psc_value(s) + 1;
     period = tim2_counter_cycle_ticks(s) * psc;
     compare = (uint64_t)tim2_active_ccr_value(s, s->output_channel) * psc;
     if (!compare || compare >= (tim2_center_aligned(s) ? period / 2 : period)) {
+        tim2_output_schedule(s, 0);
         return;
     }
-    phase = tim2_phase_clock_cycles(s, now);
-    dead = output.dead_time_cycles;
-    /* Gate changes at OCREF transitions and the two delayed turn-ons.
-     * Extra candidates are harmless: identical resolved levels are omitted. */
+    if (s->dispatching && s->output_sample_valid &&
+        s->output_sample_ns == now) {
+        /* The sampled pin and its next edge use the same counter phase.
+         * Active writes invalidate both through output_sample_valid. */
+        phase = s->output_sample_phase_cycles;
+        elapsed = s->output_sample_elapsed_cycles;
+    } else {
+        phase = tim2_phase_clock_cycles(s, now, &elapsed);
+    }
+    dead = output.main_enabled && output.complementary_enabled ?
+           output.dead_time_cycles : 0;
+    /* A lone main/N output follows OCREF without dead time.  The two delayed
+     * turn-ons are additional candidates only for an enabled output pair. */
     targets[count++] = tim2_center_aligned(s) ? period - compare : 0;
     targets[count++] = compare;
-    targets[count++] = (targets[0] + dead) % period;
-    targets[count++] = (compare + dead) % period;
+    if (dead) {
+        targets[count++] = (targets[0] + dead) % period;
+        targets[count++] = (compare + dead) % period;
+    }
     for (unsigned i = 0; i < count; ++i) {
-        uint64_t distance = tim2_phase_distance(phase, targets[i], period);
-        __uint128_t cycles = (__uint128_t)tim2_elapsed_clock_cycles(s, now) +
-                             distance;
-        __uint128_t deadline = s->start_ns +
-            (cycles * UINT64_C(1000000000) + hz - 1) / hz;
-
-        if (deadline > now && deadline <= INT64_MAX) {
-            next = MIN(next, (uint64_t)deadline);
-        }
+        distance = MIN(distance,
+                       tim2_phase_distance(phase, targets[i], period));
     }
-    if (next != UINT64_MAX) {
-        s->next_output_ns = next;
-        timer_mod(s->output_timer, next);
-    }
+    /* Absolute deadlines increase with phase distance.  Select the nearest
+     * candidate in clock cycles, then perform the wide division just once. */
+    cycles = (__uint128_t)elapsed + distance;
+    deadline = s->start_ns +
+        (cycles * UINT64_C(1000000000) + hz - 1) / hz;
+    tim2_output_schedule(s, deadline > now && deadline <= INT64_MAX ?
+                         (uint64_t)deadline : 0);
 }
 
 static void tim2_output_timer(void *opaque)
 {
     DmMc02Tim2 *s = opaque;
 
+    if (tim2_dispatch_window(s, s->output_timer, s->next_output_ns)) {
+        return;
+    }
     s->dispatching = true;
     s->dispatch_ns = s->next_output_ns;
     tim2_output_refresh(s);
@@ -2069,6 +2390,7 @@ void dm_mc02_tim2_set_output(DmMc02Tim2 *s, unsigned channel,
                              bool complementary, DmDigitalOutput *output,
                              void *opaque)
 {
+    tim2_window_sync_before_access(s);
     if (s->output == output && s->output_channel == channel &&
         s->output_complementary == complementary && s->output_opaque == opaque) {
         return;
@@ -2084,6 +2406,7 @@ void dm_mc02_tim2_set_output(DmMc02Tim2 *s, unsigned channel,
     s->output_channel = channel;
     s->output_complementary = complementary;
     s->output_initialized = false;
+    s->output_sample_valid = false;
     s->next_output_ns = 0;
     s->update_interval_ns = 0;
     tim2_schedule_compare(s);
@@ -2123,6 +2446,41 @@ bool dm_mc02_tim2_output_connected(const DmMc02Tim2 *s)
 uint64_t dm_mc02_tim2_event_time(const DmMc02Tim2 *s)
 {
     return tim2_now(s);
+}
+
+uint32_t dm_mc02_tim2_event_window_ns(const DmMc02Tim2 *s)
+{
+    return tim2_window_enabled(s) ? s->event_window_ns : 0;
+}
+
+void dm_mc02_tim2_window_changed(DmMc02Tim2 *s)
+{
+    if (!s || !s->event_window_ns) {
+        return;
+    }
+    /* Do not recalculate phase or skip a due event when eligibility changes.
+     * Only the global queue representation of the same events has changed. */
+    if (s->update_timer && timer_pending(s->update_timer)) {
+        tim2_timer_mod(s, s->update_timer, s->next_update_ns);
+    }
+    tim2_queue_compare(s);
+    if (s->output_timer && timer_pending(s->output_timer)) {
+        tim2_timer_mod(s, s->output_timer, s->next_output_ns);
+    }
+}
+
+void dm_mc02_tim2_set_window_allowed(DmMc02Tim2 *s,
+                                      DmMc02TimWindowAllowed *allowed,
+                                      void *opaque)
+{
+    if (!s || (s->window_allowed == allowed &&
+               s->window_allowed_opaque == opaque)) {
+        return;
+    }
+    tim2_window_sync_before_access(s);
+    s->window_allowed = allowed;
+    s->window_allowed_opaque = opaque;
+    dm_mc02_tim2_window_changed(s);
 }
 
 bool dm_mc02_tim2_get_pwm_state(const DmMc02Tim2 *s, unsigned channel,
@@ -2205,25 +2563,32 @@ static void tim2_generate_update_event(DmMc02Tim2 *s,
                                         unsigned output_mask)
 {
     uint16_t ocref_output_masks = tim2_master_ocref_output_masks(s);
-    uint8_t old_valid_mask;
-    uint8_t new_valid_mask;
-    uint8_t ocref_old_level_mask;
-    uint8_t ocref_new_level_mask;
-    uint64_t old_counter = reset_counter ? tim2_counter(s) :
-                                           (tim2_center_aligned(s) ? 0 :
-                                            tim2_active_arr_value(s));
+    uint8_t old_valid_mask = 0;
+    uint8_t new_valid_mask = 0;
+    uint8_t ocref_old_level_mask = 0;
+    uint8_t ocref_new_level_mask = 0;
     bool active_changed;
 
-    tim2_snapshot_ocref_levels(s, old_counter, &old_valid_mask,
-                               &ocref_old_level_mask);
+    if (!s->output_sample_static) {
+        s->output_sample_valid = false;
+    }
+    if (ocref_output_masks) {
+        uint64_t old_counter = reset_counter ? tim2_counter(s) :
+            (tim2_center_aligned(s) ? 0 : tim2_active_arr_value(s));
+
+        tim2_snapshot_ocref_levels(s, old_counter, &old_valid_mask,
+                                   &ocref_old_level_mask);
+    }
     active_changed = tim2_transfer_preloads(s);
     /* A qualified update reloads REP.  The scheduler accounts for this
      * value when selecting the next qualified update deadline. */
     s->repetition_remaining = tim2_active_rcr_value(s);
     tim2_refresh_break_state(s, true);
-    tim2_snapshot_ocref_levels(s, 0, &new_valid_mask,
-                               &ocref_new_level_mask);
-    old_valid_mask &= new_valid_mask;
+    if (ocref_output_masks) {
+        tim2_snapshot_ocref_levels(s, 0, &new_valid_mask,
+                                   &ocref_new_level_mask);
+        old_valid_mask &= new_valid_mask;
+    }
     if (reset_counter || tim2_center_aligned(s)) {
         tim2_store(s, TIM_CNT, 0, 4);
         s->start_ns = timestamp_ns;
@@ -2238,21 +2603,24 @@ static void tim2_generate_update_event(DmMc02Tim2 *s,
 
     /* UIF is latched independently from UIE; polling firmware must see the
      * update event even when the interrupt is masked. */
-    tim2_store(s, TIM_SR, tim2_load(s, TIM_SR, 4) | TIM_SR_UIF, 4);
-    tim2_update_irq(s);
+    tim2_raise_flags(s, TIM_SR_UIF);
     if (s->update_callback) {
         s->update_callback(s->update_opaque);
     }
-    if (active_changed && s->output) {
+    if (active_changed && (s->output || s->compare_precise)) {
         tim2_schedule_compare(s);
     }
     tim2_emit_master_event(s, output_mask, DM_MC02_TIM_MASTER_UPDATE, true, 1,
                            timestamp_ns);
-    tim2_emit_ocref_snapshot(s, ocref_output_masks, old_valid_mask,
-                             ocref_old_level_mask, ocref_new_level_mask, 1,
-                             timestamp_ns);
-    tim2_output_refresh(s);
+    if (ocref_output_masks) {
+        tim2_emit_ocref_snapshot(s, ocref_output_masks, old_valid_mask,
+                                 ocref_old_level_mask, ocref_new_level_mask, 1,
+                                 timestamp_ns);
+    }
+    /* The outer update wrapper (or EGR write) schedules after consumers have
+     * finished changing the active timer configuration. */
     if (active_changed && s->changed) {
+        tim2_output_sample(s, NULL);
         s->changed(s->changed_opaque);
     }
 }
@@ -2332,14 +2700,18 @@ static void tim2_schedule_update(DmMc02Tim2 *s, bool preserve_phase)
         s->next_update_ns = 0;
         return;
     }
-    timer_mod(s->update_timer, s->next_update_ns);
+    tim2_timer_mod(s, s->update_timer, s->next_update_ns);
+    tim2_queue_compare(s);
 }
 
 static void tim2_reschedule(DmMc02Tim2 *s)
 {
+    s->output_sample_valid = false;
     s->update_interval_ns = 0;
     tim2_schedule_update(s, false);
     tim2_schedule_compare(s);
+    /* Reconsider an output deadline whose hardware-event owner moved. */
+    tim2_output_refresh(s);
 }
 
 static void tim2_reschedule_from_count(DmMc02Tim2 *s)
@@ -2364,7 +2736,7 @@ static void tim2_reschedule_from_count(DmMc02Tim2 *s)
     delay = tim2_remaining_interval_ns(s);
     s->next_update_ns = tim2_add_deadline(now, delay);
     if (s->next_update_ns) {
-        timer_mod(s->update_timer, s->next_update_ns);
+        tim2_timer_mod(s, s->update_timer, s->next_update_ns);
     } else {
         timer_del(s->update_timer);
         s->next_update_ns = 0;
@@ -2380,6 +2752,7 @@ static uint64_t tim2_read(void *opaque, hwaddr offset, unsigned size)
     if (offset + size > DM_MC02_TIM2_REGION_SIZE) {
         return 0;
     }
+    tim2_window_sync_before_access(s);
     value = tim2_load(s, offset, size);
     if (!s->repetition_supported) {
         for (unsigned i = 0; i < size; ++i) {
@@ -2404,8 +2777,8 @@ static uint64_t tim2_read(void *opaque, hwaddr offset, unsigned size)
     return value;
 }
 
-static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
-                       unsigned size)
+static void tim2_write_at(void *opaque, hwaddr offset, uint64_t value,
+                          unsigned size)
 {
     DmMc02Tim2 *s = opaque;
     bool was_enabled;
@@ -2421,6 +2794,34 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
 
     if (offset + size > DM_MC02_TIM2_REGION_SIZE) {
         return;
+    }
+    /* A DMA write to an enabled CCR preload only changes the shadow value.
+     * Keep the existing compare/output deadlines until the update event
+     * transfers it.  Rebuilding timers and publishing board state here can
+     * starve the CPU at WS2812 rates even while CCR repeatedly remains zero. */
+    if (offset >= TIM_CCR1 && offset + size <= TIM_CCR4 + 4 &&
+        offset / 4 == (offset + size - 1) / 4) {
+        unsigned channel = (offset - TIM_CCR1) / 4 + 1;
+        bool active = channel == 1 ? s->cc1_active :
+                      channel == 2 ? s->cc2_active :
+                      channel == 3 ? s->cc3_active : s->cc4_active;
+
+        if (active && tim2_channel_preload_enabled(s, channel)) {
+            unsigned bit = 1u << (channel - 1);
+
+            tim2_store(s, offset, value, size);
+            s->preload_pending_mask &= ~bit;
+            if (s->active_ccr[channel - 1] !=
+                tim2_load(s, TIM_CCR1 + 4 * (channel - 1), 4)) {
+                s->preload_pending_mask |= bit;
+            }
+            return;
+        }
+    }
+    /* CCR preload writes above only affect the next update. All remaining
+     * configuration writes can replace the current event's sampled stage. */
+    if (offset != TIM_SR || size != sizeof(uint32_t)) {
+        s->output_sample_valid = false;
     }
     ignore_rcr_write = !s->repetition_supported &&
                        tim2_accesses(offset, size, TIM_RCR);
@@ -2480,6 +2881,9 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
         return;
     }
     tim2_store(s, offset, value, size);
+    if (tim2_accesses(offset, size, TIM_CR1)) {
+        s->counter_period_cached = false;
+    }
     if (ignore_rcr_write) {
         tim2_store(s, TIM_RCR, old_rcr, sizeof(uint32_t));
     }
@@ -2497,6 +2901,7 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
         }
     }
     (void)tim2_update_active_from_write(s, offset, size, was_enabled);
+    tim2_refresh_pending_preloads(s);
     if (!s->mms2_supported &&
         tim2_accesses(offset, size, TIM_CR2)) {
         uint32_t cr2 = tim2_load(s, TIM_CR2, 4);
@@ -2597,13 +3002,37 @@ static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
         tim2_schedule_compare(s);
         tim2_schedule_update(s, true);
     }
-    if (tim2_accesses(offset, size, TIM_DIER)) {
+    if (tim2_accesses(offset, size, TIM_DIER) ||
+        tim2_accesses(offset, size, TIM_SR)) {
+        /* Subword/unaligned SR accesses take this generic write path. */
         tim2_update_irq(s);
     }
     tim2_output_refresh(s);
     if (s->changed) {
         s->changed(s->changed_opaque);
     }
+}
+
+static void tim2_write(void *opaque, hwaddr offset, uint64_t value,
+                       unsigned size)
+{
+    DmMc02Tim2 *s = opaque;
+    bool dispatching = s->dispatching;
+    uint64_t dispatch_ns = s->dispatch_ns;
+
+    tim2_window_sync_before_access(s);
+    /* A register transaction has one virtual instant. Re-reading the live
+     * clock while scheduling its events would offset update from compare
+     * phase by the host time spent executing this MMIO handler. Nested DMA
+     * writes retain the peripheral event's already selected timestamp. */
+    if (!dispatching) {
+        s->dispatch_ns = tim2_now(s);
+        s->dispatching = true;
+        s->output_sample_valid = false;
+    }
+    tim2_write_at(s, offset, value, size);
+    s->dispatching = dispatching;
+    s->dispatch_ns = dispatch_ns;
 }
 
 static const MemoryRegionOps tim2_ops = {
@@ -2617,27 +3046,141 @@ static const MemoryRegionOps tim2_ops = {
 static void tim2_update_timer(void *opaque)
 {
     DmMc02Tim2 *s = opaque;
-    s->dispatching = s->output != NULL;
+    unsigned zero_matches = 0;
+
+    if (tim2_dispatch_window(s, s->update_timer, s->next_update_ns)) {
+        return;
+    }
+    if (!s->output_sample_static) {
+        s->output_sample_valid = false;
+    }
+    s->dispatching = s->output != NULL || s->compare_precise;
+    s->dispatching_update = s->dispatching;
     s->dispatch_ns = s->next_update_ns;
     tim2_update_dispatch(s);
+    /* Reload/preload transfer precedes the compare at counter zero. A newly
+     * loaded CCR=0 matches this rollover; a stale zero match must disappear
+     * when the new CCR is nonzero. Both events belong to one hardware instant
+     * and need one QEMU queue entry, while every DMA request is still issued. */
+    if (s->compare_owned_by_update && s->next_compare_ns == s->dispatch_ns &&
+        s->compare_period_ns &&
+        s->compare_channel_mask == s->compare_period_mask &&
+        !s->active_ccr[ctz32(s->compare_period_mask)]) {
+        /* An exact single-channel zero match already scheduled at this
+         * rollover proves both the channel and phase without recalculation. */
+        zero_matches = s->compare_channel_mask;
+    } else if (s->dispatching_update &&
+        (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) &&
+        tim2_counter_at(s, s->dispatch_ns) == 0) {
+        for (unsigned channel = 1; channel <= 4; ++channel) {
+            if (tim2_compare_channel_required(s, channel) &&
+                tim2_active_ccr_value(s, channel) == 0) {
+                zero_matches |= 1u << (channel - 1);
+            }
+        }
+    }
+    if (zero_matches) {
+        s->next_compare_ns = s->dispatch_ns;
+        s->compare_channel_mask = zero_matches;
+        tim2_queue_compare(s);
+        tim2_compare_dispatch(s);
+    }
     tim2_output_refresh(s);
+    s->dispatching_update = false;
     s->dispatching = false;
 }
 
 static void tim2_compare_timer(void *opaque)
 {
     DmMc02Tim2 *s = opaque;
-    s->dispatching = s->output != NULL;
+
+    if (tim2_dispatch_window(s, s->compare_timer, s->next_compare_ns)) {
+        return;
+    }
+    if (!s->output_sample_static) {
+        s->output_sample_valid = false;
+    }
+    s->compare_owned_by_update = false;
+    s->dispatching = s->output != NULL || s->compare_precise;
     s->dispatch_ns = s->next_compare_ns;
     tim2_compare_dispatch(s);
     tim2_output_refresh(s);
     s->dispatching = false;
 }
 
+static void tim2_sync_events(DmMc02Tim2 *s, uint64_t timestamp_ns,
+                             unsigned budget)
+{
+    DmDigitalOutput *output = s->output;
+    void *opaque = s->output_opaque;
+    bool window = tim2_window_enabled(s);
+
+    if ((!output && !(s->event_window_ns && s->compare_precise)) ||
+        s->dispatching || s->syncing_output) {
+        return;
+    }
+    s->syncing_output = true;
+    while (budget-- && s->output == output && s->output_opaque == opaque &&
+           (!window || tim2_window_enabled(s))) {
+        uint64_t next = UINT64_MAX;
+        unsigned kind = 0;
+
+        if (s->next_update_ns && timer_pending(s->update_timer) &&
+            s->next_update_ns < next) {
+            next = s->next_update_ns;
+            kind = 1;
+        }
+        if (s->next_compare_ns && timer_pending(s->compare_timer) &&
+            s->next_compare_ns < next) {
+            next = s->next_compare_ns;
+            kind = 2;
+        }
+        if (s->next_output_ns && timer_pending(s->output_timer) &&
+            s->next_output_ns < next) {
+            next = s->next_output_ns;
+            kind = 3;
+        }
+        if (!kind || next > timestamp_ns) {
+            break;
+        }
+        switch (kind) {
+        case 1:
+            timer_del(s->update_timer);
+            tim2_update_timer(s);
+            break;
+        case 2:
+            timer_del(s->compare_timer);
+            tim2_compare_timer(s);
+            break;
+        case 3:
+            timer_del(s->output_timer);
+            tim2_output_timer(s);
+            break;
+        }
+    }
+    s->syncing_output = false;
+}
+
+void dm_mc02_tim2_sync_output(DmMc02Tim2 *s, uint64_t timestamp_ns)
+{
+    tim2_sync_events(s, timestamp_ns, UINT_MAX);
+}
+
 void dm_mc02_tim2_init(DmMc02Tim2 *s, Object *owner,
                        DmMc02TimChanged *changed, void *changed_opaque)
 {
+    const char *window = g_getenv("DM_TIM_EVENT_WINDOW_NS");
+
     memset(s, 0, sizeof(*s));
+    if (window && *window) {
+        char *end;
+        uint64_t ns = g_ascii_strtoull(window, &end, 10);
+
+        /* Keep the experiment bounded; zero/unset is the normal scheduler. */
+        if (!*end && ns >= 250 && ns <= 10000) {
+            s->event_window_ns = ns;
+        }
+    }
     s->start_ns = tim2_now(s);
     s->break_input_level = true;
     s->update_batch = 1;
@@ -2659,6 +3202,8 @@ void dm_mc02_tim2_set_clock(DmMc02Tim2 *s, Clock *clock)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
+    s->output_sample_valid = false;
     running = tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN;
     now = tim2_now(s);
     if (running) {
@@ -2678,6 +3223,7 @@ void dm_mc02_tim2_set_clock(DmMc02Tim2 *s, Clock *clock)
         s->start_counting_down = counting_down;
     }
     s->clock = clock;
+    s->counter_period_cached = false;
     s->update_interval_ns = 0;
     if (running && s->update_timer &&
         tim2_update_required(s)) {
@@ -2685,7 +3231,7 @@ void dm_mc02_tim2_set_clock(DmMc02Tim2 *s, Clock *clock)
 
         s->next_update_ns = tim2_add_deadline(now, delay);
         if (s->next_update_ns) {
-            timer_mod(s->update_timer, s->next_update_ns);
+            tim2_timer_mod(s, s->update_timer, s->next_update_ns);
         } else {
             timer_del(s->update_timer);
             s->next_update_ns = 0;
@@ -2707,6 +3253,9 @@ void dm_mc02_tim2_clock_changed(DmMc02Tim2 *s)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
+    s->output_sample_valid = false;
+    s->counter_period_cached = false;
     if (tim2_load(s, TIM_CR1, 4) & TIM_CR1_CEN) {
         counting_down = tim2_counting_down_at(
             s, tim2_now(s));
@@ -2723,6 +3272,7 @@ void dm_mc02_tim2_set_irq(DmMc02Tim2 *s, qemu_irq irq)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->irq = irq;
     s->irq_level_valid = false;
     tim2_update_irq(s);
@@ -2737,6 +3287,13 @@ void dm_mc02_tim2_sync_runtime(DmMc02Tim2 *s)
     if (!s) {
         return;
     }
+    s->output_sample_valid = false;
+    tim2_refresh_pending_preloads(s);
+    s->counter_period_cached = false;
+    s->compare_period_ns = 0;
+    s->compare_period_mask = 0;
+    s->compare_owned_by_update = false;
+    s->dispatching_update = false;
     if (s->update_timer) {
         timer_del(s->update_timer);
     }
@@ -2751,6 +3308,7 @@ void dm_mc02_tim2_sync_runtime(DmMc02Tim2 *s)
     if (!running) {
         s->next_update_ns = 0;
         s->next_compare_ns = 0;
+        tim2_output_refresh(s);
         return;
     }
 
@@ -2763,7 +3321,7 @@ void dm_mc02_tim2_sync_runtime(DmMc02Tim2 *s)
             deadline = now;
             s->next_update_ns = deadline;
         }
-        timer_mod(s->update_timer, deadline);
+        tim2_timer_mod(s, s->update_timer, deadline);
     } else {
         tim2_schedule_update(s, true);
     }
@@ -2775,10 +3333,11 @@ void dm_mc02_tim2_sync_runtime(DmMc02Tim2 *s)
             deadline = now;
             s->next_compare_ns = deadline;
         }
-        timer_mod(s->compare_timer, deadline);
+        tim2_queue_compare(s);
     } else {
         tim2_schedule_compare(s);
     }
+    tim2_output_refresh(s);
 }
 
 bool dm_mc02_tim2_validate_vmstate(const DmMc02Tim2 *s)
@@ -2811,17 +3370,23 @@ void dm_mc02_tim2_reset(DmMc02Tim2 *s)
     if (!s) {
         return;
     }
+    s->output_sample_valid = false;
     memset(s->regs, 0, sizeof(s->regs));
     s->active_psc = 0;
     s->active_arr = 0;
     memset(s->active_ccr, 0, sizeof(s->active_ccr));
     s->active_rcr = 0;
+    s->preload_pending_mask = 0;
+    s->counter_period_cached = false;
+    s->compare_period_ns = 0;
+    s->compare_period_mask = 0;
     s->repetition_remaining = 0;
     s->start_ns = tim2_now(s);
     s->start_counting_down = false;
     s->next_update_ns = 0;
     s->update_interval_ns = 0;
     s->next_compare_ns = 0;
+    s->compare_owned_by_update = false;
     s->compare_channel_mask = 0;
     s->cc1_active = false;
     s->cc2_active = false;
@@ -2851,6 +3416,7 @@ void dm_mc02_tim2_set_update_callback(DmMc02Tim2 *s,
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->update_callback = callback;
     s->update_opaque = opaque;
     tim2_reschedule(s);
@@ -2862,6 +3428,7 @@ void dm_mc02_tim2_set_compare_callback(
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->compare_callback = callback;
     s->compare_opaque = opaque;
     tim2_reschedule(s);
@@ -2873,6 +3440,7 @@ void dm_mc02_tim2_set_event_callback(
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->event_callback = callback;
     s->event_opaque = opaque;
     tim2_reschedule(s);
@@ -2883,6 +3451,7 @@ void dm_mc02_tim2_set_mms2_supported(DmMc02Tim2 *s, bool supported)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->mms2_supported = supported;
     tim2_reschedule(s);
 }
@@ -2892,6 +3461,7 @@ void dm_mc02_tim2_set_repetition_supported(DmMc02Tim2 *s, bool supported)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->repetition_supported = supported;
     if (supported) {
         s->active_rcr = tim2_load(s, TIM_RCR, 4) & 0xffffu;
@@ -2902,6 +3472,7 @@ void dm_mc02_tim2_set_repetition_supported(DmMc02Tim2 *s, bool supported)
         tim2_store(s, TIM_RCR, 0, 4);
     }
     s->update_interval_ns = 0;
+    tim2_refresh_pending_preloads(s);
     tim2_reschedule(s);
 }
 
@@ -2910,6 +3481,8 @@ void dm_mc02_tim2_set_break_supported(DmMc02Tim2 *s, bool supported)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
+    s->output_sample_valid = false;
     s->break_supported = supported;
     if (!supported) {
         tim2_store(s, TIM_BDTR, 0, sizeof(uint32_t));
@@ -2923,6 +3496,8 @@ void dm_mc02_tim2_set_break_input(DmMc02Tim2 *s, bool level)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
+    s->output_sample_valid = false;
     s->break_input_level = level;
     tim2_refresh_break_state(s, false);
     tim2_output_refresh(s);
@@ -2936,6 +3511,8 @@ void dm_mc02_tim2_set_complementary_supported(DmMc02Tim2 *s, bool supported)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
+    s->output_sample_valid = false;
     s->complementary_supported = supported;
     tim2_output_refresh(s);
     if (s->changed) {
@@ -2948,6 +3525,7 @@ void dm_mc02_tim2_set_update_batch(DmMc02Tim2 *s, unsigned batch)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->update_batch = MAX(batch, 1u);
     s->update_interval_ns = 0;
     tim2_reschedule(s);
@@ -2963,6 +3541,7 @@ void dm_mc02_tim2_set_compare_batch(DmMc02Tim2 *s, unsigned batch)
     if (!s) {
         return;
     }
+    tim2_window_sync_before_access(s);
     s->compare_batch = MAX(batch, 1u);
     tim2_reschedule(s);
 }
@@ -2970,4 +3549,14 @@ void dm_mc02_tim2_set_compare_batch(DmMc02Tim2 *s, unsigned batch)
 unsigned dm_mc02_tim2_get_compare_batch(const DmMc02Tim2 *s)
 {
     return s ? s->compare_batch : 0;
+}
+
+void dm_mc02_tim2_set_compare_precise(DmMc02Tim2 *s, bool precise)
+{
+    if (!s || s->compare_precise == precise) {
+        return;
+    }
+    tim2_window_sync_before_access(s);
+    s->compare_precise = precise;
+    tim2_reschedule(s);
 }

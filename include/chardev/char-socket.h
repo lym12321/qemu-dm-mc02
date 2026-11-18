@@ -58,6 +58,13 @@ struct SocketChardev {
     int max_size;
     int do_telnetopt;
     int do_nodelay;
+    bool write_buffer;
+    /* Protected by parent.chr_write_lock; bytes already accepted from the FE. */
+    uint8_t *write_buf;
+    size_t write_head;
+    size_t write_len;
+    GSource *write_timer;
+    GSource *write_watch;
     int *read_msgfds;
     size_t read_msgfds_num;
     int *write_msgfds;

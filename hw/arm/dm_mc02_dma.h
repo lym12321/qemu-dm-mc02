@@ -5,6 +5,7 @@
 #include "exec/memory.h"
 #include "hw/irq.h"
 #include "hw/arm/dm_mc02_dma_endpoint.h"
+#include "hw/arm/dm_mc02_event.h"
 #include "qemu/typedefs.h"
 
 #include <stdint.h>
@@ -44,6 +45,10 @@
 typedef void DmMc02DmaStreamEnabled(void *opaque, unsigned stream,
                                     uint32_t control);
 
+/* Board-owned synchronization around a register transaction. Hooks may
+ * service other devices; the board owns any cross-device reentry guard. */
+typedef void DmMc02DmaMmioHook(void *opaque);
+
 typedef struct DmMc02Dma {
     MemoryRegion iomem;
     uint8_t regs[DM_MC02_DMA_REGION_SIZE];
@@ -70,16 +75,27 @@ typedef struct DmMc02Dma {
     uint8_t fifo_length[DM_MC02_DMA_STREAM_COUNT];
     DmMc02DmaStreamEnabled *stream_enabled;
     void *stream_enabled_opaque;
+    /* Board-owned runtime wiring, preserved by reset and state loading. */
+    DmMc02EventTime *event_time;
+    DmMc02DmaMmioHook *before_access;
+    DmMc02DmaMmioHook *after_write;
+    void *mmio_hook_opaque;
     qemu_irq stream_irq[DM_MC02_DMA_STREAM_COUNT];
     /* Cache all streams carrying a request ID.  More than one DMAMUX channel
      * may legally select the same request, so a single cached stream would
      * silently starve the other channel. */
     uint8_t request_stream_mask[128];
     uint8_t request_cache_seen[128];
+    /* Explicit endpoint callbacks retain their fixed-PAR routing contract;
+     * ordinary M2P requests may instead target any configured MMIO PAR. */
+    bool request_cache_has_endpoint[128];
     /* A request ID can be raised by more than one peripheral endpoint (for
      * example ADC1->DR and ADC12_COMMON->CDR).  Cache the endpoint key too;
      * otherwise a negative lookup for one endpoint can starve another. */
     hwaddr request_cache_peripheral_addr[128];
+    /* Generations are local to one mux; equal values in different muxes
+     * do not identify the same route table. Runtime-only, like this cache. */
+    const struct DmMc02Dmamux *request_cache_dmamux;
     uint64_t request_cache_generation;
     bool request_cache_valid;
     /* DMA status IRQs are level-sensitive.  Avoid re-entering the QEMU IRQ
@@ -94,6 +110,10 @@ typedef struct DmMc02Dmamux {
     MemoryRegion iomem;
     uint8_t regs[DM_MC02_DMAMUX_REGION_SIZE];
     uint64_t generation;
+    /* Runtime wiring, retained by reset and excluded from VMState. */
+    DmMc02DmaMmioHook *before_access;
+    DmMc02DmaMmioHook *after_write;
+    void *mmio_hook_opaque;
 } DmMc02Dmamux;
 
 /* The H723 DMA subsystem has two stream controllers and two DMAMUX windows.
@@ -109,17 +129,24 @@ typedef struct DmMc02DmaSubsystem {
     DmMc02Dmamux dmamux[DM_MC02_DMAMUX_COUNT];
 } DmMc02DmaSubsystem;
 
-/* DMA peripheral_addr is the fixed request/endpoint identity.  For PINC
- * streams it is matched against the captured initial PAR while live PAR is
- * advanced for each beat; endpoint callbacks are only used at that identity. */
+/* DMA peripheral_addr identifies the requesting peripheral. Plain M2P
+ * requests use the stream's configured PAR independently of that address.
+ * P2M and explicit endpoint requests match the captured initial PAR; endpoint
+ * callbacks are only used while the live PAR remains at that identity. */
 
 /* Advance one enabled stream selected by a DMAMUX request.  When multiple
  * streams match, the DMA controller selects the highest SxCR.PL priority and
  * uses the lowest stream number as the deterministic tie-break.  The
- * peripheral endpoint is an address in address_space_memory (and may
- * therefore be an MMIO register).  Only one NDTR item is moved per call. */
+ * configured PAR is an address in address_space_memory (and may therefore
+ * be an MMIO register). Only one NDTR item is moved per call. */
 bool dm_mc02_dma_request(DmMc02Dma *state, const DmMc02Dmamux *dmamux,
                          uint32_t request_id, hwaddr peripheral_addr);
+
+/* Same transfer with its scheduled time scoped across synchronous MMIO and
+ * IRQ side effects. Nested requests restore the caller's event time. */
+bool dm_mc02_dma_request_at(DmMc02Dma *state, const DmMc02Dmamux *dmamux,
+                            uint32_t request_id, hwaddr peripheral_addr,
+                            uint64_t timestamp_ns);
 
 /* Service one request through a board-independent endpoint callback.  The
  * endpoint is used instead of address_space_memory for the peripheral data
@@ -147,6 +174,13 @@ bool dm_mc02_dma_request_batch(DmMc02Dma *state,
                                hwaddr peripheral_addr,
                                unsigned items);
 
+/* All items share timestamp_ns. Sources needing distinct event times must
+ * issue one request per event rather than coalescing their timestamps. */
+bool dm_mc02_dma_request_batch_at(DmMc02Dma *state,
+                                  const DmMc02Dmamux *dmamux,
+                                  uint32_t request_id, hwaddr peripheral_addr,
+                                  uint64_t timestamp_ns, unsigned items);
+
 /* Service a repeated request batch while retaining only the final write to a
  * fixed peripheral endpoint.  This is an explicit approximation contract for
  * peripherals whose externally visible state is sampled after the batch;
@@ -170,6 +204,18 @@ uint32_t dm_mc02_dma_transfer_length(const DmMc02Dma *state, unsigned stream);
 void dm_mc02_dma_set_stream_enabled_callback(DmMc02Dma *state,
                                               DmMc02DmaStreamEnabled *callback,
                                               void *opaque);
+
+void dm_mc02_dma_set_event_time(DmMc02Dma *state, DmMc02EventTime *context);
+
+/* Hooks wrap external MMIO, including ignored accesses. Internal DMA beat
+ * bookkeeping bypasses them. NULL callbacks preserve the standalone model. */
+void dm_mc02_dma_set_mmio_hooks(DmMc02Dma *state,
+                                DmMc02DmaMmioHook *before_access,
+                                DmMc02DmaMmioHook *after_write, void *opaque);
+void dm_mc02_dmamux_set_mmio_hooks(DmMc02Dmamux *state,
+                                   DmMc02DmaMmioHook *before_access,
+                                   DmMc02DmaMmioHook *after_write, void *opaque);
+
 
 void dm_mc02_dma_set_dmamux_channel_offset(DmMc02Dma *state,
                                            unsigned channel_offset);

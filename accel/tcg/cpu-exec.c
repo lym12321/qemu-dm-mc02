@@ -250,7 +250,7 @@ static inline TranslationBlock *tb_lookup(CPUState *cpu, vaddr pc,
     /* we should never be trying to look up an INVALID tb */
     tcg_debug_assert(!(cflags & CF_INVALID));
 
-    hash = tb_jmp_cache_hash_func(pc);
+    hash = tb_jmp_cache_hash_func(pc, cflags);
     jc = cpu->tb_jmp_cache;
 
     if (cflags & CF_PCREL) {
@@ -357,7 +357,7 @@ static bool check_for_breakpoints_slow(CPUState *cpu, vaddr pc,
 #ifdef CONFIG_USER_ONLY
                 g_assert_not_reached();
 #else
-                CPUClass *cc = CPU_GET_CLASS(cpu);
+                CPUClass *cc = cpu->cc;
                 assert(cc->tcg_ops->debug_check_breakpoint);
                 match_bp = cc->tcg_ops->debug_check_breakpoint(cpu);
 #endif
@@ -476,7 +476,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
          * counter hit zero); we must restore the guest PC to the address
          * of the start of the TB.
          */
-        CPUClass *cc = CPU_GET_CLASS(cpu);
+        CPUClass *cc = cpu->cc;
 
         if (cc->tcg_ops->synchronize_from_tb) {
             cc->tcg_ops->synchronize_from_tb(cpu, last_tb);
@@ -511,7 +511,7 @@ cpu_tb_exec(CPUState *cpu, TranslationBlock *itb, int *tb_exit)
 
 static void cpu_exec_enter(CPUState *cpu)
 {
-    CPUClass *cc = CPU_GET_CLASS(cpu);
+    CPUClass *cc = cpu->cc;
 
     if (cc->tcg_ops->cpu_exec_enter) {
         cc->tcg_ops->cpu_exec_enter(cpu);
@@ -520,7 +520,7 @@ static void cpu_exec_enter(CPUState *cpu)
 
 static void cpu_exec_exit(CPUState *cpu)
 {
-    CPUClass *cc = CPU_GET_CLASS(cpu);
+    CPUClass *cc = cpu->cc;
 
     if (cc->tcg_ops->cpu_exec_exit) {
         cc->tcg_ops->cpu_exec_exit(cpu);
@@ -699,7 +699,7 @@ static inline bool cpu_handle_halt(CPUState *cpu)
 
 static inline void cpu_handle_debug_exception(CPUState *cpu)
 {
-    CPUClass *cc = CPU_GET_CLASS(cpu);
+    CPUClass *cc = cpu->cc;
     CPUWatchpoint *wp;
 
     if (!cpu->watchpoint_hit) {
@@ -740,7 +740,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
            which will be handled outside the cpu execution
            loop */
 #if defined(TARGET_I386)
-        CPUClass *cc = CPU_GET_CLASS(cpu);
+        CPUClass *cc = cpu->cc;
         cc->tcg_ops->fake_user_interrupt(cpu);
 #endif /* TARGET_I386 */
         *ret = cpu->exception_index;
@@ -748,7 +748,7 @@ static inline bool cpu_handle_exception(CPUState *cpu, int *ret)
         return true;
 #else
         if (replay_exception()) {
-            CPUClass *cc = CPU_GET_CLASS(cpu);
+            CPUClass *cc = cpu->cc;
             qemu_mutex_lock_iothread();
             cc->tcg_ops->do_interrupt(cpu);
             qemu_mutex_unlock_iothread();
@@ -803,12 +803,15 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
         return false;
     }
 
-    /* Clear the interrupt flag now since we're processing
-     * cpu->interrupt_request and cpu->exit_request.
-     * Ensure zeroing happens before reading cpu->exit_request or
-     * cpu->interrupt_request (see also smp_wmb in cpu_exit())
+    /*
+     * Clear an observed interrupt flag before reading the requests it
+     * announces (see also smp_wmb in cpu_exit()). If it is already clear,
+     * leave it untouched: a concurrent kick will remain set for the next TB
+     * entry check. The request checks below are required in either case.
      */
-    qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    if (unlikely(qatomic_read(&cpu->neg.icount_decr.u16.high))) {
+        qatomic_set_mb(&cpu->neg.icount_decr.u16.high, 0);
+    }
 
     if (unlikely(qatomic_read(&cpu->interrupt_request))) {
         int interrupt_request;
@@ -859,7 +862,7 @@ static inline bool cpu_handle_interrupt(CPUState *cpu,
            True when it is, and we should restart on a new TB,
            and via longjmp via cpu_loop_exit.  */
         else {
-            CPUClass *cc = CPU_GET_CLASS(cpu);
+            CPUClass *cc = cpu->cc;
 
             if (cc->tcg_ops->cpu_exec_interrupt &&
                 cc->tcg_ops->cpu_exec_interrupt(cpu, interrupt_request)) {
@@ -1010,7 +1013,7 @@ cpu_exec_loop(CPUState *cpu, SyncClocks *sc)
                  * We add the TB in the virtual pc hash table
                  * for the fast lookup
                  */
-                h = tb_jmp_cache_hash_func(pc);
+                h = tb_jmp_cache_hash_func(pc, cflags);
                 jc = cpu->tb_jmp_cache;
                 if (cflags & CF_PCREL) {
                     jc->array[h].pc = pc;
@@ -1092,7 +1095,7 @@ int cpu_exec(CPUState *cpu)
 bool tcg_exec_realizefn(CPUState *cpu, Error **errp)
 {
     static bool tcg_target_initialized;
-    CPUClass *cc = CPU_GET_CLASS(cpu);
+    CPUClass *cc = cpu->cc;
 
     if (!tcg_target_initialized) {
         cc->tcg_ops->initialize();

@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 
 #include "qemu/osdep.h"
+#include "qemu/bswap.h"
 #include "libqtest.h"
 #include "qapi/qmp/qdict.h"
 
@@ -342,6 +343,8 @@ static void test_board_state_ws2812_observation(void)
     state = board_state(qts);
     assert_led(state, "A7", 0, 0, "ws2812-din");
     qobject_unref(state);
+    /* Releasing the MCU output does not remove the physical DIN node. */
+    qtest_writel(qts, GPIOA_BASE + GPIO_MODER, 0);
     qtest_clock_step(qts, 50000);
     state = board_state(qts);
     assert_led(state, "A7", 0x120034, 0x34, "ws2812-din");
@@ -412,10 +415,267 @@ static void test_board_state_ws2812_spi(void)
     }
 }
 
+static void test_board_state_ws2812_spi6(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+    const uint32_t spi = 0x58001400;
+    const uint32_t grb = 0x12ab34;
+    uint8_t symbols[24];
+    QDict *state;
+
+    /* H723 SPI6: PA7 AF8, HSE24 /4. These byte symbols produce
+     * H333ns or H667ns, independent of the SPI1 packing above. */
+    for (unsigned i = 0; i < G_N_ELEMENTS(symbols); ++i) {
+        symbols[i] = grb & (1u << (23 - i)) ? 0x78 : 0x60;
+    }
+    qtest_writel(qts, 0x58024400, qtest_readl(qts, 0x58024400) | (1u << 16));
+    qtest_writel(qts, 0x58024458, 5u << 28); /* SPI6SEL = HSE */
+    qtest_writel(qts, GPIOA_BASE + 0x20, 8u << 28);
+    qtest_writel(qts, GPIOA_BASE, 2u << 14);
+    qtest_writel(qts, spi + 8, 7 | (1u << 28)); /* 8 bits, MBR /4 */
+    qtest_writel(qts, spi + 12,
+                 (1u << 22) | (1u << 17) | (1u << 26) | (1u << 24));
+    qtest_writel(qts, spi + 4, sizeof(symbols));
+    qtest_writel(qts, spi + 0x10, 8); /* EOTIE */
+    qtest_writel(qts, 0xe000e108, 1u << 22); /* NVIC IRQ86 */
+    qtest_writel(qts, spi, 1 | (1u << 9));
+    qtest_writel(qts, spi + 0x20, ldl_le_p(symbols));
+    /* APB4 gate is still closed. Queued frames cannot complete. */
+    qtest_clock_step(qts, 100000);
+    g_assert_false(qtest_readl(qts, spi + 0x14) & 8);
+    state = board_state(qts);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 0);
+    qobject_unref(state);
+
+    qtest_writel(qts, 0x580244f4, 1u << 5); /* SPI6EN */
+    qtest_clock_step(qts, 6000);
+    for (unsigned i = 4; i < sizeof(symbols); i += 4) {
+        g_assert_true(qtest_readl(qts, spi + 0x14) & 2); /* TXP */
+        qtest_writel(qts, spi + 0x20, ldl_le_p(symbols + i));
+        /* Neither another bank's CS nor another pin on the LED bank
+         * changes the cached PA7 route or injects a new DIN sample. */
+        qtest_writel(qts, GPIOC_BASE + GPIO_ODR, (i & 4) ? 1 : 0);
+        qtest_writel(qts, GPIOA_BASE + GPIO_ODR, (i & 4) ? 1 : 0);
+        qtest_clock_step(qts, 6000);
+    }
+    g_assert_true(qtest_readl(qts, spi + 0x14) & 8);
+    g_assert_true(qtest_readl(qts, 0xe000e208) & (1u << 22));
+    /* HAL polling closes each transfer by disabling SPE before reset low
+     * has elapsed. The DIN node keeps the already driven final low. */
+    qtest_writel(qts, spi, 0);
+    qtest_clock_step(qts, 50000);
+    state = board_state(qts);
+    assert_led(state, "A7", 0xab1234, 0xab, "ws2812-din");
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+    qobject_unref(state);
+
+    qtest_writel(qts, 0x5802449c, 1u << 5); /* SPI6RST */
+    g_assert_cmphex(qtest_readl(qts, spi), ==, 0);
+    g_assert_cmphex(qtest_readl(qts, spi + 8), ==, 0x00070007);
+    g_assert_false(qtest_readl(qts, spi + 0x14) & 8);
+    qtest_writel(qts, 0x5802449c, 0);
+    qtest_writel(qts, spi + 4, 7);
+    qtest_qmp_assert_success(qts, "{ 'execute': 'system_reset' }");
+    g_assert_cmphex(qtest_readl(qts, spi + 4), ==, 0);
+    qtest_quit(qts);
+}
+
+static void test_board_state_ws2812_tim8_dma(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+    const uint32_t timer = 0x40010400;
+    const uint32_t grb = 0x320012;
+    uint16_t duty[72] = { 0 };
+    QDict *state;
+
+    /* Reset TIM8 clock is HSI64.  80 ticks = 1.25us; N alone follows
+     * OCREF (RM0468 Table 351), including the low reset suffix. */
+    for (unsigned i = 0; i < 24; ++i) {
+        duty[i] = cpu_to_le16(grb & (1u << (23 - i)) ? 48 : 32);
+    }
+    qtest_memwrite(qts, AXI_WAVEFORM, duty, sizeof(duty));
+    qtest_writel(qts, GPIOA_BASE + 0x20, 3u << 28);
+    qtest_writel(qts, GPIOA_BASE, 2u << 14);
+    qtest_writel(qts, timer + 0x18, (6u << 4) | (1u << 3));
+    qtest_writel(qts, timer + 0x20, 4);
+    qtest_writel(qts, timer + 0x44, 1u << 15);
+    qtest_writel(qts, timer + 0x2c, 79);
+    qtest_writel(qts, timer + 0x14, 1);
+    qtest_writel(qts, timer + 0xc, 1u << 9);
+    qtest_writel(qts, DMA2_S6PAR, timer + 0x34);
+    qtest_writel(qts, DMA2_S6M0AR, AXI_WAVEFORM);
+    qtest_writel(qts, DMA2_S6NDTR, G_N_ELEMENTS(duty));
+    qtest_writel(qts, 0x40020838, 47); /* DMA2 stream6, TIM8_CH1. */
+    qtest_writel(qts, DMA2_S6CR, 1 | (1u << 6) | (1u << 8) |
+                    (1u << 10) | (1u << 11) | (1u << 13));
+    qtest_writel(qts, timer, 1);
+    qtest_clock_step(qts, 1000000); /* Late dispatch preserves every pulse. */
+    state = board_state(qts);
+    assert_led(state, "A7", 0x003212, 0x32, "ws2812-din");
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), >=, 9);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+    qobject_unref(state);
+    qtest_quit(qts);
+}
+
+static void test_board_state_ws2812_dma_gpio(gconstpointer data)
+{
+    bool bsrr = GPOINTER_TO_INT(data);
+    QTestState *qts = qtest_init("-machine dm-mc02,accurate-timing=on");
+    const uint32_t timer = 0x40010400;
+    const uint32_t grb = 0x5aa53c;
+    uint32_t waveform[24 * 5 + 100];
+    unsigned count = 0;
+    QDict *state;
+
+    /* The request line paces transfers; PAR independently names GPIO.
+     * Five 250ns samples encode H500/L750ns or H750/L500ns. */
+    for (unsigned bit = 0; bit < 24; ++bit) {
+        unsigned high = grb & (1u << (23 - bit)) ? 3 : 2;
+
+        for (unsigned sample = 0; sample < 5; ++sample) {
+            waveform[count++] = cpu_to_le32(sample < high ? 1u << 7 :
+                                             bsrr ? 1u << 23 : 0);
+        }
+        if (bit == 7) {
+            /* A 25us low pause keeps the same frame but carries its data
+             * past the first pending 50us check. That check must follow
+             * current DIN state instead of latching or going backward. */
+            for (unsigned sample = 0; sample < 100; ++sample) {
+                waveform[count++] = cpu_to_le32(bsrr ? 1u << 23 : 0);
+            }
+        }
+    }
+    g_assert_cmpuint(count, ==, G_N_ELEMENTS(waveform));
+    qtest_memwrite(qts, AXI_WAVEFORM, waveform, sizeof(waveform));
+    qtest_writel(qts, GPIOA_BASE + GPIO_MODER, 1u << 14);
+    qtest_writel(qts, GPIOA_BASE + GPIO_ODR, 0);
+    qtest_clock_step(qts, 50000);
+    qtest_writel(qts, timer + 0x18, 6u << 4);
+    qtest_writel(qts, timer + 0x20, 1);
+    qtest_writel(qts, timer + 0x44, 1u << 15);
+    qtest_writel(qts, timer + 0x2c, 15); /* HSI64 / 16 = 4MHz requests. */
+    qtest_writel(qts, timer + 0x34, 8);
+    qtest_writel(qts, timer + 0x14, 1);
+    qtest_writel(qts, timer + 0xc, 1u << 9);
+    qtest_writel(qts, DMA2_S6PAR, GPIOA_BASE + (bsrr ? 0x18 : GPIO_ODR));
+    qtest_writel(qts, DMA2_S6M0AR, AXI_WAVEFORM);
+    qtest_writel(qts, DMA2_S6NDTR, count);
+    qtest_writel(qts, 0x40020838, 47); /* TIM8_CH1 request, GPIO destination. */
+    qtest_writel(qts, DMA2_S6CR,
+                 1 | (1u << 6) | (1u << 10) | (2u << 11) | (2u << 13));
+    qtest_writel(qts, timer, 1);
+    /* Dispatch the entire waveform late. GPIO must observe each request's
+     * scheduled time rather than one shared current-clock timestamp. */
+    qtest_clock_step(qts, count * 250);
+    g_assert_cmpuint(qtest_readl(qts, DMA2_S6NDTR), ==, 0);
+    g_assert_false(qtest_readl(qts, DMA2_S6CR) & 1);
+    g_assert_false(qtest_readl(qts, GPIOA_BASE + GPIO_ODR) & (1u << 7));
+    state = board_state(qts);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 0);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+    qobject_unref(state);
+    qtest_writel(qts, timer, 0);
+    qtest_clock_step(qts, 50000);
+    state = board_state(qts);
+    assert_led(state, "A7", 0xa55a3c, 0xa5, "ws2812-din");
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 0);
+    qobject_unref(state);
+    qtest_quit(qts);
+}
+
+static void test_board_state_ws2812_released_node(gconstpointer data)
+{
+    bool release_high = GPOINTER_TO_INT(data);
+    QTestState *qts = qtest_init("-machine dm-mc02");
+    QDict *state;
+
+    /* No known driver at power-on does not imply a valid low input. */
+    qtest_clock_step(qts, 50000);
+    qtest_writel(qts, GPIOA_BASE + GPIO_MODER, 1u << 14);
+    qtest_clock_step(qts, 50000);
+    qtest_writel(qts, GPIOA_BASE + GPIO_ODR, 1u << 7);
+    qtest_clock_step(qts, 400);
+    if (!release_high) {
+        qtest_writel(qts, GPIOA_BASE + GPIO_ODR, 0);
+    }
+    qtest_writel(qts, GPIOA_BASE + GPIO_MODER, 0);
+    qtest_clock_step(qts, 50000);
+    state = board_state(qts);
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 0);
+    /* Holding low must not make an incomplete frame valid. Holding high
+     * must not invent a falling edge and then a low reset interval. */
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"),
+                    ==, release_high ? 0 : 1);
+    qobject_unref(state);
+    if (release_high) {
+        /* Passive bias still acts on DIN with the MCU pin in input mode.
+         * It ends the retained long high, which must be rejected. */
+        qtest_writel(qts, GPIOA_BASE + 0x0c, 2u << 14);
+        qtest_clock_step(qts, 50000);
+        state = board_state(qts);
+        g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "errors"), ==, 1);
+        qobject_unref(state);
+    }
+    qtest_quit(qts);
+}
+
+static void test_board_state_ws2812_pad_config(void)
+{
+    QTestState *qts = qtest_init("-machine dm-mc02");
+    const uint32_t timer = 0x40010400;
+    QDict *state;
+
+    qtest_writel(qts, GPIOA_BASE + 0x20, 3u << 28);
+    qtest_writel(qts, GPIOA_BASE, 2u << 14);
+    qtest_writel(qts, timer + 0x18, 5u << 4); /* Forced active. */
+    qtest_writel(qts, timer + 0x20, 4); /* N-only high. */
+    qtest_writel(qts, timer + 0x44, 1u << 15);
+    qtest_writel(qts, timer + 0x2c, 79);
+    qtest_writel(qts, timer, 1);
+    qtest_clock_step(qts, 100000);
+    /* Releasing a static high must reach DIN even though the peripheral
+     * has no further edge to publish. A later pull-down starts reset. */
+    qtest_writel(qts, GPIOA_BASE + 0x04, 1u << 7);
+    qtest_clock_step(qts, 100000);
+    qtest_writel(qts, GPIOA_BASE + 0x0c, 1u << 14);
+    qtest_clock_step(qts, 100000);
+    qtest_writel(qts, GPIOA_BASE + 0x0c, 2u << 14);
+    qtest_clock_step(qts, 50000);
+    qtest_writel(qts, timer + 0x18, 4u << 4); /* Keep DIN low. */
+    qtest_writel(qts, GPIOA_BASE + 0x04, 0); /* Push-pull again. */
+    /* Send a frame with the same timer binding after pad-only changes. */
+    for (int bit = 23; bit >= 0; --bit) {
+        qtest_writel(qts, timer + 0x18, 5u << 4);
+        qtest_clock_step(qts, (0x001234 & (1u << bit)) ? 800 : 400);
+        qtest_writel(qts, timer + 0x18, 4u << 4);
+        qtest_clock_step(qts, (0x001234 & (1u << bit)) ? 450 : 850);
+    }
+    qtest_clock_step(qts, 50000);
+    state = board_state(qts);
+    assert_led(state, "A7", 0x120034, 0x34, "ws2812-din");
+    g_assert_cmpuint(qdict_get_int(qdict_get_qdict(state, "led"), "frames"), ==, 1);
+    qobject_unref(state);
+    qtest_quit(qts);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/dm-mc02/board-state/ws2812-spi", test_board_state_ws2812_spi);
+    g_test_add_func("/dm-mc02/board-state/ws2812-spi6", test_board_state_ws2812_spi6);
+    g_test_add_func("/dm-mc02/board-state/ws2812-tim8-dma", test_board_state_ws2812_tim8_dma);
+    g_test_add_data_func("/dm-mc02/board-state/ws2812-dma-gpio-bsrr",
+                        GINT_TO_POINTER(true), test_board_state_ws2812_dma_gpio);
+    g_test_add_data_func("/dm-mc02/board-state/ws2812-dma-gpio-odr",
+                        GINT_TO_POINTER(false), test_board_state_ws2812_dma_gpio);
+    g_test_add_func("/dm-mc02/board-state/ws2812-pad-config", test_board_state_ws2812_pad_config);
+    g_test_add_data_func("/dm-mc02/board-state/ws2812-release-high",
+                        GINT_TO_POINTER(true), test_board_state_ws2812_released_node);
+    g_test_add_data_func("/dm-mc02/board-state/ws2812-release-low-partial",
+                        GINT_TO_POINTER(false), test_board_state_ws2812_released_node);
     if (qtest_has_machine("mps2-an500")) {
         g_test_add_func("/armv7m/nvic/configured-priority-width",
                         test_native_nvic_configured_width);

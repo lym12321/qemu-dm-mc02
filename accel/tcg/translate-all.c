@@ -55,6 +55,7 @@
 #include "exec/log.h"
 #include "sysemu/cpus.h"
 #include "sysemu/cpu-timers.h"
+#include "sysemu/replay.h"
 #include "sysemu/tcg.h"
 #include "qapi/error.h"
 #include "hw/core/tcg-cpu-ops.h"
@@ -199,14 +200,14 @@ static int cpu_unwind_data_from_tb(TranslationBlock *tb, uintptr_t host_pc,
  * The cpu state corresponding to 'host_pc' is restored in
  * preparation for exiting the TB.
  */
-void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
-                               uintptr_t host_pc)
+static int cpu_restore_state_from_tb_count(CPUState *cpu, TranslationBlock *tb,
+                                           uintptr_t host_pc)
 {
     uint64_t data[TARGET_INSN_START_WORDS];
     int insns_left = cpu_unwind_data_from_tb(tb, host_pc, data);
 
     if (insns_left < 0) {
-        return;
+        return insns_left;
     }
 
     if (tb_cflags(tb) & CF_USE_ICOUNT) {
@@ -219,6 +220,13 @@ void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
     }
 
     cpu->cc->tcg_ops->restore_state_to_opc(cpu, tb, data);
+    return insns_left;
+}
+
+void cpu_restore_state_from_tb(CPUState *cpu, TranslationBlock *tb,
+                               uintptr_t host_pc)
+{
+    cpu_restore_state_from_tb_count(cpu, tb, host_pc);
 }
 
 bool cpu_restore_state(CPUState *cpu, uintptr_t host_pc)
@@ -285,9 +293,10 @@ static int setjmp_gen_code(CPUArchState *env, TranslationBlock *tb,
 }
 
 /* Called with mmap_lock held for user mode emulation.  */
-TranslationBlock *tb_gen_code(CPUState *cpu,
-                              vaddr pc, uint64_t cs_base,
-                              uint32_t flags, int cflags)
+static TranslationBlock *tb_gen_code_limit(CPUState *cpu,
+                                           vaddr pc, uint64_t cs_base,
+                                           uint32_t flags, int cflags,
+                                           int insn_limit)
 {
     CPUArchState *env = cpu_env(cpu);
     TranslationBlock *tb, *existing_tb;
@@ -310,6 +319,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     max_insns = cflags & CF_COUNT_MASK;
     if (max_insns == 0) {
         max_insns = TCG_MAX_INSNS;
+    }
+    if (insn_limit > 0) {
+        max_insns = MIN(max_insns, insn_limit);
     }
     QEMU_BUILD_BUG_ON(CF_COUNT_MASK + 1 != TCG_MAX_INSNS);
 
@@ -562,6 +574,13 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
     return tb;
 }
 
+TranslationBlock *tb_gen_code(CPUState *cpu,
+                              vaddr pc, uint64_t cs_base,
+                              uint32_t flags, int cflags)
+{
+    return tb_gen_code_limit(cpu, pc, cs_base, flags, cflags, 0);
+}
+
 /* user-mode: call with mmap_lock held */
 void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
 {
@@ -592,6 +611,57 @@ void tb_check_watchpoint(CPUState *cpu, uintptr_t retaddr)
 }
 
 #ifndef CONFIG_USER_ONLY
+static void tb_recompile_io_prefix(CPUState *cpu, TranslationBlock *tb,
+                                   int insns_left)
+{
+    uint32_t cflags = tb_cflags(tb);
+    vaddr pc, start_pc;
+    uint64_t cs_base;
+    uint32_t flags;
+    int prefix_insns = tb->icount - insns_left + 1;
+
+    if (icount_enabled() != 1 ||
+        replay_mode != REPLAY_MODE_NONE || !first_cpu || CPU_NEXT(first_cpu) ||
+        cpu->singlestep_enabled || !QTAILQ_EMPTY(&cpu->breakpoints) ||
+        !bitmap_empty(cpu->plugin_mask, QEMU_PLUGIN_EV_MAX) ||
+        cpu->cc->tcg_ops->io_recompile_replay_branch ||
+        (cflags & (CF_COUNT_MASK | CF_MEMI_ONLY | CF_NOIRQ | CF_PARALLEL |
+                   CF_SINGLE_STEP | CF_INVALID)) ||
+        cflags != curr_cflags(cpu) || !(cflags & CF_USE_ICOUNT) ||
+        tb_page_addr0(tb) == -1 || tb_page_addr1(tb) != -1 ||
+        insns_left <= 0 || prefix_insns < 1 || prefix_insns > tb->icount) {
+        return;
+    }
+
+    /*
+     * Recover the active mapping for a PC-relative TB. Restrict replacement
+     * to its original single-page mapping; aliases keep the normal retry path.
+     */
+    cpu_get_tb_cpu_state(cpu_env(cpu), &pc, &cs_base, &flags);
+    start_pc = cflags & CF_PCREL
+        ? (pc & TARGET_PAGE_MASK) | (tb->pc & ~TARGET_PAGE_MASK) : tb->pc;
+    if (start_pc != tb->pc || (pc & TARGET_PAGE_MASK) !=
+        (start_pc & TARGET_PAGE_MASK) ||
+        get_page_addr_code(cpu_env(cpu), start_pc) != tb_page_addr0(tb)) {
+        return;
+    }
+
+    /*
+     * Keep the normal lookup key and restrict only translation's upper bound.
+     * translator_loop enables I/O on the final instruction. Native invalidation
+     * removes old direct jumps; the replacement uses ordinary SMC/page tracking.
+     * This code is only for future visits: the current instruction still takes
+     * its original CF_MEMI_ONLY retry, already installed by the caller.
+     */
+    pc = tb->pc;
+    cs_base = tb->cs_base;
+    flags = tb->flags;
+    assert_no_pages_locked();
+    qemu_thread_jit_write();
+    tb_phys_invalidate(tb, -1);
+    tb_gen_code_limit(cpu, pc, cs_base, flags, cflags, prefix_insns);
+}
+
 /*
  * In deterministic execution mode, instructions doing device I/Os
  * must be at the end of the TB.
@@ -603,13 +673,14 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
     TranslationBlock *tb;
     CPUClass *cc;
     uint32_t n;
+    int insns_left;
 
     tb = tcg_tb_lookup(retaddr);
     if (!tb) {
         cpu_abort(cpu, "cpu_io_recompile: could not find TB for pc=%p",
                   (void *)retaddr);
     }
-    cpu_restore_state_from_tb(cpu, tb, retaddr);
+    insns_left = cpu_restore_state_from_tb_count(cpu, tb, retaddr);
 
     /*
      * Some guests must re-execute the branch when re-executing a delay
@@ -640,6 +711,8 @@ void cpu_io_recompile(CPUState *cpu, uintptr_t retaddr)
         }
     }
 
+    /* Set cflags_next_tb above before replacement codegen can longjmp. */
+    tb_recompile_io_prefix(cpu, tb, insns_left);
     cpu_loop_exit_noexc(cpu);
 }
 

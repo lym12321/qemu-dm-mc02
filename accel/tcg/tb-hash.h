@@ -42,20 +42,23 @@ static inline unsigned int tb_jmp_cache_hash_page(vaddr pc)
     return (tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK;
 }
 
-static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
+static inline unsigned int tb_jmp_cache_hash_func(vaddr pc, uint32_t cflags)
 {
     vaddr tmp;
     tmp = pc ^ (pc >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS));
+    /* Keep count variants apart within the page invalidation bucket. */
     return (((tmp >> (TARGET_PAGE_BITS - TB_JMP_PAGE_BITS)) & TB_JMP_PAGE_MASK)
-           | (tmp & TB_JMP_ADDR_MASK));
+           | ((tmp ^ ((cflags & CF_COUNT_MASK) * 0x9e3779b9u)) &
+              TB_JMP_ADDR_MASK));
 }
 
 #else
 
 /* In user-mode we can get better hashing because we do not have a TLB */
-static inline unsigned int tb_jmp_cache_hash_func(vaddr pc)
+static inline unsigned int tb_jmp_cache_hash_func(vaddr pc, uint32_t cflags)
 {
-    return (pc ^ (pc >> TB_JMP_CACHE_BITS)) & (TB_JMP_CACHE_SIZE - 1);
+    return (pc ^ (pc >> TB_JMP_CACHE_BITS) ^
+            ((cflags & CF_COUNT_MASK) * 0x9e3779b9u)) & (TB_JMP_CACHE_SIZE - 1);
 }
 
 #endif /* CONFIG_SOFTMMU */

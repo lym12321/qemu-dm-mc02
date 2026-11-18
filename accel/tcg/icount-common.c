@@ -38,6 +38,7 @@
 #include "sysemu/cpu-timers.h"
 #include "sysemu/cpu-throttle.h"
 #include "sysemu/cpu-timers-internal.h"
+#include "sysemu/icount-conversion.h"
 #include "sysemu/virtual-execution.h"
 
 /*
@@ -52,7 +53,7 @@ static bool icount_sleep = true;
 
 /*
  * 0 = Do not count executed instructions.
- * 1 = Fixed conversion of insn to ns via "shift" option
+ * 1 = Fixed conversion of insn to ns via "shift" or "ns-per-insn"
  * 2 = Runtime adaptive algorithm to compute shift
  */
 int use_icount;
@@ -60,7 +61,8 @@ int use_icount;
 bool icount_has_exact_ns_deadlines(void)
 {
     return icount_enabled() == 1 && !qemu_tcg_mttcg_enabled() &&
-        timers_state.icount_time_shift == 0 && !icount_sleep &&
+        timers_state.icount_time_shift == 0 &&
+        timers_state.icount_ns_per_insn <= 1 && !icount_sleep &&
         !icount_align_option;
 }
 
@@ -106,6 +108,11 @@ static void icount_update_locked(CPUState *cpu)
  */
 void icount_update(CPUState *cpu)
 {
+    /* The vCPU owns these counters; a zero delta publishes no new time. */
+    if (icount_get_executed(cpu) == 0) {
+        return;
+    }
+
     seqlock_write_lock(&timers_state.vm_clock_seqlock,
                        &timers_state.vm_clock_lock);
     icount_update_locked(cpu);
@@ -165,6 +172,16 @@ int64_t icount_get(void)
 
 int64_t icount_to_ns(int64_t icount)
 {
+    if (timers_state.icount_ns_per_insn) {
+        int64_t ns;
+
+        if (!icount_ns_per_insn_to_ns(icount, timers_state.icount_ns_per_insn,
+                                     &ns)) {
+            error_report("icount: instruction clock overflow");
+            exit(1);
+        }
+        return ns;
+    }
     return icount << qatomic_read(&timers_state.icount_time_shift);
 }
 
@@ -235,6 +252,10 @@ static void icount_adjust_vm(void *opaque)
 int64_t icount_round(int64_t count)
 {
     int shift = qatomic_read(&timers_state.icount_time_shift);
+
+    if (timers_state.icount_ns_per_insn) {
+        return icount_ns_per_insn_round(count, timers_state.icount_ns_per_insn);
+    }
     return (count + (1 << shift) - 1) >> shift;
 }
 
@@ -432,13 +453,20 @@ void icount_account_warp_timer(void)
 void icount_configure(QemuOpts *opts, Error **errp)
 {
     const char *option = qemu_opt_get(opts, "shift");
+    const char *ns_option = qemu_opt_get(opts, "ns-per-insn");
     bool sleep = qemu_opt_get_bool(opts, "sleep", true);
     bool align = qemu_opt_get_bool(opts, "align", false);
     long time_shift = -1;
+    long ns_per_insn = 0;
 
-    if (!option) {
+    if (option && ns_option) {
+        error_setg(errp, "icount: shift and ns-per-insn are mutually exclusive");
+        return;
+    }
+
+    if (!option && !ns_option) {
         if (qemu_opt_get(opts, "align") != NULL) {
-            error_setg(errp, "Please specify shift option when using align");
+            error_setg(errp, "Please specify shift or ns-per-insn when using align");
         }
         return;
     }
@@ -448,16 +476,23 @@ void icount_configure(QemuOpts *opts, Error **errp)
         return;
     }
 
-    if (strcmp(option, "auto") != 0) {
+    if (ns_option) {
+        if (qemu_strtol(ns_option, NULL, 10, &ns_per_insn) < 0 ||
+            ns_per_insn < 1 || ns_per_insn > ICOUNT_MAX_NS_PER_INSN) {
+            error_setg(errp, "icount: ns-per-insn must be an integer from 1 to %d",
+                       ICOUNT_MAX_NS_PER_INSN);
+            return;
+        }
+    } else if (strcmp(option, "auto") != 0) {
         if (qemu_strtol(option, NULL, 0, &time_shift) < 0
             || time_shift < 0 || time_shift > MAX_ICOUNT_SHIFT) {
             error_setg(errp, "icount: Invalid shift value");
             return;
         }
-    } else if (icount_align_option) {
+    } else if (align) {
         error_setg(errp, "shift=auto and align=on are incompatible");
         return;
-    } else if (!icount_sleep) {
+    } else if (!sleep) {
         error_setg(errp, "shift=auto and sleep=off are incompatible");
         return;
     }
@@ -470,8 +505,10 @@ void icount_configure(QemuOpts *opts, Error **errp)
 
     icount_align_option = align;
 
-    if (time_shift >= 0) {
-        timers_state.icount_time_shift = time_shift;
+    if (time_shift >= 0 || ns_per_insn) {
+        timers_state.icount_time_shift = MAX(time_shift, 0);
+        timers_state.icount_ns_per_insn = ns_per_insn;
+        timers_state.icount_ns_per_insn_flags = sleep | (align << 1);
         icount_enable_precise();
         return;
     }

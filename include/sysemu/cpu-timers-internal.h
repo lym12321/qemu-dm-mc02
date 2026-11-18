@@ -43,6 +43,12 @@ typedef struct TimersState {
 
     /* Conversion factor from emulated instructions to virtual clock ticks.  */
     int16_t icount_time_shift;
+    /* Fixed ns per instruction; zero selects the legacy shift conversion. */
+    uint16_t icount_ns_per_insn;
+    /* Fixed-scale snapshot configuration: bit 0 sleep, bit 1 align. */
+    uint8_t icount_ns_per_insn_flags;
+    /* Load-time marker: new fixed scales require their matching subsection. */
+    bool icount_ns_per_insn_loaded;
     /* Icount delta used for shift auto adjust. */
     int64_t last_delta;
 

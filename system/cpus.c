@@ -66,6 +66,9 @@
 #endif /* CONFIG_LINUX */
 
 static QemuMutex qemu_global_mutex;
+#ifdef _WIN32
+#define BQL_VCPU_SPIN_LIMIT 128
+#endif
 
 /*
  * The chosen accelerator is supposed to register this.
@@ -502,6 +505,22 @@ void qemu_mutex_lock_iothread_impl(const char *file, int line)
     QemuMutexLockFunc bql_lock = qatomic_read(&qemu_bql_mutex_lock_func);
 
     g_assert(!qemu_mutex_iothread_locked());
+#ifdef _WIN32
+    /*
+     * An SRW waiter can miss brief BQL releases under heavy main-loop load.
+     * Let vCPUs try briefly before entering the kernel wait.  Preserve the
+     * normal BQL acquisition wrapper when synchronization profiling is active.
+     */
+    if (current_cpu && bql_lock == qemu_mutex_lock_impl) {
+        for (unsigned int i = 0; i < BQL_VCPU_SPIN_LIMIT; i++) {
+            if (!qemu_mutex_trylock_impl(&qemu_global_mutex, file, line)) {
+                set_iothread_locked(true);
+                return;
+            }
+            cpu_relax();
+        }
+    }
+#endif
     bql_lock(&qemu_global_mutex, file, line);
     set_iothread_locked(true);
 }

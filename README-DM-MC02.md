@@ -78,21 +78,46 @@ latched RGB and timestamped buzzer changes. `user-key` and `reset-key` accept
 booleans; holding `reset-key=true` keeps the CPU in reset until release.
 
 WS2812 DIN consumes the resolved PA7 pin level at QEMU virtual nanoseconds.
-GPIO writes, TIM1_CH1N/AF1, TIM3_CH2/AF2, TIM8_CH1N/AF3 and SPI1_MOSI/AF5
-feed the same decoder. Timer outputs retain polarity, preload and dead-time
-behavior. SPI1 uses RCC SPI123SEL, its 16-byte TX FIFO and DMAMUX request 38
+CPU/DMA GPIO writes, TIM1_CH1N/AF1, TIM3_CH2/AF2, TIM8_CH1N/AF3,
+SPI1_MOSI/AF5 and SPI6_MOSI/AF8 feed the same decoder. Timer outputs retain
+polarity, preload and dead-time behavior. SPI1 uses RCC SPI123SEL, its 16-byte TX FIFO and DMAMUX request 38
 on either DMA controller. TX supports 4–32-bit frames, packed writes, bit
-order, CPHA, MBR, MSSI/MIDI and EOT IRQ35. SPI2 keeps its existing synchronous
+order, CPHA, MBR, MSSI/MIDI and EOT IRQ35. SPI6 has an 8-byte FIFO,
+4–16-bit frames, IRQ86 and RCC SPI6SEL / APB4 gate and reset; its BDMA path
+is not connected. SPI2 keeps its existing synchronous
 BMI088 path. Timed SPI RX retains one result; full RX FIFO and timed SPI
 component migration require separate implementation. Changing an active SPI
-clock resumes its next pending bit after one period of the new clock.
+clock first delivers due edges at the old clock, then resumes the pending bit
+within the constant run after one period of the new clock.
+
+SPI schedules level changes and frame completions, coalescing adjacent equal
+bits while retaining FIFO/DMA/EOT frame boundaries. MMIO accesses first deliver
+due events, so polling sees current FIFO state and late writes cannot fill past
+gaps. GPIO mode/AF routing is cached; pad changes still synchronize old producer
+edges before resolving the new electrical state. Unrelated GPIO banks do not
+recheck the LED or buzzer routes. The LED reuses one pending reset check across
+pulses. Timer/DMA events retain scheduled timestamps through GPIO writes.
 
 `led.source=ws2812-din` includes `timing_profile`, `frames`, `errors`,
 `latched_ns` and `powered`. The `worldsemi-ws2812b-classic` reference profile
 uses the [Worldsemi WS2812B sheet](https://cdn-shop.adafruit.com/datasheets/WS2812B.pdf):
 T0H/T0L 400/850 ns, T1H/T1L 800/450 ns, each ±150 ns; reset low ≥50 µs;
 GRB, MSB first. The schematic's WS2812B-3528 revision still needs matching to
-its purchasing-part datasheet. Invalid frames retain the last latched color.
+its purchasing-part datasheet. Bit values depend on high pulse width; low
+intervals below 50 µs do not reject a bit. Invalid frames retain the last latched
+color. DIN is an ideal digital node: a released pad retains its last resolved
+level until another driver or pull changes it. Initially unknown DIN stays
+unknown, and power changes clear the node and decoder. This approximation omits
+leakage and noise; it is not a hardware guarantee of floating input retention.
+
+High-rate timer workloads can opt into bounded event-window scheduling with
+`DM_TIM_EVENT_WINDOW_NS=5000`. The timer still replays each output and DMA
+timestamp in order, while the host timer queue wakes at 5 us boundaries and
+MMIO accesses flush pending events before they observe or change state. This
+mode is intended for sustained real-time runs such as WS2812 animation; leave
+the variable unset when strict one-event-at-a-time scheduling or migration is
+required. The board rejects the window for DMA endpoints and GPIO banks whose
+side effects need exact global interleaving.
 
 PB15/TIM12_CH2 publishes frequency/duty changes with generation and sequence
 in a 256-event ring. GPIO rise/fall/rise periods also produce tones; two missing

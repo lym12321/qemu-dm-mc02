@@ -57,6 +57,9 @@ typedef struct QEMUClock {
 QEMUTimerListGroup main_loop_tlg;
 static QEMUClock qemu_clocks[QEMU_CLOCK_MAX];
 
+/* The innermost callback on this thread; guest execution is outside its scope. */
+static __thread QEMUTimerList *current_timerlist;
+
 /* A QEMUTimerList is a list of timers attached to a clock. More
  * than one QEMUTimerList can be attached to each clock, for instance
  * used by different AioContexts / threads. Each clock also has
@@ -197,6 +200,22 @@ bool timerlist_expired(QEMUTimerList *timer_list)
     }
 
     return expire_time <= qemu_clock_get_ns(timer_list->clock->type);
+}
+
+void qemu_clock_notify_expired(QEMUClockType type, QEMUTimerList *exclude)
+{
+    QEMUTimerList *timer_list;
+
+    QLIST_FOREACH(timer_list, &qemu_clock_ptr(type)->timerlists, list) {
+        if (timer_list != exclude && timerlist_expired(timer_list)) {
+            timerlist_notify(timer_list);
+        }
+    }
+}
+
+bool qemu_clock_in_main_loop_timer_callback(QEMUClockType type)
+{
+    return current_timerlist && current_timerlist == main_loop_tlg.tl[type];
 }
 
 bool qemu_clock_expired(QEMUClockType type)
@@ -505,10 +524,8 @@ static bool timer_mod_ns_locked(QEMUTimerList *timer_list,
 
 static void timerlist_rearm(QEMUTimerList *timer_list)
 {
-    /* Interrupt execution to force deadline recalculation.  */
-    if (icount_enabled() && timer_list->clock->type == QEMU_CLOCK_VIRTUAL) {
-        icount_start_warp_timer();
-    }
+    /* A callback may rearm before raising its IRQ. Only the main loop can
+     * decide to warp once that callback has finished making CPUs runnable. */
     timerlist_notify(timer_list);
 }
 
@@ -591,6 +608,7 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
     bool progress = false;
     QEMUTimerCB *cb;
     void *opaque;
+    QEMUTimerList *previous_timerlist;
 
     if (!qatomic_read(&timer_list->active_timers)) {
         return false;
@@ -659,7 +677,10 @@ bool timerlist_run_timers(QEMUTimerList *timer_list)
 
         /* run the callback (the timer list can be modified) */
         qemu_mutex_unlock(&timer_list->active_timers_lock);
+        previous_timerlist = current_timerlist;
+        current_timerlist = timer_list;
         cb(opaque);
+        current_timerlist = previous_timerlist;
         qemu_mutex_lock(&timer_list->active_timers_lock);
 
         progress = true;
@@ -734,6 +755,7 @@ int64_t qemu_clock_get_ns(QEMUClockType type)
 void init_clocks(QEMUTimerListNotifyCB *notify_cb)
 {
     QEMUClockType type;
+
     for (type = 0; type < QEMU_CLOCK_MAX; type++) {
         qemu_clock_init(type, notify_cb);
     }

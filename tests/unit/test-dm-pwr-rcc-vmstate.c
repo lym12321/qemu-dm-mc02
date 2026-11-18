@@ -14,6 +14,15 @@
 
 #define RCC_CR 0x00
 #define RCC_D1CFGR 0x18
+#define RCC_D3CFGR 0x20
+#define RCC_PLLCKSELR 0x28
+#define RCC_PLLCFGR 0x2c
+#define RCC_PLL2DIVR 0x38
+#define RCC_PLL2FRACR 0x3c
+#define RCC_PLL3DIVR 0x40
+#define RCC_D3CCIPR 0x58
+#define RCC_APB4RSTR 0x9c
+#define RCC_APB4ENR 0xf4
 
 static int temp_fd;
 
@@ -188,6 +197,125 @@ static void rcc_writew(DmMc02PwrRcc *state, hwaddr offset, uint16_t value)
                           sizeof(uint16_t));
 }
 
+static void test_spi6_clock_sources(void)
+{
+    DmMc02PwrRcc state;
+
+    dm_mc02_pwr_rcc_init(&state, NULL);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_kernel_clock_hz(&state), ==,
+                     64000000);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 0);
+    rcc_writel(&state, RCC_APB4ENR, 1u << 5);
+
+    /* PCLK4 uses HCLK (including D1CPRE/HPRE), then D3PPRE. */
+    rcc_writel(&state, RCC_D1CFGR, (10u << 8) | 8u);
+    rcc_writel(&state, RCC_D3CFGR, 5u << 4);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_cpu_clock_hz(&state), ==, 8000000);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 1000000);
+    rcc_writel(&state, RCC_D3CFGR, 3u << 4);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 4000000);
+
+    rcc_writel(&state, RCC_D3CCIPR, 3u << 28);
+    rcc_writel(&state, RCC_CR, 1u | (2u << 3));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 16000000);
+    rcc_writel(&state, RCC_D3CCIPR, 4u << 28);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 0);
+    rcc_writel(&state, RCC_CR, 1u | (1u << 7));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 4000000);
+    rcc_writel(&state, RCC_D3CCIPR, 5u << 28);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 0);
+    rcc_writel(&state, RCC_CR, 1u | (1u << 16));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 24000000);
+
+    /* HSE / M * N / Q. P has a different divisor to catch P/Q mixups. */
+    rcc_writel(&state, RCC_PLLCKSELR, 2u | (3u << 12) | (6u << 20));
+    rcc_writel(&state, RCC_PLL2DIVR, 23u | (1u << 9) | (3u << 16));
+    rcc_writel(&state, RCC_PLL3DIVR, 29u | (1u << 9) | (4u << 16));
+    rcc_writel(&state, RCC_CR,
+               1u | (1u << 16) | (1u << 26) | (1u << 28));
+    rcc_writel(&state, RCC_D3CCIPR, 1u << 28);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 0);
+    rcc_writel(&state, RCC_PLLCFGR, (1u << 20) | (1u << 23));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 48000000);
+    rcc_writel(&state, RCC_PLL2FRACR, 4096u << 3);
+    rcc_writel(&state, RCC_PLLCFGR,
+               (1u << 4) | (1u << 20) | (1u << 23));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 49000000);
+    rcc_writel(&state, RCC_D3CCIPR, 2u << 28);
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 24000000);
+    rcc_writel(&state, RCC_CR, 1u | (1u << 26) | (1u << 28));
+    g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_clock_hz(&state), ==, 0);
+
+    for (unsigned source = 6; source <= 7; source++) {
+        rcc_writel(&state, RCC_D3CCIPR, source << 28);
+        g_assert_cmpuint(dm_mc02_pwr_rcc_spi6_kernel_clock_hz(&state), ==, 0);
+    }
+}
+
+typedef struct Spi6ClockObservation {
+    DmMc02PwrRcc *state;
+    unsigned calls;
+    uint64_t hz;
+    bool reset;
+} Spi6ClockObservation;
+
+static void spi6_clock_changed(void *opaque, uint64_t cpu_hz)
+{
+    Spi6ClockObservation *observation = opaque;
+
+    (void)cpu_hz;
+    observation->calls++;
+    observation->hz = dm_mc02_pwr_rcc_spi6_clock_hz(observation->state);
+    observation->reset =
+        dm_mc02_pwr_rcc_spi6_reset_asserted(observation->state);
+}
+
+static void test_spi6_clock_notifications(void)
+{
+    DmMc02PwrRcc state;
+    Spi6ClockObservation observation = { .state = &state };
+    static const struct {
+        hwaddr offset;
+        unsigned size;
+        uint32_t value;
+        uint64_t hz;
+        bool reset;
+    } writes[] = {
+        { RCC_APB4ENR, 1, 1u << 5, 64000000, false },
+        { RCC_D3CFGR, 2, 4u << 4, 32000000, false },
+        { RCC_D3CCIPR + 3, 1, 5u << 4, 0, false },
+        { RCC_CR, 4, 1u | (1u << 16), 24000000, false },
+        { RCC_APB4RSTR, 2, 1u << 5, 0, true },
+        { RCC_APB4RSTR, 4, 0, 24000000, false },
+        { RCC_APB4ENR, 4, 0, 0, false },
+        { RCC_APB4ENR, 4, 1u << 5, 24000000, false },
+        { RCC_D3CCIPR, 4, 3u << 28, 64000000, false },
+        { RCC_CR, 1, 1u | (3u << 3), 8000000, false },
+        { RCC_PLLCKSELR, 4, 2u | (3u << 12), 8000000, false },
+        { RCC_PLL2DIVR, 4, 23u | (7u << 16), 8000000, false },
+        { RCC_PLLCFGR, 4, 1u << 20, 8000000, false },
+        { RCC_D3CCIPR, 4, 1u << 28, 0, false },
+        { RCC_CR, 4, 1u | (1u << 16) | (1u << 26), 24000000, false },
+        { RCC_PLL2DIVR, 4, 23u | (3u << 16), 48000000, false },
+    };
+
+    dm_mc02_pwr_rcc_init(&state, NULL);
+    dm_mc02_pwr_rcc_set_clock_callback(&state, spi6_clock_changed,
+                                       &observation);
+    observation.calls = 0;
+    for (unsigned i = 0; i < G_N_ELEMENTS(writes); i++) {
+        state.rcc.ops->write(state.rcc.opaque, writes[i].offset,
+                              writes[i].value, writes[i].size);
+        g_assert_cmpuint(observation.calls, ==, i + 1);
+        g_assert_cmpuint(observation.hz, ==, writes[i].hz);
+        g_assert_cmpint(observation.reset, ==, writes[i].reset);
+    }
+    dm_mc02_pwr_rcc_reset(&state);
+    g_assert_cmpuint(observation.calls, ==, G_N_ELEMENTS(writes) + 1);
+    g_assert_cmpuint(observation.hz, ==, 0);
+    g_assert_false(observation.reset);
+}
+
 static void test_iwdg_reset_reason_survives_reset_and_clears_with_rmvf(void)
 {
     DmMc02PwrRcc state;
@@ -302,6 +430,9 @@ int main(int argc, char **argv)
                     test_power_on_reset_reason_is_explicit_and_preserved);
     g_test_add_func("/dm-pwr-rcc/brownout-reset-reason",
                     test_brownout_reset_reason_is_latched_and_preserved);
+    g_test_add_func("/dm-pwr-rcc/spi6-clock-sources", test_spi6_clock_sources);
+    g_test_add_func("/dm-pwr-rcc/spi6-clock-notifications",
+                    test_spi6_clock_notifications);
     ret = g_test_run();
     close(temp_fd);
     unlink(temp_file);

@@ -69,13 +69,19 @@ typedef struct DmMc02BoardTimerPinRoute {
     bool complementary;
 } DmMc02BoardTimerPinRoute;
 
+typedef struct DmMc02BoardSpiPinRoute {
+    unsigned controller;
+    unsigned af;
+} DmMc02BoardSpiPinRoute;
+
 /* Board-side devices and their MCU-facing pins.  The chip models consume
  * generic masks/indices; only this profile names physical board signals. */
 typedef struct DmMc02BoardDeviceWiring {
     DmMc02BoardPin led;
     DmMc02BoardTimerPinRoute led_timers[3];
     unsigned led_timer_count;
-    unsigned led_spi_af;
+    DmMc02BoardSpiPinRoute led_spis[2];
+    unsigned led_spi_count;
     DmMc02BoardPin buzzer;
     DmMc02BoardPin user_key;
     DmMc02BoardPin power_out1;

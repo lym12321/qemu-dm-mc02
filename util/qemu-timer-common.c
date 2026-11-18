@@ -32,6 +32,7 @@ int64_t clock_start;
 #ifdef _WIN32
 
 int64_t clock_freq;
+uint32_t clock_ns_per_tick;
 
 static void __attribute__((constructor)) init_get_clock(void)
 {
@@ -43,6 +44,11 @@ static void __attribute__((constructor)) init_get_clock(void)
         exit(1);
     }
     clock_freq = freq.QuadPart;
+    /* Only exact integer ratios bypass muldiv64; retain its existing
+     * conversion for all other QPC frequencies. */
+    if (clock_freq > 0 && NANOSECONDS_PER_SECOND % clock_freq == 0) {
+        clock_ns_per_tick = NANOSECONDS_PER_SECOND / clock_freq;
+    }
     clock_start = get_clock();
 }
 

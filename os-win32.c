@@ -26,6 +26,7 @@
 #include "qemu/osdep.h"
 #include <windows.h>
 #include <mmsystem.h>
+#include "qemu/error-report.h"
 #include "sysemu/runstate.h"
 
 static BOOL WINAPI qemu_ctrl_handler(DWORD type)
@@ -47,9 +48,45 @@ static void os_undo_timer_resolution(void)
     timeEndPeriod(mm_tc.wPeriodMin);
 }
 
+static void os_setup_execution_speed_qos(void)
+{
+    typedef BOOL (WINAPI *ProcessInformationFunc)(HANDLE,
+        PROCESS_INFORMATION_CLASS, LPVOID, DWORD);
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    ProcessInformationFunc get_information = (ProcessInformationFunc)
+        GetProcAddress(kernel32, "GetProcessInformation");
+    ProcessInformationFunc set_information = (ProcessInformationFunc)
+        GetProcAddress(kernel32, "SetProcessInformation");
+    PROCESS_POWER_THROTTLING_STATE state = {
+        .Version = PROCESS_POWER_THROTTLING_CURRENT_VERSION,
+    };
+
+    if (!get_information || !set_information) {
+        warn_report("process execution-speed QoS is unavailable; "
+                    "using Windows default scheduling");
+        return;
+    }
+    if (!get_information(GetCurrentProcess(), ProcessPowerThrottling,
+                         &state, sizeof(state))) {
+        warn_report("cannot read process execution-speed QoS (error %lu)",
+                    GetLastError());
+        return;
+    }
+
+    /* Keep time-sensitive emulation on HighQoS even without a visible window. */
+    state.ControlMask |= PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    state.StateMask &= ~PROCESS_POWER_THROTTLING_EXECUTION_SPEED;
+    if (!set_information(GetCurrentProcess(), ProcessPowerThrottling,
+                         &state, sizeof(state))) {
+        warn_report("cannot request process execution-speed HighQoS "
+                    "(error %lu)", GetLastError());
+    }
+}
+
 void os_setup_early_signal_handling(void)
 {
     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
+    os_setup_execution_speed_qos();
     timeGetDevCaps(&mm_tc, sizeof(mm_tc));
     timeBeginPeriod(mm_tc.wPeriodMin);
     atexit(os_undo_timer_resolution);

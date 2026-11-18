@@ -68,7 +68,8 @@ static const DmMc02BoardProfile dm_mc02_profile = {
         .led_timers = {{ 1, 0, 1, true }, { 2, 1, 2, false },
                        { 3, 2, 1, true }},
         .led_timer_count = 3,
-        .led_spi_af = 5,
+        .led_spis = {{ 1, 5 }, { 6, 8 }},
+        .led_spi_count = 2,
         .buzzer = { 1, 15 },
         .user_key = { 0, 15 },
         .power_out1 = { 2, 14 },
@@ -207,7 +208,7 @@ static const DmMc02BoardProfile stm32h723_eval_profile = {
         .led = { 0, 0 },
         .led_timers = {{ 1, DM_MC02_BOARD_TIMER_COUNT, 1, false }},
         .led_timer_count = 1,
-        .led_spi_af = DM_MC02_BOARD_PIN_NONE,
+        .led_spi_count = 0,
         .buzzer = { 1, 0 },
         .user_key = { 0, 13 },
         .power_out1 = { 2, 0 },
@@ -600,8 +601,7 @@ bool dm_mc02_board_validate(const DmMc02BoardProfile *board, Error **errp)
     }
     if (board->devices.led_timer_count >
         ARRAY_SIZE(board->devices.led_timers) ||
-        (board->devices.led_spi_af > 15 &&
-         board->devices.led_spi_af != DM_MC02_BOARD_PIN_NONE)) {
+        board->devices.led_spi_count > ARRAY_SIZE(board->devices.led_spis)) {
         error_setg(errp, "board profile '%s' has invalid LED routes", board->name);
         return false;
     }
@@ -622,6 +622,31 @@ bool dm_mc02_board_validate(const DmMc02BoardProfile *board, Error **errp)
             if (board->devices.led_timers[j].af == route->af ||
                 board->devices.led_timers[j].timer_index == route->timer_index) {
                 error_setg(errp, "board profile '%s' repeats an LED timer route",
+                           board->name);
+                return false;
+            }
+        }
+    }
+    for (unsigned i = 0; i < board->devices.led_spi_count; ++i) {
+        const DmMc02BoardSpiPinRoute *route = &board->devices.led_spis[i];
+
+        if (route->af > 15 ||
+            (route->controller != 1 && route->controller != 6)) {
+            error_setg(errp, "board profile '%s' has an invalid LED SPI route",
+                       board->name);
+            return false;
+        }
+        for (unsigned j = 0; j < i; ++j) {
+            if (board->devices.led_spis[j].af == route->af ||
+                board->devices.led_spis[j].controller == route->controller) {
+                error_setg(errp, "board profile '%s' repeats an LED SPI route",
+                           board->name);
+                return false;
+            }
+        }
+        for (unsigned j = 0; j < board->devices.led_timer_count; ++j) {
+            if (board->devices.led_timers[j].af == route->af) {
+                error_setg(errp, "board profile '%s' repeats an LED GPIO AF",
                            board->name);
                 return false;
             }

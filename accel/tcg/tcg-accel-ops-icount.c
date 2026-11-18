@@ -72,8 +72,19 @@ static int64_t icount_get_limit(void)
 
 static void icount_notify_aio_contexts(void)
 {
-    /* Wake up other AioContexts.  */
-    qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    if (icount_enabled() == 1 && replay_mode == REPLAY_MODE_NONE &&
+        first_cpu && !CPU_NEXT(first_cpu)) {
+        /*
+         * This thread services the main list below. Other AioContexts only
+         * need waking when their own timers expire; rearming a timer already
+         * notifies its list. Avoid a wakeup on every device timer deadline.
+         */
+        qemu_clock_notify_expired(QEMU_CLOCK_VIRTUAL,
+            qemu_clock_get_main_loop_timerlist(QEMU_CLOCK_VIRTUAL));
+    } else {
+        /* Keep replay, adaptive icount and multi-vCPU scheduling unchanged. */
+        qemu_clock_notify(QEMU_CLOCK_VIRTUAL);
+    }
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
 }
 

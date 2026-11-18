@@ -50,6 +50,19 @@
 #define ADC1_CR         (ADC1_BASE + 0x08)
 #define ADC1_CFGR       (ADC1_BASE + 0x0c)
 #define ADC1_SQR1       (ADC1_BASE + 0x30)
+#define DMA2_HISR       0x40020404u
+#define DMA2_S6CR       0x400204a0u
+#define DMA2_S6NDTR     0x400204a4u
+#define DMA2_S6PAR      0x400204a8u
+#define DMA2_S6M0AR     0x400204acu
+#define DMA2_S6FCR      0x400204b4u
+#define DMAMUX1_C14CR   0x40020838u
+#define DMA_CR_EN       (1u << 0)
+#define DMA_CR_DIR_M2P  (1u << 6)
+#define DMA_CR_CIRC     (1u << 8)
+#define DMA_FLAG_TEIF6  (1u << 19)
+#define DMA_FLAG_TCIF6  (1u << 21)
+#define DMA_FLAG_MASK6  (0x3du << 16)
 
 #define TIM_CR1_CEN     (1u << 0)
 #define TIM_CR1_CMS_1   (1u << 5)
@@ -61,6 +74,7 @@
 #define TIM_DIER_CC2IE  (1u << 2)
 #define TIM_DIER_CC3IE  (1u << 3)
 #define TIM_DIER_CC4IE  (1u << 4)
+#define TIM_DIER_CC1DE  (1u << 9)
 #define TIM_SR_UIF      (1u << 0)
 #define TIM_SR_CC1IF    (1u << 1)
 #define TIM_SR_CC2IF    (1u << 2)
@@ -311,6 +325,30 @@ static void test_update_period_sets_uif(void)
     qtest_clock_step(qts, 1000);
     g_assert_true(qtest_readl(qts, TIM2_SR) & TIM_SR_UIF);
 
+    qtest_quit(qts);
+}
+
+static void test_sr_subword_updates_irq(void)
+{
+    QTestState *qts = tim2_start();
+
+    qtest_irq_intercept_in(qts, "/machine/armv7m");
+    tim2_configure(qts, 3, 7);
+    qtest_writel(qts, TIM2_DIER, 1);
+    qtest_writel(qts, TIM2_CR1, TIM_CR1_CEN);
+    qtest_clock_step(qts, 1000);
+    g_assert_true(qtest_get_irq(qts, 28));
+
+    /* Clearing SR must lower IRQ at this MMIO access, without another tick. */
+    qtest_writeb(qts, TIM2_SR, 0);
+    g_assert_false(qtest_readl(qts, TIM2_SR) & TIM_SR_UIF);
+    g_assert_false(qtest_get_irq(qts, 28));
+    qtest_clock_step(qts, 1000);
+    g_assert_true(qtest_get_irq(qts, 28));
+    qtest_writel(qts, TIM2_CR1, 0);
+    qtest_writew(qts, TIM2_SR, 0);
+    g_assert_false(qtest_readl(qts, TIM2_SR) & TIM_SR_UIF);
+    g_assert_false(qtest_get_irq(qts, 28));
     qtest_quit(qts);
 }
 
@@ -777,6 +815,159 @@ static void test_tim8_rcr_gates_update_flag_only(void)
     qtest_quit(qts);
 }
 
+typedef struct DmaReadCase {
+    const char *name;
+    uint32_t source;
+    unsigned width;
+    unsigned ram_bytes;
+    bool fails;
+} DmaReadCase;
+
+static const DmaReadCase dma_read_cases[] = {
+    { "/dm-mc02/dma/direct-memory/ram-byte", 0x24000101, 1, 1, false },
+    { "/dm-mc02/dma/direct-memory/ram-unaligned-halfword",
+      0x24000101, 2, 2, false },
+    { "/dm-mc02/dma/direct-memory/ram-unaligned-word",
+      0x24000101, 4, 4, false },
+    /* AXI SRAM ends at 0x24050000; only initialize its mapped prefix. */
+    { "/dm-mc02/dma/direct-memory/ram-boundary-halfword",
+      0x2404ffff, 2, 1, true },
+    { "/dm-mc02/dma/direct-memory/ram-boundary-word",
+      0x2404fffe, 4, 2, true },
+    { "/dm-mc02/dma/direct-memory/mmio-word", 0x50003000, 4, 0, false },
+    /* WWDG allows byte/halfword/word reads but rejects unaligned accesses. */
+    { "/dm-mc02/dma/direct-memory/mmio-unaligned-halfword",
+      0x50003001, 2, 0, true },
+};
+
+static void test_dma_direct_memory(gconstpointer opaque)
+{
+    const DmaReadCase *test = opaque;
+    const uint32_t destination = 0x24000200;
+    const uint8_t payload[] = { 0x19, 0xa6, 0x73, 0xc5 };
+    uint8_t sentinel[8], expected[8], actual[8];
+    unsigned size_encoding = test->width == 4 ? 2 : test->width == 2 ? 1 : 0;
+    QTestState *qts = qtest_init("-machine dm-mc02");
+
+    memset(sentinel, 0xa5, sizeof(sentinel));
+    memcpy(expected, sentinel, sizeof(expected));
+    qtest_memwrite(qts, destination, sentinel, sizeof(sentinel));
+    if (test->ram_bytes) {
+        qtest_memwrite(qts, test->source, payload, test->ram_bytes);
+        if (!test->fails) {
+            memcpy(expected, payload, test->width);
+        }
+    } else if (!test->fails) {
+        stl_le_p(expected, 0x7f); /* WWDG CR reset value, watchdog disabled. */
+    }
+
+    /* One TIM8_CH1 request at 500 ns, using the reset 64 MHz timer clock.
+     * PAR is ordinary RAM so this checks the DMA's actual address-space
+     * read and write paths without depending on a peripheral data format. */
+    qtest_writel(qts, TIM8_PSC, 0);
+    qtest_writel(qts, TIM8_ARR, 63);
+    qtest_writel(qts, TIM8_CCR1, 32);
+    qtest_writel(qts, TIM8_EGR, TIM_EGR_UG);
+    qtest_writel(qts, TIM8_SR, 0);
+    qtest_writel(qts, DMA2_S6PAR, destination);
+    qtest_writel(qts, DMA2_S6M0AR, test->source);
+    qtest_writel(qts, DMA2_S6NDTR, 1);
+    qtest_writel(qts, DMA2_S6FCR, 0);
+    qtest_writel(qts, DMAMUX1_C14CR, 47);
+    qtest_writel(qts, DMA2_S6CR, DMA_CR_EN | DMA_CR_DIR_M2P |
+                 (size_encoding << 11) | (size_encoding << 13));
+    qtest_writel(qts, TIM8_DIER, TIM_DIER_CC1DE);
+    qtest_writel(qts, TIM8_CR1, TIM_CR1_CEN);
+
+    qtest_clock_step(qts, 499);
+    g_assert_cmpuint(qtest_readl(qts, DMA2_S6NDTR), ==, 1);
+    qtest_memread(qts, destination, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), sentinel, sizeof(sentinel));
+    qtest_clock_step(qts, 1);
+    qtest_writel(qts, TIM8_CR1, 0);
+
+    g_assert_true(qtest_readl(qts, TIM8_SR) & TIM_SR_CC1IF);
+    g_assert_false(qtest_readl(qts, DMA2_S6CR) & DMA_CR_EN);
+    g_assert_cmpuint(qtest_readl(qts, DMA2_S6NDTR), ==, test->fails ? 1 : 0);
+    g_assert_cmphex(qtest_readl(qts, DMA2_HISR) & DMA_FLAG_MASK6, ==,
+                    test->fails ? DMA_FLAG_TEIF6 : DMA_FLAG_TCIF6);
+    qtest_memread(qts, destination, actual, sizeof(actual));
+    g_assert_cmpmem(actual, sizeof(actual), expected, sizeof(expected));
+    qtest_quit(qts);
+}
+
+/* These tests observe only the destination timer while time advances.
+ * Reading source TIM8 or DMA registers would itself flush a pending window. */
+static QTestState *tim8_window_start(void)
+{
+    g_autofree char *saved = g_strdup(g_getenv("DM_TIM_EVENT_WINDOW_NS"));
+    QTestState *qts;
+
+    g_setenv("DM_TIM_EVENT_WINDOW_NS", "5000", true);
+    qts = tim2_start();
+    if (saved) {
+        g_setenv("DM_TIM_EVENT_WINDOW_NS", saved, true);
+    } else {
+        g_unsetenv("DM_TIM_EVENT_WINDOW_NS");
+    }
+    return qts;
+}
+
+static void tim8_configure_window_dma(QTestState *qts, uint32_t destination,
+                                     bool circular)
+{
+    const uint32_t source = 0x24000100;
+
+    /* At the fixture's 32 MHz, compare at 500 ns repeats every 1000 ns.
+     * Writing 16 back to TIM8 CCR1 preserves that schedule after the beat. */
+    qtest_writel(qts, source, 16);
+    qtest_writel(qts, TIM8_PSC, 0);
+    qtest_writel(qts, TIM8_ARR, 31);
+    qtest_writel(qts, TIM8_CCR1, 16);
+    qtest_writel(qts, TIM8_EGR, TIM_EGR_UG);
+    qtest_writel(qts, TIM8_SR, 0);
+    qtest_writel(qts, DMA2_S6PAR, destination);
+    qtest_writel(qts, DMA2_S6M0AR, source);
+    qtest_writel(qts, DMA2_S6NDTR, 1);
+    qtest_writel(qts, DMA2_S6FCR, 0);
+    qtest_writel(qts, DMAMUX1_C14CR, 47);
+    qtest_writel(qts, DMA2_S6CR, DMA_CR_EN | DMA_CR_DIR_M2P |
+                 (circular ? DMA_CR_CIRC : 0) | (2u << 11) | (2u << 13));
+    qtest_writel(qts, TIM8_DIER, TIM_DIER_CC1DE);
+}
+
+static void test_window_cross_timer_dma_is_exact(void)
+{
+    QTestState *qts = tim8_window_start();
+
+    tim8_configure_window_dma(qts, TIM1_CCR1, false);
+    qtest_writel(qts, TIM8_CR1, TIM_CR1_CEN);
+    qtest_clock_step(qts, 499);
+    g_assert_cmpuint(qtest_readl(qts, TIM1_CCR1), ==, 0);
+    qtest_clock_step(qts, 1);
+    /* An idle TIM1 read cannot settle TIM8: the DMA must already be done. */
+    g_assert_cmpuint(qtest_readl(qts, TIM1_CCR1), ==, 16);
+    qtest_quit(qts);
+}
+
+static void test_window_circular_reload_target_is_exact(void)
+{
+    QTestState *qts = tim8_window_start();
+
+    /* EN captures TIM1 as reload_par. The first beat instead uses the
+     * changed live PAR, but completing NDTR=1 restores TIM1 for beat two. */
+    tim8_configure_window_dma(qts, TIM1_CCR1, true);
+    qtest_writel(qts, DMA2_S6PAR, TIM8_CCR1);
+    qtest_writel(qts, TIM8_CR1, TIM_CR1_CEN);
+    qtest_clock_step(qts, 500);
+    g_assert_cmpuint(qtest_readl(qts, TIM1_CCR1), ==, 0);
+    qtest_clock_step(qts, 999);
+    g_assert_cmpuint(qtest_readl(qts, TIM1_CCR1), ==, 0);
+    qtest_clock_step(qts, 1);
+    g_assert_cmpuint(qtest_readl(qts, TIM1_CCR1), ==, 16);
+    qtest_quit(qts);
+}
+
 static void test_ws2812_dma_sram_sources(void)
 {
     /* Actual TIM8_CH1N -> PA7 -> DIN, with DMA updating the next preload.
@@ -798,7 +989,7 @@ static void test_ws2812_dma_sram_sources(void)
         qtest_writel(qts, 0x58020020, 3u << 28); /* PA7 AF3 TIM8_CH1N */
         qtest_writel(qts, 0x58020000, 2u << 14);
         qtest_writel(qts, TIM8_BASE + 0x18, (6u << 4) | 8u);
-        qtest_writel(qts, TIM8_BASE + 0x20, 12); /* complementary, inverted */
+        qtest_writel(qts, TIM8_BASE + 0x20, 4); /* N-only follows OC1REF */
         qtest_writel(qts, TIM8_BDTR, 1u << 15);
         qtest_writel(qts, TIM8_ARR, 79); /* 64MHz, 1.25us */
         qtest_writel(qts, TIM8_CCR1, 26);
@@ -914,8 +1105,16 @@ static void test_buzzer_gpio_tone(void)
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
+    for (unsigned i = 0; i < ARRAY_SIZE(dma_read_cases); ++i) {
+        g_test_add_data_func(dma_read_cases[i].name, &dma_read_cases[i],
+                             test_dma_direct_memory);
+    }
     g_test_add_func("/dm-mc02/tim12/buzzer-short-tone", test_buzzer_retains_short_tone);
     g_test_add_func("/dm-mc02/buzzer/gpio-tone", test_buzzer_gpio_tone);
+    g_test_add_func("/dm-mc02/tim8/window-cross-timer-dma",
+                    test_window_cross_timer_dma_is_exact);
+    g_test_add_func("/dm-mc02/tim8/window-circular-reload-target",
+                    test_window_circular_reload_target_is_exact);
     g_test_add_func("/dm-mc02/ws2812/dma-sram-sources",
                     test_ws2812_dma_sram_sources);
     g_test_add_func("/dm-mc02/tim2/counter-freezes-disabled",
@@ -932,6 +1131,8 @@ int main(int argc, char **argv)
                     test_tim1_extended_ocref_mode_is_not_aliased);
     g_test_add_func("/dm-mc02/tim2/update-period-uif",
                     test_update_period_sets_uif);
+    g_test_add_func("/dm-mc02/tim2/sr-subword-irq",
+                    test_sr_subword_updates_irq);
     g_test_add_func("/dm-mc02/tim2/live-psc-arr-preserves-counter",
                     test_live_psc_arr_write_preserves_counter);
     g_test_add_func("/dm-mc02/tim2/apb-timer-domains-independent",

@@ -810,6 +810,9 @@ qio_channel_socket_set_blocking(QIOChannel *ioc,
     QIOChannelSocket *sioc = QIO_CHANNEL_SOCKET(ioc);
 
     if (enabled) {
+#ifdef CONFIG_WIN32
+        qio_channel_socket_watch_use_polling(ioc);
+#endif
         qemu_socket_set_block(sioc->fd);
     } else {
         qemu_socket_set_nonblock(sioc->fd);
@@ -907,6 +910,9 @@ static void qio_channel_socket_set_aio_fd_handler(QIOChannel *ioc,
 {
     QIOChannelSocket *sioc = QIO_CHANNEL_SOCKET(ioc);
 
+#ifdef CONFIG_WIN32
+    qio_channel_socket_watch_use_polling(ioc);
+#endif
     qio_channel_util_set_aio_fd_handler(sioc->fd, read_ctx, io_read,
                                         sioc->fd, write_ctx, io_write,
                                         opaque);

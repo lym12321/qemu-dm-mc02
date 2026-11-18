@@ -539,6 +539,55 @@ uint64_t dm_mc02_pwr_rcc_spi1_clock_hz(const DmMc02PwrRcc *state)
            dm_mc02_pwr_rcc_spi123_kernel_clock_hz(state) : 0;
 }
 
+uint64_t dm_mc02_pwr_rcc_spi6_kernel_clock_hz(const DmMc02PwrRcc *state)
+{
+    uint32_t cr;
+    unsigned source =
+        (dm_mc02_reg_load(state->rcc_regs, RCC_D3CCIPR, 4) >> 28) & 7u;
+
+    /* STM32H723 RCC_D3CCIPR.SPI6SEL and HAL_RCCEx_GetPeriphCLKFreq:
+     * SPI6 uses PLL2/3 Q outputs, unlike SPI123's P outputs. */
+    switch (source) {
+    case 0: { /* PCLK4; D3PPRE 0..3=/1, 4..7=/2,/4,/8,/16. */
+        unsigned prescaler =
+            (dm_mc02_reg_load(state->rcc_regs, RCC_D3CFGR, 4) >> 4) & 7u;
+
+        return dm_mc02_pwr_rcc_hclk_hz(state) /
+               (prescaler < 4 ? 1u : 1u << (prescaler - 3));
+    }
+    case 1: /* PLL2Q */
+        return dm_mc02_pll_output_hz(state, RCC_CR_PLL2ON, 12,
+            RCC_PLL2DIVR, RCC_PLL2FRACR, RCC_PLLCFGR_PLL2FRACEN, 16,
+            RCC_PLLCFGR_PLL2DIVQEN);
+    case 2: /* PLL3Q */
+        return dm_mc02_pll_output_hz(state, RCC_CR_PLL3ON, 20,
+            RCC_PLL3DIVR, RCC_PLL3FRACR, RCC_PLLCFGR_PLL3FRACEN, 16,
+            RCC_PLLCFGR_PLL3DIVQEN);
+    case 3: /* HSI */
+        cr = dm_mc02_reg_load(state->rcc_regs, RCC_CR, 4);
+        return dm_mc02_rcc_oscillator_ready(state, 0) ?
+               DM_MC02_HSI_HZ / dm_mc02_hsi_divider(cr) : 0;
+    case 4: /* CSI */
+        return dm_mc02_rcc_oscillator_ready(state, 1) ? DM_MC02_CSI_HZ : 0;
+    case 5: /* HSE */
+        return dm_mc02_rcc_oscillator_ready(state, 2) ? DM_MC02_HSE_HZ : 0;
+    default: /* SPI6SEL 6/7 are reserved on STM32H723. */
+        return 0;
+    }
+}
+
+bool dm_mc02_pwr_rcc_spi6_reset_asserted(const DmMc02PwrRcc *state)
+{
+    return dm_mc02_reg_load(state->rcc_regs, RCC_APB4RSTR, 4) & (1u << 5);
+}
+
+uint64_t dm_mc02_pwr_rcc_spi6_clock_hz(const DmMc02PwrRcc *state)
+{
+    return !dm_mc02_pwr_rcc_spi6_reset_asserted(state) &&
+           (dm_mc02_reg_load(state->rcc_regs, RCC_APB4ENR, 4) & (1u << 5)) ?
+           dm_mc02_pwr_rcc_spi6_kernel_clock_hz(state) : 0;
+}
+
 uint64_t dm_mc02_pwr_rcc_adc_kernel_clock_hz(const DmMc02PwrRcc *state)
 {
     uint32_t d3ccipr;
@@ -793,6 +842,7 @@ static void dm_mc02_pwr_rcc_write(void *opaque, hwaddr offset, uint64_t value,
     bool adc_clock_dirty = false;
     bool fdcan_clock_dirty = false;
     bool uart_clock_dirty = false;
+    bool spi_clock_dirty = false;
     bool adc_source_selected;
     bool pll2_enabled;
 
@@ -891,6 +941,14 @@ static void dm_mc02_pwr_rcc_write(void *opaque, hwaddr offset, uint64_t value,
             (offset < RCC_PLL3FRACR + 4 && offset + size > RCC_PLL3FRACR) ||
             (offset < RCC_D2CCIP2R + 4 && offset + size > RCC_D2CCIP2R) ||
             (offset < RCC_BDCR + 4 && offset + size > RCC_BDCR);
+        /* SPI mux and PLL/oscillator changes share the clock roots above.
+         * PCLK4 and each instance's enable/reset gates are independent. */
+        spi_clock_dirty =
+            (offset < RCC_D3CFGR + 4 && offset + size > RCC_D3CFGR) ||
+            (offset < RCC_APB2ENR + 4 && offset + size > RCC_APB2ENR) ||
+            (offset < RCC_APB2RSTR + 4 && offset + size > RCC_APB2RSTR) ||
+            (offset < RCC_APB4ENR + 4 && offset + size > RCC_APB4ENR) ||
+            (offset < RCC_APB4RSTR + 4 && offset + size > RCC_APB4RSTR);
         /* PLL1 setup is commonly performed before the independent ADC clock
          * is configured.  It must not turn the compatibility default into a
          * zero-rate PLL2P clock merely because PLLCKSELR/PLL1DIVR changed.
@@ -907,8 +965,7 @@ static void dm_mc02_pwr_rcc_write(void *opaque, hwaddr offset, uint64_t value,
         }
         dm_mc02_rcc_try_switch_system_clock(s);
         if (cpu_clock_dirty || adc_clock_dirty || fdcan_clock_dirty ||
-            uart_clock_dirty || (offset < 0xf4 && offset + size > 0xf0) ||
-            (offset < 0x9c && offset + size > 0x98)) {
+            uart_clock_dirty || spi_clock_dirty) {
             dm_mc02_pwr_rcc_notify_clock(s);
         }
     }

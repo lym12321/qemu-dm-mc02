@@ -466,17 +466,12 @@ static int get_prio(NVICState *s, unsigned irq, bool secure)
     }
 }
 
-/* Recompute state and assert irq line accordingly.
- * Must be called after changes to:
- *  vec->active, vec->enabled, vec->pending or vec->prio for any vector
- *  prigroup
- */
-static void nvic_irq_update(NVICState *s)
+/* Assert the IRQ line using the cached pending and active priorities. */
+static void nvic_irq_update_output(NVICState *s)
 {
     int lvl;
     int pend_prio;
 
-    nvic_recompute_state(s);
     pend_prio = nvic_pending_prio(s);
 
     /* Raise NVIC output if this IRQ would be taken, except that we
@@ -488,6 +483,49 @@ static void nvic_irq_update(NVICState *s)
     lvl = (pend_prio < s->exception_prio);
     trace_nvic_irq_update(s->vectpending, pend_prio, s->exception_prio, lvl);
     qemu_set_irq(s->excpout, lvl);
+}
+
+/* Recompute state and assert irq line accordingly.
+ * Must be called after changes to:
+ *  vec->active, vec->enabled, vec->pending or vec->prio for any vector
+ *  prigroup
+ */
+static void nvic_irq_update(NVICState *s)
+{
+    nvic_recompute_state(s);
+    nvic_irq_update_output(s);
+}
+
+/* Only this exception's pending bit has changed from zero to one. */
+static void nvic_irq_update_new_pending(NVICState *s, unsigned int irq)
+{
+    VecInfo *vec = &s->vectors[irq];
+    unsigned int pending = s->vectpending;
+
+    if (arm_feature(&s->cpu->env, ARM_FEATURE_M_SECURITY)) {
+        nvic_irq_update(s);
+        return;
+    }
+
+    /*
+     * Active priority is unchanged. With one PRIGROUP, raw priorities
+     * order pending exceptions, including their subpriority bits. Equal
+     * priorities are resolved by the lowest exception number.
+     */
+    if (vec->enabled &&
+        (!pending || vec->prio < s->vectors[pending].prio ||
+         (vec->prio == s->vectors[pending].prio && irq < pending))) {
+        s->vectpending = irq;
+        s->vectpending_prio = vec->prio;
+        if (s->vectpending_prio > 0) {
+            s->vectpending_prio &= nvic_gprio_mask(s, false);
+        }
+    }
+
+    trace_nvic_recompute_state(s->vectpending,
+                               s->vectpending_prio,
+                               s->exception_prio);
+    nvic_irq_update_output(s);
 }
 
 /**
@@ -657,7 +695,7 @@ static void do_armv7m_nvic_set_pending(void *opaque, int irq, bool secure,
 
     if (!vec->pending) {
         vec->pending = 1;
-        nvic_irq_update(s);
+        nvic_irq_update_new_pending(s, irq);
     }
 }
 
