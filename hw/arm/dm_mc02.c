@@ -3261,6 +3261,7 @@ static void dm_mc02_ws2812_refresh(void *opaque)
      * without turning it into a visible frame error; subsequent partial
      * frames still use the strict decoder path. */
     if (windowed && !s->ws2812_warmup_resynced && !s->ws2812.frames &&
+        !s->ws2812.synchronized &&
         ((s->ws2812.count && s->ws2812.count < 24) || s->ws2812.bad) &&
         timestamp_ns >= s->ws2812.last_ns) {
         dm_ws2812_resync(&s->ws2812, timestamp_ns);
